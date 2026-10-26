@@ -1,0 +1,17 @@
+{
+  "description": "Bring the installed Claude Watch to the foreground before its Computer Use calls.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^mcp__computer[_-]use__(get_app_state|click|drag|perform_secondary_action|press_key|scroll|select_text|set_value|type_text)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 /Users/anyun/Desktop/bash/monitor/tools/claude_watch_foreground_hook.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

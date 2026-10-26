@@ -1,0 +1,655 @@
+{
+  "scenario": "recovered",
+  "simulated": true,
+  "environment": {
+    "status": "ok",
+    "purpose": "environment_detection",
+    "grants_launch_permission": false,
+    "observed_at": 1792901550.500384,
+    "expires_at": 1792901850.500384,
+    "rows": [
+      {
+        "id": "proxy",
+        "name": "代理内核",
+        "state": "ok",
+        "detail": "TAG 运行进程、回环监听者和控制接口已核对；当前选择 Japan fixture",
+        "required": false,
+        "scope": "本机环境",
+        "current": "tag",
+        "reference": "运行进程与监听者身份",
+        "source": "进程清单 / 后台新鲜样本 / 控制接口"
+      },
+      {
+        "id": "tun",
+        "name": "TUN 网卡",
+        "state": "ok",
+        "detail": "接口与代理状态核对；不构成逐包出站保证",
+        "required": false,
+        "scope": "本机环境",
+        "current": "utun4",
+        "reference": "代理与 TUN 路由同时存在",
+        "source": "ifconfig / route"
+      },
+      {
+        "id": "egress",
+        "name": "出口国家",
+        "state": "ok",
+        "detail": "本轮出口 IP 与国家交叉确认",
+        "required": false,
+        "scope": "诊断请求",
+        "current": "222.10.87.169 / JP",
+        "reference": "Cloudflare 与 Net.Coffee 本轮出口一致",
+        "source": "Cloudflare trace + Net.Coffee lookup",
+        "sampled_at": 1792901550.500384
+      },
+      {
+        "id": "ip_history",
+        "name": "IP 一致性",
+        "state": "fail",
+        "detail": "会话已因 IP 变化停止；再次启动必须完整核验并建立新基准。",
+        "required": true,
+        "scope": "检测历史；运行中 IP 变化由不可滚动的会话基准阻断",
+        "current": "222.10.87.169",
+        "reference": "会话基准 222.10.87.169",
+        "source": "本轮实测出口 / 受控启动会话基准"
+      },
+      {
+        "id": "timezone",
+        "name": "时区",
+        "state": "ok",
+        "detail": "比较当前系统时区与本轮检测出口的时区；不读取已保存目标",
+        "required": false,
+        "scope": "本机环境",
+        "current": "Asia/Tokyo",
+        "reference": "Asia/Tokyo",
+        "source": "/etc/localtime / Net.Coffee / IPinfo timezone",
+        "sampled_at": 1792901550.500384
+      },
+      {
+        "id": "locale",
+        "name": "地区与日期格式",
+        "state": "ok",
+        "detail": "当前 ja_JP · 示例 2026/10/23；本轮出口要求 ja_JP · 示例 2026/10/23；短、中、长日期模板已核对，界面语言独立",
+        "required": false,
+        "scope": "本机环境",
+        "current": "ja_JP · 示例 2026/10/23",
+        "reference": "ja_JP · 示例 2026/10/23",
+        "source": "Foundation 日期模板 / AppleLocale / 本轮出口国家",
+        "sampled_at": 1792901550.500384
+      },
+      {
+        "id": "ipv6",
+        "name": "IPv6 策略",
+        "state": "ok",
+        "detail": "关闭策略已启用",
+        "required": false,
+        "scope": "本机环境",
+        "current": "已关闭",
+        "reference": "实际 IPv6 状态；不证明无泄漏",
+        "source": "networksetup -getinfo Ethernet"
+      },
+      {
+        "id": "dns",
+        "name": "DNS",
+        "state": "ok",
+        "detail": "本轮 DNS 递归出口与同轮公网出口国家一致；采样 2026-10-25 13:12:30；DNS 国家 JP；DNS 出口 8.8.8.8",
+        "required": false,
+        "scope": "Net.Coffee DNS 泄漏采样；不代表所有应用或浏览器 DoH",
+        "current": "8.8.8.8 / JP",
+        "reference": "同轮 HTTP 出口国家 JP",
+        "source": "Net.Coffee 权威 DNS 记录 + 同轮 HTTP 参考；DNS 采样 2026-10-25 13:12:30",
+        "sampled_at": 1792901550.4969301
+      },
+      {
+        "id": "stun",
+        "name": "UDP/STUN 出口",
+        "state": "ok",
+        "detail": "汇总：1 个公网候选；参考：222.10.87.169；全部服务器完成\n未知服务器：成功；出口 222.10.87.169；未提供逐次尝试记录；最终状态：成功",
+        "required": false,
+        "scope": "原生 UDP/STUN 探针，用于 AI 受控启动网络检查；不等于 Claude 实际 socket 或 WebRTC",
+        "sampled_at": null,
+        "stun_finished_at": null,
+        "stun_observations": [
+          {
+            "status": "ok",
+            "address": "222.10.87.169"
+          }
+        ],
+        "stun_probe": {
+          "complete": true,
+          "observations": [
+            {
+              "status": "ok",
+              "address": "222.10.87.169"
+            }
+          ]
+        },
+        "current": "222.10.87.169",
+        "reference": "222.10.87.169",
+        "source": "原生 UDP/STUN 逐台探针；用于 AI 受控启动网络检查，不等于 Claude 实际 socket 或 WebRTC"
+      },
+      {
+        "id": "guard",
+        "name": "会话保护",
+        "state": "fail",
+        "detail": "运行中实测 HTTP 出口 IP 已变化；后台心跳与会话安全分别核对。",
+        "required": true,
+        "scope": "本机环境",
+        "current": "已停止",
+        "reference": "再次启动仍执行完整校验",
+        "source": "持久会话保护状态"
+      },
+      {
+        "id": "routing",
+        "name": "代理规则覆盖",
+        "state": "unknown",
+        "detail": "TAG 运行配置不存在\n保存清单：Claude Watch/原版相同的 13 项域名；TAG 持久配置为加密容器，不能逐条比较",
+        "required": false,
+        "scope": "规则配置；实际流量另见连接页",
+        "current": "0/13 已覆盖",
+        "reference": "规则模式：运行配置 0/13；控制器规则 0/13",
+        "source": "TAG 运行配置"
+      },
+      {
+        "id": "language",
+        "name": "Claude 语言",
+        "state": "ok",
+        "detail": "Claude 应用语言或系统首选语言",
+        "required": false,
+        "scope": "本机环境",
+        "current": "en-JP",
+        "reference": "英文偏好；与国家分开判断",
+        "source": "系统 AppleLanguages（Claude 未单独设置）"
+      },
+      {
+        "id": "asn",
+        "name": "ASN 属性",
+        "state": "ok",
+        "detail": "AS2516 · KDDI CORPORATION (isolated fixture)；ASN 注册国家 JP（RIPEstat RIR；统计日期 未提供，本次查询 未提供）。当前 IP 出口归属国家 JP（Net.Coffee）。",
+        "required": false,
+        "scope": "Net.Coffee 出口归属 / RIPEstat RIR",
+        "current": "AS2516 KDDI CORPORATION (isolated fixture) · 当前 IP JP",
+        "reference": "ASN 注册国家 JP；本轮出口地理国家 JP",
+        "source": "Net.Coffee lookup（采样 未提供）/ RIPEstat RIR（统计日期 未提供；查询 未提供）",
+        "sampled_at": 1792901550.500384
+      },
+      {
+        "id": "reachability",
+        "name": "Claude 服务",
+        "state": "ok",
+        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "required": false,
+        "scope": "无账号凭据的诊断请求",
+        "service_responses": {
+          "claude": {
+            "status": "ok",
+            "transport_reached": true,
+            "access": "challenge",
+            "http_status": 403,
+            "source": "https://claude.ai/",
+            "queried_at": 1792901550.478421,
+            "challenge": {
+              "provider": "cloudflare",
+              "mitigated": "challenge"
+            }
+          },
+          "api": {
+            "status": "ok",
+            "transport_reached": true,
+            "access": "authentication_required",
+            "http_status": 401,
+            "source": "https://api.anthropic.com/v1/models",
+            "queried_at": 1792901550.478505
+          }
+        },
+        "sampled_at": 1792901550.478505,
+        "current": "网络可达 · 网页：需要浏览器验证 / API：未提供密钥",
+        "reference": "网页/API 分别展示网络与访问状态；不证明登录或账号可用",
+        "source": "网页：https://claude.ai/；API：https://api.anthropic.com/v1/models"
+      }
+    ],
+    "facts": {
+      "state": "ok",
+      "risks": [],
+      "evidence": {
+        "country": "JP"
+      },
+      "measured": {
+        "ip": "222.10.87.169",
+        "country": "JP",
+        "timezone": "Asia/Tokyo",
+        "locale": "ja_JP",
+        "timezone_source": "Net.Coffee / IPinfo timezone",
+        "locale_source": "出口国家对应的地区格式；界面语言独立"
+      }
+    },
+    "egress_reference": {
+      "ip": "222.10.87.169",
+      "country": "JP",
+      "timezone": "Asia/Tokyo",
+      "checked_at": 1792901550.500384,
+      "context": "stable"
+    },
+    "session_guard": {
+      "state": "locked",
+      "phase": "locked",
+      "baseline": {
+        "ip": "222.10.87.169",
+        "country": "JP",
+        "observed_at": 1792901550.4842298,
+        "source": "isolated HTTP"
+      },
+      "current": {
+        "country": "JP",
+        "ip": "8.8.4.4",
+        "observed_at": 1792901550.493121,
+        "source": "isolated HTTP"
+      },
+      "reason": {
+        "code": "egress_ip_changed",
+        "detail": "运行中实测 HTTP 出口 IP 已变化",
+        "observed_at": 1792901550.4936268,
+        "source": "session guard"
+      },
+      "risk_evidence": {
+        "observed_at": 1792901550.47574,
+        "sources": {
+          "dns": {
+            "detail": "本轮 DNS 递归出口与同轮公网出口国家一致；采样 2026-10-25 13:12:30",
+            "observed_at": 1792901550.47574,
+            "state": "ok"
+          },
+          "webrtc": {
+            "detail": "WebRTC 公网候选与同轮 HTTP 出口一致",
+            "observed_at": 1792901550.47574,
+            "state": "ok"
+          }
+        },
+        "state": "safe"
+      },
+      "locked_at": 1792901550.493626
+    },
+    "candidates": [
+      "tag"
+    ],
+    "regional_reference": {
+      "ip": "222.10.87.169",
+      "country": "JP",
+      "timezone": "Asia/Tokyo",
+      "locale": "ja_JP",
+      "timezone_source": "Net.Coffee / IPinfo timezone",
+      "locale_source": "出口国家对应的地区格式；界面语言独立"
+    },
+    "netcoffee_lookup": null,
+    "source_notices": [],
+    "observation_id": "74a9a4fa-587c-472a-b01c-81f3428f21ad",
+    "context_id": "stable",
+    "context_transition": {
+      "state": "stable",
+      "before": {
+        "context_id": "stable",
+        "identity": {
+          "context": "stable"
+        },
+        "unavailable": []
+      },
+      "after": {
+        "context_id": "stable",
+        "identity": {
+          "context": "stable"
+        },
+        "unavailable": []
+      },
+      "changed_fields": [],
+      "unavailable": []
+    },
+    "policy_evaluation": {
+      "schema": 1,
+      "observed_at": 1792901550.500384,
+      "expires_at": 1792901850.500384,
+      "context": "stable",
+      "policy": "362784cb5125287aadacd8dd690fca11b562d6d82fdb1ca2b83b67bc2315d813",
+      "rows": [
+        {
+          "id": "proxy",
+          "name": "代理内核",
+          "state": "ok",
+          "detail": "TAG 运行进程、回环监听者和控制接口已核对",
+          "required": true,
+          "scope": "本机环境"
+        },
+        {
+          "id": "tun",
+          "name": "TUN 网卡",
+          "state": "ok",
+          "detail": "接口与代理状态核对；不构成逐包出站保证",
+          "required": true,
+          "scope": "本机环境"
+        },
+        {
+          "id": "egress",
+          "name": "出口国家",
+          "state": "ok",
+          "detail": "222.10.87.169 / JP",
+          "required": true,
+          "scope": "诊断请求"
+        },
+        {
+          "id": "ip_history",
+          "name": "IP 一致性",
+          "state": "fail",
+          "detail": "会话已因 IP 变化停止；再次启动必须完整核验并建立新基准。",
+          "required": true,
+          "scope": "检测历史；运行中 IP 变化由不可滚动的会话基准阻断",
+          "current": "222.10.87.169",
+          "reference": "会话基准 222.10.87.169",
+          "source": "本轮实测出口 / 受控启动会话基准"
+        },
+        {
+          "id": "timezone",
+          "name": "时区",
+          "state": "ok",
+          "detail": "当前 Asia/Tokyo；本轮出口要求 Asia/Tokyo；已接受目标 未配置",
+          "required": true,
+          "scope": "本机环境"
+        },
+        {
+          "id": "locale",
+          "name": "地区与日期格式",
+          "state": "ok",
+          "detail": "当前 ja_JP · 示例 2026/10/23；本轮出口要求 ja_JP · 示例 2026/10/23；短、中、长日期模板已核对，界面语言独立",
+          "required": true,
+          "scope": "本机环境"
+        },
+        {
+          "id": "ipv6",
+          "name": "IPv6 策略",
+          "state": "ok",
+          "detail": "关闭策略已启用",
+          "required": true,
+          "scope": "本机环境"
+        },
+        {
+          "id": "dns",
+          "name": "DNS",
+          "state": "ok",
+          "detail": "本轮 DNS 递归出口与同轮公网出口国家一致；采样 2026-10-25 13:12:30",
+          "required": true,
+          "scope": "Net.Coffee DNS 泄漏采样；不代表所有应用或浏览器 DoH"
+        },
+        {
+          "id": "stun",
+          "name": "UDP/STUN 出口",
+          "state": "ok",
+          "detail": "汇总：1 个公网候选；参考：222.10.87.169；全部服务器完成\n未知服务器：成功；出口 222.10.87.169；未提供逐次尝试记录；最终状态：成功",
+          "required": true,
+          "scope": "原生 UDP/STUN 探针，用于 AI 受控启动网络检查；不等于 Claude 实际 socket 或 WebRTC",
+          "sampled_at": null,
+          "stun_finished_at": null,
+          "stun_observations": [
+            {
+              "status": "ok",
+              "address": "222.10.87.169"
+            }
+          ],
+          "stun_probe": {
+            "complete": true,
+            "observations": [
+              {
+                "status": "ok",
+                "address": "222.10.87.169"
+              }
+            ]
+          }
+        },
+        {
+          "id": "guard",
+          "name": "会话保护",
+          "state": "fail",
+          "detail": "运行中实测 HTTP 出口 IP 已变化；后台心跳与会话安全分别核对。",
+          "required": true,
+          "scope": "本机环境",
+          "current": "已停止",
+          "reference": "再次启动仍执行完整校验",
+          "source": "持久会话保护状态"
+        },
+        {
+          "id": "routing",
+          "name": "代理规则覆盖",
+          "state": "unknown",
+          "detail": "TAG 运行配置不存在",
+          "required": false,
+          "scope": "规则配置；实际流量另见连接页"
+        },
+        {
+          "id": "language",
+          "name": "Claude 语言",
+          "state": "ok",
+          "detail": "Claude 应用语言或系统首选语言",
+          "required": true,
+          "scope": "本机环境"
+        },
+        {
+          "id": "asn",
+          "name": "ASN 属性",
+          "state": "ok",
+          "detail": "AS2516 · KDDI CORPORATION (isolated fixture)；ASN 注册国家 JP（RIPEstat RIR；统计日期 未提供，本次查询 未提供）。当前 IP 出口归属国家 JP（Net.Coffee）。",
+          "required": false,
+          "scope": "Net.Coffee 出口归属 / RIPEstat RIR"
+        },
+        {
+          "id": "reachability",
+          "name": "Claude 服务",
+          "state": "ok",
+          "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+          "required": true,
+          "scope": "无账号凭据的诊断请求",
+          "service_responses": {
+            "claude": {
+              "status": "ok",
+              "transport_reached": true,
+              "access": "challenge",
+              "http_status": 403,
+              "source": "https://claude.ai/",
+              "queried_at": 1792901550.478421,
+              "challenge": {
+                "provider": "cloudflare",
+                "mitigated": "challenge"
+              }
+            },
+            "api": {
+              "status": "ok",
+              "transport_reached": true,
+              "access": "authentication_required",
+              "http_status": 401,
+              "source": "https://api.anthropic.com/v1/models",
+              "queried_at": 1792901550.478505
+            }
+          },
+          "sampled_at": 1792901550.478505
+        }
+      ],
+      "ready": false,
+      "blocked": [
+        "guard",
+        "ip_history"
+      ],
+      "message": "会话已因 IP 变化停止；再次启动必须完整核验并建立新基准。",
+      "netcoffee_lookup": null,
+      "source_notices": [],
+      "egress_reference": {
+        "ip": "222.10.87.169",
+        "country": "JP",
+        "timezone": "Asia/Tokyo",
+        "checked_at": 1792901550.502157,
+        "context": "stable"
+      },
+      "facts": {
+        "state": "ok",
+        "risks": [],
+        "evidence": {
+          "country": "JP"
+        },
+        "measured": {
+          "ip": "222.10.87.169",
+          "country": "JP",
+          "timezone": "Asia/Tokyo",
+          "locale": "ja_JP",
+          "timezone_source": "Net.Coffee / IPinfo timezone",
+          "locale_source": "出口国家对应的地区格式；界面语言独立"
+        }
+      },
+      "purpose": "launch_requirements_preview",
+      "grants_launch_permission": false,
+      "session_guard": {
+        "state": "locked",
+        "phase": "locked",
+        "baseline": {
+          "ip": "222.10.87.169",
+          "country": "JP",
+          "observed_at": 1792901550.4842298,
+          "source": "isolated HTTP"
+        },
+        "current": {
+          "country": "JP",
+          "ip": "8.8.4.4",
+          "observed_at": 1792901550.493121,
+          "source": "isolated HTTP"
+        },
+        "reason": {
+          "code": "egress_ip_changed",
+          "detail": "运行中实测 HTTP 出口 IP 已变化",
+          "observed_at": 1792901550.4936268,
+          "source": "session guard"
+        },
+        "risk_evidence": {
+          "observed_at": 1792901550.47574,
+          "sources": {
+            "dns": {
+              "detail": "本轮 DNS 递归出口与同轮公网出口国家一致；采样 2026-10-25 13:12:30",
+              "observed_at": 1792901550.47574,
+              "state": "ok"
+            },
+            "webrtc": {
+              "detail": "WebRTC 公网候选与同轮 HTTP 出口一致",
+              "observed_at": 1792901550.47574,
+              "state": "ok"
+            }
+          },
+          "state": "safe"
+        },
+        "locked_at": 1792901550.493626
+      },
+      "observation_id": "74a9a4fa-587c-472a-b01c-81f3428f21ad",
+      "context_id": "stable"
+    },
+    "message": "本轮实测结果；未知项保留未知。受控启动仍需独立预检。"
+  },
+  "background": {
+    "status": "ok",
+    "observed_at": 1792901550.5044339,
+    "backend_healthy": true,
+    "services": [
+      {
+        "id": "guard",
+        "title": "Claude Watch 保镖",
+        "state": "running",
+        "detail": "后台及保护心跳有效；受控运行时核对会话 IP、中国风险与检测时效，命中阻断条件即退出 Claude。实际会话状态见下方。",
+        "source": "本工具保护心跳 / 后台进程身份",
+        "desired": true,
+        "last_checked": 1792901550.4963741
+      },
+      {
+        "id": "original",
+        "title": "原版 Claude切换器保镖",
+        "state": "scheduled",
+        "detail": "已加载，每 10 秒检查；最近退出码：0",
+        "source": "system/local.claude-bodyguard / 原版任务定义",
+        "desired": null,
+        "last_checked": null
+      },
+      {
+        "id": "watchdog",
+        "title": "时区守护",
+        "state": "inactive",
+        "detail": "实际目标：未设置；已接受目标：停用。任务按计划运行，不持续占用进程。",
+        "source": "时区任务注册 / root 管理的目标文件",
+        "desired": false,
+        "last_checked": null
+      },
+      {
+        "id": "updater",
+        "title": "自动更新",
+        "state": "unavailable",
+        "detail": "缺少本项目发布源或固定公钥；保存的开启意愿不代表可用的更新服务。",
+        "source": "本项目发布配置 / 用户更新任务",
+        "desired": false,
+        "last_checked": null
+      }
+    ],
+    "policy_issues": [],
+    "update_source_ready": false,
+    "session_guard": {
+      "state": "locked",
+      "phase": "locked",
+      "baseline": {
+        "ip": "222.10.87.169",
+        "country": "JP",
+        "observed_at": 1792901550.4842298,
+        "source": "isolated HTTP"
+      },
+      "current": {
+        "country": "JP",
+        "ip": "8.8.4.4",
+        "observed_at": 1792901550.493121,
+        "source": "isolated HTTP"
+      },
+      "reason": {
+        "code": "egress_ip_changed",
+        "detail": "运行中实测 HTTP 出口 IP 已变化",
+        "observed_at": 1792901550.4936268,
+        "source": "session guard"
+      },
+      "risk_evidence": {
+        "observed_at": 1792901550.47574,
+        "sources": {
+          "dns": {
+            "detail": "本轮 DNS 递归出口与同轮公网出口国家一致；采样 2026-10-25 13:12:30",
+            "observed_at": 1792901550.47574,
+            "state": "ok"
+          },
+          "webrtc": {
+            "detail": "WebRTC 公网候选与同轮 HTTP 出口一致",
+            "observed_at": 1792901550.47574,
+            "state": "ok"
+          }
+        },
+        "state": "safe"
+      },
+      "locked_at": 1792901550.493626
+    }
+  },
+  "webrtc": {
+    "kind": "webrtc",
+    "status": "complete",
+    "startedAt": 1792901549.4969301,
+    "finishedAt": 1792901550.4969301,
+    "contextChanged": false,
+    "scope": "隔离场景 · 生产回执链",
+    "observations": [
+      {
+        "address": "222.10.87.169",
+        "country": "JP",
+        "kind": "http",
+        "source": ""
+      },
+      {
+        "address": "222.10.87.169",
+        "country": "JP",
+        "kind": "srflx",
+        "source": ""
+      }
+    ],
+    "errors": []
+  }
+}

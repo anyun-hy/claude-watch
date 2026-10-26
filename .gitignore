@@ -1,0 +1,28 @@
+# Local build products and release packages
+/monitor/build/
+/monitor/dist/
+/monitor/preview/
+*.app/
+*.dmg
+*.dmg.sha256
+*.dSYM/
+
+# Machine-specific observations, research captures, and maintenance records
+/reports/
+/monitor/reports/
+/local/
+*.har
+*.log
+
+# Interpreter and OS caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+
+# Local credentials and editor state
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/

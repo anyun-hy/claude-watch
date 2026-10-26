@@ -1,0 +1,46 @@
+Feature reference and adapted behavior:
+https://github.com/YOURSJEYO/claude-switcher
+Original integration revision: b74112a508762bd33c1400fb17c922c72ab26604
+macOS update reference: 303cd1057cc1ab2f24cfac5b4c0a43094011caa1
+Adapted macOS commits:
+2cf108596a7bb382acbc62c2d1dd9b89e17e1d71 (read-only explicit proxy diagnostics)
+c8a1069955b074b0b068cc48a7c32b779ff643ce (move archives and copy-on-write loading)
+
+The 14-check inventory, A/B profile workflow, proxy modes, region mapping,
+13-domain pinned rule list, native STUN probe and scheduled protection/update
+features are adapted into Claude Watch's own runtime and interface.
+
+Since 2.9.1, the pinned original account functions (status, archive_current,
+copy_tree and switch_to) execute directly in a private verified workspace.
+The upstream quit/open hooks are bound to the host process checks and complete
+launch gate. The host publishes the original engine outputs with schema-3
+recovery; schema-1 and schema-2 recovery remain supported.
+Process identity checks, audit results, preview-bound repairs and release
+updates remain local integration code.
+An empty STUN result is not treated as a pass. The integrated interface keeps
+all fourteen checks and displays their evidence boundaries.
+
+Proxy diagnostics use an independent transport-only command and GUI result;
+they do not grant launch permission or modify account/environment policy.
+Snapshot optimization retains full source/destination hashes, private storage,
+version/launch gates, and recoverable journals. Same-volume archive moves use
+a schema-2 account journal; schema-1 recovery remains supported. APFS file
+clones fall back to verified regular copying on unsupported filesystems.
+Separate Web, Windows and Linux additions are outside this macOS adaptation.
+
+Version 2.6 adds direct current-environment detection without saved-target or
+enabled-policy prerequisites. Measurements and their sources are displayed;
+this receipt cannot grant launch permission. Optional environment adjustments
+use an expiring, context-bound plan and a separate recovery journal. Existing
+account hashes, launch checks and complete-release rollback remain.
+
+The upstream MIT notice is retained in LICENSE. This integration is not an
+endorsement by the upstream project, Anthropic or any proxy vendor.
+
+Directly vendored macOS source revision:
+e2da42956bccd39f5e8e2e052c5002b96137f146
+See UPSTREAM.json for file-by-file original Git blob IDs and SHA-256 hashes.
+The upstream files in upstream/ are unmodified. The top-level shell setup,
+installer and daemons are retained for provenance, not automatically executed.
+Runtime DNS renewal uses the existing collector at launch gates; it does not
+extend evidence expiry or bypass risk checks.

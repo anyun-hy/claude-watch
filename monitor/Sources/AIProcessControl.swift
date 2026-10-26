@@ -1,0 +1,188 @@
+import AppKit
+import Combine
+import Darwin
+import Foundation
+
+struct AIProcessIdentity: Equatable, Sendable {
+    let pid, parent: Int32
+    let uid: UInt32
+    let startSeconds, startMicroseconds: UInt64
+    let executable: String
+    var rootProduct: MonitoredProduct? = nil
+    var desktopMain = false
+    func sameProcess(as other: Self) -> Bool {
+        pid == other.pid && uid == other.uid && startSeconds == other.startSeconds
+            && startMicroseconds == other.startMicroseconds && executable == other.executable
+    }
+}
+struct AIProcessClosePlan: Sendable {
+    let product: MonitoredProduct
+    let uid: UInt32
+    let targets: [AIProcessIdentity]
+    let protected: Set<Int32>
+}
+enum AIProcessClosePolicy {
+    static func plan(_ product: MonitoredProduct, inventory: [AIProcessIdentity], uid: UInt32,
+                     protected: Set<Int32>) -> AIProcessClosePlan {
+        let owned = inventory.filter { $0.uid == uid && $0.pid > 1 && !protected.contains($0.pid) }
+        var ids = Set(owned.filter { $0.rootProduct == product }.map(\.pid))
+        while true {
+            let next = ids.union(owned.filter { ids.contains($0.parent) && ($0.rootProduct == nil || $0.rootProduct == product) }.map(\.pid))
+            if next == ids { break }; ids = next
+        }
+        return .init(product: product, uid: uid,
+                     targets: owned.filter { ids.contains($0.pid) }.sorted { $0.pid < $1.pid }, protected: protected)
+    }
+    static func execute(_ plan: AIProcessClosePlan, lookup: (Int32) -> AIProcessIdentity?,
+                        quitApplication: (Int32) -> Bool, terminate: (Int32) -> Bool) -> (requested: Int, skipped: Int, failed: Int) {
+        var requested = 0, skipped = 0, failed = 0
+        // Roots are asked to quit normally. No SIGKILL or privileged helper is used.
+        for target in plan.targets.sorted(by: { $0.desktopMain && !$1.desktopMain }) {
+            guard target.uid == plan.uid, !plan.protected.contains(target.pid), target.pid > 1,
+                  let live = lookup(target.pid), target.sameProcess(as: live) else { skipped += 1; continue }
+            let accepted = target.desktopMain ? quitApplication(target.pid) : terminate(target.pid)
+            if accepted { requested += 1 } else { failed += 1 }
+        }
+        return (requested, skipped, failed)
+    }
+}
+
+enum AIProcessInventory {
+    static func identity(_ pid: Int32) -> AIProcessIdentity? {
+        guard pid > 1 else { return nil }
+        var info = proc_bsdinfo()
+        let expected = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, expected) == expected else { return nil }
+        // PROC_PIDPATHINFO_MAXSIZE is a C expression macro unavailable in Swift.
+        var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return nil }
+        return .init(pid: pid, parent: Int32(info.pbi_ppid), uid: info.pbi_uid,
+                     startSeconds: info.pbi_start_tvsec, startMicroseconds: info.pbi_start_tvusec,
+                     executable: String(cString: path))
+    }
+    static func read() throws -> [AIProcessIdentity] {
+        let output = try command(["-axo", "pid="])
+        var identities = output.split(whereSeparator: \.isWhitespace).compactMap { Int32($0) }.compactMap(identity)
+        for index in identities.indices where identities[index].uid == getuid() {
+            let path = identities[index].executable
+            if let bundleRange = path.range(of: ".app/Contents/") {
+                let bundlePath = String(path[..<bundleRange.lowerBound]) + ".app"
+                let id = Bundle(path: bundlePath)?.bundleIdentifier ?? ""
+                let product: MonitoredProduct? = id == "com.anthropic.claudefordesktop" ? .claude
+                    : ["com.openai.codex", "com.openai.chat"].contains(id) ? .openAI : nil
+                identities[index].rootProduct = product
+                identities[index].desktopMain = product != nil && path.hasPrefix(bundlePath + "/Contents/MacOS/")
+            } else if let product = nativeCLI(path) { identities[index].rootProduct = product }
+            else if ["node", "nodejs", "bun"].contains(URL(fileURLWithPath: path).lastPathComponent),
+                    let args = try? command(["-ww", "-p", String(identities[index].pid), "-o", "args="]),
+                    let script = nodeEntry(args) {
+                if script.hasSuffix("/node_modules/@anthropic-ai/claude-code/cli.js") { identities[index].rootProduct = .claude }
+                if script.hasSuffix("/node_modules/@openai/codex/bin/codex.js") { identities[index].rootProduct = .openAI }
+            }
+        }
+        return identities
+    }
+    static func nativeCLI(_ path: String) -> MonitoredProduct? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let known: [(String, MonitoredProduct)] = [
+            (home + "/.local/bin/claude", .claude), (home + "/.claude/local/claude", .claude),
+            ("/opt/homebrew/bin/claude", .claude), ("/usr/local/bin/claude", .claude),
+            ("/opt/homebrew/bin/codex", .openAI), ("/usr/local/bin/codex", .openAI)
+        ]
+        for (entry, product) in known where FileManager.default.fileExists(atPath: entry) {
+            if URL(fileURLWithPath: entry).resolvingSymlinksInPath().path == path { return product }
+        }
+        if path.hasPrefix(home + "/.local/share/claude/versions/") { return .claude }
+        if path.contains("/Caskroom/codex/"), path.hasSuffix("/bin/codex") { return .openAI }
+        if path.contains("/node_modules/@openai/codex/"), path.hasSuffix("/codex") { return .openAI }
+        return nil
+    }
+    static func nodeEntry(_ command: String) -> String? {
+        // Reject ambiguous shell quoting and executing flags such as -e. A path
+        // merely present in another argument never establishes process ownership.
+        guard !command.contains("\""), !command.contains("'") else { return nil }
+        let tokens = command.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard let first = tokens.first, ["node", "nodejs", "bun"].contains(URL(fileURLWithPath: first).lastPathComponent) else { return nil }
+        for token in tokens.dropFirst() {
+            if ["--no-warnings", "--enable-source-maps", "--"].contains(token) { continue }
+            guard !token.hasPrefix("-"), token.hasPrefix("/") else { return nil }
+            return token
+        }
+        return nil
+    }
+    static func protectedIDs(in inventory: [AIProcessIdentity], backendPID: Int?) -> Set<Int32> {
+        var result: Set<Int32> = [1, getpid()]
+        var current = getpid()
+        for _ in 0..<64 {
+            guard let parent = inventory.first(where: { $0.pid == current })?.parent, parent > 0,
+                  result.insert(parent).inserted else { break }; current = parent
+        }
+        if let pid = backendPID, pid > 1, pid <= Int(Int32.max) { result.insert(Int32(pid)) }
+        return result
+    }
+    private static func command(_ arguments: [String]) throws -> String {
+        let task = Process(), pipe = Pipe()
+        task.executableURL = URL(fileURLWithPath: "/bin/ps"); task.arguments = arguments
+        task.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"]
+        task.standardOutput = pipe; task.standardError = FileHandle.nullDevice
+        try task.run()
+        let deadline = DispatchWorkItem { if task.isRunning { task.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: deadline)
+        defer { deadline.cancel() }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile(); task.waitUntilExit()
+        guard task.terminationStatus == 0, let text = String(data: data, encoding: .utf8) else {
+            throw NSError(domain: "ClaudeWatch.ProcessControl", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "无法读取当前进程身份，未关闭任何进程。"])
+        }
+        return text
+    }
+}
+
+#if !PROCESS_HELPER
+@MainActor
+final class AIProcessControl: ObservableObject {
+    @Published private(set) var busy = false
+    let isFixture: Bool
+    init(isFixture: Bool = false) {
+        #if UI_REVIEW
+        self.isFixture = true
+        #else
+        self.isFixture = isFixture
+        #endif
+    }
+    func prepare(_ product: MonitoredProduct, sampled: [WatchedProcess], backendPID: Int?) async throws -> AIProcessClosePlan {
+        guard !busy else { throw CancellationError() }
+        busy = true; defer { busy = false }
+        if isFixture {
+            return .init(product: product, uid: getuid(), targets: sampled.filter { $0.product == product }.map {
+                .init(pid: Int32($0.pid), parent: 1, uid: getuid(), startSeconds: 1, startMicroseconds: 0, executable: "/mock/" + $0.name)
+            }, protected: [])
+        }
+        return try await Task.detached(priority: .userInitiated) {
+            let inventory = try AIProcessInventory.read()
+            return AIProcessClosePolicy.plan(product, inventory: inventory, uid: getuid(),
+                protected: AIProcessInventory.protectedIDs(in: inventory, backendPID: backendPID))
+        }.value
+    }
+    func execute(_ plan: AIProcessClosePlan) async -> String {
+        guard !busy else { return "已有关闭操作正在进行。" }
+        busy = true; defer { busy = false }
+        if isFixture { return "模拟关闭 \(plan.targets.count) 个 \(plan.product.title) 进程；未向任何系统进程发送退出请求。" }
+        let outcome = await Task.detached(priority: .userInitiated) {
+            AIProcessClosePolicy.execute(plan, lookup: AIProcessInventory.identity,
+                quitApplication: { NSRunningApplication(processIdentifier: $0)?.terminate() ?? false },
+                terminate: { Darwin.kill($0, SIGTERM) == 0 })
+        }.value
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        do {
+            let remaining = try await Task.detached {
+                AIProcessClosePolicy.plan(plan.product, inventory: try AIProcessInventory.read(), uid: plan.uid,
+                                          protected: plan.protected).targets.count
+            }.value
+            return remaining == 0
+                ? "当前未检测到 \(plan.product.title) 相关进程。退出请求 \(outcome.requested) 项，身份变化跳过 \(outcome.skipped) 项。"
+                : "仍有 \(remaining) 个 \(plan.product.title) 进程。退出请求 \(outcome.requested) 项，失败 \(outcome.failed) 项；部分进程可能拒绝退出或重新启动。"
+        } catch { return "已发送 \(outcome.requested) 项退出请求，但无法复核是否全部退出。" }
+    }
+}
+#endif

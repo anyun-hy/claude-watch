@@ -1,0 +1,26 @@
+[
+  {
+    "file": "claude.webp",
+    "url": "https://ip.net.coffee/favicons/claude.webp",
+    "sha256": "99bcb29210559c827d5820dc3f1d3d82de3b783ae63588ea58ac30da5efac5a3",
+    "bytes": 800
+  },
+  {
+    "file": "chatgpt.png",
+    "url": "https://ip.net.coffee/favicons/chatgpticon.png?v=1",
+    "sha256": "adc7b177182af810bf0d92c930881c8f49b37bdcac17d4c173a5f5e2a2cd22f1",
+    "bytes": 4679
+  },
+  {
+    "file": "cloudflare.webp",
+    "url": "https://ip.net.coffee/favicons/cloudflare.webp",
+    "sha256": "318cb41aa19589e6936840401e86023c02ae6270e0e191aeefabb773744e2739",
+    "bytes": 522
+  },
+  {
+    "file": "flag-icons 7.3.2, 4x3 SVGs",
+    "url": "https://codeload.github.com/lipis/flag-icons/zip/refs/tags/v7.3.2",
+    "sha256": "9d5415b68061026a466fc3586a8cc2940b66b6a1ee9648f7b98bdaa370275042",
+    "count": 257
+  }
+]

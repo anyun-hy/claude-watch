@@ -1,0 +1,342 @@
+import Foundation
+
+@main
+struct SwitcherStoreTests {
+    @MainActor
+    static func main() async throws {
+        var checks = 0
+        func expect(_ value: @autoclosure () -> Bool, _ message: String) {
+            checks += 1
+            if !value() {
+                FileHandle.standardError.write(Data(("FAIL: " + message + "\n").utf8))
+                exit(1)
+            }
+        }
+        let cachedRow = try JSONDecoder().decode(EnvironmentCheckRow.self, from: Data(#"{"id":"dns","name":"DNS","state":"cached","detail":"保留上次有效样本","scope":"Net.Coffee","required":true,"sampled_at":1000,"query_error":"本轮超时"}"#.utf8))
+        expect(cachedRow.statusLabel == "上次有效" && cachedRow.sampled_at == 1000 && cachedRow.query_error == "本轮超时", "environment row preserves cached timing and query error")
+        let infoRow = try JSONDecoder().decode(EnvironmentCheckRow.self, from: Data(#"{"id":"asn","name":"ASN 属性","state":"info","detail":"已读取资料","scope":"RIPEstat","required":false}"#.utf8))
+        expect(infoRow.statusLabel == "已读取", "informational environment row uses neutral status")
+        let reachableRow = try JSONDecoder().decode(EnvironmentCheckRow.self, from: Data(#"{"id":"reachability","name":"Claude 服务","state":"ok","detail":"网络可达","scope":"HTTPS","required":false}"#.utf8))
+        expect(reachableRow.statusLabel == "网络可达", "service card green state names connectivity")
+        let login = try JSONDecoder().decode(ClaudeLoginProbeResult.self, from: Data(#"{"state":"logged_in","observedAt":1792901000,"source":"Claude Accessibility","detail":"应用当前会话已核对","appVersion":"1.0","processId":42,"account":{"displayName":"Example","email":"example@example.com","menuLabel":"Example"}}"#.utf8))
+        expect(login.state == "logged_in" && login.account?.email == "example@example.com", "current login receipt remains separate from local slots")
+        expect(!SwitcherStore.isLoginHistorical(observedAt: 100, now: 190) &&
+               SwitcherStore.isLoginHistorical(observedAt: 100, now: 191),
+               "login status becomes historical after 90 seconds without inventing logout")
+        let emptyA = SwitcherAccountSlot(id: "A", stored: false, current: false)
+        let emptyB = SwitcherAccountSlot(id: "B", stored: false, current: false)
+        let storedB = SwitcherAccountSlot(id: "B", stored: true, current: false)
+        expect(SwitcherStore.accountSlotPresentation(emptyA, current: nil).summary == "未保存" &&
+               SwitcherStore.accountSlotPresentation(emptyA, current: nil).confirmationDetail.contains("保存为 A") &&
+               SwitcherStore.accountSlotPresentation(emptyB, current: "A").confirmationDetail.contains("保存当前 A") &&
+               SwitcherStore.accountSlotPresentation(storedB, current: "A").actionTitle == "切换到 B",
+               "A/B slot presentation preserves explicit empty-slot actions")
+        var replaceable = try JSONDecoder().decode(CurrentEnvironmentReceipt.self, from: SwitcherStore.fixtureCurrentEnvironment())
+        replaceable.source_notices = [.init(id: "metadata", title: "IPinfo", detail: "本轮元数据查询失败", severity: "warn")]
+        let originalEgress = replaceable.rows.first { $0.id == "egress" }?.current
+        replaceable.replaceDNSRow(cachedRow)
+        expect(replaceable.rows.first { $0.id == "dns" }?.state == "cached", "DNS record response replaces only the DNS environment row")
+        expect(replaceable.source_notices?.first?.id == "metadata" && replaceable.rows.first { $0.id == "egress" }?.current == originalEgress,
+               "DNS success preserves metadata source notices and unrelated environment rows")
+        let store = SwitcherStore(isFixture: true)
+        let reference = EgressReference(ip: "222.10.87.169", country: "JP", timezone: nil, context_id: nil, checked_at: nil, observed_at: 900)
+        var service = BackgroundServiceReceipt(observed_at: 1000, backend_healthy: true, update_source_ready: false,
+            services: [.init(id: "guard", title: "保护", state: "running", detail: "", source: "fixture", desired: true, last_checked: 1000)],
+            policy_issues: [], session_guard: .init(state: "safe", phase: "active", baseline: reference, current: reference))
+        expect(SessionBaselinePresentation.make(service, now: 1005).tone == "success", "automatic session baseline drives overview without legacy file")
+        expect(SessionBaselinePresentation.make(service, now: 1036).title == "上次会话基准", "old receipt cannot present current safety")
+        expect(SessionBaselinePresentation.make(service, error: "read failed", now: 1005).tone != "success", "read failure preserves history without green safety")
+        service.session_guard = .init(state: "idle", phase: "active", baseline: reference, current: reference)
+        expect(SessionBaselinePresentation.make(service, now: 1005).title == "后台保护待命", "closed app displays standby with session history")
+        let idle = SessionProtectionEvidence(session: service.session_guard!, observedAt: 1000, backendReady: true)
+        expect(idle.presentation(at: 1005).detail.contains("后台保护待命，无需操作") && idle.presentation(at: 1005).tone == "info", "normal closed app never prompts confirmation")
+        expect(idle.presentation(at: 1040).title == "正在更新保护状态", "stale idle does not claim current standby")
+        expect(SessionProtectionPresentation.make(service.session_guard!, backendReady: false).tone == "warning", "disabled or failed backend is not mislabeled healthy idle")
+        let active = SessionProtectionEvidence(session: .init(state: "safe"), observedAt: 990, backendReady: true)
+        expect(SessionProtectionEvidence.latest([idle, active])?.session.state == "idle", "older active sample cannot overwrite newer closed-app observation")
+        expect(SessionProtectionEvidence.latest([idle, .init(session: .init(state: "safe"), observedAt: 1010, backendReady: true)])?.session.state == "safe", "new controlled run replaces idle display")
+        let locked = SessionGuardStatus(state: "locked", phase: "locked", reason: .init(code: "dns_risk", detail: "DNS 风险"))
+        expect(SessionProtectionPresentation.make(locked, stale: true, backendReady: false).tone == "danger", "latched real risk wins over stale or missing backend state")
+        expect(SessionProtectionPresentation.make(.init(state: "idle", phase: "locked")).tone == "danger", "contradictory idle cannot mask locked phase")
+        for state in ["idle", "safe", "unknown", "missing", "pending"] {
+            let display = SessionProtectionPresentation.make(.init(state: state))
+            expect(!display.detail.contains("尚未确认"), "display names the state or next automatic step rather than an absent confirmation action")
+        }
+        let shared = SwitcherStore(isFixture: true)
+        var sharedEnvironment = try JSONDecoder().decode(CurrentEnvironmentReceipt.self,
+            from: SwitcherStore.fixtureCurrentEnvironment(settings: ["enabled": true, "guard_enabled": true]))
+        sharedEnvironment.observed_at = 1010
+        sharedEnvironment.session_guard = idle.session
+        shared.loadReviewReceipts(sharedEnvironment, background: service)
+        shared.advanceLoginClock(Date(timeIntervalSince1970: 1015))
+        expect(shared.sessionDisplayEvidence?.session.state == "idle" && shared.sessionDisplay.title == SessionProtectionPresentation.idleTitle,
+               "all pages select the latest shared session observation")
+        expect(SessionBaselinePresentation.make(evidence: shared.sessionDisplayEvidence, now: 1015).title == shared.sessionDisplay.title,
+               "overview and other pages agree on normal idle")
+        sharedEnvironment.observed_at = 1020
+        sharedEnvironment.session_guard = locked
+        shared.loadReviewReceipts(sharedEnvironment, background: service)
+        expect(shared.sessionDisplay.tone == "danger", "newer risk is never hidden behind an older idle receipt")
+        service.session_guard = .init(state: "locked", phase: "locked", baseline: reference, current: reference)
+        expect(SessionBaselinePresentation.make(service, now: 5000).tone == "danger", "latched stop remains visible even with old receipt")
+        service.session_guard = .init(state: "missing")
+        expect(SessionBaselinePresentation.make(service, now: 1005).detail.contains("无需手动配置"), "new install explains automatic creation")
+        expect(AccessibilityPermission.shouldPrompt(trusted: false, build: "296", previous: "295", bundle: "io.local.watchpanel", path: AccessibilityPermission.installedPath), "new installed build requests permission")
+        expect(!AccessibilityPermission.shouldPrompt(trusted: true, build: "296", previous: nil, bundle: "io.local.watchpanel", path: AccessibilityPermission.installedPath), "existing valid access not prompted")
+        expect(!AccessibilityPermission.shouldPrompt(trusted: false, build: "296", previous: "296", bundle: "io.local.watchpanel", path: AccessibilityPermission.installedPath), "no recurring prompt each refresh")
+        expect(!AccessibilityPermission.shouldPrompt(trusted: false, build: "296", previous: nil, bundle: "io.local.watchpanel.review", path: AccessibilityPermission.installedPath), "isolated app cannot request production permission")
+        let review = SwitcherStore(isFixture: true)
+        for scenario in SwitcherReviewScenario.allCases {
+            review.loadReviewScenario(scenario)
+            expect(review.currentEnvironment?.purpose == "environment_detection" &&
+                   review.background?.session_guard != nil,
+                   "review scenario \(scenario.rawValue) stays entirely in fixture state")
+        }
+        review.loadReviewScenario(.ipChanged)
+        expect(review.currentPolicyEvaluation?.blocked.contains("ip_history") == true &&
+               review.background?.session_guard?.state == "locked",
+               "IP-change review scenario links environment, preview, and session guard")
+        await review.refreshBackground()
+        expect(review.background?.session_guard?.state == "locked" &&
+               review.background?.session_guard?.current?.ip == "8.8.4.4",
+               "review background refresh preserves the selected locked session scenario")
+        review.loadReviewScenario(.recovered)
+        expect(review.currentPolicyEvaluation?.ready == true &&
+               review.auditOperationMessage.contains("手动"),
+               "recovery scenario remains manual-start only")
+        expect(SwitcherStore.webRTCSubmissionError(backendMessage: nil, hasContext: false, contextStillMatches: false).contains("上下文未稳定") &&
+               SwitcherStore.webRTCSubmissionError(backendMessage: "后端拒绝", hasContext: true, contextStillMatches: true).contains("后端拒绝") &&
+               SwitcherStore.webRTCSubmissionError(backendMessage: nil, hasContext: true, contextStillMatches: false).contains("上下文已变化"),
+               "WebRTC submission failures distinguish context and backend causes")
+        review.setWebRTCReceiptErrorForFixture("本地检测已完成，但未提交当前保护判定：fixture")
+        _ = await review.recordWebRTCRisk(.failure(.webrtc, code: "fixture", message: "fixture"))
+        expect(review.webRTCReceiptError.isEmpty, "new accepted WebRTC submission clears prior submission error")
+        await store.load()
+        let coordinated = SwitcherStore(isFixture: true)
+        await coordinated.load()
+        coordinated.fixtureEnvironmentReadDelayNanoseconds = 150_000_000
+        var freshCalls = 0
+        coordinated.awaitFreshDNSReceipt = {
+            freshCalls += 1
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            return true
+        }
+        let readTask = Task { await coordinated.detectCurrentEnvironment() }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        let firstAction = Task { await coordinated.perform(["account", "switch", "B", "--apply", "--ack-unverified-version"]) }
+        let secondAction = Task { await coordinated.perform(["account", "switch", "B", "--apply", "--ack-unverified-version"]) }
+        _ = await firstAction.value
+        _ = await secondAction.value
+        _ = await readTask.value
+        expect(coordinated.accounts?.current == "B" && freshCalls == 1 && !coordinated.busy,
+               "user action cancels a read, runs fresh gate once, and blocks overlapping mutation")
+        let timeout = SwitcherStore(isFixture: true)
+        await timeout.load()
+        timeout.fixtureEnvironmentReadDelayNanoseconds = 300_000_000
+        timeout.environmentReadWaitTimeout = 0.02
+        let timeoutRead = Task { await timeout.detectCurrentEnvironment() }
+        try await Task.sleep(nanoseconds: 10_000_000)
+        await timeout.perform(["account", "switch", "B", "--apply", "--ack-unverified-version"])
+        expect(timeout.accounts?.current == nil && timeout.message.contains("未执行此操作"),
+               "read cancellation timeout does not execute an account mutation")
+        _ = await timeoutRead.value
+        let automatic = SwitcherStore(isFixture: true)
+        await automatic.load(automaticCheck: true)
+        expect(automatic.currentEnvironment?.rows.count == 14, "opening the page starts detection without an online-policy setting")
+        expect(automatic.currentEnvironment?.context_transition?.state == "stable", "real-shaped context transition decodes while opaque summaries are ignored")
+        expect(automatic.currentPolicyEvaluation?.grants_launch_permission == false &&
+               automatic.currentPolicyEvaluation?.observed_at == automatic.currentEnvironment?.observed_at,
+               "same observation supplies a display-only launch preview")
+        if let environment = automatic.currentEnvironment, let preview = automatic.currentPolicyEvaluation {
+            expect(SwitcherStore.acceptsDisplayPolicy(preview, for: environment, hasUnsavedSettings: false),
+                   "matching observation/context preview is displayable")
+            let mismatched = EnvironmentPolicyEvaluation(purpose: preview.purpose, grants_launch_permission: false,
+                                                         observed_at: preview.observed_at, expires_at: preview.expires_at,
+                                                         observation_id: "other-observation", context_id: preview.context_id,
+                                                         policy: preview.policy, rows: preview.rows, blocked: preview.blocked,
+                                                         ready: preview.ready, message: preview.message)
+            expect(!SwitcherStore.acceptsDisplayPolicy(mismatched, for: environment, hasUnsavedSettings: false) &&
+                   !SwitcherStore.acceptsDisplayPolicy(preview, for: environment, hasUnsavedSettings: true),
+                   "mismatched or draft-bound preview is rejected")
+            var unavailableEnvironment = environment
+            unavailableEnvironment.context_transition = .init(state: "sampling_unavailable", unavailable: ["代理控制接口"])
+            let unavailablePreview = EnvironmentPolicyEvaluation(purpose: preview.purpose, grants_launch_permission: false,
+                                                                  observed_at: preview.observed_at, expires_at: preview.expires_at,
+                                                                  observation_id: preview.observation_id, context_id: preview.context_id,
+                                                                  policy: preview.policy, rows: preview.rows, blocked: ["dns"],
+                                                                  ready: false, message: preview.message)
+            expect(SwitcherStore.acceptsDisplayPolicy(unavailablePreview, for: unavailableEnvironment, hasUnsavedSettings: false),
+                   "current unavailable observation still shows its blocked display preview")
+            let unsafePreview = EnvironmentPolicyEvaluation(purpose: preview.purpose, grants_launch_permission: false,
+                                                             observed_at: preview.observed_at, expires_at: preview.expires_at,
+                                                             observation_id: preview.observation_id, context_id: preview.context_id,
+                                                             policy: preview.policy, rows: preview.rows, blocked: [],
+                                                             ready: true, message: preview.message)
+            expect(!SwitcherStore.acceptsDisplayPolicy(unsafePreview, for: unavailableEnvironment, hasUnsavedSettings: false),
+                   "nonstable observation cannot display a satisfied preview")
+        } else { fatalError("fixture must contain policy preview") }
+        automatic.invalidateCurrentEnvironmentRequest()
+        expect(automatic.currentEnvironmentIsHistorical && automatic.currentPolicyEvaluation == nil,
+               "real context invalidation marks prior environment historical and clears current preview")
+        _ = await automatic.detectCurrentEnvironment()
+        expect(!automatic.currentEnvironmentIsHistorical && automatic.currentPolicyEvaluation != nil,
+               "new stable observation recovers the shared display-only preview")
+        expect(automatic.candidate == nil, "automatic detection does not create a configuration candidate")
+        expect(automatic.settings["country"] as? String == "", "automatic detection does not save a country target")
+        expect(automatic.currentEnvironment?.rows.first { $0.name == "DNS" }?.state == "ok", "fixture DNS matches the same-run public egress country")
+        expect(automatic.currentEnvironment?.rows.last?.state == "warn", "401/403 remain warnings in the rendered detection fixture")
+        expect((try? JSONDecoder().decode(EnvironmentAuditReceipt.self, from: SwitcherStore.fixtureCurrentEnvironment())) == nil,
+               "a direct-detection receipt cannot decode as a controlled-launch audit")
+        expect(store.loaded, "fixture state loads")
+        expect(store.accounts?.accounts.count == 2, "A/B slots are represented")
+        expect(store.accounts?.current == nil, "no invented logged-in account")
+        expect(!store.hasUnsavedSettings, "initial state is clean")
+        expect(store.environment?.rows.count == 10, "first open performs isolated local discovery")
+        expect(store.environment?.rows.first { $0.id == "country" }?.current == "未知", "offline discovery does not invent a country")
+        expect(store.candidate == nil, "first open does not request online candidates")
+        expect(store.environment?.rows.first { $0.id == "network_service" }?.current == "Ethernet", "active service is observed instead of assuming Wi-Fi")
+        let initialSettings = store.settings["country"] as? String
+        await store.detectEnvironment()
+        expect(store.candidate != nil, "one explicit detection produces a candidate")
+        expect(store.settings["country"] as? String == initialSettings, "candidate does not replace saved target")
+        expect(store.candidate?.rows.first { $0.id == "country" }?.proposed_source.contains("IPinfo") == true, "candidate source reaches the UI")
+        await store.previewEnvironment()
+        expect(store.setupCanConfirm, "candidate requires a separate preview before confirmation")
+        store.setupWatchdog.toggle()
+        expect(store.setupPlan == nil && !store.setupCanConfirm, "changing selected services invalidates confirmation")
+        await store.previewEnvironment()
+        await store.refreshBackground()
+        expect(store.background?.services.count == 4, "each background service has its own actual state")
+        expect(store.background?.services.first { $0.id == "original" }?.state == "scheduled", "original bodyguard remains independently visible")
+        expect(store.background?.services.first { $0.id == "updater" }?.state == "unavailable", "missing publication source is not shown as active updating")
+        await store.detectEnvironment()
+        store.text("locale").wrappedValue = "en_GB"
+        await store.previewEnvironment()
+        expect(store.setupPlan == nil, "unsaved manual settings cannot be overwritten by candidate confirmation")
+        await store.inspectEnvironment()
+        expect(store.hasUnsavedSettings, "local discovery does not overwrite a manual draft")
+        expect(store.settings["locale"] as? String == "en_GB", "manual draft survives local discovery")
+        await store.refreshBackground()
+        expect(store.settings["locale"] as? String == "en_GB" && store.hasUnsavedSettings, "refreshing actual services preserves a draft")
+        await store.load()
+        expect(store.settings["locale"] as? String == "en_GB" && store.hasUnsavedSettings, "reloading authoritative status cannot replace a draft")
+        store.discardChanges()
+        expect(store.settings["locale"] as? String == "" && !store.hasUnsavedSettings, "discard restores the saved settings without saving")
+        store.text("locale").wrappedValue = "en_GB"
+        expect(!store.updateSourceReady, "missing update manifest and key remain unavailable")
+        _ = await store.detectCurrentEnvironment()
+        expect(store.currentEnvironment?.rows.count == 14, "current-state detection always exposes all fourteen checks")
+        expect(store.currentEnvironment?.grants_launch_permission == false, "live observation cannot grant launch permission")
+        expect(store.hasUnsavedSettings, "direct live detection does not require saving a manual draft")
+        expect(store.settings["locale"] as? String == "en_GB", "direct live detection cannot replace draft settings")
+        expect(store.currentEnvironment?.rows.first?.source != nil, "live row source is available to the UI")
+        await store.save()
+        store.text("country").wrappedValue = "GB"
+        expect(store.hasUnsavedSettings, "editing policy requires save")
+        await store.save()
+        expect(!store.hasUnsavedSettings, "fixture save stays in memory")
+        await store.perform(["checkdetail", "--online"])
+        expect(store.audit?.rows.count == 14, "all fourteen rows reach the UI")
+        expect(store.audit?.ready == false, "unknown STUN is not ready")
+        expect(store.audit?.rows.contains { $0.state == "unknown" } == true, "unknown remains visible")
+        store.text("country").wrappedValue = "JP"
+        expect(store.audit == nil, "editing policy invalidates the previous launch-check display")
+        store.diagnosticProxy = "socks5h://fixture:private@127.0.0.1:1080"
+        await store.diagnoseProxy()
+        expect(store.diagnostic?.checks.count == 2, "both independent transport checks are displayed")
+        expect(store.diagnostic?.checks.first?.accessLabel == "需要账号认证", "401 is not login success")
+        expect(store.diagnostic?.checks.last?.accessLabel == "访问受限", "403 remains restricted")
+        expect(store.audit == nil, "transport receipt cannot restore invalidated launch readiness")
+        expect(store.accounts?.current == nil, "transport check cannot initialize an account")
+        expect(store.hasUnsavedSettings, "independent check does not reload or overwrite draft settings")
+        expect(store.settings["proxy_url"] == nil, "private diagnostic proxy is not persisted in settings")
+        expect(!store.busy, "diagnostic returns to idle")
+        await store.save()
+        await store.preview("repair")
+        expect(store.plan?.actions.count == 1, "repair preview is reviewable")
+        await store.applyPreview()
+        expect(store.plan == nil, "applied preview cleared")
+        await store.perform(["account", "switch", "B", "--apply", "--ack-unverified-version"])
+        expect(store.accounts?.current == "B", "fixture switching updates only fixture state")
+        expect(store.message.contains("隔离预览"), "fixture boundary remains visible")
+        expect(!store.busy, "operation state returns to idle")
+        store.flag("require_dns").wrappedValue = true
+        expect(!store.policyWarnings.contains { $0.contains("DNS") }, "DNS has no manual trusted-resolver warning")
+        store.discardChanges()
+        let planJSON = Data(#"{"id":"clock","title":"设置时区","scope":"administrator","before":"Asia/Tokyo","after":"Asia/Seoul"}"#.utf8)
+        let change = try JSONDecoder().decode(SwitcherRepairAction.self, from: planJSON)
+        expect(change.detail == "Asia/Tokyo → Asia/Seoul", "raw backend before/after values reach the review UI")
+        let booleanJSON = Data(#"{"id":"guard","title":"保护","scope":"watch","before":false,"after":true}"#.utf8)
+        let booleanChange = try JSONDecoder().decode(SwitcherRepairAction.self, from: booleanJSON)
+        expect(booleanChange.detail == "关闭 → 开启", "boolean changes are human-readable")
+        await store.previewProtection("guard_enabled", enable: true)
+        expect(store.plan != nil, "service actions first produce a concrete preview")
+        expect(store.settings["guard_enabled"] as? Bool != true, "preview cannot enable a guard")
+        await store.applyPreview()
+        await store.refreshBackground()
+        expect(store.settings["guard_enabled"] as? Bool == true, "explicit application commits only the fixture service change")
+        expect(store.background?.services.first { $0.id == "original" }?.state == "scheduled", "own guard changes retain the original bodyguard")
+        let cancelledRead = SwitcherReadCancellation()
+        cancelledRead.cancel()
+        let neverStarted = Process(); neverStarted.executableURL = URL(fileURLWithPath: "/bin/sleep"); neverStarted.arguments = ["1"]
+        do { try cancelledRead.start(neverStarted); fatalError("cancelled read should not start") }
+        catch is CancellationError { expect(!neverStarted.isRunning, "cancel before start cannot launch a late read process") }
+        let runningRead = SwitcherReadCancellation()
+        let readProcess = Process(); readProcess.executableURL = URL(fileURLWithPath: "/bin/sleep"); readProcess.arguments = ["2"]
+        try runningRead.start(readProcess); runningRead.cancel(); readProcess.waitUntilExit()
+        expect(runningRead.isCancelled && !readProcess.isRunning, "read cancellation terminates only its attached read process")
+        if CommandLine.arguments.count > 1 {
+            let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
+            let audit = try JSONDecoder().decode(EnvironmentAuditReceipt.self, from: data)
+            expect(audit.rows.count == 14, "Python-to-Swift JSON contract")
+            expect(audit.rows.contains { $0.id == "language" }, "client language is not dropped")
+            expect(audit.rows.contains { $0.id == "asn" }, "ASN is not dropped")
+            expect(audit.rows.contains { $0.id == "reachability" }, "reachability is not dropped")
+            expect(audit.ready == false, "offline receipt cannot become a pass")
+        }
+        if CommandLine.arguments.count > 2 {
+            let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2]))
+            let diagnostic = try JSONDecoder().decode(ProxyDiagnosticReceipt.self, from: data)
+            expect(diagnostic.reached, "Python transport receipt reaches its own UI model")
+            expect(diagnostic.checks.first?.http_status == 401, "API authentication status is preserved")
+            expect(diagnostic.checks.last?.http_status == 403, "web access restriction is preserved")
+        }
+        if CommandLine.arguments.count > 3 {
+            let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[3]))
+            let candidate = try JSONDecoder().decode(EnvironmentCandidate.self, from: data)
+            expect(candidate.rows.count == 10, "Python onboarding preserves every observation row")
+            expect(candidate.rows.first { $0.id == "country" }?.target == "未配置", "first-time Python target remains unset")
+            expect(candidate.rows.first { $0.id == "locale" }?.proposed == "ja_JP", "Japanese date formats remain independent from English interface language")
+        }
+        if CommandLine.arguments.count > 4 {
+            let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[4]))
+            let detection = try JSONDecoder().decode(CurrentEnvironmentReceipt.self, from: data)
+            expect(detection.rows.count == 14, "Python-to-Swift direct detection contract")
+            expect(!detection.grants_launch_permission, "Python detection remains separate from launch authority")
+            expect(detection.rows.first { $0.id == "timezone" }?.reference == "Asia/Tokyo", "reference timezone comes from current egress")
+        }
+        if CommandLine.arguments.count > 5 {
+            let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[5]))
+            let service = try JSONDecoder().decode(BackgroundServiceReceipt.self, from: data)
+            expect(service.services.count == 4, "Python actual-service contract preserves both guards, timezone and updater")
+            expect(service.services.first { $0.id == "original" }?.state == "scheduled", "one-shot original guard is shown as loaded")
+            expect(service.services.first { $0.id == "updater" }?.state == "unavailable", "source-less update intent cannot become an active updater")
+        }
+        if CommandLine.arguments.count > 6 {
+            let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[6]))
+            let plan = try JSONDecoder().decode(SwitcherRepairPlan.self, from: data)
+            expect(plan.actions.first?.detail?.contains("开启 → 关闭") == true, "real service preview differences reach the review sheet")
+        }
+        let failedRoundStore = SwitcherStore(isFixture: true)
+        await failedRoundStore.load()
+        _ = await failedRoundStore.detectCurrentEnvironment()
+        let priorTime = failedRoundStore.currentEnvironment?.observed_at
+        failedRoundStore.recordDetectionFailure("fixture: entire observation reader failed")
+        expect(failedRoundStore.currentPolicyEvaluation == nil, "whole-reader failure cannot retain a ready preview")
+        expect(failedRoundStore.currentEnvironmentIsHistorical, "previous observation is explicitly historical after whole-reader failure")
+        expect(failedRoundStore.currentEnvironment?.observed_at == priorTime, "failure does not renew previous evidence time")
+        _ = await failedRoundStore.detectCurrentEnvironment()
+        expect(!failedRoundStore.currentEnvironmentIsHistorical && failedRoundStore.currentPolicyEvaluation != nil, "fresh successful round restores the shared current preview")
+        print("SwitcherStore: \(checks) isolated assertions passed")
+    }
+}

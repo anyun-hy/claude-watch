@@ -1,0 +1,61 @@
+{
+  "repository": "https://github.com/YOURSJEYO/claude-switcher",
+  "commit": "e2da42956bccd39f5e8e2e052c5002b96137f146",
+  "files": {
+    "LICENSE": {
+      "git_blob_sha1": "d5a6fa56215dcff3c01e281e20da22870d820b26",
+      "size": 1085,
+      "sha256": "c288d9b3c1c5bdb2038628f39c82b82375570798005c8e263b365057457b393a"
+    },
+    "app/main.swift": {
+      "git_blob_sha1": "6e7224c0b44ef1b727691f6592e299d6ed58fef4",
+      "size": 24340,
+      "sha256": "20fe23340fbfb9c2e39a842ab494519038a3456f60bb81a02ed5b9ebb8374824"
+    },
+    "core/claude-switch.sh": {
+      "git_blob_sha1": "cce9af0acb00d407d10f954340da2b1a89b2d2ac",
+      "size": 45489,
+      "sha256": "965c7c9b072b6ae2f023941598c29218e8959251704c6e939f54313377ff72ca"
+    },
+    "core/stun-probe.py": {
+      "git_blob_sha1": "d921e9d78ed3ad49381bf71be24a1cfca8131dc7",
+      "size": 2234,
+      "sha256": "2c891f5f3cf392a6bb736dacc65a945afe89ae8e4d88e353b04fd1f9cd792ab1"
+    },
+    "daemons/claude-bodyguard.sh": {
+      "git_blob_sha1": "838ccd8b295cc35038d45c9b561b4d285924adca",
+      "size": 1543,
+      "sha256": "b423fce9ee729d554494b9ec6905aa00d766e7de63c3ad5f44deba38231e433e"
+    },
+    "daemons/local.claude-bodyguard.plist": {
+      "git_blob_sha1": "47fe32cfa3193964d7bb9fe0234d1436de670c1e",
+      "size": 633,
+      "sha256": "0105bf35a2bcbc286fd785534f7730059354cbfb2c6a30a1ba3fb44c146dab4f"
+    },
+    "daemons/local.claude-update.plist": {
+      "git_blob_sha1": "9f371b8c123edbcb8c2d96132497e0854ab00ee8",
+      "size": 616,
+      "sha256": "d467716f831d87ad167e6dac98b34bd299f4c5230eb89ffbafebebe66f6d69d9"
+    },
+    "daemons/local.tz-watchdog.plist": {
+      "git_blob_sha1": "3acaa59854b841cb2d64c709a364e18157df9e96",
+      "size": 625,
+      "sha256": "c0b6b95e88becfb9aa51ec75e3c2a04b8e5a8a2698c5f87ec139d57621971300"
+    },
+    "daemons/tz-watchdog.sh": {
+      "git_blob_sha1": "b980e81588dd9800a809dbdc6f5e2c9814903c98",
+      "size": 531,
+      "sha256": "b09e1e98efafbf6935ea55f01b079f0d4d692d22727bf0649ee1861202527cd7"
+    },
+    "installer/卸载.command": {
+      "git_blob_sha1": "5c19bf38cd9aedd68ca95028d72711e7db4f8215",
+      "size": 1465,
+      "sha256": "2ed59432d85917f1c0b67d8276bf348e3a2cf55b5330af4f8cedd9a3672e6b0f"
+    },
+    "installer/安装.command": {
+      "git_blob_sha1": "31039fb9f37c51dda3571a174cfd8a3990122dae",
+      "size": 13494,
+      "sha256": "17e886aa554bdf223d3839fb1f7f48589e95a2f47e988d1e2c5e245481b8c4d6"
+    }
+  }
+}

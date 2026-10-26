@@ -1,0 +1,22 @@
+Lucide icon sources
+===================
+
+Repository: https://github.com/lucide-icons/lucide
+Pinned commit: 7b0196e249ca09ca27c584c497aca9a8cab8a7f5
+License: ISC (full text retained in LICENSE)
+
+Downloaded source SVGs from:
+https://raw.githubusercontent.com/lucide-icons/lucide/7b0196e249ca09ca27c584c497aca9a8cab8a7f5/icons/
+
+  square-terminal.svg -> graph-square-terminal.png
+  monitor.svg         -> graph-monitor.png
+  router.svg          -> graph-router.png
+  network.svg         -> graph-network.png
+  server.svg          -> graph-server.png
+  cloud.svg           -> graph-cloud.png
+  laptop.svg          -> graph-laptop.png
+  globe.svg           -> graph-globe.png
+
+Rendered locally at 256x256 pixels with sharp. PNGs preserve a transparent
+background and use black template strokes at stroke-width 1.6 for native
+SwiftUI tinting.

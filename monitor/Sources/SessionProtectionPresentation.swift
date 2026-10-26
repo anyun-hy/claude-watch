@@ -1,0 +1,61 @@
+import Foundation
+
+/// Shared display evidence. This never changes a session, a gate or a protection decision.
+struct SessionProtectionEvidence {
+    let session: SessionGuardStatus
+    let observedAt: Double
+    let backendReady: Bool
+    var readError: String = ""
+
+    static func latest(_ candidates: [Self]) -> Self? {
+        candidates.filter { $0.observedAt.isFinite && $0.observedAt > 0 }
+            .max { $0.observedAt < $1.observedAt }
+    }
+    func isStale(at now: Double) -> Bool {
+        let age = now - observedAt
+        return !readError.isEmpty || !age.isFinite || age < 0 || age > 35
+    }
+    func presentation(at now: Double) -> SessionProtectionPresentation {
+        .make(session, stale: isStale(at: now), backendReady: backendReady)
+    }
+}
+
+struct SessionProtectionPresentation {
+    let title, detail, symbol, tone: String
+    static let idleTitle = "后台保护待命"
+    static let idleDetail = "后台保护待命，无需操作。Claude 已关闭；下次使用时通过“检查并启动 Claude”执行完整校验。"
+    static let loading = Self(title: "正在读取保护状态", detail: "正在读取后台检测结果。", symbol: "clock", tone: "info")
+
+    static func make(_ session: SessionGuardStatus, stale: Bool = false, backendReady: Bool = true) -> Self {
+        if session.state == "locked" || session.phase == "locked" {
+            return .init(title: "会话保护已拦截",
+                         detail: "上次会话停止：" + (session.reason?.detail ?? "保护检测命中阻断条件。") + " 恢复后通过“检查并启动 Claude”重新执行完整校验。",
+                         symbol: "pause.circle", tone: "danger")
+        }
+        if stale {
+            return .init(title: "正在更新保护状态", detail: "显示的是上次记录，正在等待新的后台检测结果。",
+                         symbol: "clock", tone: "info")
+        }
+        if !backendReady {
+            return .init(title: "保护后台不可用", detail: "尚未取得有效保护心跳或保护未启用；具体原因见“后台保护”。",
+                         symbol: "exclamationmark.shield", tone: "warning")
+        }
+        switch session.state {
+        case "idle":
+            return .init(title: idleTitle, detail: idleDetail, symbol: "shield", tone: "info")
+        case "safe":
+            if ["egress_unconfirmed", "risk_evidence_missing", "risk_evidence_unavailable"].contains(session.reason?.code ?? "") {
+                return .init(title: "本轮保护检测未完成", detail: session.reason?.detail ?? "正在重试采样。",
+                             symbol: "clock", tone: "warning")
+            }
+            return .init(title: "保护运行中", detail: "会话基准与当前出口已核对。", symbol: "checkmark.shield", tone: "success")
+        case "pending":
+            return .init(title: "正在建立受控会话", detail: "正在绑定 Claude 启动进程，完成后自动更新。", symbol: "clock", tone: "info")
+        case "missing":
+            return .init(title: "等待受控启动", detail: "使用“检查并启动 Claude”时自动建立会话，无需手动配置。", symbol: "shield", tone: "info")
+        default:
+            return .init(title: "本轮保护检测未完成", detail: session.reason?.detail ?? "尚未取得有效的本轮保护检测结果，正在等待下一轮采样。",
+                         symbol: "clock", tone: "warning")
+        }
+    }
+}
