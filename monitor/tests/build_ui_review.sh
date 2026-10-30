@@ -12,7 +12,7 @@ SDK="$DEVELOPER/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
 if [[ ! -d "$SDK" ]]; then SDK=$(xcrun --sdk macosx --show-sdk-path); fi
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Icons" "$ROOT/build/ui-review-module-cache"
-"$SWIFTC" -swift-version 5 "$REVIEW_OPTIMIZATION" -parse-as-library -D UI_REVIEW -target arm64-apple-macosx14.0 \
+"$SWIFTC" -swift-version 5 "$REVIEW_OPTIMIZATION" -parse-as-library -D UI_REVIEW -target arm64-apple-macosx13.0 \
   -sdk "$SDK" -module-cache-path "$ROOT/build/ui-review-module-cache" \
   -framework SwiftUI -framework AppKit -framework WebKit "$ROOT"/Sources/*.swift "$ROOT/tests/UIReviewApp.swift" \
   -o "$APP/Contents/MacOS/ClaudeWatchUIReview"
