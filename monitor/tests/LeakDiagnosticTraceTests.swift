@@ -18,6 +18,7 @@ struct LeakDiagnosticTraceTests {
         expect(summaryObject["run_id"] as? String == id.uuidString, "diagnostic summary carries the trace run identity")
         log.record(kind: "dns", event: "start", run: id)
         log.record(kind: "dns", event: "phase_dns", run: id, attached: true)
+        log.record(kind: "webrtc", event: "http_retry", run: id)
         log.record(kind: "dns", event: "secret-ip-203.0.113.9", run: id)
         let clock = Date(timeIntervalSince1970: 1000)
         log.schedule(kind: "webrtc", event: "schedule_context_missing", now: clock)
@@ -29,8 +30,9 @@ struct LeakDiagnosticTraceTests {
         expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600, "private file permissions")
         let content = try String(contentsOf: files[0], encoding: .utf8)
         let rows = try content.split(separator: "\n").map { try JSONSerialization.jsonObject(with: Data($0.utf8)) as! [String: Any] }
-        expect(rows.count == 4, "repeated schedule state is rate limited")
+        expect(rows.count == 5, "repeated schedule state is rate limited")
         expect(rows[0]["run_id"] as? String == id.uuidString && rows[1]["view_attached"] as? Bool == true, "correlates run and view attachment")
+        expect(rows.contains { $0["event"] as? String == "http_retry" }, "records a recovered HTTP retry without including addresses")
         expect(!content.contains("203.0.113.9") && !content.contains("secret"), "rejects unrecognized and potentially sensitive data")
         let rotating = root.appendingPathComponent("rotating")
         let bounded = LeakDiagnosticTrace(directory: rotating, recordLimit: 2)

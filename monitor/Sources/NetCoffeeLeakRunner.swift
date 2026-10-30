@@ -133,6 +133,7 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
             trace("phase_" + phase)
             onPhase?(phase, elapsed)
         }
+        if body["diagnostic"] as? String == "http_retry" { trace("http_retry") }
         if let cancel = body["cancelRequest"] as? [String: String], let key = cancel["id"] {
             requests.removeValue(forKey: key)?.cancel()
             return

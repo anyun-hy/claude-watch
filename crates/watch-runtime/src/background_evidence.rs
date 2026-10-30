@@ -379,7 +379,8 @@ impl FixedCommandExecutor for ProbeExecutor {
         if result.is_err() {
             stop_group(&job);
         }
-        // Keep detailed worker phases only for an unsuccessful collection.
+        // Keep detailed worker phases for an unsuccessful collection, and
+        // retain the single bounded HTTP-retry event even after recovery.
         // stderr can contain system output: accept only the fixed JSON fields
         // and event vocabulary, never persist arbitrary stderr text.
         let incomplete = result.as_ref().map_or(true, |output| {
@@ -387,7 +388,7 @@ impl FixedCommandExecutor for ProbeExecutor {
                 .and_then(|value| value["status"].as_str().map(str::to_owned))
                 .as_deref() != Some("complete")
         });
-        if incomplete {
+        if incomplete || !error_output.is_empty() {
             if let Some(store) = &self.diagnostics {
                 let events = crate::events::EventStore::new(store.clone());
                 let run = uuid::Uuid::new_v4().to_string();
@@ -397,6 +398,7 @@ impl FixedCommandExecutor for ProbeExecutor {
                     if recorded >= 64 { break; }
                     let Ok(value) = serde_json::from_slice::<Value>(line) else { continue };
                     let (Some(event), Some(attached), Some(ms)) = (value["cw_trace"].as_str(), value["attached"].as_bool(), value["elapsed_ms"].as_f64()) else { continue };
+                    if !incomplete && event != "http_retry" { continue; }
                     if !(0.0..=120_000.0).contains(&ms) { continue; }
                     if events.record_worker_trace(kind, &run, event, attached, ms / 1000.0, started_at + ms / 1000.0).is_ok() {
                         recorded += 1;

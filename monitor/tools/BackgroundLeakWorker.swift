@@ -95,8 +95,9 @@ struct BackgroundLeakWorkerMain {
         let workerStarted = ProcessInfo.processInfo.systemUptime
         let runner = NetCoffeeLeakRunner(resourceDirectory: directory, backendVariant: .rustCandidate)
         let dnsRunner = IPLeakDNSRetryRunner(resourceDirectory: directory)
-        // Fixed labels only; the supervisor validates and persists these on an
-        // incomplete run. Never include probe data or arbitrary WebKit errors.
+        // Fixed labels only; the supervisor validates and persists them for
+        // incomplete runs and retains HTTP-retry evidence after recovery.
+        // Never include probe data or arbitrary WebKit errors.
         let diagnostic: (String, Bool) -> Void = { event, attached in
             let record: [String: Any] = ["cw_trace": event, "attached": attached,
                                          "elapsed_ms": Int((ProcessInfo.processInfo.systemUptime - workerStarted) * 1000)]

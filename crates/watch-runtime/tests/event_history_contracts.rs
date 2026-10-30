@@ -94,6 +94,40 @@ fn filters_cover_previous_history_before_paging_and_old_traffic_cannot_hide_warn
 }
 
 #[test]
+fn degraded_sampling_appears_in_attention_and_recovery_remains_informational() {
+    let f = Fixture::new();
+    let events = EventStore::new(f.store.clone());
+    for (time, status, previous) in [(1000.0, "degraded", "running"), (1004.0, "running", "degraded")] {
+        events.append("sampling-state", EventFields {
+            operation: Some("health".into()), status: Some(status.into()),
+            action: Some("transition".into()), previous_state: Some(previous.into()),
+            ..Default::default()
+        }, time).unwrap();
+    }
+    let attention = query(&f.store, "attention", "", 0);
+    assert_eq!(attention["total"], 1);
+    assert_eq!(attention["events"][0]["severity"], "warning");
+    assert!(attention["events"][0]["detail"].as_str().unwrap().contains("采样异常"));
+    let samples = query(&f.store, "sample", "", 0);
+    assert_eq!(samples["total"], 2);
+    assert_eq!(samples["events"][0]["severity"], "info");
+}
+
+#[test]
+fn unreadable_socket_identity_remains_an_attention_event() {
+    let f = Fixture::new();
+    EventStore::new(f.store.clone()).append("sampling-state", EventFields {
+        operation: Some("connection".into()), status: Some("partial".into()),
+        action: Some("transition".into()),
+        reason_counts: Some(std::collections::BTreeMap::from([("identity_unavailable".into(), 1)])),
+        ..Default::default()
+    }, 1000.0).unwrap();
+    let attention = query(&f.store, "attention", "", 0);
+    assert_eq!(attention["total"], 1);
+    assert!(attention["events"][0]["detail"].as_str().unwrap().contains("进程身份不可读"));
+}
+
+#[test]
 fn diagnostic_stream_is_minimal_deduplicated_and_rejects_untrusted_fields() {
     let f = Fixture::new();
     let events = EventStore::new(f.store.clone());

@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UserNotifications
 
 enum ReadOutcome: Sendable {
     case success(MonitorSnapshot)
@@ -154,6 +155,7 @@ final class MonitorStore: ObservableObject {
     @Published var error: String?
     @Published var refreshing = false
     @Published var automatic = true
+    @Published private(set) var notificationAccess = WatchNotificationAccess.unknown
     @Published var page: Page = .environment
     @Published var now = Date()
     @Published var networkSelection = NetworkGraphSelection()
@@ -168,6 +170,7 @@ final class MonitorStore: ObservableObject {
     private var environmentRefreshScheduler = EnvironmentRefreshScheduler()
     private var diagnosticContext = DiagnosticContextTracker()
     private var refreshGate = MonitorRefreshGate()
+    private var notificationRequestGeneration = 0
     init(leakChecks: LeakCheckStore? = nil, aiChecks: AIProbeStore? = nil, switcher: SwitcherStore? = nil) {
         self.leakChecks = leakChecks ?? LeakCheckStore()
         self.aiChecks = aiChecks ?? AIProbeStore()
@@ -224,6 +227,26 @@ final class MonitorStore: ObservableObject {
             }
         }
     }
+    func refreshNotificationAccess() async {
+        guard !switcher.isFixture else { return }
+        await readNotificationAccess {
+            let settings = await UNUserNotificationCenter.current().notificationSettings()
+            return .classify(settings.authorizationStatus, alert: settings.alertSetting, style: settings.alertStyle)
+        }
+    }
+    private func readNotificationAccess(_ reader: () async -> WatchNotificationAccess) async {
+        notificationRequestGeneration += 1
+        let generation = notificationRequestGeneration
+        let value = await reader()
+        guard generation == notificationRequestGeneration else { return }
+        notificationAccess = value
+    }
+    #if UI_REVIEW
+    func refreshNotificationAccessForFixture(_ reader: () async -> WatchNotificationAccess) async {
+        guard switcher.isFixture else { return }
+        await readNotificationAccess(reader)
+    }
+    #endif
     func monitorTick(at date: Date) {
         now = date
         leakChecks.now = date

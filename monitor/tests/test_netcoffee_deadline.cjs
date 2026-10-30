@@ -34,7 +34,7 @@ function receipt(kind, query, data = {}, raw = '{}') {
 
 function fixture(options = {}) {
   const clock = new Clock();
-  const payloads = [], requests = [], cancellations = [], images = [];
+  const payloads = [], requests = [], cancellations = [], images = [], diagnostics = [];
   const queued = [];
   let context;
   const apiOutcomes = { trace: [], dns: [], geoip: [], ...(options.apiOutcomes || {}) };
@@ -75,6 +75,7 @@ function fixture(options = {}) {
     document: { getElementById() { return null; } },
     window: { webkit: { messageHandlers: { coffeeProbe: { postMessage(message) {
       if (message.payload) { payloads.push(message.payload); return; }
+      if (message.diagnostic) diagnostics.push(message.diagnostic);
       if (message.cancelRequest) { cancellations.push(message.cancelRequest.id); return; }
       if (!message.request) return;
       requests.push(message.request);
@@ -92,7 +93,7 @@ function fixture(options = {}) {
   });
   vm.runInContext(source, context);
   return {
-    clock, context, payloads, requests, cancellations, images, queued,
+    clock, context, payloads, requests, cancellations, images, queued, diagnostics,
     start(kind, id, rounds = 5, budgetMs = 70000) {
       context.window.NetCoffeeProbe.run({ kind, runID: id, rounds, budgetMs });
     },
@@ -149,6 +150,34 @@ async function collect(run, kind = 'dns', id = 'one', rounds = 5) {
   assert.equal(slowSuccess.status, 'complete');
   assert(slowSuccess.elapsedMs < 70000);
   assert(run.requests.some(row => Number(row.timeoutMs) === 21000));
+
+  // A transient WebRTC HTTP timeout gets one new HTTP/ICE attempt. Existing
+  // ICE observations remain part of the result, and retries stay in budget.
+  const timeoutReceipt = { ...receipt('trace', ''), status: 'timeout', error: 'fixture timeout' };
+  run = fixture({ apiOutcomes: { trace: [{ delay: 5000, value: timeoutReceipt }, { delay: 0 }] } });
+  const recoveredRTC = await collect(run, 'webrtc');
+  assert.equal(recoveredRTC.status, 'complete');
+  assert.equal(run.requests.filter(row => row.kind === 'trace').length, 2);
+  assert(run.diagnostics.includes('http_retry'));
+  assert(recoveredRTC.elapsedMs < 70000);
+
+  // Both failed attempts remain incomplete, and both stalled requests are
+  // cancelled rather than silently becoming a pass.
+  run = fixture({ apiOutcomes: { trace: [{ never: true }, { never: true }] } });
+  const failedRTC = await collect(run, 'webrtc');
+  assert.equal(failedRTC.status, 'partial');
+  assert.equal(run.requests.filter(row => row.kind === 'trace').length, 2);
+  assert(failedRTC.errors.some(row => row.stage === 'http' && row.code === 'timeout'));
+  assert.equal(run.cancellations.length, 2);
+  assert(failedRTC.elapsedMs < 70000);
+
+  // Cancelling during the retry cannot publish a late result.
+  run = fixture({ apiOutcomes: { trace: [{ delay: 5000, value: timeoutReceipt }, { never: true }] } });
+  run.start('webrtc', 'retry-cancel');
+  await run.clock.runUntil(() => run.requests.filter(row => row.kind === 'trace').length === 2);
+  run.context.window.NetCoffeeProbe.cancel();
+  await Promise.resolve();
+  assert.equal(run.payloads.length, 0);
 
   // A late response belonging to a cancelled run cannot populate a later run.
   run = fixture({ deferRequests: true });

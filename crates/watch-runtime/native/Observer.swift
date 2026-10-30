@@ -19,7 +19,19 @@ private struct Identity: Codable, Equatable {
     }
 }
 private struct Request: Decodable { let schema: Int; let round_id: String; let targets: [Identity] }
+#if OBSERVER_TESTING
+// Test-only hooks target processes created and owned by the test harness.
+private var observerIdentityMisses: [Int32: Int] = [:]
+private var observerAfterInventoryScan: (() -> Void)?
+private var observerBeforeSocketRecheck: ((Int32) -> Void)?
+#endif
 private func currentIdentity(_ pid: Int32) -> Identity? {
+    #if OBSERVER_TESTING
+    if let count = observerIdentityMisses[pid], count > 0 {
+        observerIdentityMisses[pid] = count - 1
+        return nil
+    }
+    #endif
     guard pid > 1 else { return nil }
     var info = proc_bsdinfo()
     let size = Int32(MemoryLayout<proc_bsdinfo>.size)
@@ -69,15 +81,8 @@ private func inventory() throws -> [String: Any] {
     // though nothing was wrong. The guard rescans every round, so a longer
     // deadline only costs time on a genuinely hung system.
     let deadline = DispatchTime.now().uptimeNanoseconds + 10_000_000_000
-    var values = [[String: Any]](), unavailable = [[String: Any]](), ended = [Int32]()
-    for pid in pids {
-        if DispatchTime.now().uptimeNanoseconds > deadline {
-            unavailable.append(["pid": pid, "code": "inventory_deadline"]); break
-        }
-        guard let identity = currentIdentity(pid), identity.uid == getuid() else {
-            if exited(pid) { ended.append(pid) } else { unavailable.append(["pid": pid, "code": "identity_unavailable"]) }
-            continue
-        }
+    var values = [[String: Any]](), unavailable = [[String: Any]](), ended = [Int32](), pending = [Int32]()
+    func appendIdentity(_ identity: Identity) throws {
         var value = try encoded(identity)
         if let range = identity.executable.range(of: ".app/Contents/") {
             let bundle = String(identity.executable[..<range.lowerBound]) + ".app"
@@ -86,10 +91,31 @@ private func inventory() throws -> [String: Any] {
         }
         values.append(value)
     }
-    // `identity_unavailable` means the PID vanished between the listing and the
-    // lookup — ordinary churn, not a failed scan, and the next round sees the
-    // truth again. Only a truncated listing or an expired deadline means the
-    // inventory itself cannot be trusted.
+    for pid in pids {
+        if DispatchTime.now().uptimeNanoseconds > deadline {
+            unavailable.append(["pid": pid, "code": "inventory_deadline"]); break
+        }
+        guard let identity = currentIdentity(pid), identity.uid == getuid() else {
+            if exited(pid) { ended.append(pid) } else { pending.append(pid) }
+            continue
+        }
+        try appendIdentity(identity)
+    }
+    #if OBSERVER_TESTING
+    observerAfterInventoryScan?()
+    #endif
+    // Recheck unresolved PIDs after the rest of the scan. A process which is
+    // still unreadable stays unknown; only a confirmed exit can be excluded.
+    for pid in pending {
+        if DispatchTime.now().uptimeNanoseconds > deadline {
+            unavailable.append(["pid": pid, "code": "inventory_deadline"]); break
+        }
+        if let identity = currentIdentity(pid), identity.uid == getuid() { try appendIdentity(identity) }
+        else if exited(pid) { ended.append(pid) }
+        else { unavailable.append(["pid": pid, "code": "identity_unavailable"]) }
+    }
+    // Unresolved identities remain in unavailable and are treated as an
+    // incomplete inventory by the Rust decoder; this state does not hide them.
     let fatal = truncated || unavailable.contains { ($0["code"] as? String) == "inventory_deadline" }
     return ["processes": values, "unavailable": unavailable, "exited": ended, "truncated": truncated,
         "state": fatal ? "partial" : "ok", "requested_count": pids.count]
@@ -255,20 +281,23 @@ private func sockets(_ input: Request) throws -> [String: Any] {
     var rows = [[String: Any]]()
     for target in input.targets {
         if DispatchTime.now().uptimeNanoseconds > deadline { rows.append(["pid": target.pid, "state": "unknown", "code": "socket_deadline"]); break }
-        guard let before = currentIdentity(target.pid), before.sameProcess(target) else {
-            rows.append(["pid": target.pid, "state": "unknown", "code": exited(target.pid) ? "process_exited" : "identity_changed"]); continue
+        guard let before = currentIdentity(target.pid) else {
+            rows.append(["pid": target.pid, "state": "unknown", "code": exited(target.pid) ? "process_exited" : "identity_unavailable"]); continue
+        }
+        guard before.sameProcess(target) else {
+            rows.append(["pid": target.pid, "state": "unknown", "code": "identity_changed"]); continue
         }
         let width = MemoryLayout<proc_fdinfo>.stride
         errno = 0
         let expected = proc_pidinfo(target.pid, PROC_PIDLISTFDS, 0, nil, 0)
         guard expected >= 0 && (expected > 0 || errno == 0) && expected <= 32768 * width else {
-            rows.append(["pid": target.pid, "state": "unknown", "code": "fd_inventory_unavailable"]); continue
+            rows.append(["pid": target.pid, "state": "unknown", "code": exited(target.pid) ? "process_exited" : "fd_inventory_unavailable"]); continue
         }
         let count = max(32, Int(expected) / width + 32)
         var descriptors = [proc_fdinfo](repeating: proc_fdinfo(), count: count)
         errno = 0
         let bytes = descriptors.withUnsafeMutableBytes { pointer in proc_pidinfo(target.pid, PROC_PIDLISTFDS, 0, pointer.baseAddress, Int32(pointer.count)) }
-        guard bytes >= 0, (bytes > 0 || errno == 0), Int(bytes) % width == 0 else { rows.append(["pid": target.pid, "state": "unknown", "code": "fd_inventory_unavailable"]); continue }
+        guard bytes >= 0, (bytes > 0 || errno == 0), Int(bytes) % width == 0 else { rows.append(["pid": target.pid, "state": "unknown", "code": exited(target.pid) ? "process_exited" : "fd_inventory_unavailable"]); continue }
         var values = [[String: Any]](), dropped = [String: Int](), inspected = 0
         if Int(bytes) >= count * width { dropped["fd_list_truncated"] = 1 }
         for descriptor in descriptors.prefix(Int(bytes) / width) where descriptor.proc_fdtype == PROX_FDTYPE_SOCKET {
@@ -280,7 +309,13 @@ private func sockets(_ input: Request) throws -> [String: Any] {
             inspected += 1
             if let value = socketValue(info, pid: target.pid, fd: descriptor.proc_fd) { values.append(value) }
         }
-        guard let after = currentIdentity(target.pid), before.sameProcess(after) else {
+        #if OBSERVER_TESTING
+        observerBeforeSocketRecheck?(target.pid)
+        #endif
+        guard let after = currentIdentity(target.pid) else {
+            rows.append(["pid": target.pid, "state": "unknown", "code": exited(target.pid) ? "process_exited" : "identity_unavailable"]); continue
+        }
+        guard before.sameProcess(after) else {
             rows.append(["pid": target.pid, "state": "unknown", "code": "identity_changed"]); continue
         }
         rows.append(["pid": target.pid, "identity": try encoded(after), "state": dropped.isEmpty ? "ok" : "partial", "sockets": values,
@@ -288,6 +323,7 @@ private func sockets(_ input: Request) throws -> [String: Any] {
     }
     return ["round_id": input.round_id, "socket_samples": rows]
 }
+#if !OBSERVER_TESTING
 @main
 private struct Observer {
     static func main() {
@@ -316,3 +352,4 @@ private struct Observer {
         }
     }
 }
+#endif

@@ -463,6 +463,25 @@ fn webrtc_country_risk_and_candidate_mismatch_win_over_incomplete_samples() {
     assert_eq!(receipt["observations"].as_array().unwrap().len(), 2);
 }
 
+#[test]
+fn webrtc_recovered_http_retry_keeps_earlier_candidate_risk() {
+    let mut p = probe("webrtc", NOW);
+    // A timed-out HTTP reference is retried while ICE is sampled again.
+    // Both attempts' candidates must participate in the backend decision.
+    p["observations"] = json!([
+        {"kind":"http","address":"1.1.1.1"},
+        {"kind":"srflx","address":"8.8.8.8","source":"first ICE sample"},
+        {"kind":"srflx","address":"1.1.1.1","source":"retry ICE sample"}
+    ]);
+    p["externalJSON"] = json!(serde_json::to_string(&json!([
+        {"kind":"trace","status":"timeout"},
+        {"kind":"trace","status":"complete"}
+    ])).unwrap());
+    let receipt = receipts::record_webrtc(&p, &local(), None, NOW + 1.0).unwrap();
+    assert_eq!(receipt["risk"]["state"], "fail");
+    assert_eq!(receipts::webrtc_status(&receipt, "ctx", NOW + 2.0)["state"], "fail");
+}
+
 /// A realistic partially-answering round: the domestic servers answer, the
 /// overseas one times out.  This is the shape that used to flip the row.
 fn stun_probe(now: f64) -> Value {

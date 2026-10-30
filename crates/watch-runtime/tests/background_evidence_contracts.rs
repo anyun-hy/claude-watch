@@ -79,6 +79,46 @@ printf '%s\n' '{"status":"timeout"}'
         "phase evidence survives the supervisor timeout"
     );
 }
+
+#[test]
+fn recovered_worker_retains_only_bounded_http_retry_diagnostic() {
+    use claude_watch_runtime::{
+        background_evidence::{ProbeExecutor, WORKER},
+        release_native::{FixedCommand, FixedCommandExecutor},
+    };
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::{atomic::AtomicBool, Arc},
+        time::Duration,
+    };
+    let f = Fixture::new();
+    let script = f.root.join(WORKER);
+    fs::write(
+        &script,
+        r##"#!/bin/sh
+printf '%s\n' '{"cw_trace":"navigation_finished","attached":true,"elapsed_ms":40}' >&2
+printf '%s\n' '{"cw_trace":"http_retry","attached":true,"elapsed_ms":45}' >&2
+printf '%s\n' '{"cw_trace":"secret-203.0.113.9","attached":true,"elapsed_ms":50}' >&2
+printf '%s\n' '{"status":"complete"}'
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = ProbeExecutor::new(Arc::new(AtomicBool::new(false)))
+        .with_diagnostics(f.store.clone())
+        .run(FixedCommand {
+            program: script,
+            args: vec!["--webrtc".into()],
+            timeout: Duration::from_secs(3),
+        })
+        .unwrap();
+    assert!(output.stderr.is_empty());
+    let log = fs::read_to_string(f.store.paths.base().join("diagnostic-events.jsonl")).unwrap();
+    assert!(log.contains("http_retry"));
+    assert!(!log.contains("navigation_finished") && !log.contains("203.0.113.9"));
+    assert_eq!(log.lines().count(), 1);
+}
+
 impl Fixture {
     fn new() -> Self {
         let root =

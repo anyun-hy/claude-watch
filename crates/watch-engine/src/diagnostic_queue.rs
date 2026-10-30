@@ -96,6 +96,7 @@ fn reasons(value: &Value) -> BTreeMap<String, u32> {
         let key = if [
             "process_exited",
             "identity_changed",
+            "identity_unavailable",
             "missing_target_sample",
             "fd_inventory_unavailable",
             "socket_deadline",
@@ -693,6 +694,7 @@ mod tests {
         let sample = |state: &str, reason: &str| json!({"health":{"state":"running"},"proxy":{"connectionObservation":{"roundID":round,"collectorState":state,"confirmedExitedCount":0,"dropped":{reason:1}}}});
         samples.observe(&queue, &sample("partial", "identity_changed"), 1000.0);
         samples.observe(&queue, &sample("partial", "socket_deadline"), 1002.0);
+        samples.observe(&queue, &sample("partial", "identity_unavailable"), 1004.0);
         samples.observe(&queue, &sample("ok", "socket_deadline"), 1010.0);
         let mut guard = GuardHistory::default();
         let sid = Uuid::new_v4().to_string();
@@ -711,6 +713,9 @@ mod tests {
             })
         });
         let rows = events.history().unwrap().events;
+        assert!(rows.iter().any(|e| e.category == "sampling-state"
+            && e.time == 1004.0
+            && e.fields.reason_counts.as_ref().and_then(|m| m.get("identity_unavailable")) == Some(&1)));
         let guards: Vec<_> = rows
             .iter()
             .filter(|e| e.category == "guard-decision")

@@ -82,7 +82,6 @@ struct EventTimelinePage: View {
     @State private var hasLoaded = false
     @State private var showingOlder = false
     @State private var requestID = UUID()
-    @State private var notificationsDenied = false
     @ObservedObject private var diagnosticLog = DiagnosticLogStatus.shared
 
     private let filters = ["关键", "需关注", "网络", "进程", "采样", "全部"]
@@ -135,9 +134,9 @@ struct EventTimelinePage: View {
                 if LeakDiagnosticTrace.shared.error != nil {
                     InlineNotice(title: "检测过程日志不完整", detail: "本次运行曾发生检测过程日志写入失败，部分历史可能缺失。", symbol: "exclamationmark.triangle", tint: p.amber, p: p).padding(.top, 12)
                 }
-                if notificationsDenied {
+                if let notice = store.notificationAccess.notice {
                     HStack {
-                        Text("系统通知当前未获授权；保护判断不依赖通知。")
+                        Text(notice)
                         Button("打开通知设置") {
                             if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") { NSWorkspace.shared.open(url) }
                         }
@@ -191,14 +190,6 @@ struct EventTimelinePage: View {
                                detail: "等待首次监控快照。", p: p)
                 }
             }
-        }
-        .task {
-            guard !store.switcher.isFixture else { return }
-            notificationsDenied = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus == .denied
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            guard !store.switcher.isFixture else { return }
-            Task { notificationsDenied = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus == .denied }
         }
         .task(id: filterKey + "\u{1f}" + query) {
             guard hasHistoryBackend else { return }

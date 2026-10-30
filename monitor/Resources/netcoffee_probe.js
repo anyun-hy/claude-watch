@@ -61,7 +61,24 @@
   function error(run,stageName,e,code){
     run.errors.push({stage:phaseNames[stageName]?stageName:'collector',code:code || (e&&e.budget?'timeout':'incomplete'),message:String((e&&e.message)||e)});
   }
-  async function trace(run){stage(run,'http','读取同轮 HTTP 参考');try{var r=await api(run,'trace','','http'),m=r.raw.match(/^ip=(.+)$/m);if(!m||!publicAddress(m[1].trim()))throw new Error('HTTP reference missing');observe(run,m[1].trim(),'http',r.sourceURL+' · 本机代理 HTTP');}catch(e){error(run,'http',e,e.timeout||e.budget?'timeout':undefined);}}
+  async function traceOnce(run){var r=await api(run,'trace','','http'),m=r.raw.match(/^ip=(.+)$/m);if(!m||!publicAddress(m[1].trim()))throw new Error('HTTP reference missing');observe(run,m[1].trim(),'http',r.sourceURL+' · 本机代理 HTTP');}
+  async function trace(run){
+    stage(run,'http','读取同轮 HTTP 参考');
+    try{await traceOnce(run);return;}catch(first){
+      // Retry a transient WebRTC HTTP timeout once, within the original
+      // deadline. Re-sample ICE as well and retain the first candidates: an
+      // observed mismatch or any other failed probe must never be hidden.
+      if(run.kind==='webrtc' && first.timeout && !first.budget && !run.stopped && remaining(run)>9000){
+        run.details.push('HTTP 参考首次超时，已重新采集 HTTP 与 ICE；保留此前候选用于比较。');
+        sendFor(run,{diagnostic:'http_retry',phase:'http',elapsedMs:elapsed(run)});
+        stage(run,'http','HTTP 参考超时，正在重新采集');
+        var results=await Promise.all([traceOnce(run).then(function(){return null;},function(e){return e;}),Promise.all(stuns.map(function(source){return ice(run,source);}))]);
+        if(!results[0])return;
+        first=results[0];
+      }
+      error(run,'http',first,first.timeout||first.budget?'timeout':undefined);
+    }
+  }
   function image(run,url){
     ensure(run,'dns_images',3000 + RETURN_RESERVE_MS);
     return new Promise(function(resolve){var img=new Image(),done=false;run.images.push(img);function end(){if(done)return;done=true;img.onload=img.onerror=null;resolve();}img.onload=img.onerror=end;run.timers.push(setTimeout(end,3000));img.src=url;});

@@ -331,6 +331,7 @@ fn confirmed_exit_is_distinct_from_missing_or_unverified_target() {
     .is_err());
     for code in [
         "identity_changed",
+        "identity_unavailable",
         "fd_inventory_unavailable",
         "socket_deadline",
     ] {

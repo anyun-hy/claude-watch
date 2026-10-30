@@ -170,7 +170,7 @@ impl EventFields {
         if self.previous_state.as_ref().is_some_and(|v| !matches!(v.as_str(), "running" | "degraded" | "ok" | "partial" | "empty" | "no_targets" | "unknown" | "failed" | "idle" | "safe" | "risk" | "locked" | "missing" | "pending" | "disabled")) { return Err(invalid("前一状态无效")); }
         if self.process_reason_counts.as_ref().is_some_and(|m| m.len() > 8 || m.keys().any(|k| !["inventory_partial","inventory_truncated","inventory_count_mismatch","identity_unavailable","inventory_deadline","bundle_identity_unavailable","root_arguments_unavailable","other"].contains(&k.as_str()))) { return Err(invalid("进程采样原因无效")); }
         if self.sampling_diagnostics.as_ref().is_some_and(|v| !v.valid()) { return Err(invalid("采样诊断无效")); }
-        if self.reason_counts.as_ref().is_some_and(|m| m.len() > 12 || m.keys().any(|k| !matches!(k.as_str(), "process_exited" | "identity_changed" | "missing_target_sample" | "fd_inventory_unavailable" | "socket_deadline" | "socket_info_unavailable" | "fd_closed_during_sample" | "fd_list_truncated" | "foreign_socket_pid" | "socket_sample_partial" | "other"))) { return Err(invalid("采样原因无效")); }
+        if self.reason_counts.as_ref().is_some_and(|m| m.len() > 12 || m.keys().any(|k| !matches!(k.as_str(), "process_exited" | "identity_changed" | "identity_unavailable" | "missing_target_sample" | "fd_inventory_unavailable" | "socket_deadline" | "socket_info_unavailable" | "fd_closed_during_sample" | "fd_list_truncated" | "foreign_socket_pid" | "socket_sample_partial" | "other"))) { return Err(invalid("采样原因无效")); }
         if let Some(value) = &self.guard_diagnostics { value.validate()?; }
         Ok(())
     }
@@ -308,7 +308,7 @@ impl EventStore {
     pub fn record_worker_trace(&self, kind: &str, run: &str, event: &str, attached: bool, elapsed: f64, at: f64) -> Result<()> {
         let allowed = ["host_attached", "host_detached", "navigation_finished", "navigation_failed",
             "webcontent_terminated", "script_started", "script_failed", "message_rejected", "payload_invalid",
-            "payload_received", "watchdog_timeout", "dns_retry", "phase_http", "phase_dns", "phase_dns_images",
+            "payload_received", "watchdog_timeout", "dns_retry", "http_retry", "phase_http", "phase_dns", "phase_dns_images",
             "phase_dns_records", "phase_geoip", "phase_ice", "phase_collector",
             "dns_request_timeout", "dns_request_network", "dns_request_http_status", "dns_request_invalid_response",
             "http_request_timeout", "http_request_network", "http_request_http_status", "http_request_invalid_response",

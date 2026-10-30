@@ -285,7 +285,7 @@ fn present_event(e: Event) -> Value {
     } else if severity == "info"
         && matches!(
             fields.status.as_deref(),
-            Some("timeout" | "partial" | "incomplete" | "blocked" | "unknown")
+            Some("timeout" | "partial" | "incomplete" | "blocked" | "unknown" | "degraded")
         )
     {
         severity = "warning";
@@ -432,7 +432,7 @@ fn present_event(e: Event) -> Value {
     if let Some(counts) = &fields.reason_counts {
         for (reason, count) in counts {
             let label = match reason.as_str() {
-                "process_exited" => "进程退出", "identity_changed" => "身份变化", "missing_target_sample" => "目标缺样", "fd_inventory_unavailable" => "描述符不可读", "socket_deadline" => "采样超时", "socket_info_unavailable" => "套接字不可读", "fd_closed_during_sample" => "采样时句柄关闭", "fd_list_truncated" => "描述符列表截断", "foreign_socket_pid" => "套接字身份不符", "socket_sample_partial" => "采样不完整", _ => "其他原因",
+                "process_exited" => "进程退出", "identity_changed" => "身份变化", "identity_unavailable" => "进程身份不可读", "missing_target_sample" => "目标缺样", "fd_inventory_unavailable" => "描述符不可读", "socket_deadline" => "采样超时", "socket_info_unavailable" => "套接字不可读", "fd_closed_during_sample" => "采样时句柄关闭", "fd_list_truncated" => "描述符列表截断", "foreign_socket_pid" => "套接字身份不符", "socket_sample_partial" => "采样不完整", _ => "其他原因",
             };
             if *count > 0 { summary.push(format!("{label}：{count}")); }
         }

@@ -92,6 +92,13 @@ struct MonitorView: View {
         .onAppear {
             if restoresNavigation { store.page = Page.restored(savedPage) }
             if startMonitoring { store.start() }
+            Task { await store.refreshNotificationAccess() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await store.refreshNotificationAccess() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .watchNotificationPermissionChanged)) { _ in
+            Task { await store.refreshNotificationAccess() }
         }
         .onChange(of: store.page) { _, page in if restoresNavigation { savedPage = page.rawValue } }
     }
@@ -290,7 +297,16 @@ struct MonitorView: View {
                     DetailRow(title: "最近心跳", value: heartbeatValue, p: p, monospaced: true)
                     DetailRow(title: "登录自启", value: store.snapshot.map { $0.autoStart ? "已配置" : "未配置" } ?? "读取中", p: p)
                     DetailRow(title: "异常退出恢复", value: store.snapshot.map { $0.keepAlive ? "已配置" : "未配置" } ?? "读取中", p: p)
-                    DetailRow(title: "系统提醒", value: store.snapshot?.health.alerts ?? "读取中", p: p)
+                    DetailRow(title: "系统提醒", value: WatchNotificationAccess.summary(mode: store.snapshot?.health.alerts, access: store.notificationAccess), p: p,
+                              tint: store.notificationAccess.notice == nil ? nil : p.amber)
+                    if let notice = store.notificationAccess.notice {
+                        HStack(alignment: .top, spacing: 8) {
+                            Text(notice).font(WatchTypography.caption).foregroundStyle(p.amber)
+                            Button("打开通知设置") {
+                                if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") { NSWorkspace.shared.open(url) }
+                            }.buttonStyle(.borderless).font(WatchTypography.caption)
+                        }
+                    }
                     Text("关闭窗口后，已安装的后台服务继续运行。")
                         .font(WatchTypography.caption).foregroundStyle(p.secondary).lineSpacing(3).padding(.top, 11)
                     Button("查看保镖与任务实际状态") { store.page = .protection }.buttonStyle(.borderless).font(WatchTypography.caption).padding(.top, 8)
@@ -411,7 +427,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let center = UNUserNotificationCenter.current()
         center.getNotificationSettings { settings in
             if settings.authorizationStatus == .notDetermined {
-                center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+                center.requestAuthorization(options: [.alert, .sound]) { _, _ in
+                    DispatchQueue.main.async {
+                        NotificationCenter.default.post(name: .watchNotificationPermissionChanged, object: nil)
+                    }
+                }
             }
         }
     }
