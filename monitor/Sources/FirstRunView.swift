@@ -17,6 +17,7 @@ struct FirstRunView: View {
     @ObservedObject var store: MonitorStore
     @ObservedObject var initialization: FirstRunInitialization
     @ObservedObject private var switcher: SwitcherStore
+    @ObservedObject private var leakChecks: LeakCheckStore
     @AppStorage("darkAppearance") private var dark = true
     @State private var showingApproval: InitializationApproval?
     @State private var showingReport = false
@@ -25,6 +26,7 @@ struct FirstRunView: View {
 
     init(store: MonitorStore, initialization: FirstRunInitialization) {
         self.store = store; self.initialization = initialization; self.switcher = store.switcher
+        self.leakChecks = store.leakChecks
     }
     private var p: Palette { Palette(dark: dark) }
     var body: some View {
@@ -112,7 +114,8 @@ struct FirstRunView: View {
                 HStack {
                     Text("\(number). \(row.step.title)").font(WatchTypography.section)
                     Spacer(minLength: 8)
-                    Text(row.status.title).font(WatchTypography.caption).foregroundStyle(tint(row.status))
+                    Text(row.status == .authorization && initialization.approval?.action != .accessibility ? "等待确认" : row.status.title)
+                        .font(WatchTypography.caption).foregroundStyle(tint(row.status))
                 }
                 if !row.detail.isEmpty {
                     Text(row.detail).font(WatchTypography.body).foregroundStyle(p.secondary)
@@ -122,9 +125,14 @@ struct FirstRunView: View {
                     Text("DNS 需要多轮查询，请等待本轮完成。")
                         .font(WatchTypography.caption).foregroundStyle(p.secondary)
                 }
+                if row.status == .running, row.step == .dns || row.step == .webrtc,
+                   let browser = leakChecks.browserViews[row.step == .dns ? .dns : .webrtc] {
+                    CoffeeCollectorView(browser: browser).frame(height: 72)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
                 if row.status == .authorization, let request = initialization.approval {
                     HStack(spacing: 12) {
-                        Button("查看并授权…") { showingApproval = request }.frame(minHeight: 36)
+                        Button(request.action == .accessibility ? "查看并授权…" : "查看并确认…") { showingApproval = request }.frame(minHeight: 36)
                         if request.action == .accessibility {
                             Button("我已授权，重新核对") { Task { await initialization.recheckAuthorization() } }
                                 .frame(minHeight: 36)
@@ -164,7 +172,7 @@ struct FirstRunView: View {
             Text("TAG 配置与独立原版保镖保持不变。")
                 .font(WatchTypography.caption).foregroundStyle(p.secondary)
             HStack {
-                Button("暂不授权") { showingApproval = nil }.frame(minHeight: 44)
+                Button(request.action == .accessibility ? "暂不授权" : "暂不应用") { showingApproval = nil }.frame(minHeight: 44)
                 Spacer()
                 Button(request.action == .accessibility ? "打开系统授权" : "确认并应用") {
                     showingApproval = nil

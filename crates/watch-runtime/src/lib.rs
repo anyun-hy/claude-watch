@@ -45,6 +45,7 @@ pub mod server_reference;
 pub mod service_native;
 pub mod services;
 pub mod session_store;
+pub mod setup_progress;
 pub mod snapshot_publication;
 pub mod storage;
 pub mod stun_probe;

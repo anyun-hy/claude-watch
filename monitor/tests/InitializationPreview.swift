@@ -10,7 +10,7 @@ private final class PreviewInitializationChecks: InitializationChecking {
         if fails && step == .dns { return .failed(code: "timeout", detail: "本轮 DNS 查询未完整结束。请确认网络稳定后重新检查；已有结果保留用于核对。") }
         return .passed("隔离模拟：此项已核对，未读取实际网络或执行系统操作。", validUntil: Date().timeIntervalSince1970 + 120)
     }
-    func approve(_ request: InitializationApproval) async -> InitializationResult { .failed(code: "preview", detail: "界面验收不执行授权。") }
+    func approve(_ request: InitializationApproval, progress: @escaping SetupProgressObserver) async -> InitializationResult { .failed(code: "preview", detail: "界面验收不执行授权。") }
     func validateCurrentEvidence() -> InitializationResult { .passed("fixture", validUntil: Date().timeIntervalSince1970 + 120) }
     func finish() {}
 }

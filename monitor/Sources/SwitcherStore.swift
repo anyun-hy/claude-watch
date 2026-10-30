@@ -323,8 +323,8 @@ struct ProxyDiagnosticReceipt: Decodable {
 
 enum SwitcherCommandRunner {
     static func run(_ args: [String], input: Data? = nil, cancellation: SwitcherReadCancellation? = nil,
-                    dnsRefreshToken: String? = nil) throws -> Data {
-        let task = Process(), output = Pipe()
+                    dnsRefreshToken: String? = nil, setupProgress: SetupProgressReader? = nil) throws -> Data {
+        let task = Process()
         guard let variant = BundledBackendVariant.current() else {
             throw NSError(domain: "Switcher", code: 1, userInfo: [NSLocalizedDescriptionKey: "构建包未声明后台类型，请重新构建界面。"])
         }
@@ -347,10 +347,31 @@ enum SwitcherCommandRunner {
         if case .stable = variant { env["PYTHONDONTWRITEBYTECODE"] = "1" }
         env.removeValue(forKey: "BASH_ENV")
         env.removeValue(forKey: "CLAUDE_WATCH_DNS_REFRESH_TOKEN")
+        env.removeValue(forKey: "CW_SETUP_PROGRESS")
         if let dnsRefreshToken { env["CLAUDE_WATCH_DNS_REFRESH_TOKEN"] = dnsRefreshToken }
+        let observesSetup: Bool
+        if case .rustCandidate = variant { observesSetup = args.starts(with: ["setup", "apply"]) && setupProgress != nil }
+        else { observesSetup = false }
+        if observesSetup { env["CW_SETUP_PROGRESS"] = "1" }
         task.environment = env
+        return try execute(task, input: input, cancellation: cancellation, setupProgress: observesSetup ? setupProgress : nil)
+    }
+    static func execute(_ task: Process, input: Data? = nil, cancellation: SwitcherReadCancellation? = nil,
+                        setupProgress: SetupProgressReader? = nil) throws -> Data {
+        let output = Pipe(), progressOutput = Pipe()
         task.standardOutput = output
-        task.standardError = output
+        if let setupProgress {
+            task.standardError = progressOutput
+            progressOutput.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                if data.isEmpty { handle.readabilityHandler = nil }
+                else { setupProgress.consume(data) }
+            }
+        } else { task.standardError = output }
+        defer {
+            setupProgress?.finish()
+            progressOutput.fileHandleForReading.readabilityHandler = nil
+        }
         let incoming = Pipe()
         task.standardInput = incoming
         if let cancellation { try cancellation.start(task) } else { try task.run() }
@@ -962,11 +983,12 @@ final class SwitcherStore: ObservableObject {
             message = "请核对候选目标、选项与系统变更。确认后才会保存基线。"; failure = false
         } catch { message = error.localizedDescription; failure = true }
     }
-    func applyEnvironment(refreshDetection: Bool = true) async {
+    func applyEnvironment(refreshDetection: Bool = true, progress: SetupProgressObserver? = nil) async {
         guard setupCanConfirm, let setupPlan else { return }
         let input = try? JSONSerialization.data(withJSONObject: setupOptions)
-        await perform(["setup", "apply", "--candidate-id", setupPlan.candidate_id, "--plan-id", setupPlan.id, "--apply"], input: input)
+        await perform(["setup", "apply", "--candidate-id", setupPlan.candidate_id, "--plan-id", setupPlan.id, "--apply"], input: input, setupProgress: progress)
         self.setupPlan = nil; candidate = nil
+        progress?(.verifySettings)
         await inspectEnvironment()
         if refreshDetection { _ = await detectCurrentEnvironment() }
     }
@@ -1024,7 +1046,7 @@ final class SwitcherStore: ObservableObject {
             try SwitcherCommandRunner.run(args, input: input, dnsRefreshToken: token)
         }.value
     }
-    func perform(_ args: [String], input: Data? = nil, refresh: Bool = true) async {
+    func perform(_ args: [String], input: Data? = nil, refresh: Bool = true, setupProgress: SetupProgressObserver? = nil) async {
         guard !busy else { return }
         busy = true
         let activityToken = beginActivity("等待环境读取结束…")
@@ -1089,7 +1111,16 @@ final class SwitcherStore: ObservableObject {
                 if args.starts(with: ["account", "switch"]) && args.contains("--apply") {
                     data = try await runAccountSwitchWithDNSRefresh(args, input: input)
                 } else {
-                    data = try await Task.detached { try SwitcherCommandRunner.run(args, input: input) }.value
+                    let channel = setupProgress.map { observer in
+                        SetupProgressReader { [weak self] phase, stream in
+                            Task { @MainActor in
+                                guard let self, stream.isActive, self.busy, self.activityGeneration == activityToken else { return }
+                                self.updateActivity(phase.detail, token: activityToken)
+                                observer(phase)
+                            }
+                        }
+                    }
+                    data = try await Task.detached { try SwitcherCommandRunner.run(args, input: input, setupProgress: channel) }.value
                 }
                 let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
                 let status = raw["status"] as? String ?? ""
@@ -1127,6 +1158,7 @@ final class SwitcherStore: ObservableObject {
                     settings = result; savedSettings = result; hasUnsavedSettings = false; audit = nil
                 }
                 if refresh && !(args.first == "config" && failure) {
+                    setupProgress?(.verifySettings)
                     let state = try await Task.detached { try SwitcherCommandRunner.run(["status"]) }.value
                     try consumeStatus(state)
                 }

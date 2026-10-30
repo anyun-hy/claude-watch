@@ -619,8 +619,8 @@ impl EventStore {
             }
         }
         if alert.severity == Severity::Critical {
-            // Reserve before a modal notification so retries cannot create
-            // repeated dialogs while the first request awaits dismissal.
+            // Reserve before dispatch so repeated critical observations cannot
+            // enqueue duplicate notifications while the request is in flight.
             cooldowns.entries.insert(key.clone(), at);
             self.storage.atomic_json(
                 &self.cooldowns_path(),
@@ -671,7 +671,7 @@ impl EventStore {
         }
     }
     /// `test-alert` maps here. The dispatcher supplies a platform notifier; this
-    /// module neither invokes osascript nor claims delivery when it fails.
+    /// module delegates platform delivery and records a failure when it fails.
     pub fn test_alert<N: Notifier + ?Sized>(&self, notifier: &N, at: f64) -> Result<AlertOutcome> {
         let alert = Alert {
             title: "Claude-Watch-Test".into(),

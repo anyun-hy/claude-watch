@@ -23,6 +23,9 @@ struct LeakCheckTests {
             LeakPolicy.evaluate(result, kind: kind, expected: expected, now: epoch).state
         }
         expect(verdict(receipt(.dns, [http, resolver]), .dns) == .matched, "same-country DNS and HTTP egress passes without an IP list")
+        let unavailableError = LeakProbeError(stage: "context", code: "context_unavailable", message: "fixture")
+        expect(verdict(receipt(.dns, [http, observation("8.8.8.8", "resolver", country: "CN")], errors: [unavailableError]), .dns) == .incomplete,
+               "a foreign resolver with unconfirmed context is unknown, not an attributed risk")
         expect(verdict(receipt(.dns, [http, resolver]), .dns, expected: "9.9.9.9") == .matched, "DNS ignores an obsolete manual resolver list")
         expect(verdict(receipt(.dns, []), .dns) == .incomplete, "empty DNS receipt is never safe")
         expect(verdict(receipt(.dns, [http]), .dns) == .incomplete, "HTTP success is not DNS evidence")
@@ -96,6 +99,20 @@ struct LeakCheckTests {
         networkContext = "B"
         try await Task.sleep(nanoseconds: 450_000_000)
         expect(store.rtc.verdict.state == .incomplete, "context change during a run cannot retain pass")
+        expect(store.rtc.result?.contextChanged == true, "a verified different context remains a real change")
+        let missingDuringDNS = LeakCheckStore(isFixture: true)
+        var dnsContext: String? = "A"
+        var unknownSubmissions = 0
+        missingDuringDNS.contextProvider = { dnsContext }
+        missingDuringDNS.onDNSComplete = { _ in unknownSubmissions += 1; return true }
+        missingDuringDNS.start(.dns); dnsContext = nil
+        try await Task.sleep(nanoseconds: 450_000_000)
+        expect(missingDuringDNS.dns.verdict.state == .incomplete, "missing context never passes")
+        expect(missingDuringDNS.dns.result?.contextChanged == false, "missing context is not a confirmed change")
+        expect(missingDuringDNS.dns.result?.errors.contains(where: { $0.code == "context_unavailable" }) == true,
+               "missing context is recorded as unavailable")
+        expect(unknownSubmissions == 1 && !missingDuringDNS.initializationReceiptIsCurrent(.dns),
+               "the incomplete result can be recorded but cannot authorize initialization")
         var optionalContext: String? = nil
         store.contextProvider = { optionalContext }
         store.start(.webrtc); optionalContext = "ready"

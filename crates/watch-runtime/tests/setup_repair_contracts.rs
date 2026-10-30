@@ -5,7 +5,11 @@ use claude_watch_runtime::{
     storage::{Paths, StateStore},
 };
 use serde_json::{json, Value};
-use std::{cell::Cell, fs, path::PathBuf};
+use std::{
+    cell::{Cell, RefCell},
+    fs,
+    path::PathBuf,
+};
 use uuid::Uuid;
 
 struct Fake {
@@ -21,6 +25,9 @@ struct Fake {
     local_reads: Cell<usize>,
     egress_reads: Cell<usize>,
     lose_backend_after_first_read: bool,
+    egress: Value,
+    egress_after_first_read: Option<Value>,
+    progress: RefCell<Vec<claude_watch_runtime::setup_progress::Phase>>,
 }
 impl RepairSystem for Fake {
     fn local(&self, _: &Config) -> Result<Value> {
@@ -64,13 +71,21 @@ impl RepairSystem for Fake {
         Ok(true)
     }
     fn egress_reference(&self, _: &Config) -> Result<Value> {
+        let prior = self.egress_reads.get();
         self.egress_reads.set(self.egress_reads.get() + 1);
-        Ok(
-            json!({"trace":{"ip":"1.1.1.1","loc":"JP"},"geo":{"ip":"1.1.1.1","country":"JP","timezone":"Asia/Tokyo"}}),
-        )
+        Ok(if prior > 0 {
+            self.egress_after_first_read
+                .clone()
+                .unwrap_or_else(|| self.egress.clone())
+        } else {
+            self.egress.clone()
+        })
     }
 }
 impl OnboardingSystem for Fake {
+    fn progress(&self, phase: claude_watch_runtime::setup_progress::Phase) {
+        self.progress.borrow_mut().push(phase);
+    }
     fn network(&self) -> Result<Value> {
         Ok(if self.baseline_read.get() {
             self.network_after_baseline
@@ -108,7 +123,129 @@ fn fake() -> Fake {
         local_reads: Cell::new(0),
         egress_reads: Cell::new(0),
         lose_backend_after_first_read: false,
+        egress: json!({"trace":{"ip":"1.1.1.1","loc":"JP"},"geo":{"ip":"1.1.1.1","country":"JP","timezone":"Asia/Tokyo"}}),
+        egress_after_first_read: None,
+        progress: RefCell::new(Vec::new()),
     }
+}
+
+#[test]
+fn missing_timezone_uses_same_unique_zone_for_detection_and_confirmation() {
+    let (home, store) = store();
+    let zones = claude_watch_runtime::region_catalog::load_system_catalog();
+    let mut system = fake();
+    system.egress["geo"]["timezone"] = Value::Null;
+    let candidate = onboarding::detect(&store, &system, "auto", true, &zones).unwrap();
+    assert_eq!(candidate["values"]["timezone"], "Asia/Tokyo");
+    let options = json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false});
+    let plan = onboarding::preview(
+        &store,
+        &system,
+        candidate["id"].as_str().unwrap(),
+        &options,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        onboarding::apply(
+            &store,
+            &mut system,
+            candidate["id"].as_str().unwrap(),
+            &options,
+            plan["id"].as_str().unwrap(),
+            None
+        )
+        .unwrap()["status"],
+        "ok"
+    );
+    assert_eq!(
+        *system.progress.borrow(),
+        vec![
+            claude_watch_runtime::setup_progress::Phase::VerifyEgress,
+            claude_watch_runtime::setup_progress::Phase::VerifySettings,
+            claude_watch_runtime::setup_progress::Phase::SaveBaseline,
+        ],
+        "a settings-only initialization must never announce an administrator request"
+    );
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn changed_or_incomplete_confirmation_never_applies_settings() {
+    let zones = claude_watch_runtime::region_catalog::load_system_catalog();
+    for (replacement, expected_code) in [
+        (
+            json!({"trace":{"ip":"8.8.8.8","loc":"JP"},"geo":{"ip":"8.8.8.8","country":"JP","timezone":"Asia/Tokyo"}}),
+            "egress_changed",
+        ),
+        (
+            json!({"trace":{"ip":"1.1.1.1","loc":"US"},"geo":{"ip":"1.1.1.1","country":"US","timezone":"America/New_York"}}),
+            "egress_changed",
+        ),
+        (
+            json!({"trace":{"ip":"1.1.1.1","loc":"JP"},"geo":{"ip":"1.1.1.1","country":null,"timezone":null}}),
+            "egress_unconfirmed",
+        ),
+        (
+            json!({"trace":{"ip":null,"loc":null},"geo":{"ip":null,"country":null,"timezone":null}}),
+            "egress_unconfirmed",
+        ),
+    ] {
+        let (home, store) = store();
+        let mut system = fake();
+        system.egress_after_first_read = Some(replacement);
+        let candidate = onboarding::detect(&store, &system, "auto", true, &zones).unwrap();
+        let options = json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false});
+        let plan = onboarding::preview(
+            &store,
+            &system,
+            candidate["id"].as_str().unwrap(),
+            &options,
+            None,
+        )
+        .unwrap();
+        let error = onboarding::apply(
+            &store,
+            &mut system,
+            candidate["id"].as_str().unwrap(),
+            &options,
+            plan["id"].as_str().unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, expected_code);
+        assert_eq!(
+            *system.progress.borrow(),
+            vec![claude_watch_runtime::setup_progress::Phase::VerifyEgress],
+            "a failed egress recheck must not report an administrator request or system action"
+        );
+        assert!(system.applied.is_empty());
+        assert!(!store.paths.config().exists());
+        assert!(!store.paths.base().join("setup-transaction.json").exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+}
+
+#[test]
+fn ambiguous_missing_timezone_and_actual_timezone_change_fail_closed() {
+    let zones: ZoneCatalog =
+        serde_json::from_value(json!({"US":["America/New_York","America/Los_Angeles"]})).unwrap();
+    let values =
+        json!({"ip":"1.1.1.1","country":"US","timezone":"America/New_York","locale":"en_US"});
+    let missing = json!({"trace":{"ip":"1.1.1.1","loc":"US"},"geo":{"ip":"1.1.1.1","country":"US","timezone":null}});
+    assert_eq!(
+        onboarding::confirm_reference(&values, &missing, &zones)
+            .unwrap_err()
+            .code,
+        "egress_unconfirmed"
+    );
+    let changed = json!({"trace":{"ip":"1.1.1.1","loc":"US"},"geo":{"ip":"1.1.1.1","country":"US","timezone":"America/Los_Angeles"}});
+    assert_eq!(
+        onboarding::confirm_reference(&values, &changed, &zones)
+            .unwrap_err()
+            .code,
+        "egress_changed"
+    );
 }
 
 #[test]

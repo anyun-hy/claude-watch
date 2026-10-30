@@ -420,6 +420,9 @@ impl NativeMutationRunner {
 impl MutationRunner for NativeMutationRunner {
     fn admin(&mut self, command: AdminCommand) -> Result<()> {
         let plan = self.admin_authorization_plan(command)?;
+        // Emit only after validating the fixed helper and immediately before
+        // the actual macOS administrator request, never during egress reads.
+        crate::setup_progress::emit(crate::setup_progress::Phase::RequestAdministrator);
         if Self::execute_input_timeout(&plan.program, &plan.args, Vec::new(), plan.timeout)?.0 {
             Ok(())
         } else {
@@ -660,6 +663,7 @@ impl<R: MutationRunner> FixedMacosMutator<R> {
 
     fn confirm_applied(&mut self, action: &Value) -> Result<()> {
         if let Some((state, expected)) = Self::applied_state(action)? {
+            crate::setup_progress::emit(crate::setup_progress::Phase::VerifySettings);
             self.require_readback(
                 state,
                 expected,

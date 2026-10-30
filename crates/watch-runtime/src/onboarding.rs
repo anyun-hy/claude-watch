@@ -8,6 +8,7 @@
 use crate::{
     config_store::{policy_digest, ConfigStore},
     repair::{self, RepairSystem},
+    setup_progress::Phase,
     storage::StateStore,
 };
 use claude_watch_core::{
@@ -36,6 +37,64 @@ pub trait OnboardingSystem: RepairSystem {
     fn network(&self) -> Result<Value>;
     fn now(&self) -> f64;
     fn baseline_data(&self) -> Result<String>;
+    fn progress(&self, phase: Phase) {
+        crate::setup_progress::emit(phase);
+    }
+}
+/// Detection and confirmation must use identical country/timezone rules.
+/// A missing timezone can resolve only through a unique authoritative zone;
+/// malformed, conflicting or ambiguous metadata never creates a reference.
+pub fn normalized_reference(egress: &Value, zones: &region::ZoneCatalog) -> Result<Value> {
+    let measured = region::reference(&egress["trace"], &egress["geo"], zones);
+    if ["ip", "country", "timezone", "locale"]
+        .iter()
+        .any(|key| text(&measured, key).is_empty())
+    {
+        return Err(err(
+            "region_inconsistent",
+            "出口 IP、国家、对应时区或地区格式未能确认，请重新检测",
+        ));
+    }
+    Ok(measured)
+}
+pub fn confirm_reference(
+    values: &Value,
+    egress: &Value,
+    zones: &region::ZoneCatalog,
+) -> Result<()> {
+    // Positive IP/country differences remain changes even when another
+    // metadata field is missing. Missing data alone is an incomplete check.
+    let ip_changed = [&egress["trace"]["ip"], &egress["geo"]["ip"]]
+        .into_iter()
+        .filter_map(|v| {
+            v.as_str()
+                .and_then(claude_watch_core::network::public_unicast)
+        })
+        .any(|ip| Some(ip.as_str()) != values["ip"].as_str());
+    let country_changed = [&egress["trace"]["loc"], &egress["geo"]["country"]]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .filter(|v| v.len() == 2 && v.bytes().all(|b| b.is_ascii_uppercase()))
+        .any(|country| Some(country) != values["country"].as_str());
+    if ip_changed || country_changed {
+        return Err(err("egress_changed", "确认时出口发生变化，请重新检测"));
+    }
+    let measured = normalized_reference(egress, zones).map_err(|_| {
+        err(
+            "egress_unconfirmed",
+            "出口复核未取得完整且一致的资料，未执行变更；请重新检测",
+        )
+    })?;
+    if ["ip", "country", "timezone", "locale"]
+        .iter()
+        .any(|key| measured[*key] != values[*key])
+    {
+        return Err(err(
+            "egress_changed",
+            "确认时出口或地区要求发生变化，请重新检测",
+        ));
+    }
+    Ok(())
 }
 fn context(network: &Value, local: &Value) -> Result<String> {
     policy_digest(
@@ -171,16 +230,7 @@ pub fn detect<S: OnboardingSystem>(
     }
     require_transport(&local)?;
     let egress = system.egress_reference(&cfg)?;
-    let measured = region::reference(&egress["trace"], &egress["geo"], zones);
-    if text(&measured, "country").is_empty()
-        || text(&measured, "timezone").is_empty()
-        || text(&measured, "locale").is_empty()
-    {
-        return Err(err(
-            "region_inconsistent",
-            "出口 IP、国家、对应时区或地区格式未能确认；未生成候选",
-        ));
-    }
+    let measured = normalized_reference(&egress, zones)?;
     if text(&measured, "country") == "CN" {
         return Err(err(
             "region_confirmation_required",
@@ -325,15 +375,16 @@ fn apply_inner<S: OnboardingSystem>(
     }
     let (c, before, network, local) = checked_candidate(store, system, candidate_id)?;
     let desired = Config::from_value(plan["desired_config"].clone())?;
+    system.progress(Phase::VerifyEgress);
     let reread = system.egress_reference(&before)?;
-    let same_egress = reread["trace"]["ip"] == c["values"]["ip"]
-        && reread["trace"]["loc"] == c["values"]["country"]
-        && reread["geo"]["ip"] == c["values"]["ip"]
-        && reread["geo"]["country"] == c["values"]["country"]
-        && reread["geo"]["timezone"] == c["values"]["timezone"];
-    if !same_egress {
-        return Err(err("egress_changed", "确认时出口发生变化，请重新检测"));
-    }
+    confirm_reference(
+        &c["values"],
+        &reread,
+        &crate::region_catalog::load_system_catalog(),
+    )?;
+    // Permission dialogs and writes must not begin on a context or candidate
+    // that changed/expired while the network reference was being rechecked.
+    checked_candidate(store, system, candidate_id)?;
     if setup_path(store).exists() {
         return Err(err("recovery_required", "已有初始化事务待恢复，未覆盖"));
     }
@@ -355,6 +406,7 @@ fn apply_inner<S: OnboardingSystem>(
             .unwrap()
             .push(json!({"action":action,"state":"pending"}));
         store.atomic_json(&setup_path(store), &journal)?;
+        system.progress(Phase::ApplySettings);
         system.apply(action)?;
         journal["actions"]
             .as_array_mut()
@@ -365,6 +417,7 @@ fn apply_inner<S: OnboardingSystem>(
     }
     // Time and locale changes are expected; the transport identity and saved
     // policy must nevertheless still be the one bound to the preview.
+    system.progress(Phase::VerifySettings);
     let final_network = system.network()?;
     let final_local = system.local(&desired)?;
     require_transport(&final_local)?;
@@ -404,6 +457,7 @@ fn apply_inner<S: OnboardingSystem>(
     {
         return Err(err("setting_unconfirmed", "应用后的日期格式未能核对"));
     }
+    system.progress(Phase::SaveBaseline);
     let mut baseline = system.baseline_data()?;
     let end_network = system.network()?;
     let end_local = system.local(&desired)?;
@@ -550,6 +604,7 @@ fn recover_inner<S: OnboardingSystem>(
         ));
     }
     let _ = Config::from_value(journal["desired_config"].clone())?;
+    system.progress(Phase::RestoreSettings);
     let mut skipped = Vec::new();
     let action_count = journal["actions"].as_array().unwrap().len();
     for index in (0..action_count).rev() {

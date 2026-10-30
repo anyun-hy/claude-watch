@@ -43,6 +43,13 @@ fn errors(v: &Value) -> Value {
         "stage":clipped(v,"stage",80),"code":clipped(v,"code",80),"message":clipped(v,"message",240)
     })).collect())
 }
+fn context_unavailable(probe: &Value) -> bool {
+    probe["errors"].as_array().is_some_and(|errors| {
+        errors.iter().any(|item| {
+            text(item, "stage") == "context" && text(item, "code") == "context_unavailable"
+        })
+    })
+}
 fn query_error(v: &Value) -> String {
     let Some(v) = v.as_array().and_then(|v| v.iter().find(|v| v.is_object())) else {
         return String::new();
@@ -219,6 +226,12 @@ pub fn record_dns(probe: &Value, local: &Value, expected: Option<&str>, now: f64
             "context_changed",
             "DNS 检测期间网络或代理上下文变化，不能给出通过结论",
         )
+    } else if context_unavailable(probe) {
+        comparison(
+            "unknown",
+            "context_unavailable",
+            "DNS 检测期间代理上下文未能持续确认，不能给出通过结论",
+        )
     } else if mismatched {
         comparison(
             "fail",
@@ -383,7 +396,10 @@ pub fn dns_status(
                 text(&receipt["comparison"], "reason"),
                 "country_missing" | "dns_http_reference_missing" | "dns_resolver_missing"
             ))
-        && text(&receipt["comparison"], "reason") != "context_changed";
+        && !matches!(
+            text(&receipt["comparison"], "reason"),
+            "context_changed" | "context_unavailable"
+        );
     let valid = dns_last_valid(last_valid, context, now);
     let fresh = dns_state(last_valid, context, false, now, &stamp).0 == "ok";
     let cached = cacheable && valid;
@@ -405,6 +421,12 @@ pub fn record_webrtc(
         return Err(CoreError::new(
             "webrtc_context_changed",
             "WebRTC 检测期间网络上下文变化",
+        ));
+    }
+    if context_unavailable(probe) {
+        return Err(CoreError::new(
+            "webrtc_context_unavailable",
+            "WebRTC 检测期间代理上下文未能持续确认",
         ));
     }
     let countries = netcoffee_countries(&probe["externalJSON"]);

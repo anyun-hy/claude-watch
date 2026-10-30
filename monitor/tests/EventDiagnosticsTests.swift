@@ -30,7 +30,11 @@ struct EventDiagnosticsTests {
         var changed = result
         changed.contextChanged = true
         let changedSummary = EventDiagnosticInput.make(kind: .dns, source: "netcoffee", result: changed, verdict: .incomplete)!
-        expect(changedSummary.reason == "context_changed", "context changes take priority over timeout")
+        expect(changedSummary.reason == "timeout", "timeout remains visible when context also changed")
+        let confirmedChange = LeakProbeResult(kind: "dns", status: "complete", startedAt: 10, finishedAt: 12,
+            scope: "fixture", observations: [], errors: [], contextChanged: true, details: [])
+        expect(EventDiagnosticInput.make(kind: .dns, source: "netcoffee", result: confirmedChange, verdict: .incomplete)?.reason == "context_changed",
+               "a confirmed context change is still recorded")
         expect(EventDiagnosticInput.make(kind: .dns, source: "ipleak", result: result, verdict: .cancelled) == nil,
                "cancelled runs do not create a result")
         if CommandLine.arguments.count == 2 {

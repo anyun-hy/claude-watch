@@ -32,7 +32,7 @@ struct LeakProbeResult: Codable, Sendable {
     let startedAt, finishedAt: Double
     let scope: String
     let observations: [LeakObservation]
-    let errors: [LeakProbeError]
+    var errors: [LeakProbeError]
     var contextChanged: Bool
     let details: [String]
     var externalJSON: String? = nil
@@ -83,7 +83,8 @@ struct LeakCheckState {
     var inputError: String? = nil
 
     var displaysPreviousSuccessfulResult: Bool {
-        guard let result, lastSuccessfulResult != nil, !result.contextChanged else { return false }
+        guard let result, lastSuccessfulResult != nil, !result.contextChanged,
+              !result.errors.contains(where: { $0.code == "context_unavailable" }) else { return false }
         if case .difference = verdict.state { return false }
         return result.status != "complete" || !result.errors.isEmpty
     }
@@ -179,6 +180,9 @@ enum LeakPolicy {
               result.errors.count <= 32 else { return incomplete("采集结果无效，不能用于当前判断。") }
         guard now - result.finishedAt <= 300 else { return .init(state: .incomplete, title: "结果已过期", detail: "这次采样已超过 5 分钟，请重新检测。") }
         guard !result.contextChanged else { return incomplete("检测期间或之后网络/代理上下文发生变化，请在网络稳定后重新检测。") }
+        guard !result.errors.contains(where: { $0.stage == "context" && $0.code == "context_unavailable" }) else {
+            return incomplete("检测期间代理上下文未能持续确认，不能使用本次结果判断风险。")
+        }
         // A partial WebRTC result can contain useful addresses, but never earns a pass.
         // DNS is handled below: a valid foreign resolver remains a leak-risk
         // finding even if another DNS round or enrichment request failed.

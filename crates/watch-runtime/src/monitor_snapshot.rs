@@ -233,7 +233,7 @@ fn present_event(e: Event) -> Value {
         "daemon-stop" => ("监控服务已停止", "info", "service"),
         "controlled-launch" => ("受控启动", "info", "process"),
         "controlled-exit" => ("CLI已退出", "info", "process"),
-        "alert-dispatched" => ("系统提醒已发送", "notice", "service"),
+        "alert-dispatched" => ("通知请求已提交系统", "notice", "service"),
         "alert-failed" => ("系统提醒发送失败", "warning", "service"),
         "dns-diagnostic" => ("DNS 检测", "info", "network"),
         "webrtc-diagnostic" => ("WebRTC 检测", "info", "network"),

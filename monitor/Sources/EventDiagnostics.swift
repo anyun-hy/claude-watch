@@ -18,8 +18,8 @@ struct EventDiagnosticInput: Encodable, Sendable {
         let codes = Set(result.errors.map(\.code))
         let reason: String
         if outcome != "incomplete" { reason = outcome }
-        else if result.contextChanged { reason = "context_changed" }
         else if result.status == "timeout" || codes.contains("timeout") { reason = "timeout" }
+        else if result.contextChanged { reason = "context_changed" }
         else if codes.contains("component_missing") { reason = "component_missing" }
         else if codes.contains("invalid_result") { reason = "invalid_result" }
         else if codes.contains("page_failed") { reason = "page_failed" }

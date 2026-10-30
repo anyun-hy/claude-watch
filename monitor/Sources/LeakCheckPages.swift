@@ -318,7 +318,7 @@ private struct LeakInspectorPage: View {
     }
 }
 
-private struct CoffeeCollectorView: NSViewRepresentable {
+struct CoffeeCollectorView: NSViewRepresentable {
     let browser: WKWebView
     func makeNSView(context: Context) -> WKWebView { browser }
     func updateNSView(_ nsView: WKWebView, context: Context) {}

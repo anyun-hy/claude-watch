@@ -213,9 +213,8 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
         }
     };
     let mut sampling_gate = AlertGate::new(SUSTAINED_SAMPLING_ROUNDS, SAMPLING_QUIET);
-    // Last reported evidence set for the two "standing fact" alerts below.
+    // Last reported sensitive-file evidence set.
     let mut reported_files: Option<String> = None;
-    let mut reported_services: Option<String> = None;
     let outcome = (|| {
         let mut rounds = 0u64;
         loop {
@@ -270,25 +269,13 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                         severity: Severity::Critical,
                     });
                 }
-                // The two alerts below describe a standing fact about the
-                // machine — a helper holds a sensitive directory open, or a
-                // tagged AI service is simply running. Evaluating them per
-                // round re-queued the same fact every round, and because the
-                // queue only suppresses an alert that is still pending or on
-                // screen, the popup came back as soon as it was dismissed.
-                // Report each distinct evidence set once; report again only
-                // after it clears and returns.
+                // Report each distinct sensitive-file evidence set once;
+                // service-name candidates remain in the event log only.
                 let files_signature = evidence_signature(&snapshot["activity"]["files"]["rows"]);
                 if files_signature.is_some() && files_signature != reported_files {
                     alerts.enqueue(Alert{title:"Claude Watch：敏感目录文件描述符".into(),message:"未关联会话的进程持有敏感目录文件描述符；这不是完整的文件读取记录。详情见事件记录。".into(),severity:Severity::Warning});
                 }
                 reported_files = files_signature;
-                let services_signature =
-                    evidence_signature(&snapshot["activity"]["services"]["candidates"]);
-                if services_signature.is_some() && services_signature != reported_services {
-                    alerts.enqueue(Alert{title:"Claude Watch：后台服务候选".into(),message:"发现尚未关联当前会话的 AI 应用标签服务。标签本身不能证明归属，请核对事件记录。".into(),severity:Severity::Warning});
-                }
-                reported_services = services_signature;
             }
             rounds = rounds.saturating_add(1);
             if request.flag("once") {

@@ -70,15 +70,21 @@ final class FirstRunChecks: InitializationChecking {
         case .accessibility:
             return accessResult
         case .dns, .webrtc:
-            guard contextMatches else { return changedFailure }
+            guard contextMatches else {
+                return Self.networkContextFailure(bound: boundContext, current: store.initializationContext, timeoutStage: nil)
+            }
             let kind: LeakKind = step == .dns ? .dns : .webrtc
             let accepted = await store.leakChecks.ensureInitializationReceipt(kind)
-            guard contextMatches else { return changedFailure }
+            let value = kind == .dns ? store.leakChecks.dns : store.leakChecks.rtc
+            let timeoutStage = value.result?.errors.first(where: { $0.code == "timeout" })?.stage
+            guard contextMatches else {
+                return Self.networkContextFailure(bound: boundContext, current: store.initializationContext, timeoutStage: timeoutStage)
+            }
             guard accepted else {
-                let value = kind == .dns ? store.leakChecks.dns : store.leakChecks.rtc
                 let error = kind == .dns ? store.switcher.dnsReceiptError : store.switcher.webRTCReceiptError
+                let timeoutDetail = timeoutStage.map { Self.timeoutDescription($0) + value.verdict.detail }
                 return .failed(code: kind == .dns ? "dns_not_passed" : "webrtc_not_passed",
-                               detail: error.isEmpty ? value.verdict.detail : error)
+                               detail: timeoutDetail ?? (error.isEmpty ? value.verdict.detail : error))
             }
             return .passed("检测通过，结果已提交后台；主界面与保护检查共用本次回执。")
         case .protection:
@@ -115,7 +121,7 @@ final class FirstRunChecks: InitializationChecking {
             return validateCurrentEvidence()
         }
     }
-    func approve(_ request: InitializationApproval) async -> InitializationResult {
+    func approve(_ request: InitializationApproval, progress: @escaping SetupProgressObserver) async -> InitializationResult {
         switch request.action {
         case .accessibility:
             requestAccessibility()
@@ -134,7 +140,7 @@ final class FirstRunChecks: InitializationChecking {
                 let precheck = preProtectionEvidence()
                 if case .failed = precheck { return precheck }
             }
-            await store.switcher.applyEnvironment(refreshDetection: false)
+            await store.switcher.applyEnvironment(refreshDetection: false, progress: progress)
             guard !store.switcher.failure, !recoveryRequired,
                   store.switcher.environment?.initialized == true,
                   request.action != .protection || protectionSettingsEnabled else {
@@ -172,9 +178,13 @@ final class FirstRunChecks: InitializationChecking {
             acceptedSettings = settingsData
             return .passed(enableProtection ? "已保存的两项守护开启设置保持一致，继续复核实际心跳。" : "已确认的环境设置保持一致。")
         }
+        let needsAdministrator = plan.actions.contains { ["timezone", "ipv6", "watchdog"].contains($0.id) }
+        let description = needsAdministrator
+            ? "确认后先复核出口，再请求 macOS 管理员权限以执行所列系统操作，完成后回读。"
+            : "确认后先复核出口，再保存 Watch 设置；本次列出的操作不需要管理员权限。"
         return .approval(.init(id: plan.id, action: enableProtection ? .protection : .environment,
             title: enableProtection ? "启用 Watch 自有守护" : "确认初始化环境",
-            detail: "确认后应用下列变更。需要管理员权限时，macOS 会弹出密码窗口；完成后重新读取实际状态。",
+            detail: description,
             changes: (enableProtection ? ["开启 Watch 保镖与时区守护，保存重启后的自动恢复设置"] : ["保存本次实测环境及 Watch 启动策略"])
                 + plan.actions.map { $0.title + "：" + ($0.detail ?? $0.scope) }))
     }
@@ -231,6 +241,18 @@ final class FirstRunChecks: InitializationChecking {
             changes: ["在系统设置中开启 Claude Watch 的辅助功能权限", "授权状态以 macOS 实际回读为准；密码仅在系统窗口输入"]))
     }
     private var contextMatches: Bool { boundContext != nil && boundContext == store.initializationContext }
+    static func timeoutDescription(_ stage: String) -> String {
+        let label = ["dns_images": "DNS 查询", "dns_records": "DNS 记录读取",
+                     "geoip": "地址归属查询", "http": "HTTP 出口查询", "ice": "WebRTC 采样"][stage] ?? "检测"
+        return "\(label)超时。"
+    }
+    static func networkContextFailure(bound: String?, current: String?, timeoutStage: String?) -> InitializationResult {
+        let unavailable = bound == nil || current == nil
+        let detail = unavailable ? "代理上下文暂不可确认，不能使用本次检测结果。请重新检查。"
+                                 : "检测期间代理上下文已变化，不能使用本次检测结果。请重新检查。"
+        return .failed(code: unavailable ? "context_unavailable" : "context_changed",
+                       detail: timeoutStage.map(timeoutDescription).map { $0 + detail } ?? detail)
+    }
     private var settingsData: Data? { try? JSONSerialization.data(withJSONObject: store.switcher.settings, options: .sortedKeys) }
     private var protectionSettingsEnabled: Bool {
         ["enabled", "guard_enabled", "timezone_watchdog"].allSatisfy { store.switcher.settings[$0] as? Bool == true }

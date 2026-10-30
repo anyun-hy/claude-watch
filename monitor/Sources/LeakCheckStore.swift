@@ -427,7 +427,13 @@ final class LeakCheckStore: ObservableObject {
         if let context = contexts[kind], context.required {
             if let original = context.value, let current = contextProvider?() {
                 if current != original { completed.contextChanged = true }
-            } else { completed.contextChanged = true }
+            } else {
+                // Missing evidence is not proof that the proxy changed. The
+                // error keeps the receipt incomplete even if sampling resumes.
+                if completed.errors.count >= 32 { completed.errors.removeLast() }
+                completed.errors.append(.init(stage: "context", code: "context_unavailable",
+                                              message: "检测期间代理上下文未能持续确认。"))
+            }
         }
         let previous = state(kind)
         set(LeakCheckState(running: false, result: completed, lastSuccessfulResult: previous.lastSuccessfulResult,
@@ -476,7 +482,11 @@ final class LeakCheckStore: ObservableObject {
         if var result = value.result {
             if let context = contexts[kind], context.required {
                 guard let original = context.value, let current = contextProvider?() else {
-                    value.verdict = .init(state: .incomplete, title: "检测未完成", detail: "本轮代理上下文暂不可确认，保留地址观测，请在后台采样就绪后重新检测。")
+                    let timedOut = result.status == "timeout" || result.errors.contains { $0.code == "timeout" }
+                    let detail = timedOut
+                        ? "本轮检测超时；代理上下文也暂不可确认。请在后台采样就绪后重新检测。"
+                        : "本轮代理上下文暂不可确认，保留地址观测，请在后台采样就绪后重新检测。"
+                    value.verdict = .init(state: .incomplete, title: "检测未完成", detail: detail)
                     set(value, for: kind); return
                 }
                 if current != original { result.contextChanged = true }

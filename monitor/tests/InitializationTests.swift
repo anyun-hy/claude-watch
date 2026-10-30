@@ -1,5 +1,12 @@
 import Foundation
 
+private final class RecordedPhases: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [SetupProgressPhase] = []
+    func append(_ value: SetupProgressPhase) { lock.lock(); values.append(value); lock.unlock() }
+    var snapshot: [SetupProgressPhase] { lock.lock(); defer { lock.unlock() }; return values }
+}
+
 @MainActor
 private final class ScriptedInitializationChecks: InitializationChecking {
     var calls: [InitializationStep] = []
@@ -8,13 +15,16 @@ private final class ScriptedInitializationChecks: InitializationChecking {
     var approvalResult = InitializationResult.passed("authorized")
     var begins = 0, approvals = 0, finishes = 0
     var delayStep: InitializationStep?
+    var previousProgress: SetupProgressObserver?
     func begin() { begins += 1 }
     func check(_ step: InitializationStep) async -> InitializationResult {
         calls.append(step)
         if delayStep == step { try? await Task.sleep(nanoseconds: 100_000_000) }
         return overrides[step] ?? .passed("checked", validUntil: step == .verification ? Date().timeIntervalSince1970 + 120 : nil)
     }
-    func approve(_ request: InitializationApproval) async -> InitializationResult { approvals += 1; return approvalResult }
+    func approve(_ request: InitializationApproval, progress: @escaping SetupProgressObserver) async -> InitializationResult {
+        approvals += 1; previousProgress = progress; progress(.verifyEgress); return approvalResult
+    }
     func validateCurrentEvidence() -> InitializationResult { validation }
     func finish() { finishes += 1 }
 }
@@ -31,6 +41,35 @@ struct InitializationTests {
         func passed(_ result: InitializationResult) -> Bool {
             if case .passed = result { return true }; return false
         }
+        expect(AppDelegate.notificationPage("events") == .events &&
+               AppDelegate.notificationPage("environment") == .environment &&
+               AppDelegate.notificationPage("protection") == .protection,
+               "notification destinations resolve to the corresponding Watch pages")
+        expect(AppDelegate.notificationPage("unexpected") == nil && AppDelegate.notificationPage(nil) == nil,
+               "unknown notification destinations cannot navigate")
+        if case .failed(let code, let detail) = FirstRunChecks.networkContextFailure(bound: "A", current: nil, timeoutStage: "dns_images") {
+            expect(code == "context_unavailable" && detail.contains("超时") && !detail.contains("已变化"),
+                   "a sampling gap does not hide the DNS timeout or claim a confirmed change")
+        } else { expect(false, "missing context blocks initialization") }
+        if case .failed(let code, _) = FirstRunChecks.networkContextFailure(bound: "A", current: "B", timeoutStage: nil) {
+            expect(code == "context_changed", "a confirmed different context remains blocked")
+        } else { expect(false, "changed context blocks initialization") }
+        let parserEvents = RecordedPhases()
+        let parser = SetupProgressReader { phase, _ in parserEvents.append(phase) }
+        parser.consume(Data("CW_SETUP_PRO".utf8))
+        parser.consume(Data("GRESS:verify_egress\nCW_SETUP_PROGRESS:unknown-private-token\n".utf8))
+        parser.consume(Data((String(repeating: "x", count: 500) + "\nCW_SETUP_PROGRESS:request_administrator\n").utf8))
+        expect(parserEvents.snapshot == [.verifyEgress, .requestAdministrator], "only complete allowlisted progress frames reach the UI")
+        parser.finish()
+        parser.consume(Data("CW_SETUP_PROGRESS:apply_settings\n".utf8))
+        expect(parserEvents.snapshot.count == 2, "finished operations reject late progress")
+        let pipeEvents = RecordedPhases()
+        let pipe = SetupProgressReader { phase, _ in pipeEvents.append(phase) }
+        let child = Process(); child.executableURL = URL(fileURLWithPath: "/bin/sh")
+        child.arguments = ["-c", "printf 'CW_SETUP_PROGRESS:verify_egress\\n' >&2; /bin/sleep 0.2; printf 'CW_SETUP_PROGRESS:request_administrator\\n' >&2; /bin/sleep 0.2; printf '{\"status\":\"ok\"}'"]
+        let childData = try await Task.detached { try SwitcherCommandRunner.execute(child, setupProgress: pipe) }.value
+        let childResult = try JSONSerialization.jsonObject(with: childData) as? [String: String]
+        expect(childResult?["status"] == "ok" && pipeEvents.snapshot == [.verifyEgress, .requestAdministrator], "real child stderr progress streams independently from the JSON result")
         let approval = InitializationApproval(id: "plan-1", action: .environment, title: "setup", detail: "review", changes: ["Watch only"])
         let fake = ScriptedInitializationChecks()
         fake.overrides[.environment] = .approval(approval)
@@ -48,6 +87,10 @@ struct InitializationTests {
         fake.approvalResult = .failed(code: "authorization_denied", detail: "denied")
         await coordinator.authorize(approval)
         expect(!coordinator.allPassed && !coordinator.entered && writes == 0 && coordinator.approval == nil, "denied authorization leaves the gate closed")
+        let failedDetail = coordinator.rows[2].detail
+        fake.previousProgress?(.requestAdministrator)
+        expect(coordinator.rows[2].status == .failed && coordinator.rows[2].detail == failedDetail,
+               "late progress cannot overwrite a completed failure or reopen the gate")
         fake.overrides = [:]
         await coordinator.retry()
         expect(coordinator.allPassed && !coordinator.entered && writes == 0, "all required checks must finish before entry becomes available")

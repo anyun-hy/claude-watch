@@ -18,14 +18,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const OSASCRIPT: &str = "/usr/bin/osascript";
+const WATCH_APP: &str = "/Applications/Claude Watch Monitor.app/Contents/MacOS/ClaudeWatchMonitor";
 const MAX_PENDING: usize = 8;
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(125);
-const NOTIFICATION_LINE: &str = "display notification (item 2 of argv) with title (item 1 of argv)";
-const DIALOG_LINE: &str = "display dialog (item 2 of argv) with title (item 1 of argv) buttons {\"OK\"} default button \"OK\" with icon stop";
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// A real platform notifier.  Its AppleScript source is fixed: title and
-/// message are positional argv values, never string-interpolated source.
+/// Send through the installed app executable so macOS sees the Watch app's
+/// identity. The worker runs without opening a window or requesting consent.
 pub struct NativeNotifier<E: FixedCommandExecutor + Send = SystemExecutor> {
     executor: Mutex<E>,
 }
@@ -56,6 +54,11 @@ impl<E: FixedCommandExecutor + Send> Notifier for NativeNotifier<E> {
             })?;
         if output.status == 0 {
             Ok(())
+        } else if output.status == 3 {
+            Err(NotifyError {
+                code: "notification_not_authorized".into(),
+                detail: "Claude Watch 尚未获得系统通知权限".into(),
+            })
         } else {
             Err(NotifyError {
                 code: "notification_command_failed".into(),
@@ -66,25 +69,23 @@ impl<E: FixedCommandExecutor + Send> Notifier for NativeNotifier<E> {
 }
 
 fn fixed_command(alert: &Alert) -> FixedCommand {
-    let line = if alert.severity == Severity::Critical {
-        DIALOG_LINE
-    } else {
-        NOTIFICATION_LINE
-    };
-    // `SystemExecutor` rejects line breaks in every argv element.  Keep each
-    // AppleScript statement in a separate fixed `-e` argument and make alert
-    // data unambiguously positional after `--`.
     let message = alert.message.replace(['\r', '\n'], " ");
+    let destination = match alert.title.as_str() {
+        "Claude Watch：保护采样异常" => "environment",
+        "Claude Watch：已触发保护" => "protection",
+        _ => "events",
+    };
     FixedCommand {
-        program: PathBuf::from(OSASCRIPT),
+        program: PathBuf::from(WATCH_APP),
         args: vec![
-            "-e".into(),
-            "on run argv".into(),
-            "-e".into(),
-            line.into(),
-            "-e".into(),
-            "end run".into(),
-            "--".into(),
+            "--notification-deliver".into(),
+            match alert.severity {
+                Severity::Critical => "critical",
+                Severity::Warning => "warning",
+                Severity::Info => "info",
+            }
+            .into(),
+            destination.into(),
             alert.title.clone(),
             message,
         ],
@@ -111,8 +112,8 @@ struct Shared {
 ///
 /// The dispatcher stores the mode which existed at enqueue time.  A pause,
 /// re-arm, or snooze transition invalidates queued work before `emit` can call
-/// the notifier.  Drop does not join a dialog worker; the production command
-/// itself is limited by `SystemExecutor` to at most 125 seconds.
+/// the notifier.  Drop does not join a notification worker; the production command
+/// itself is limited by `SystemExecutor` to at most 12 seconds.
 pub struct AlertDispatcher {
     store: Arc<EventStore>,
     notifier: Arc<dyn Notifier>,

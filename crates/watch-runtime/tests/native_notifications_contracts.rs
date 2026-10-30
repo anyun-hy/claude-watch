@@ -51,7 +51,7 @@ fn alert(title: &str, severity: Severity) -> Alert {
 }
 
 #[test]
-fn notifier_uses_fixed_script_and_positional_data() {
+fn notifier_uses_the_watch_app_and_positional_data() {
     let commands = Arc::new(Mutex::new(Vec::new()));
     let notifier = NativeNotifier::new(FakeExecutor {
         commands: Arc::clone(&commands),
@@ -62,18 +62,16 @@ fn notifier_uses_fixed_script_and_positional_data() {
         .notify(&alert("warning-title", Severity::Warning))
         .unwrap();
     let command = commands.lock().unwrap()[0].clone();
-    assert_eq!(command.program.to_string_lossy(), "/usr/bin/osascript");
-    assert_eq!(command.args[0], "-e");
+    assert_eq!(
+        command.program.to_string_lossy(),
+        "/Applications/Claude Watch Monitor.app/Contents/MacOS/ClaudeWatchMonitor"
+    );
     assert_eq!(
         command.args,
         vec![
-            "-e",
-            "on run argv",
-            "-e",
-            "display notification (item 2 of argv) with title (item 1 of argv)",
-            "-e",
-            "end run",
-            "--",
+            "--notification-deliver",
+            "warning",
+            "events",
             "warning-title",
             "message; $(not source) second line",
         ]
@@ -82,11 +80,47 @@ fn notifier_uses_fixed_script_and_positional_data() {
         .args
         .iter()
         .all(|argument| !argument.contains(['\r', '\n'])));
-    assert_eq!(command.timeout, Duration::from_secs(125));
+    assert_eq!(command.timeout, Duration::from_secs(12));
 }
 
 #[test]
-fn critical_dialog_runs_on_dispatcher_worker() {
+fn known_alerts_route_to_the_relevant_watch_pages() {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let notifier = NativeNotifier::new(FakeExecutor {
+        commands: Arc::clone(&commands),
+        started: None,
+        gate: None,
+    });
+    for (title, expected) in [
+        ("Claude Watch：保护采样异常", "environment"),
+        ("Claude Watch：已触发保护", "protection"),
+        ("Claude Watch：敏感目录文件描述符", "events"),
+    ] {
+        notifier.notify(&alert(title, Severity::Warning)).unwrap();
+        assert_eq!(commands.lock().unwrap().last().unwrap().args[2], expected);
+    }
+}
+
+#[test]
+fn a_missing_notification_permission_is_not_reported_as_success() {
+    struct Denied;
+    impl FixedCommandExecutor for Denied {
+        fn run(&mut self, _: FixedCommand) -> Result<FixedOutput> {
+            Ok(FixedOutput {
+                status: 3,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+    let error = NativeNotifier::new(Denied)
+        .notify(&alert("warning", Severity::Warning))
+        .unwrap_err();
+    assert_eq!(error.code, "notification_not_authorized");
+}
+
+#[test]
+fn critical_notification_runs_on_dispatcher_worker() {
     let commands = Arc::new(Mutex::new(Vec::new()));
     let (started_tx, started_rx) = mpsc::channel();
     let (gate_tx, gate_rx) = mpsc::channel();
@@ -98,10 +132,7 @@ fn critical_dialog_runs_on_dispatcher_worker() {
     let dispatcher = AlertDispatcher::new(storage("dialog"), notifier);
     assert!(dispatcher.enqueue(alert("critical-title", Severity::Critical)));
     started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert!(commands.lock().unwrap()[0]
-        .args
-        .iter()
-        .any(|argument| argument.contains("display dialog")));
+    assert_eq!(commands.lock().unwrap()[0].args[1], "critical");
     gate_tx.send(()).unwrap();
 }
 

@@ -55,9 +55,14 @@ enum InitializationResult {
 protocol InitializationChecking: AnyObject {
     func begin()
     func check(_ step: InitializationStep) async -> InitializationResult
-    func approve(_ request: InitializationApproval) async -> InitializationResult
+    func approve(_ request: InitializationApproval, progress: @escaping SetupProgressObserver) async -> InitializationResult
     func validateCurrentEvidence() -> InitializationResult
     func finish()
+}
+extension InitializationChecking {
+    func approve(_ request: InitializationApproval) async -> InitializationResult {
+        await approve(request, progress: { _ in })
+    }
 }
 
 /// This marker remembers onboarding only. It contains no address, account,
@@ -126,6 +131,7 @@ final class FirstRunInitialization: ObservableObject {
     private let checks: InitializationChecking
     private let saveCompletion: () throws -> Void
     private var started = false
+    private var approvalOperation: UUID?
 
     init(checks: InitializationChecking, completed: Bool, saveCompletion: @escaping () throws -> Void) {
         self.checks = checks; self.entered = completed; self.saveCompletion = saveCompletion
@@ -175,7 +181,8 @@ final class FirstRunInitialization: ObservableObject {
             return true
         case .approval(let request):
             rows[index].status = .authorization; rows[index].detail = request.detail
-            rows[index].code = "authorization_required"; approval = request
+            rows[index].code = request.action == .accessibility ? "authorization_required" : "confirmation_required"
+            approval = request
         case .failed(let code, let detail):
             rows[index].status = .failed; rows[index].detail = detail; rows[index].code = code
             approval = nil
@@ -188,8 +195,17 @@ final class FirstRunInitialization: ObservableObject {
               let index = rows.firstIndex(where: { $0.status == .authorization }) else { return }
         running = true
         rows[index].status = .running
-        rows[index].detail = "等待授权操作完成并回读…"
-        let accepted = accept(await checks.approve(request), at: index)
+        rows[index].detail = request.action == .accessibility
+            ? "正在请求辅助功能授权，请在系统设置中确认…" : SetupProgressPhase.verifyEgress.detail
+        let operation = UUID(); approvalOperation = operation
+        let result = await checks.approve(request, progress: { [weak self] phase in
+            guard let self, self.approvalOperation == operation, self.running,
+                  self.rows[index].status == .running else { return }
+            self.rows[index].detail = phase.detail
+            self.rows[index].code = "progress_" + phase.rawValue
+        })
+        approvalOperation = nil
+        let accepted = accept(result, at: index)
         running = false
         if accepted { await run(from: index + 1) }
     }

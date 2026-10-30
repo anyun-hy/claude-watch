@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UserNotifications
 
 struct MonitorView: View {
     @ObservedObject var store: MonitorStore
@@ -405,7 +406,16 @@ func timeText(_ epoch: Double, date: Bool = false) -> String {
     return formatter.string(from: Date(timeIntervalSince1970: epoch))
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, ObservableObject {
+    @Published var notificationTarget: String?
+    static func notificationPage(_ target: String?) -> Page? {
+        let pages: [String: Page] = ["events": .events, "environment": .environment, "protection": .protection]
+        guard let target else { return nil }
+        return pages[target]
+    }
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        UNUserNotificationCenter.current().delegate = self
+    }
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
            let icon = NSImage(contentsOf: url) {
@@ -413,12 +423,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { settings in
+            if settings.authorizationStatus == .notDetermined {
+                center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            }
+        }
+    }
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list, .sound])
+    }
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        guard response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+              let target = response.notification.request.content.userInfo["destination"] as? String,
+              Self.notificationPage(target) != nil else {
+            completionHandler(); return
+        }
+        DispatchQueue.main.async {
+            self.notificationTarget = target
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows.first(where: { $0.canBecomeKey })?.makeKeyAndOrderFront(nil)
+            completionHandler()
+        }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 
 #if !UI_REVIEW
-@main
 struct ClaudeWatchApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject private var store: MonitorStore
@@ -431,7 +464,14 @@ struct ClaudeWatchApp: App {
             completed: storage.isComplete(), saveCompletion: { try storage.complete() }))
     }
     var body: some Scene {
-        WindowGroup("Claude Watch") { MonitorEntryView(store: store, initialization: initialization) }
+        WindowGroup("Claude Watch") {
+            MonitorEntryView(store: store, initialization: initialization)
+                .onReceive(delegate.$notificationTarget) { target in
+                    guard let page = AppDelegate.notificationPage(target) else { return }
+                    UserDefaults.standard.set(page.rawValue, forKey: "selectedPage")
+                    store.page = page
+                }
+        }
             .defaultSize(width: 1240, height: 820)
             .windowStyle(.titleBar)
             .windowToolbarStyle(.unifiedCompact)
@@ -446,6 +486,16 @@ struct ClaudeWatchApp: App {
                     }.disabled(!initialization.entered)
                 }
             }
+    }
+}
+
+@main
+enum ClaudeWatchMain {
+    @MainActor static func main() {
+        if CommandLine.arguments.dropFirst().first == "--notification-deliver" {
+            WatchNotificationWorker.run(arguments: CommandLine.arguments)
+        }
+        ClaudeWatchApp.main()
     }
 }
 #endif

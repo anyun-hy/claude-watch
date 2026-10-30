@@ -203,6 +203,33 @@ fn stored_receipt_status_matches_legacy_ttl_and_history_contract() {
     }
 }
 #[test]
+fn unavailable_context_never_becomes_a_pass_or_a_confirmed_change() {
+    let good = receipts::record_dns(&probe("dns", NOW), &local(), None, NOW + 1.0).unwrap();
+    let mut unknown = probe("dns", NOW + 3.0);
+    unknown["errors"] = json!([{"stage":"context","code":"context_unavailable"}]);
+    // Even an observed foreign resolver cannot be attributed to an unverified context.
+    unknown["externalJSON"] = json!(serde_json::to_string(&json!([
+        {"kind":"geoip","status":"complete","query":"1.1.1.1","data":{"country_code":"JP"}},
+        {"kind":"geoip","status":"complete","query":"8.8.8.8","data":{"country_code":"US"}}
+    ]))
+    .unwrap());
+    let receipt = receipts::record_dns(&unknown, &local(), None, NOW + 4.0).unwrap();
+    assert_eq!(receipt["comparison"]["state"], "unknown");
+    assert_eq!(receipt["comparison"]["reason"], "context_unavailable");
+    let status = receipts::dns_status(&receipt, &good, "ctx", true, NOW + 5.0, |v| v.to_string());
+    assert_eq!(status["state"], "unknown");
+    assert_eq!(status["display_cached"], false);
+    let mut rtc = probe("webrtc", NOW);
+    rtc["errors"] = json!([{"stage":"context","code":"context_unavailable"}]);
+    assert_eq!(
+        receipts::record_webrtc(&rtc, &local(), None, NOW + 1.0)
+            .unwrap_err()
+            .code,
+        "webrtc_context_unavailable"
+    );
+}
+
+#[test]
 fn dns_history_never_hides_new_mismatch_or_context_change_and_never_authorizes_launch() {
     let f = Fixture::new();
     let now = NOW;
