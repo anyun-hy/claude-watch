@@ -360,7 +360,7 @@ final class MonitorStore: ObservableObject {
               MonitorSnapshotTiming.isCurrent(capturedAt: snapshot.capturedAt, now: date.timeIntervalSince1970),
               let value = snapshot.proxy else { return nil }
         let age = date.timeIntervalSince1970 - value.observedAt
-        return (0...30).contains(age) ? value : nil
+        return (0...MonitorSnapshotTiming.proxyMaximumAge).contains(age) ? value : nil
     }
     private func freshProxy(in snapshot: MonitorSnapshot?, at date: Date) -> ProxySnapshot? {
         guard snapshot?.proxyError == nil else { return nil }

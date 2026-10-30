@@ -14,11 +14,12 @@ use serde_json::{json, Value};
 pub const UPDATE_LABEL: &str = "io.local.claudewatch.update";
 pub const TIMEZONE_LABEL: &str = "io.local.claudewatch.timezone";
 const UPDATE_INTERVAL: u64 = 43_200;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendHealthSnapshot {
     pub sampling_healthy: bool,
     pub guard_backend_healthy: bool,
     pub guard_healthy: bool,
+    pub diagnostics: Value,
 }
 fn err(code: &str, msg: &str) -> CoreError {
     CoreError::new(code, msg)
@@ -84,6 +85,7 @@ pub trait ServiceSystem {
             sampling_healthy: self.backend_healthy(),
             guard_backend_healthy: self.guard_backend_healthy(),
             guard_healthy: self.guard_status(config)?,
+            diagnostics: json!({"reason":"unavailable"}),
         })
     }
     fn service_job(&self, name: &str) -> Result<Value>;
@@ -123,6 +125,7 @@ pub fn service_status<S: ServiceSystem>(system: &S, config: &Config) -> Result<V
             sampling_healthy: false,
             guard_backend_healthy: false,
             guard_healthy: false,
+            diagnostics: json!({"reason":"status_read_failed"}),
         });
     let helper = system
         .admin_helper_status()
@@ -181,7 +184,7 @@ pub fn service_status<S: ServiceSystem>(system: &S, config: &Config) -> Result<V
         "mismatch"
     };
     Ok(
-        json!({"status":"ok","observed_at":system.now(),"backend_healthy":health.sampling_healthy,"guard_backend_healthy":health.guard_backend_healthy,"backend_sampling_state":if health.sampling_healthy{"complete"}else{"incomplete"},"admin_helper":helper,"update_source_ready":ready,"policy_issues":policy_issues(config),"services":[
+        json!({"status":"ok","observed_at":system.now(),"backend_healthy":health.sampling_healthy,"guard_backend_healthy":health.guard_backend_healthy,"backend_diagnostics":health.diagnostics,"backend_sampling_state":if health.sampling_healthy{"complete"}else{"incomplete"},"admin_helper":helper,"update_source_ready":ready,"policy_issues":policy_issues(config),"services":[
           {"id":"guard","title":"Claude Watch 保镖","state":guard_state,"desired":config.guard_enabled,"source":"本工具保护心跳 / 后台进程身份"},
           {"id":"original","title":"原版 Claude切换器保镖","state":original_state,"desired":null,"source":"system/local.claude-bodyguard / 原版任务定义"},
           {"id":"watchdog","title":"时区守护","state":watchdog_state,"desired":config.timezone_watchdog,"actual_target":watchdog["target"],"accepted_target":desired_target,"source":"时区任务注册 / root 管理的目标文件"},

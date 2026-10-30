@@ -185,7 +185,7 @@ struct FirstRunView: View {
     private var report: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("初始化检查记录").font(WatchTypography.title)
-            Text("可复制或保存状态记录用于排查；不包含 IP、节点、账号、密码或凭据。")
+            Text("第 2 步逐轮记录自动保存到本机日志；首次失败与重试分别保留。可复制下方记录，不包含 IP、节点、账号或凭据。")
                 .font(WatchTypography.caption).foregroundStyle(p.secondary)
             ScrollView {
                 Text(initialization.diagnosticReport).font(WatchTypography.mono).textSelection(.enabled)

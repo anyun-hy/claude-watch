@@ -57,12 +57,14 @@ protocol InitializationChecking: AnyObject {
     func check(_ step: InitializationStep) async -> InitializationResult
     func approve(_ request: InitializationApproval, progress: @escaping SetupProgressObserver) async -> InitializationResult
     func validateCurrentEvidence() -> InitializationResult
+    var connectionDiagnosticReport: String { get }
     func finish()
 }
 extension InitializationChecking {
     func approve(_ request: InitializationApproval) async -> InitializationResult {
         await approve(request, progress: { _ in })
     }
+    var connectionDiagnosticReport: String { "" }
 }
 
 /// This marker remembers onboarding only. It contains no address, account,
@@ -258,6 +260,8 @@ final class FirstRunInitialization: ObservableObject {
             }
             return "\(row.step.rawValue)\t\(row.status.rawValue)\t\(safe ? row.code : "unknown")\t\(row.checkedAt.map { String(Int($0)) } ?? "-")"
         }
-        return (["Claude Watch 首次初始化检查", "仅含检查步骤、状态、原因代码及时间；不含 IP、节点、账号或凭据。"] + values).joined(separator: "\n")
+        let summary = (["Claude Watch 首次初始化检查", "包含步骤、状态、采样时间、PID 与核对结果；不含 IP、节点、账号或凭据。"] + values).joined(separator: "\n")
+        let connection = checks.connectionDiagnosticReport
+        return connection.isEmpty ? summary : summary + "\n\n" + connection
     }
 }

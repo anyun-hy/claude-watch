@@ -124,6 +124,7 @@ struct BackendFacts {
     guard_native: bool,
     sampling_detail: &'static str,
     guard_detail: &'static str,
+    diagnostics: Value,
 }
 
 /// A fresh observation and independently verified backend are both required;
@@ -226,58 +227,97 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             )
     }
     fn backend_facts(&self) -> BackendFacts {
-        let unavailable = |detail| BackendFacts {
-            sampling_healthy: false,
-            guard_healthy: false,
-            sampling_native: false,
-            guard_native: false,
-            sampling_detail: detail,
-            guard_detail: detail,
+        let mut diagnostics = json!({"reason":"unavailable","observed_at":native::now()});
+        let unavailable = |reason, detail, mut diagnostics: Value| {
+            diagnostics["reason"] = json!(reason);
+            diagnostics["detail"] = json!(detail);
+            BackendFacts {
+                sampling_healthy: false,
+                guard_healthy: false,
+                sampling_native: false,
+                guard_native: false,
+                sampling_detail: detail,
+                guard_detail: detail,
+                diagnostics,
+            }
         };
-        let Ok(Some(bytes)) = self
+        let bytes = match self
             .storage
             .read_bytes(&self.storage.paths.watch().join("state/heartbeat"), 4096)
-        else {
-            return unavailable("未找到或无法读取采集后台心跳");
+        {
+            Ok(Some(bytes)) => {
+                diagnostics["heartbeat_present"] = json!(true);
+                bytes
+            }
+            Ok(None) => {
+                diagnostics["heartbeat_present"] = json!(false);
+                return unavailable("heartbeat_missing", "未找到或无法读取采集后台心跳", diagnostics);
+            }
+            Err(e) => {
+                diagnostics["source_error_code"] = json!(e.code);
+                return unavailable("heartbeat_unreadable", "未找到或无法读取采集后台心跳", diagnostics);
+            }
         };
         let Ok(text) = std::str::from_utf8(&bytes) else {
-            return unavailable("后台心跳编码无效");
+            return unavailable("heartbeat_encoding", "后台心跳编码无效", diagnostics);
         };
         let fields: Vec<_> = text.trim().split('|').collect();
         if fields.len() != 5 || !matches!(fields[3], "ok" | "error") {
-            return unavailable("心跳质量状态无效");
+            return unavailable("heartbeat_format", "心跳质量状态无效", diagnostics);
         }
         let sampling_healthy = fields[3] == "ok";
         let Ok(pid) = fields[0].parse::<u32>() else {
-            return unavailable("心跳 PID 无效");
+            return unavailable("pid_invalid", "心跳 PID 无效", diagnostics);
         };
+        diagnostics["heartbeat_pid"] = json!(pid);
+        diagnostics["heartbeat_status"] = json!(fields[3]);
         let Ok(sampled) = fields[2].parse::<f64>() else {
-            return unavailable("心跳时间字段无效");
+            return unavailable("time_invalid", "心跳时间字段无效", diagnostics);
         };
-        if !(0.0..=30.0).contains(&(native::now() - sampled)) {
-            return unavailable("后台心跳已过期或时间异常");
+        let age = native::now() - sampled;
+        diagnostics["heartbeat_age_seconds"] = json!(age.is_finite().then_some(age));
+        if !(0.0..=30.0).contains(&age) {
+            return unavailable("heartbeat_stale", "后台心跳已过期或时间异常", diagnostics);
         }
         let sampler = Sampler::new(&self.runner, self.storage.paths.clone());
-        let Ok(table) = sampler.process_table() else {
-            return unavailable("系统进程采样失败");
+        let table = match sampler.process_table() {
+            Ok(table) => table,
+            Err(e) => {
+                diagnostics["source_error_code"] = json!(e.code);
+                return unavailable("process_sample_failed", "系统进程采样失败", diagnostics);
+            }
         };
+        diagnostics["process_found"] = json!(table.contains_key(&pid));
         let Some(process) = table.get(&pid) else {
-            return unavailable("心跳 PID 已退出或无法确认");
+            return unavailable("pid_unconfirmed", "心跳 PID 已退出或无法确认", diagnostics);
         };
         let Some(uid) = process["uid"]
             .as_u64()
             .and_then(|v| u32::try_from(v).ok())
             .filter(|v| *v > 0)
         else {
-            return unavailable("采集后台用户身份无效");
+            return unavailable("uid_invalid", "采集后台用户身份无效", diagnostics);
         };
         let same_stamp = process["stamp"]
             .as_str()
             .is_some_and(|v| v.split_whitespace().eq(fields[1].split_whitespace()));
         let job = self.job_observation(ReadCommand::LaunchctlGuiAgent { uid });
-        let identity_healthy = same_stamp
-            && ((job["registered"] == true && job["state"] == "running" && job["pid"] == pid)
-                || crate::native_listener::registered_worker(&self.storage, &self.runner, pid));
+        diagnostics["start_identity_matches"] = json!(same_stamp);
+        diagnostics["launchd_registered"] = job["registered"].clone();
+        diagnostics["launchd_state"] = job["state"].clone();
+        diagnostics["launchd_pid"] = job["pid"].clone();
+        let direct_job = job["registered"] == true && job["state"] == "running" && job["pid"] == pid;
+        let worker = if same_stamp && !direct_job {
+            let result = crate::native_listener::registered_worker_result(&self.storage, &self.runner, pid);
+            diagnostics["worker_verified"] = json!(result.is_ok());
+            if let Err(ref e) = result {
+                diagnostics["worker_error_code"] = json!(e.code);
+            }
+            result.is_ok()
+        } else {
+            false
+        };
+        let identity_healthy = same_stamp && (direct_job || worker);
         let guard_native = identity_healthy
             && process["executable"].as_str()
                 == self
@@ -297,6 +337,9 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         } else {
             "原生采集后台身份与心跳已核对"
         };
+        diagnostics["native_path_matches"] = json!(process["executable"].as_str() == self.storage.paths.watch().join("runtime/watch-engine").to_str());
+        diagnostics["reason"] = json!(if !same_stamp { "identity_mismatch" } else if !identity_healthy { "job_unconfirmed" } else if !guard_native { "native_path_mismatch" } else { "confirmed" });
+        diagnostics["detail"] = json!(guard_detail);
         BackendFacts {
             // Preserve the strict historical monitor verdict: sampling health
             // binds heartbeat quality and daemon identity, but does not make a
@@ -311,6 +354,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                 "心跳未报告完整监控采样"
             },
             guard_detail,
+            diagnostics,
         }
     }
     fn guard_heartbeat(&self, config: &Config, backend: bool) -> bool {
@@ -880,6 +924,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> ServiceSystem for Macos<R, T, M> {
             sampling_healthy: facts.sampling_healthy,
             guard_backend_healthy: facts.guard_healthy,
             guard_healthy: self.guard_heartbeat(config, facts.guard_healthy),
+            diagnostics: facts.diagnostics,
         })
     }
     fn service_job(&self, name: &str) -> Result<Value> {

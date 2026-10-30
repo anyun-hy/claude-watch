@@ -650,8 +650,14 @@ pub fn read_cached<R: ReadRunner>(store: &StateStore, runner: &R) -> Result<Outp
     output(&data.evidence, &data.proof, runner, true)
 }
 pub fn registered_worker<R: ReadRunner>(store: &StateStore, runner: &R, pid: u32) -> bool {
-    cached(store)
-        .is_ok_and(|c| c.actor.worker.pid == pid && verify_actor(&c.actor, runner, true).is_ok())
+    registered_worker_result(store, runner, pid).is_ok()
+}
+pub(crate) fn registered_worker_result<R: ReadRunner>(store: &StateStore, runner: &R, pid: u32) -> Result<()> {
+    let c = cached(store)?;
+    if c.actor.worker.pid != pid {
+        return Err(error("native_listener_worker_mismatch", "采样记录中的 worker PID 与心跳 PID 不一致"));
+    }
+    verify_actor(&c.actor, runner, true)
 }
 pub fn cache_exists(store: &StateStore) -> bool {
     cache_path(store).exists()

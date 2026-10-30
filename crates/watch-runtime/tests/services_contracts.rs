@@ -15,6 +15,8 @@ struct Fake {
     applied: Vec<Value>,
     runtime: bool,
     fail_after_apply: bool,
+    native_healthy: bool,
+    diagnostics: Value,
 }
 impl ServiceSystem for Fake {
     fn now(&self) -> f64 {
@@ -25,6 +27,14 @@ impl ServiceSystem for Fake {
     }
     fn guard_status(&self, c: &Config) -> Result<bool> {
         Ok(c.enabled && c.guard_enabled)
+    }
+    fn backend_health_snapshot(&self, c: &Config) -> Result<services::BackendHealthSnapshot> {
+        Ok(services::BackendHealthSnapshot {
+            sampling_healthy: self.backend_healthy(),
+            guard_backend_healthy: self.native_healthy,
+            guard_healthy: self.guard_status(c)?,
+            diagnostics: self.diagnostics.clone(),
+        })
     }
     fn service_job(&self, n: &str) -> Result<Value> {
         Ok(self.jobs[n].clone())
@@ -84,7 +94,19 @@ fn fake() -> Fake {
         applied: vec![],
         runtime: true,
         fail_after_apply: false,
+        native_healthy: true,
+        diagnostics: json!({"reason":"confirmed"}),
     }
+}
+#[test]
+fn service_status_preserves_the_same_failed_backend_observation() {
+    let mut f = fake();
+    f.native_healthy = false;
+    f.diagnostics = json!({"reason":"job_unconfirmed","heartbeat_pid":42,"heartbeat_age_seconds":1.5,
+        "launchd_pid":40,"worker_verified":false,"worker_error_code":"native_listener_worker_mismatch"});
+    let status = services::service_status(&f, &Config::default()).unwrap();
+    assert_eq!(status["guard_backend_healthy"], false);
+    assert_eq!(status["backend_diagnostics"], f.diagnostics);
 }
 #[test]
 fn saved_intent_is_not_actual_service() {

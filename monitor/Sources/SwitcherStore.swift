@@ -252,6 +252,7 @@ struct BackgroundServiceReceipt: Decodable {
     var egress_reference: EgressReference?
     var facts: ProtectionFacts?
     var session_guard: SessionGuardStatus?
+    var backend_diagnostics: BackendInitializationDiagnostics?
 }
 struct SwitcherRepairPlan: Decodable {
     let id: String
@@ -439,6 +440,7 @@ final class SwitcherStore: ObservableObject {
     @Published private(set) var setupRecoveryRequired = false
     @Published private(set) var background: BackgroundServiceReceipt?
     @Published private(set) var backgroundError = ""
+    private(set) var backgroundReadFailureCode: String?
     @Published private(set) var readingEnvironment = false
     /// MonitorStore consumes a new observation to refresh the matching IP
     /// quality summary.  No policy/configuration is changed by this callback.
@@ -893,8 +895,14 @@ final class SwitcherStore: ObservableObject {
                 value = try JSONDecoder().decode(BackgroundServiceReceipt.self, from: data)
             }
             guard generation == backgroundGeneration else { return }
-            background = value; backgroundError = ""
-        } catch { backgroundError = error.localizedDescription }
+            background = value; backgroundError = ""; backgroundReadFailureCode = nil
+        } catch {
+            backgroundError = error.localizedDescription
+            if case DecodingError.keyNotFound(let key, _) = error {
+                backgroundReadFailureCode = "missing_" + BackendInitializationDiagnostics.code(key.stringValue)
+            } else if error is DecodingError { backgroundReadFailureCode = "decode_failed" }
+            else { backgroundReadFailureCode = "read_error_\((error as NSError).code)" }
+        }
     }
     /// First-run reads the same status consumed by the regular pages, with a
     /// success result so an old `loaded` value cannot conceal a failed read.

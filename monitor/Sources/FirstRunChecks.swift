@@ -14,12 +14,22 @@ final class FirstRunChecks: InitializationChecking {
     private let componentCheck: () async throws -> Void
     private let accessibilityTrusted: () -> Bool
     private let requestAccessibility: () -> Void
+    private let connectionNow: () -> Double
+    private let waitForConnectionPoll: () async -> Void
+    private let connectionLog: InitializationConnectionLog
 
     init(store: MonitorStore,
          componentCheck: (() async throws -> Void)? = nil,
          accessibilityTrusted: (() -> Bool)? = nil,
-         requestAccessibility: (() -> Void)? = nil) {
+         requestAccessibility: (() -> Void)? = nil,
+         connectionNow: @escaping () -> Double = { Date().timeIntervalSince1970 },
+         waitForConnectionPoll: @escaping () async -> Void = { try? await Task.sleep(nanoseconds: 1_000_000_000) },
+         connectionLog: InitializationConnectionLog? = nil) {
         self.store = store
+        self.connectionNow = connectionNow
+        self.waitForConnectionPoll = waitForConnectionPoll
+        self.connectionLog = connectionLog ?? (store.switcher.isFixture
+            ? InitializationConnectionLog(directory: nil) : InitializationConnectionLog())
         self.componentCheck = componentCheck ?? {
             let data = try await Task.detached { try SwitcherCommandRunner.run(["self-check"]) }.value
             let value = try JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -38,33 +48,71 @@ final class FirstRunChecks: InitializationChecking {
             do { try await componentCheck(); return .passed("运行组件完整性及 Watch 数据读取已核对。") }
             catch { return .failed(code: "components_unavailable", detail: "运行组件或 Watch 数据读取未通过，请检查安装完整性与数据目录权限。") }
         case .connection:
+            connectionLog.begin()
+            var phase = "status_read"
+            func finish(_ result: InitializationResult) -> InitializationResult {
+                let event: String, code: String
+                switch result {
+                case .passed: event = "passed"; code = "passed"
+                case .failed(let reason, _): event = reason == "cancelled" ? "cancelled" : "failed"; code = reason
+                case .approval: event = "failed"; code = "unexpected_approval"
+                }
+                traceConnection(event: event, phase: phase, code: code)
+                return result
+            }
+            traceConnection(event: "start", phase: phase, code: "started")
             boundContext = nil; acceptedSettings = nil
             guard await store.switcher.refreshInitializationStatus() else {
-                return .failed(code: "status_unavailable", detail: "后台状态读取未完成，请重试。")
+                return finish(.failed(code: "status_unavailable", detail: "后台状态读取未完成，请重试。"))
             }
-            guard !recoveryRequired else { return recoveryFailure }
-            let deadline = Date().addingTimeInterval(12)
+            traceConnection(event: "status", phase: phase, code: "status_read")
+            guard !recoveryRequired else { return finish(recoveryFailure) }
+            // A fresh install only waits for launchd's running state before
+            // opening the UI. No proxy sample need exist yet. The producer
+            // waits 10s AFTER collection before starting another network
+            // round; a single 12s budget can expire before two samples arrive.
+            let startupDeadline = connectionNow() + MonitorSnapshotTiming.proxyMaximumAge
+            var confirmationDeadline: Double?
             var candidate: String?
             var candidateSample: Double?
-            // Two separate reads of verified current context, while the normal
-            // snapshot-only timer keeps long DNS checks bound to fresh evidence.
-            while Date() < deadline && !Task.isCancelled {
+            var lastFailure = InitializationResult.failed(code: "snapshot_unavailable", detail: "采集后台尚未发布首份可读取的快照。")
+            // Once the first valid sample arrives, wait for a second source
+            // observation only while that first sample is still current.
+            // Rereads, gaps and context changes cannot renew this deadline.
+            while !Task.isCancelled {
+                phase = confirmationDeadline == nil ? "waiting_first_sample" : "waiting_next_sample"
+                let deadline = confirmationDeadline ?? startupDeadline
+                guard connectionNow() < deadline else { return finish(lastFailure) }
+                traceConnection(event: "poll_begin", phase: phase, code: "reading_backend", deadline: deadline,
+                                candidate: candidate, sampled: candidateSample)
                 await store.switcher.refreshBackground()
-                if let context = store.initializationContext, snapshotIsCurrent,
-                   Self.backendEvidenceIsCurrent(store.switcher.background, error: store.switcher.backgroundError) {
-                    let sampled = store.snapshot?.proxy?.observedAt ?? 0
+                let now = connectionNow()
+                let failure = connectionEvidenceFailure(at: now)
+                let observedCode: String
+                if case .failed(let code, _)? = failure { observedCode = code } else { observedCode = "evidence_current" }
+                traceConnection(event: "poll_end", phase: phase, code: observedCode, deadline: deadline,
+                                candidate: candidate, sampled: candidateSample)
+                guard now < deadline else { return finish(failure ?? lastFailure) }
+                if let failure {
+                    lastFailure = failure
+                    candidate = nil; candidateSample = nil
+                } else if let context = store.initializationContext, let sampled = store.snapshot?.proxy?.observedAt {
                     if candidate == context, let previous = candidateSample, sampled > previous {
                         boundContext = context
                         let detail = store.switcher.background?.backend_healthy == false
                             ? "原生采集后台身份、心跳及代理入口已确认。连接监控采样存在缺口，单独记录其完整性。"
                             : "原生采集后台身份、心跳及代理入口已确认；持续读取同一网络上下文。"
-                        return .passed(detail)
+                        return finish(.passed(detail))
                     }
                     if candidate != context { candidate = context; candidateSample = sampled }
-                } else { candidate = nil; candidateSample = nil }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    if confirmationDeadline == nil {
+                        confirmationDeadline = sampled + MonitorSnapshotTiming.proxyMaximumAge
+                    }
+                    lastFailure = .failed(code: "proxy_next_sample_timeout", detail: "已取得首轮有效代理采样，但未在其有效期内收到同一代理的后续采样。")
+                }
+                await waitForConnectionPoll()
             }
-            return .failed(code: "connection_unverified", detail: "原生采集后台身份、有效心跳或代理入口尚未持续确认。请查看检查记录后重试。")
+            return finish(.failed(code: "cancelled", detail: "本轮检查已取消，请重新检查。"))
         case .environment:
             return await prepareEnvironment(enableProtection: false)
         case .accessibility:
@@ -261,9 +309,78 @@ final class FirstRunChecks: InitializationChecking {
         store.switcher.setupRecoveryRequired || store.switcher.updateRecoveryRequired || store.switcher.accounts?.recovery_required == true
     }
     private var snapshotIsCurrent: Bool {
+        snapshotIsCurrent(at: Date().timeIntervalSince1970)
+    }
+    var connectionDiagnosticReport: String { connectionLog.report }
+    private func traceConnection(event: String, phase: String, code: String, deadline: Double? = nil,
+                                 candidate: String? = nil, sampled: Double? = nil) {
+        let now = connectionNow(), background = store.switcher.background, snapshot = store.snapshot
+        let proxy = snapshot?.proxy
+        func finite(_ number: Double?) -> Double? { number.flatMap { $0.isFinite ? $0 : nil } }
+        connectionLog.append(.init(event: event, phase: phase, code: code, time: now,
+            app_version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+            app_build: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+            backend_read_error: store.switcher.backgroundReadFailureCode,
+            backend_healthy: background?.backend_healthy, native_backend_healthy: background?.guard_backend_healthy,
+            backend_receipt_age_seconds: finite(background.map { now - $0.observed_at }),
+            backend: background?.backend_diagnostics?.sanitized,
+            snapshot_read_failed: store.error != nil, snapshot_present: snapshot != nil,
+            snapshot_age_seconds: finite(snapshot.map { now - $0.capturedAt }),
+            installed: snapshot?.installed, auto_start: snapshot?.autoStart, keep_alive: snapshot?.keepAlive,
+            proxy_present: proxy != nil, proxy_read_failed: snapshot?.proxyError != nil,
+            proxy_age_seconds: finite(proxy.map { now - $0.observedAt }),
+            proxy_entry_verified: proxy.map { $0.entryState == "verified" },
+            proxy_api_available: proxy.map { $0.apiState == "available" }, proxy_port_covered: proxy?.coversProxy,
+            context_available: store.initializationContext != nil,
+            same_candidate_context: candidate.map { $0 == store.initializationContext },
+            source_sample_advanced: sampled.flatMap { previous in proxy.map { $0.observedAt > previous } },
+            deadline_remaining_seconds: finite(deadline.map { $0 - now })))
+    }
+    /// The gate and its diagnostic code use the same facts. Never infer a
+    /// proxy outage merely because a cold daemon has not published two rounds.
+    private func connectionEvidenceFailure(at now: Double) -> InitializationResult? {
+        guard Self.backendEvidenceIsCurrent(store.switcher.background, error: store.switcher.backgroundError, now: now) else {
+            let detail: String
+            if !store.switcher.backgroundError.isEmpty {
+                detail = "后台状态读取失败（\(store.switcher.backgroundReadFailureCode ?? "read_failed")）。具体记录见“检查记录”。"
+            } else if let diagnosis = store.switcher.background?.backend_diagnostics,
+                      store.switcher.background?.guard_backend_healthy != true {
+                detail = diagnosis.failureDescription
+            } else {
+                detail = "后台状态回执缺失、过期或未提供具体诊断。具体记录见“检查记录”。"
+            }
+            return .failed(code: "backend_unverified", detail: detail)
+        }
+        guard store.error == nil, let snapshot = store.snapshot else {
+            return .failed(code: "snapshot_unavailable", detail: "采集后台快照尚未就绪或读取失败。")
+        }
+        guard snapshot.installed, snapshot.autoStart, snapshot.keepAlive else {
+            return .failed(code: "collector_registration_unverified", detail: "采集后台的安装、自启或异常恢复注册尚未确认。")
+        }
+        guard MonitorSnapshotTiming.isCurrent(capturedAt: snapshot.capturedAt, now: now) else {
+            return .failed(code: "snapshot_stale", detail: "采集后台快照已过期或时间异常。")
+        }
+        guard snapshot.proxyError == nil, let proxy = snapshot.proxy else {
+            return .failed(code: "proxy_snapshot_unavailable", detail: "后台尚未发布可用的代理采样。")
+        }
+        guard (0...MonitorSnapshotTiming.proxyMaximumAge).contains(now - proxy.observedAt) else {
+            return .failed(code: "proxy_sample_stale", detail: "代理采样已过期或时间异常。")
+        }
+        guard proxy.entryState == "verified" else {
+            return .failed(code: "proxy_entry_unverified", detail: "本机代理入口及监听进程身份尚未确认。")
+        }
+        guard proxy.apiState == "available", proxy.coversProxy else {
+            return .failed(code: "proxy_api_unverified", detail: "代理控制接口或本机代理端口覆盖尚未确认。")
+        }
+        guard store.initializationContext != nil else {
+            return .failed(code: "proxy_context_unavailable", detail: "当前代理上下文尚不完整，无法比较连续采样。")
+        }
+        return nil
+    }
+    private func snapshotIsCurrent(at now: Double) -> Bool {
         guard store.error == nil, let snapshot = store.snapshot, snapshot.installed,
               snapshot.autoStart, snapshot.keepAlive, store.initializationContext != nil else { return false }
-        return MonitorSnapshotTiming.isCurrent(capturedAt: snapshot.capturedAt, now: Date().timeIntervalSince1970)
+        return MonitorSnapshotTiming.isCurrent(capturedAt: snapshot.capturedAt, now: now)
     }
     private var backgroundIsCurrent: Bool {
         guard let value = store.switcher.background,

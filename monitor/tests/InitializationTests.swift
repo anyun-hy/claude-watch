@@ -241,6 +241,71 @@ struct InitializationTests {
                 hasBaseline: false, stderrBytes: 0, processes: [], events: [], proxy: proxy, proxyError: nil,
                 logPath: "/fixture/log", backendVersion: "fixture", monitoredApps: ["claude"])
         }
+        // A clean installation has no UI snapshot to seed the first check.
+        // Replay publication latency (4s) and the observed 14s proxy cadence:
+        // first sample at t=5, next at t=19. Timer rereads keep returning the
+        // first source timestamp; they must not count as new observations.
+        let cold = MonitorStore(leakChecks: LeakCheckStore(isFixture: true), aiChecks: AIProbeStore(isFixture: true), switcher: SwitcherStore(isFixture: true))
+        cold.beginInitialization(startSnapshotPolling: false)
+        cold.switcher.loadReviewScenario(.normal)
+        let coldEnvironment = cold.switcher.currentEnvironment!
+        let epoch = Date().timeIntervalSince1970
+        var coldTime = epoch
+        var publications: [(at: Double, sampled: Double, node: String)] = [(5, 1, "A"), (19, 15, "A")]
+        var nativeAvailable = true
+        func publishColdRound() {
+            let elapsed = coldTime - epoch
+            cold.switcher.loadReviewReceipts(coldEnvironment, background: backendEvidence(at: coldTime, sampling: true, native: nativeAvailable && elapsed >= 5))
+            guard let publication = publications.last(where: { $0.at <= elapsed }) else { cold.snapshot = nil; return }
+            let sample = snapshot(node: publication.node, at: epoch + publication.sampled)
+            let reread = MonitorSnapshot(capturedAt: coldTime, health: sample.health,
+                installed: true, autoStart: true, keepAlive: true, hasBaseline: false,
+                stderrBytes: 0, processes: [], events: [], proxy: sample.proxy, proxyError: nil,
+                logPath: "/fixture/log", backendVersion: "fixture", monitoredApps: ["claude"])
+            cold.acceptSnapshot(reread, receivedAt: Date(timeIntervalSince1970: coldTime))
+        }
+        publishColdRound()
+        expect(cold.snapshot == nil, "clean startup has no cached snapshot or proxy evidence")
+        let coldChecks = FirstRunChecks(store: cold, componentCheck: {}, connectionNow: { coldTime },
+            waitForConnectionPoll: { coldTime += 1; publishColdRound() })
+        let coldResult = await coldChecks.check(.connection)
+        if !passed(coldResult) {
+            let retryResult = await coldChecks.check(.connection)
+            print("Cold-start regression: first=\(coldResult), immediate retry=\(retryResult)")
+        }
+        expect(passed(coldResult), "clean startup must wait for the second actual proxy publication without requiring Retry")
+        expect(coldTime >= epoch + 19 && coldTime < epoch + 30,
+               "repeated reads of the first snapshot never count as two samples")
+        func replay(_ values: [(Double, Double, String)], native: Bool = true) async -> InitializationResult {
+            coldTime = epoch; publications = values; nativeAvailable = native
+            cold.snapshot = nil; publishColdRound()
+            return await coldChecks.check(.connection)
+        }
+        func failureCode(_ result: InitializationResult) -> String? {
+            if case .failed(let code, _) = result { return code }; return nil
+        }
+        let delayedStartup = await replay([(29, 25, "A"), (43, 39, "A")])
+        expect(passed(delayedStartup) && coldTime == epoch + 43,
+               "startup and confirmation have separate bounds; a late first sample does not consume the next round's window")
+        let frozenSource = await replay([(5, 1, "A")])
+        expect(failureCode(frozenSource) == "proxy_next_sample_timeout" && coldTime == epoch + 31,
+               "a stalled producer fails at the first source's expiry even as snapshot and service read times advance")
+        let missingSource = await replay([])
+        expect(failureCode(missingSource) == "snapshot_unavailable" && coldTime == epoch + 30,
+               "absence of a first snapshot has a bounded, specific failure")
+        let missingBackend = await replay([(5, 1, "A"), (19, 15, "A")], native: false)
+        expect(failureCode(missingBackend) == "backend_unverified",
+               "two proxy samples cannot substitute for an unverified native backend")
+        let changedSource = await replay([(5, 1, "A"), (19, 15, "B")])
+        expect(!passed(changedSource) && coldTime == epoch + 31,
+               "different proxy contexts cannot combine into a pass or renew the confirmation deadline")
+        for invalidTime in [-100.0, 100.0] {
+            let invalidSource = await replay([(5, invalidTime, "A")])
+            expect(failureCode(invalidSource) == "proxy_sample_stale",
+                   "stale and future proxy source times remain blocking during cold startup")
+        }
+        expect(cold.switcher.settings["guard_enabled"] as? Bool != true && !cold.leakChecks.dns.running && !cold.leakChecks.rtc.running,
+               "cold-start readiness never enables protection or starts independent network probes")
         let firstSnapshot = snapshot(node: "A", at: Date().timeIntervalSince1970)
         published.acceptSnapshot(firstSnapshot, receivedAt: Date())
         expect(published.initializationContext != nil && published.initializing && !published.leakChecks.dns.running && !published.leakChecks.rtc.running,
