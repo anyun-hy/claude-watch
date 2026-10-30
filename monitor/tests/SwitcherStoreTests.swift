@@ -91,6 +91,10 @@ struct SwitcherStoreTests {
         expect(SessionProtectionEvidence.fromBackground(closed)!.presentation(at: 1015).title == SessionProtectionPresentation.idleTitle, "fresh process observation keeps idle current despite old session sample")
         let locked = SessionGuardStatus(state: "locked", phase: "locked", reason: .init(code: "dns_risk", detail: "DNS 风险"))
         expect(SessionProtectionPresentation.make(locked, stale: true, backendReady: false).tone == "danger", "latched real risk wins over stale or missing backend state")
+        expect(SessionProtectionPresentation.make(.init(state: "risk"), stale: true, backendReady: false).tone == "danger", "explicit risk keeps danger priority")
+        expect(SessionProtectionPresentation.make(.init(state: "unknown")).tone == "info", "unknown protection evidence uses neutral presentation")
+        expect(SessionProtectionPresentation.make(.init(state: "safe", reason: .init(code: "egress_unconfirmed", detail: "unknown"))).tone == "info", "unconfirmed exit is not shown as a positive or error result")
+        expect(SessionProtectionPresentation.make(.init(state: "idle"), stale: true).title != SessionProtectionPresentation.idleTitle, "expired idle cannot appear as current standby")
         expect(SessionProtectionPresentation.make(.init(state: "idle", phase: "locked")).tone == "danger", "contradictory idle cannot mask locked phase")
         for state in ["idle", "safe", "unknown", "missing", "pending"] {
             let display = SessionProtectionPresentation.make(.init(state: state))

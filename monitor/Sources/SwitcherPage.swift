@@ -135,7 +135,7 @@ struct SwitcherPage: View {
                         InlineNotice(title: recommendation.title, detail: recommendation.detail,
                                      symbol: "lightbulb", tint: p.blue, p: p)
                     }
-                    sessionGuardNotice(title: "受控会话状态", prominent: true)
+                    SessionProtectionStatusView(value: store.sessionDisplay, p: p)
                     if let facts = result.facts, facts.state == "fail" {
                         InlineNotice(title: "当前环境风险", detail: facts.risks?.compactMap { $0.reason ?? $0.id }.joined(separator: "\n") ?? "本轮环境检测发现风险。",
                                      symbol: "exclamationmark.shield", tint: p.red, p: p)
@@ -412,7 +412,7 @@ struct SwitcherPage: View {
                         InlineNotice(title: "同轮阻断原因", detail: facts.risks?.compactMap { $0.reason ?? $0.id }.joined(separator: "\n") ?? "当前保护事实未满足。",
                                      symbol: "exclamationmark.shield", tint: p.red, p: p)
                     }
-                    sessionGuardNotice(title: "受控会话状态")
+                    SessionProtectionStatusView(value: store.sessionDisplay, p: p)
                 } else {
                     Text("尚未取得与当前环境同轮的启动要求预览。启动时仍会独立重新检查。").font(WatchTypography.body).foregroundStyle(p.secondary)
                     if !store.detectionError.isEmpty {
@@ -519,42 +519,32 @@ struct SwitcherPage: View {
     private func serviceButton(_ title: String, key: String, enable: Bool) -> some View {
         Button(title) { Task { await store.previewProtection(key, enable: enable); showReview = store.plan != nil } }
     }
-    private func sessionGuardNotice(title: String, prominent: Bool = false) -> some View {
-        let value = store.sessionDisplay
-        return InlineNotice(title: title, detail: value.detail, symbol: value.symbol,
-                            tint: sessionGuardTint(value), p: p,
-                            iconSize: prominent ? 22 : 15, iconWidth: prominent ? 28 : 20,
-                            iconWeight: prominent ? .medium : .regular,
-                            iconTint: prominent && value.title == SessionProtectionPresentation.idleTitle ? p.mint : nil)
-    }
     private func sessionGuardCard(_ evidence: SessionProtectionEvidence) -> some View {
         let session = evidence.session
         let value = evidence.presentation(at: store.loginClock.timeIntervalSince1970)
-        return Surface(p) {
-            VStack(alignment: .leading, spacing: 9) {
-                HStack {
-                    Label("会话出口保护", systemImage: "shield.lefthalf.filled").font(WatchTypography.section)
-                    Spacer()
-                    Label(value.title, systemImage: value.symbol)
-                        .font(WatchTypography.caption).foregroundStyle(sessionGuardTint(value))
-                }
-                Text(value.detail).font(WatchTypography.caption).foregroundStyle(sessionGuardTint(value))
-                if let baseline = session.baseline {
-                    Text("会话基准：" + egressText(baseline)).font(WatchTypography.caption)
-                }
-                if let current = session.current {
-                    Text((session.state == "locked" ? "退出时出口：" : "最近核验出口：") + egressText(current)).font(WatchTypography.caption)
-                }
-                if let reason = session.reason, session.state != "idle" {
-                    Text((session.state == "locked" ? "停止原因：" : "检测情况：") + reason.detail).font(WatchTypography.caption).foregroundStyle(sessionGuardTint(value))
-                    if let observed = reason.observed_at {
-                        Text("原因时间：" + timeLabel(observed)).font(WatchTypography.small).foregroundStyle(p.secondary)
+        return VStack(alignment: .leading, spacing: 10) {
+            SessionProtectionStatusView(value: value, p: p)
+            if session.baseline != nil || session.current != nil || (session.reason != nil && session.state != "idle") || session.locked_at != nil {
+                Surface(p) {
+                    VStack(alignment: .leading, spacing: 9) {
+                        if let baseline = session.baseline {
+                            Text("会话基准：" + egressText(baseline)).font(WatchTypography.caption)
+                        }
+                        if let current = session.current {
+                            Text((session.state == "locked" ? "退出时出口：" : "最近核验出口：") + egressText(current)).font(WatchTypography.caption)
+                        }
+                        if let reason = session.reason, session.state != "idle" {
+                            Text((session.state == "locked" ? "停止原因：" : "检测情况：") + reason.detail).font(WatchTypography.caption).foregroundStyle(sessionGuardTint(value))
+                            if let observed = reason.observed_at {
+                                Text("原因时间：" + timeLabel(observed)).font(WatchTypography.small).foregroundStyle(p.secondary)
+                            }
+                        }
+                        if let locked = session.locked_at {
+                            Text("锁存时间：" + timeLabel(locked)).font(WatchTypography.small).foregroundStyle(p.secondary)
+                        }
+                        Text("明确风险时退出 Claude；未知状态不会宣称已完成检测。").font(WatchTypography.small).foregroundStyle(p.secondary)
                     }
                 }
-                if let locked = session.locked_at {
-                    Text("锁存时间：" + timeLabel(locked)).font(WatchTypography.small).foregroundStyle(p.secondary)
-                }
-                Text("明确风险时退出 Claude；未知状态不会宣称已完成检测。").font(WatchTypography.small).foregroundStyle(p.secondary)
             }
         }
     }

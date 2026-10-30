@@ -1,4 +1,4 @@
-import Foundation
+import SwiftUI
 
 /// Shared display evidence. This never changes a session, a gate or a protection decision.
 struct SessionProtectionEvidence {
@@ -20,7 +20,7 @@ struct SessionProtectionEvidence {
         return !readError.isEmpty || !age.isFinite || age < 0 || age > 35 || activeExpired
     }
     func presentation(at now: Double) -> SessionProtectionPresentation {
-        if !readError.isEmpty && session.state != "locked" && session.phase != "locked" {
+        if !readError.isEmpty && session.state != "risk" && session.state != "locked" && session.phase != "locked" {
             return .init(title: "保护状态读取失败", detail: "保留上次记录：" + readError, symbol: "exclamationmark.triangle", tone: "warning")
         }
         return .make(session, stale: isStale(at: now), backendReady: backendReady)
@@ -34,7 +34,7 @@ struct SessionProtectionPresentation {
     static let loading = Self(title: "正在读取保护状态", detail: "正在读取后台检测结果。", symbol: "clock", tone: "info")
 
     static func make(_ session: SessionGuardStatus, stale: Bool = false, backendReady: Bool = true) -> Self {
-        if session.state == "locked" || session.phase == "locked" {
+        if session.state == "risk" || session.state == "locked" || session.phase == "locked" {
             let stop = session.stop_state == "confirmed" ? "Claude 已确认退出。" : (session.stop_state == "failed" ? "退出失败（\(session.stop_error ?? "未知错误")），待后台重试。" : "正在等待退出确认。")
             return .init(title: "会话保护已触发",
                          detail: (session.reason?.detail ?? "保护检测命中阻断条件。") + " " + stop,
@@ -54,7 +54,7 @@ struct SessionProtectionPresentation {
         case "safe":
             if ["egress_unconfirmed", "risk_evidence_missing", "risk_evidence_unavailable"].contains(session.reason?.code ?? "") {
                 return .init(title: "本轮保护检测未完成", detail: session.reason?.detail ?? "正在重试采样。",
-                             symbol: "clock", tone: "warning")
+                             symbol: "clock", tone: "info")
             }
             return .init(title: "保护运行中", detail: "会话基准与当前出口已核对。", symbol: "checkmark.shield", tone: "success")
         case "pending":
@@ -63,7 +63,21 @@ struct SessionProtectionPresentation {
             return .init(title: "等待受控启动", detail: "使用“检查并启动 Claude”时自动建立会话，无需手动配置。", symbol: "shield", tone: "info")
         default:
             return .init(title: "本轮保护检测未完成", detail: session.reason?.detail ?? "尚未取得有效的本轮保护检测结果，正在等待下一轮采样。",
-                         symbol: "clock", tone: "warning")
+                         symbol: "clock", tone: "info")
         }
+    }
+}
+
+/// The same read-only status presentation is used wherever the session appears.
+struct SessionProtectionStatusView: View {
+    let value: SessionProtectionPresentation
+    let p: Palette
+    private var tint: Color {
+        value.tone == "danger" ? p.red : value.tone == "warning" ? p.amber :
+            (value.tone == "success" || value.title == SessionProtectionPresentation.idleTitle) ? p.color(0x4ADE80, 0x087D36) : p.secondary
+    }
+    var body: some View {
+        InlineNotice(title: value.title, detail: value.detail, symbol: value.symbol,
+                     tint: tint, p: p, iconSize: 24, iconWidth: 32, iconWeight: .medium)
     }
 }
