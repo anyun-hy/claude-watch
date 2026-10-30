@@ -292,12 +292,8 @@ struct ConnectionGraphView: View {
     @ViewBuilder private func sourceRibbons(sourceX: CGFloat, gatewayX: CGFloat, sourceWidth: CGFloat, gatewayWidth: CGFloat, sourceTop: CGFloat, sourceBottom: CGFloat, gatewayY: CGFloat) -> some View {
         let sourceRight = sourceX + sourceWidth / 2
         let gatewayLeft = gatewayX - gatewayWidth / 2
-        if let source = codeGraph {
-            ribbon(from: CGPoint(x: sourceRight, y: sourceTop), to: CGPoint(x: gatewayLeft, y: gatewayY), c1: CGPoint(x: sourceRight + 28, y: sourceTop), c2: CGPoint(x: gatewayLeft - 28, y: gatewayY), state: source.sourceEdgeState, animated: shouldAnimate)
-        }
-        if let source = desktopGraph {
-            ribbon(from: CGPoint(x: sourceRight, y: sourceBottom), to: CGPoint(x: gatewayLeft, y: gatewayY), c1: CGPoint(x: sourceRight + 28, y: sourceBottom), c2: CGPoint(x: gatewayLeft - 28, y: gatewayY), state: source.sourceEdgeState, animated: shouldAnimate)
-        }
+        ribbon(from: CGPoint(x: sourceRight, y: sourceTop), to: CGPoint(x: gatewayLeft, y: gatewayY), c1: CGPoint(x: sourceRight + 28, y: sourceTop), c2: CGPoint(x: gatewayLeft - 28, y: gatewayY), state: codeGraph?.sourceEdgeState ?? .pending, animated: codeGraph != nil && shouldAnimate, showsArrow: codeGraph != nil)
+        ribbon(from: CGPoint(x: sourceRight, y: sourceBottom), to: CGPoint(x: gatewayLeft, y: gatewayY), c1: CGPoint(x: sourceRight + 28, y: sourceBottom), c2: CGPoint(x: gatewayLeft - 28, y: gatewayY), state: desktopGraph?.sourceEdgeState ?? .pending, animated: desktopGraph != nil && shouldAnimate, showsArrow: desktopGraph != nil)
     }
 
     @ViewBuilder private func pathRibbons(gatewayX: CGFloat, tagX: CGFloat, exitX: CGFloat, gatewayWidth: CGFloat, tagWidth: CGFloat, exitWidth: CGFloat, gatewayY: CGFloat, tagY: CGFloat, exitTop: CGFloat, exitBottom: CGFloat, unresolvedY: CGFloat) -> some View {

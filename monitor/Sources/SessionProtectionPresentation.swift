@@ -11,19 +11,19 @@ struct SessionProtectionEvidence {
         guard let session = receipt.session_guard else { return nil }
         let backendReady = (receipt.guard_backend_healthy ?? receipt.backend_healthy) &&
             receipt.services.first(where: { $0.id == "guard" })?.healthy == true
-        return .init(session: session, observedAt: receipt.observed_at, backendReady: backendReady, readError: error)
+        return .init(session: session, observedAt: (session.state == "idle" || session.state == "missing" || session.state == "pending") ? receipt.observed_at : (session.sampled_at ?? 0), backendReady: backendReady, readError: error)
     }
 
-    static func latest(_ candidates: [Self]) -> Self? {
-        candidates.filter { $0.observedAt.isFinite && $0.observedAt > 0 }
-            .max { $0.observedAt < $1.observedAt }
-    }
     func isStale(at now: Double) -> Bool {
         let age = now - observedAt
-        return !readError.isEmpty || !age.isFinite || age < 0 || age > 35
+        let activeExpired = session.state == "safe" && (session.valid_until.map { !$0.isFinite || now > $0 } ?? true)
+        return !readError.isEmpty || !age.isFinite || age < 0 || age > 35 || activeExpired
     }
     func presentation(at now: Double) -> SessionProtectionPresentation {
-        .make(session, stale: isStale(at: now), backendReady: backendReady)
+        if !readError.isEmpty && session.state != "locked" && session.phase != "locked" {
+            return .init(title: "保护状态读取失败", detail: "保留上次记录：" + readError, symbol: "exclamationmark.triangle", tone: "warning")
+        }
+        return .make(session, stale: isStale(at: now), backendReady: backendReady)
     }
 }
 
@@ -35,8 +35,9 @@ struct SessionProtectionPresentation {
 
     static func make(_ session: SessionGuardStatus, stale: Bool = false, backendReady: Bool = true) -> Self {
         if session.state == "locked" || session.phase == "locked" {
-            return .init(title: "会话保护已拦截",
-                         detail: "上次会话停止：" + (session.reason?.detail ?? "保护检测命中阻断条件。") + " 恢复后通过“检查并启动 Claude”重新执行完整校验。",
+            let stop = session.stop_state == "confirmed" ? "Claude 已确认退出。" : (session.stop_state == "failed" ? "退出失败（\(session.stop_error ?? "未知错误")），待后台重试。" : "正在等待退出确认。")
+            return .init(title: "会话保护已触发",
+                         detail: (session.reason?.detail ?? "保护检测命中阻断条件。") + " " + stop,
                          symbol: "pause.circle", tone: "danger")
         }
         if stale {

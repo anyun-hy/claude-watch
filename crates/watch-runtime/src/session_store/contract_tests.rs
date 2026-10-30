@@ -588,3 +588,40 @@ fn pending_launcher_grace_and_idle_projection_are_explicit() {
         "unknown"
     );
 }
+
+#[test]
+fn confirmed_identity_and_leak_risks_precede_missing_egress() {
+    let fixture = Fixture::new();
+    let session = active(&fixture.sessions(), 1000.0);
+    let mut probe = input(1001.0);
+    probe.egress = json!({"error":"offline"});
+    probe.identity = Identity::Changed;
+    let result = session::check(&session, &probe);
+    assert_eq!(result.state, "risk");
+    assert_eq!(result.reason.unwrap().code, "session_identity_changed");
+    probe.identity = Identity::Unavailable;
+    probe.risk = json!({"state":"risk","observed_at":1001.0,"reason":{"code":"dns_risk","detail":"fixture"}});
+    let result = session::check(&session, &probe);
+    assert_eq!(result.state, "risk");
+    assert_eq!(result.reason.unwrap().code, "dns_risk");
+    assert_eq!(result.baseline.unwrap().ip, "1.1.1.1");
+    assert!(result.current.is_none());
+}
+
+#[test]
+fn failed_probe_cannot_close_replacement_session() {
+    let fixture = Fixture::new();
+    let store = fixture.sessions();
+    let old = active(&store, 1000.0);
+    let new = active(&store, 1002.0);
+    let mut closed = false;
+    let result = store
+        .close_if_current_before(Some(&old.session_id), 1003.0, 1001.0, || {
+            closed = true;
+            Ok(())
+        })
+        .unwrap();
+    assert!(result.is_none());
+    assert!(!closed);
+    assert_ne!(old.session_id, new.session_id);
+}

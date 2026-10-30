@@ -65,6 +65,7 @@ pub struct SocketResult {
     pub flows: Vec<Flow>,
     pub rows: Vec<Value>,
     pub dropped: BTreeMap<String, u64>,
+    pub confirmed_exited_count: usize,
     pub complete: bool,
     pub parsed_count: usize,
     pub accepted_count: usize,
@@ -232,6 +233,7 @@ pub fn decode_sockets(
     let mut dropped = BTreeMap::<String, u64>::new();
     let mut parsed = 0;
     let mut accepted = 0;
+    let mut confirmed_exited_count = 0;
     let mut add_drop = |key: &str, count: u64| {
         *dropped.entry(key.into()).or_default() += count;
     };
@@ -242,6 +244,22 @@ pub fn decode_sockets(
             .ok_or_else(invalid)?;
         if !seen.insert(pid) || !expected.contains_key(&pid) {
             return Err(invalid());
+        }
+        if row["code"] == "process_exited" {
+            // The native observer emits exactly these fields for a confirmed exit.
+            // Contradictory socket/identity payloads are not exit evidence.
+            if row["state"] != "unknown"
+                || !row.as_object().is_some_and(|v| {
+                    v.len() == 3
+                        && v.contains_key("pid")
+                        && v.contains_key("state")
+                        && v.contains_key("code")
+                })
+            {
+                return Err(invalid());
+            }
+            confirmed_exited_count += 1;
+            continue;
         }
         if !matches!(row["state"].as_str(), Some("ok" | "partial")) {
             add_drop(
@@ -303,6 +321,7 @@ pub fn decode_sockets(
         flows,
         rows: rows.clone(),
         dropped,
+        confirmed_exited_count,
         complete,
         parsed_count: parsed,
         accepted_count: accepted,

@@ -59,6 +59,9 @@ struct Fake {
     closes: u32,
     ready: bool,
     fail_open: bool,
+    fail_quit: bool,
+    egress_calls: u32,
+    freeze_session: Option<PathBuf>,
     proxy: &'static str,
     ip: &'static str,
     country: &'static str,
@@ -89,6 +92,9 @@ impl Default for Fake {
             closes: 0,
             ready: true,
             fail_open: false,
+            fail_quit: false,
+            egress_calls: 0,
+            freeze_session: None,
             proxy: "ok",
             ip: "1.1.1.1",
             country: "JP",
@@ -273,6 +279,15 @@ impl DesktopSystem for Fake {
         Ok(value)
     }
     fn egress(&mut self) -> Value {
+        self.egress_calls += 1;
+        if let Some(path) = self.freeze_session.take() {
+            assert!(std::process::Command::new("/usr/bin/chflags")
+                .arg("uchg")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success());
+        }
         json!({"ip":self.ip,"country":self.country,"observed_at":self.now,"source":"fixture HTTP exit"})
     }
     fn local_guard(&mut self) -> Result<Value> {
@@ -314,6 +329,9 @@ impl DesktopSystem for Fake {
     }
     fn quit_desktop(&mut self) -> Result<()> {
         self.closes += 1;
+        if self.fail_quit {
+            return Err(CoreError::new("fixture_quit_failed", "fixture"));
+        }
         if let Some(mut child) = self.test_child.take() {
             child.kill().map_err(|_| {
                 CoreError::new(
@@ -1022,4 +1040,108 @@ fn cli_refusal_spawn_failure_wait_failure_and_interrupts_never_leave_authority()
             "{case}"
         );
     }
+}
+
+#[test]
+fn locked_session_retries_failed_stop_without_another_probe() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    fixture.receipts(system.now);
+    controller.launch(&mut system).unwrap();
+    system.fail_quit = true;
+    system.proxy = "unknown";
+    system.ip = "8.8.8.8";
+    system.now += 1.0;
+    let first = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(first["session_guard"]["state"], "risk");
+    assert_eq!(first["stop_state"], "failed");
+    assert_eq!(first["action"], "observe");
+    let calls = system.egress_calls;
+    system.ip = "1.1.1.1";
+    system.fail_quit = false;
+    system.now += 1.0;
+    let second = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(second["session_guard"]["state"], "locked");
+    assert_eq!(second["stop_state"], "confirmed");
+    assert_eq!(system.egress_calls, calls);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn confirmed_exit_stops_even_when_session_write_fails() {
+    struct Immutable(PathBuf);
+    impl Drop for Immutable {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("/usr/bin/chflags")
+                .arg("nouchg")
+                .arg(&self.0)
+                .status();
+        }
+    }
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.launch(&mut system).unwrap();
+    let path = fixture.storage.paths.session();
+    let _restore = Immutable(path.clone());
+    system.freeze_session = Some(path);
+    system.ip = "8.8.8.8";
+    system.now += 1.0;
+    let receipt = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(receipt["persistence_error"], "state_io_failed");
+    assert_eq!(receipt["stop_state"], "confirmed");
+    assert_eq!(receipt["action"], "close-desktop");
+    assert!(!system.running);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn failed_write_and_failed_stop_latch_same_session_until_retry() {
+    struct Immutable(PathBuf);
+    impl Drop for Immutable {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("/usr/bin/chflags")
+                .arg("nouchg")
+                .arg(&self.0)
+                .status();
+        }
+    }
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.launch(&mut system).unwrap();
+    let path = fixture.storage.paths.session();
+    let _restore = Immutable(path.clone());
+    system.freeze_session = Some(path);
+    system.ip = "8.8.8.8";
+    system.fail_quit = true;
+    system.now += 1.0;
+    let first = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(first["persistence_error"], "state_io_failed");
+    assert_eq!(first["stop_state"], "failed");
+    let calls = system.egress_calls;
+    system.ip = "1.1.1.1";
+    system.fail_quit = false;
+    system.now += 1.0;
+    let second = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(second["session_guard"]["state"], "locked");
+    assert_eq!(second["stop_state"], "confirmed");
+    assert_eq!(system.egress_calls, calls);
+    assert!(!system.running);
+    // The failure latch belongs only to the original session.
+    assert!(std::process::Command::new("/usr/bin/chflags")
+        .arg("nouchg")
+        .arg(&fixture.storage.paths.session())
+        .status()
+        .unwrap()
+        .success());
+    system.now += 1.0;
+    fixture.receipts(system.now);
+    controller.launch(&mut system).unwrap();
+    system.now += 1.0;
+    let new_session = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(new_session["action"], "observe");
+    assert_ne!(new_session["session_guard"]["state"], "locked");
+    assert!(system.running);
 }

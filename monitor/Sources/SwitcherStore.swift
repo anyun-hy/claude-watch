@@ -77,6 +77,10 @@ struct SessionGuardStatus: Decodable {
     var reason: SessionGuardReason?
     var risk_evidence: CoffeeJSON?
     var locked_at: Double?
+    var sampled_at: Double? = nil
+    var valid_until: Double? = nil
+    var stop_state: String? = nil
+    var stop_error: String? = nil
 }
 struct SessionGuardReason: Decodable {
     let code, detail: String
@@ -448,6 +452,7 @@ final class SwitcherStore: ObservableObject {
     @Published private(set) var setupRecoveryRequired = false
     @Published private(set) var background: BackgroundServiceReceipt?
     @Published private(set) var backgroundError = ""
+    @Published private(set) var refreshingBackground = false
     private(set) var backgroundReadFailureCode: String?
     @Published private(set) var readingEnvironment = false
     /// MonitorStore consumes a new observation to refresh the matching IP
@@ -648,15 +653,8 @@ final class SwitcherStore: ObservableObject {
         return currentLogin?.account
     }
     var sessionDisplayEvidence: SessionProtectionEvidence? {
-        var candidates: [SessionProtectionEvidence] = []
-        if let value = background, let evidence = SessionProtectionEvidence.fromBackground(value, error: backgroundError) {
-            candidates.append(evidence)
-        }
-        if let value = currentEnvironment, let session = value.session_guard {
-            candidates.append(.init(session: session, observedAt: value.observed_at,
-                                    backendReady: value.rows.first(where: { $0.id == "guard" })?.state == "ok"))
-        }
-        return SessionProtectionEvidence.latest(candidates)
+        guard let value = background else { return nil }
+        return SessionProtectionEvidence.fromBackground(value, error: backgroundError)
     }
     var sessionDisplay: SessionProtectionPresentation {
         sessionDisplayEvidence?.presentation(at: loginClock.timeIntervalSince1970) ?? .loading
@@ -953,6 +951,8 @@ final class SwitcherStore: ObservableObject {
         guard !busy else { return }
         backgroundGeneration += 1
         let generation = backgroundGeneration
+        refreshingBackground = true
+        defer { if generation == backgroundGeneration { refreshingBackground = false } }
         do {
             let value: BackgroundServiceReceipt
             if isFixture, let reviewBackground {

@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::{
     fs,
     net::{TcpListener, TcpStream},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 use uuid::Uuid;
@@ -284,4 +284,317 @@ fn own_sampling_child_has_output_and_time_limits_without_signaling_target_apps()
             1024
         )
         .is_err());
+}
+
+#[test]
+fn confirmed_exit_is_distinct_from_missing_or_unverified_target() {
+    let p = identity();
+    let mut second = p.clone();
+    second.pid = 78;
+    let mut wire = envelope();
+    wire["socket_samples"] = json!([
+        {"pid":77,"state":"unknown","code":"process_exited"},
+        {"pid":78,"state":"ok","identity":second,"sockets":[{"pid":78,"protocol":"tcp","local":["198.18.0.1",50000],"peer":["198.18.1.10",443]}],"dropped":{}}
+    ]);
+    let result =
+        native::decode_sockets(&wire, &[p.clone(), second.clone()], "round", 1000.0, 1003.0)
+            .unwrap();
+    assert!(result.complete);
+    assert_eq!(result.confirmed_exited_count, 1);
+    assert_eq!(result.flows.len(), 1);
+    assert_eq!(result.flows[0].pid, 78);
+    let mut contradictory = wire.clone();
+    contradictory["socket_samples"][0]["sockets"] = json!([{"pid":77}]);
+    assert!(native::decode_sockets(
+        &contradictory,
+        &[p.clone(), second.clone()],
+        "round",
+        1000.0,
+        1003.0
+    )
+    .is_err());
+    contradictory = wire.clone();
+    contradictory["socket_samples"][0]["state"] = json!("ok");
+    assert!(native::decode_sockets(
+        &contradictory,
+        &[p.clone(), second.clone()],
+        "round",
+        1000.0,
+        1003.0
+    )
+    .is_err());
+    for code in [
+        "identity_changed",
+        "fd_inventory_unavailable",
+        "socket_deadline",
+    ] {
+        wire["socket_samples"][0]["code"] = json!(code);
+        let unknown =
+            native::decode_sockets(&wire, &[p.clone(), second.clone()], "round", 1000.0, 1003.0)
+                .unwrap();
+        assert!(!unknown.complete);
+        assert_eq!(unknown.confirmed_exited_count, 0);
+    }
+    wire["socket_samples"] = json!([wire["socket_samples"][1]]);
+    let missing = native::decode_sockets(&wire, &[p, second], "round", 1000.0, 1003.0).unwrap();
+    assert!(!missing.complete);
+    assert_eq!(missing.dropped["missing_target_sample"], 1);
+}
+
+struct ExitedRunner;
+impl ReadRunner for ExitedRunner {
+    fn run(
+        &self,
+        command: ReadCommand,
+        input: &[u8],
+        timeout: Duration,
+        limit: usize,
+    ) -> claude_watch_core::error::Result<Output> {
+        let is_socket = matches!(command, ReadCommand::Observer(ObserverAction::Sockets));
+        let mut output = FakeRunner.run(command, input, timeout, limit)?;
+        if is_socket {
+            let mut body: Value = serde_json::from_slice(&output.stdout).unwrap();
+            body["socket_samples"] = json!([{"pid":77,"state":"unknown","code":"process_exited"}]);
+            output.stdout = serde_json::to_vec(&body).unwrap();
+        }
+        Ok(output)
+    }
+}
+#[test]
+fn sampler_reports_confirmed_exit_without_claiming_incomplete_round() {
+    let home = std::env::temp_dir().join(format!("cw-exit-fixture-{}", Uuid::new_v4()));
+    fs::create_dir(&home).unwrap();
+    let mut sampler = Sampler::new(ExitedRunner, Paths::new(&home).unwrap());
+    let process = sampler.processes().unwrap();
+    let socket = sampler.sockets(&process).unwrap();
+    assert_eq!(socket.receipt["collector_state"], "empty");
+    assert_eq!(socket.receipt["confirmed_exited_count"], 1);
+    assert!(socket.flows.is_empty());
+    let projected = claude_watch_runtime::monitor_snapshot::connection_observation(
+        &socket.receipt,
+        socket.receipt["observed_at"].as_f64().unwrap(),
+    );
+    assert_eq!(projected["collectorState"], "empty");
+    assert_eq!(projected["confirmedExitedCount"], 1);
+    let mut invalid = socket.receipt.clone();
+    invalid["confirmed_exited_count"] = json!(2);
+    assert_eq!(
+        claude_watch_runtime::monitor_snapshot::connection_observation(
+            &invalid,
+            invalid["observed_at"].as_f64().unwrap()
+        )["collectorState"],
+        "unknown"
+    );
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn real_exited_child_does_not_hide_other_owned_socket() {
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Child(
+        std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap(),
+    );
+    let runner = SystemRunner::development().unwrap();
+    let observer = Observer { runner: &runner };
+    let inventory = observer.inventory().unwrap();
+    let ended = inventory
+        .processes
+        .get(&child.0.id())
+        .expect("owned child in inventory")
+        .identity
+        .clone();
+    let current = inventory
+        .processes
+        .get(&std::process::id())
+        .unwrap()
+        .identity
+        .clone();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = TcpStream::connect(address).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let result = observer
+        .sockets(&[ended, current.clone()], "ended-and-live")
+        .unwrap();
+    assert!(result.complete);
+    assert_eq!(result.confirmed_exited_count, 1);
+    assert!(result
+        .flows
+        .iter()
+        .any(|f| f.pid == current.pid && f.peer.0 == "127.0.0.1" && f.peer.1 == address.port()));
+    drop((client, server));
+}
+
+#[test]
+fn managed_codex_app_server_requires_exact_path_and_entry() {
+    use claude_watch_core::processes::{self, Target};
+    use std::collections::{BTreeMap, BTreeSet};
+    let home = Path::new("/fixture");
+    let trusted = TrustedCliPaths::default();
+    let mut daemon = identity();
+    daemon.executable = "/fixture/.codex/packages/app-server-daemon/releases/0.166.0-aarch64-apple-darwin/bin/codex".into();
+    let classify = |p: &Identity, args: Option<&[String]>| {
+        process_roots::classify(
+            RootEvidence {
+                identity: p,
+                arguments: args,
+                cwd: Some("/fixture"),
+                bundle_path: None,
+                bundle_id: None,
+            },
+            home,
+            &trusted,
+            |_| None,
+        )
+    };
+    assert_eq!(classify(&daemon, None), Classification::NeedArguments);
+    for args in [
+        vec!["codex", "app-server", "daemon"],
+        vec!["codex", "app-server", "--listen", "unix:///tmp/socket"],
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        assert_eq!(
+            classify(&daemon, Some(&args)),
+            Classification::Root(Kind::CodexCli)
+        );
+    }
+    for args in [
+        vec!["codex", "-e", "app-server daemon"],
+        vec!["codex", "app-server", "--listen"],
+        vec!["codex", "app-server", "other"],
+        vec!["other", "app-server", "daemon"],
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        assert_eq!(classify(&daemon, Some(&args)), Classification::NotTarget);
+    }
+    for path in [
+        "/fixture2/.codex/packages/app-server-daemon/releases/v/bin/codex",
+        "/fixture/.codex/packages/app-server-daemon/releases/v/extra/bin/codex",
+        "/fixture/.codex/packages/app-server-daemon/releases/v/bin/codex-other",
+        "/fixture/.codex/packages/app-server-daemon/releases/../bin/codex",
+    ] {
+        let mut near = daemon.clone();
+        near.executable = path.into();
+        assert_eq!(classify(&near, None), Classification::NotTarget);
+    }
+    let mut desktop = identity();
+    desktop.pid = 78;
+    desktop.executable = "/Applications/Codex.app/Contents/MacOS/Codex".into();
+    daemon.parent = desktop.pid;
+    let inventory = BTreeMap::from([(desktop.pid, desktop.clone()), (daemon.pid, daemon.clone())]);
+    let targets = processes::targets(
+        &inventory,
+        &[
+            Target {
+                identity: desktop,
+                kind: Kind::CodexMain,
+            },
+            Target {
+                identity: daemon,
+                kind: Kind::CodexCli,
+            },
+        ],
+        &[],
+        501,
+        &BTreeSet::new(),
+    );
+    assert_eq!(
+        targets.iter().find(|p| p.identity.pid == 77).unwrap().kind,
+        Kind::CodexChild
+    );
+}
+
+#[test]
+fn sampler_discovers_managed_codex_servers_with_bound_arguments() {
+    struct ManagedRunner {
+        home: PathBuf,
+    }
+    impl ReadRunner for ManagedRunner {
+        fn run(
+            &self,
+            command: ReadCommand,
+            input: &[u8],
+            _: Duration,
+            _: usize,
+        ) -> claude_watch_core::error::Result<Output> {
+            let now = native::now();
+            let mut front = identity();
+            front.pid = 71;
+            front.executable = "/opt/homebrew/Caskroom/codex/v/bin/codex".into();
+            let mut daemon = identity();
+            daemon.pid = 72;
+            daemon.executable = self
+                .home
+                .join(".codex/packages/app-server-daemon/releases/v/bin/codex")
+                .to_string_lossy()
+                .into_owned();
+            let mut server = daemon.clone();
+            server.pid = 73;
+            server.parent = 72;
+            let mut body =
+                json!({"schema":1,"status":"ok","uid":501,"started_at":now,"finished_at":now});
+            match command {
+                ReadCommand::Observer(ObserverAction::Inventory) => {
+                    body["state"] = json!("ok");
+                    body["truncated"] = json!(false);
+                    body["processes"] = json!([front, daemon, server]);
+                    body["unavailable"] = json!([]);
+                    body["exited"] = json!([]);
+                    body["requested_count"] = json!(3);
+                }
+                ReadCommand::Observer(ObserverAction::Arguments) => {
+                    let request: Value = serde_json::from_slice(input).unwrap();
+                    body["round_id"] = request["round_id"].clone();
+                    body["argument_prefixes"] = json!([
+                        {"pid":71,"state":"ok","identity":front,"arguments":["codex"],"cwd":"/fixture","truncated":false},
+                        {"pid":72,"state":"ok","identity":daemon,"arguments":["codex","app-server","daemon"],"cwd":"/fixture","truncated":false},
+                        {"pid":73,"state":"ok","identity":server,"arguments":["codex","app-server","--listen","unix:///tmp/socket"],"cwd":"/fixture","truncated":false}
+                    ]);
+                }
+                _ => panic!("unexpected command"),
+            }
+            Ok(Output {
+                status: 0,
+                stdout: serde_json::to_vec(&body).unwrap(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+    // The test home must match the executable's exact installation prefix.
+    let temp = std::env::temp_dir().join(format!("cw-managed-{}", Uuid::new_v4()));
+    fs::create_dir(&temp).unwrap();
+    // Process classification only reads managed home paths; fixture binaries need not exist.
+    let paths = Paths::new(&temp).unwrap();
+    let mut sampler = Sampler::new(
+        ManagedRunner {
+            home: paths.home.clone(),
+        },
+        paths,
+    );
+    let round = sampler.processes().unwrap();
+    assert!(round.complete);
+    for pid in [71, 72, 73] {
+        assert_eq!(
+            round
+                .targets
+                .iter()
+                .find(|t| t.identity.pid == pid)
+                .unwrap()
+                .kind,
+            Kind::CodexCli
+        );
+    }
+    fs::remove_dir_all(temp).unwrap();
 }

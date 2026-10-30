@@ -23,7 +23,8 @@ struct SessionBaselinePresentation {
         let date = reference?.observed_at.map { Date(timeIntervalSince1970: $0).formatted(date: .numeric, time: .shortened) }
         let saved = baseline.isEmpty ? "" : "基准：\(baseline)" + (date.map { " · 建立于 \($0)" } ?? "")
         if session.state == "locked" || session.phase == "locked" {
-            return .init(title: "会话保护已拦截", detail: [saved, session.reason?.detail ?? "恢复后仍需通过完整启动检查。"].filter { !$0.isEmpty }.joined(separator: "。"),
+            let display = evidence.presentation(at: now)
+            return .init(title: display.title, detail: [saved, display.detail].filter { !$0.isEmpty }.joined(separator: "。"),
                          symbol: "shield.slash", tone: "danger")
         }
         guard !evidence.isStale(at: now) else {

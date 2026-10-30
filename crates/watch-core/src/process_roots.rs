@@ -128,6 +128,21 @@ pub fn cli_kind(path: &str, home: &Path, trusted: &TrustedCliPaths) -> Option<Ki
     None
 }
 
+fn managed_codex_app_server(path: &str, home: &Path) -> bool {
+    let Some(path) = lexical_path(path, None) else {
+        return false;
+    };
+    let Some(home) = lexical_path(&home.to_string_lossy(), None) else {
+        return false;
+    };
+    let base = home.join(".codex/packages/app-server-daemon/releases");
+    let Ok(relative) = path.strip_prefix(base) else {
+        return false;
+    };
+    let parts: Vec<_> = relative.components().collect();
+    matches!(parts.as_slice(), [Component::Normal(_), Component::Normal(bin), Component::Normal(executable)] if *bin == "bin" && *executable == "codex")
+}
+
 pub fn classify(
     evidence: RootEvidence<'_>,
     home: &Path,
@@ -140,6 +155,23 @@ pub fn classify(
         return NotTarget;
     }
     let path = &identity.executable;
+    if managed_codex_app_server(path, home) {
+        let Some(args) = evidence.arguments else {
+            return NeedArguments;
+        };
+        return if args.first().is_some_and(|arg| basename(arg) == "codex")
+            && args.get(1).is_some_and(|arg| arg == "app-server")
+            && (args.get(2).is_some_and(|arg| arg == "daemon")
+                || (args.get(2).is_some_and(|arg| arg == "--listen")
+                    && args
+                        .get(3)
+                        .is_some_and(|arg| !arg.is_empty() && !arg.starts_with('-'))))
+        {
+            Root(Kind::CodexCli)
+        } else {
+            NotTarget
+        };
+    }
     if let Some(kind) = cli_kind(path, home, trusted) {
         return Root(kind);
     }

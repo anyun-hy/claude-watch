@@ -483,57 +483,35 @@ pub fn check(session: &Session, input: &CheckInput) -> Outcome {
         );
         return Outcome::session("risk", value.clone(), value.reason.clone());
     }
-    match input.identity {
-        Identity::Unavailable => {
-            return uncertain_with_terminal(
-                session,
-                "session_identity_unconfirmed",
-                "Claude 主进程身份暂未能复核",
-                "Claude 主进程身份连续未能复核",
-                now,
-            )
-        }
-        Identity::Changed => {
-            let value = lock(
-                session,
-                "session_identity_changed",
-                "运行中的 Claude 主进程不再匹配受控启动身份",
-                now,
-                None,
-                None,
-            );
-            return Outcome::session("risk", value.clone(), value.reason.clone());
-        }
-        Identity::Matches => {}
-    }
-    let Some(current) = Egress::fresh(&input.egress, now, GUARD_EGRESS_TTL) else {
-        let detail = input
-            .egress
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("未收到有效公网 IP 与国家");
-        return uncertain(
-            session,
-            "egress_unconfirmed",
-            &format!("运行中出口查询失败：{detail}"),
-            now,
-        );
-    };
+    let current = Egress::fresh(&input.egress, now, GUARD_EGRESS_TTL);
     let evidence = risk(&input.risk, now);
-    let cause = if current.country == "CN" {
-        Some(("egress_country_cn", "运行中实测 HTTP 出口为 CN"))
-    } else if current.ip != session.baseline.ip {
-        Some(("egress_ip_changed", "运行中实测 HTTP 出口 IP 已变化"))
-    } else {
-        None
-    };
-    if let Some((code, detail)) = cause {
-        let baseline = session.baseline.clone();
-        let value = lock(session, code, detail, now, Some(current.clone()), None);
-        let mut out = Outcome::session("risk", value.clone(), value.reason.clone());
-        out.baseline = Some(baseline);
-        out.current = Some(current);
-        return out;
+    if let Some(exit) = current.as_ref() {
+        let cause = if exit.country == "CN" {
+            Some(("egress_country_cn", "运行中实测 HTTP 出口为 CN"))
+        } else if exit.ip != session.baseline.ip {
+            Some(("egress_ip_changed", "运行中实测 HTTP 出口 IP 已变化"))
+        } else {
+            None
+        };
+        if let Some((code, detail)) = cause {
+            let baseline = session.baseline.clone();
+            let value = lock(session, code, detail, now, Some(exit.clone()), None);
+            let mut out = Outcome::session("risk", value.clone(), value.reason.clone());
+            out.baseline = Some(baseline);
+            out.current = Some(exit.clone());
+            return out;
+        }
+    }
+    if input.identity == Identity::Changed {
+        let value = lock(
+            session,
+            "session_identity_changed",
+            "运行中的 Claude 主进程不再匹配受控启动身份",
+            now,
+            None,
+            None,
+        );
+        return Outcome::session("risk", value.clone(), value.reason.clone());
     }
     if evidence.get("state").and_then(Value::as_str) == Some("risk") {
         let cause = evidence.get("reason");
@@ -551,15 +529,37 @@ pub fn check(session: &Session, input: &CheckInput) -> Outcome {
             code,
             detail,
             now,
-            Some(current.clone()),
+            current.clone(),
             Some(evidence.clone()),
         );
         let mut out = Outcome::session("risk", value.clone(), value.reason.clone());
         out.baseline = Some(baseline);
-        out.current = Some(current);
+        out.current = current;
         out.risk_evidence = Some(evidence);
         return out;
     }
+    if input.identity == Identity::Unavailable {
+        return uncertain_with_terminal(
+            session,
+            "session_identity_unconfirmed",
+            "Claude 主进程身份暂未能复核",
+            "Claude 主进程身份连续未能复核",
+            now,
+        );
+    }
+    let Some(current) = current else {
+        let detail = input
+            .egress
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("未收到有效公网 IP 与国家");
+        return uncertain(
+            session,
+            "egress_unconfirmed",
+            &format!("运行中出口查询失败：{detail}"),
+            now,
+        );
+    };
     if evidence.get("state").and_then(Value::as_str) == Some("safe") {
         session.risk_evidence = evidence.clone();
     }
@@ -624,5 +624,5 @@ pub fn status(session: &Session, now: f64, running: Option<bool>) -> Value {
         "unknown"
     };
     json!({"state":state,"phase":phase,"baseline":session.baseline,"current":session.last_check,
-        "reason":session.reason.as_ref().or(session.last_reason.as_ref()),"risk_evidence":session.risk_evidence,"locked_at":session.locked_at})
+        "reason":session.reason.as_ref().or(session.last_reason.as_ref()),"risk_evidence":session.risk_evidence,"locked_at":session.locked_at,"sampled_at":session.extra.get("guard_checked_at"),"valid_until":session.last_check.as_ref().map(|v| v.observed_at + GUARD_EGRESS_TTL)})
 }

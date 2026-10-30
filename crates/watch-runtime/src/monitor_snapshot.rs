@@ -71,7 +71,15 @@ pub fn connection_observation(raw: &Value, observed: f64) -> Value {
     else {
         return bad("连接采样计数无效");
     };
-    if accepted > parsed
+    let exited = match raw.get("confirmed_exited_count") {
+        None => 0,
+        Some(value) => match value.as_u64() {
+            Some(value) if value <= targets => value,
+            _ => return bad("已退出目标计数无效"),
+        },
+    };
+    if (targets > 0 && exited == targets && (parsed > 0 || accepted > 0))
+        || accepted > parsed
         || correlated.saturating_add(unknown) > accepted
         || (targets == 0 && parsed + accepted + correlated + unknown > 0)
         || (state == "no_targets" && targets != 0)
@@ -94,7 +102,7 @@ pub fn connection_observation(raw: &Value, observed: f64) -> Value {
         state
     };
     json!({"schema":1,"roundID":round,"observedAt":time,"collectorState":state,"targetCount":targets,"parsedCount":parsed,"acceptedCount":accepted,"correlatedCount":correlated,"unconfirmedCount":unknown,
-        "dropped":dropped,"detail":raw["detail"].as_str().unwrap_or(""),"uiFilteredCount":0,"uiDropped":{}})
+        "confirmedExitedCount":exited,"dropped":dropped,"detail":raw["detail"].as_str().unwrap_or(""),"uiFilteredCount":0,"uiDropped":{}})
 }
 pub fn proxy(raw: &Value) -> Option<Value> {
     if raw["schema"] != 1 || !raw["entry"].is_object() || !raw["api"].is_object() {

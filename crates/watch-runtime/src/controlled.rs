@@ -69,10 +69,14 @@ pub struct CliOutcome {
 }
 pub struct Controller {
     pub storage: StateStore,
+    failed_persistence_session: std::sync::Mutex<Option<String>>,
 }
 impl Controller {
     pub fn new(storage: StateStore) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            failed_persistence_session: std::sync::Mutex::new(None),
+        }
     }
     fn record_launch(&self, target: LaunchTarget, pid: u32, now: f64) -> Option<Value> {
         crate::events::EventStore::new(self.storage.clone())
@@ -409,15 +413,72 @@ impl Controller {
         let now = system.now();
         let mut receipt = json!({"status":"unknown","action":"observe","time":now,"policy":crate::config_store::policy_digest(&config.value()?)?,"guard_policy_v1":crate::config_store::guard_policy_digest(&config)?});
         let result: Result<()> = (|| {
+            let desktops = system.desktops()?;
+            let current = sessions.load(system.now())?;
+            let id = current.as_ref().map(|s| s.session_id.clone());
+            let latched = {
+                let mut remembered = self.failed_persistence_session.lock().map_err(|_| {
+                    CoreError::new("guard_memory_unavailable", "保护内存状态不可用")
+                })?;
+                if remembered.as_ref() != id.as_ref() {
+                    *remembered = None;
+                }
+                remembered.is_some()
+            };
+            if latched {
+                receipt["persistence_error"] = json!("state_io_failed");
+                receipt["status"] = json!("protection_triggered");
+                receipt["session_id"] = json!(id);
+                receipt["session_guard"] = json!({"state":"locked", "phase":"locked", "reason":{"code":"egress_risk_persist_failed", "detail":"出口风险已确认，会话记录写入失败"}});
+                if desktops.is_empty() {
+                    receipt["stop_state"] = json!("confirmed");
+                } else {
+                    match sessions
+                        .close_if_current(id.as_deref(), system.now(), || system.quit_desktop())
+                    {
+                        Ok(Some(())) => {
+                            receipt["action"] = json!("close-desktop");
+                            receipt["stop_state"] = json!("confirmed");
+                        }
+                        Ok(None) => receipt["stop_state"] = json!("session_changed"),
+                        Err(error) => {
+                            receipt["stop_state"] = json!("failed");
+                            receipt["stop_error"] = json!(error.code);
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            if !desktops.is_empty()
+                && current
+                    .as_ref()
+                    .is_some_and(|s| s.state == session::Phase::Locked)
+            {
+                receipt["status"] = json!("protection_triggered");
+                receipt["session_id"] = json!(id);
+                receipt["session_guard"] =
+                    session::status(current.as_ref().unwrap(), system.now(), Some(true));
+                match sessions
+                    .close_if_current(id.as_deref(), system.now(), || system.quit_desktop())
+                {
+                    Ok(Some(())) => {
+                        receipt["action"] = json!("close-desktop");
+                        receipt["stop_state"] = json!("confirmed");
+                    }
+                    Ok(None) => receipt["stop_state"] = json!("session_changed"),
+                    Err(error) => {
+                        receipt["stop_state"] = json!("failed");
+                        receipt["stop_error"] = json!(error.code);
+                    }
+                }
+                return Ok(());
+            }
             let local = system.local_guard()?;
             let guard_backend = match local["guard_backend_healthy"].as_bool() {
                 Some(value) => value,
                 None => system.guard_backend_healthy()?,
             };
             let healthy = local["proxy"] == "ok" && local["tun"] == "ok" && guard_backend;
-            let desktops = system.desktops()?;
-            let current = sessions.load(now)?;
-            let id = current.as_ref().map(|s| s.session_id.clone());
             receipt["status"] = json!(if healthy { "ok" } else { "degraded" });
             if desktops.is_empty() {
                 receipt["session_guard"] = current
@@ -433,14 +494,6 @@ impl Controller {
                     "proxy_or_tun_failed",
                     "代理或TUN已确认失效",
                     true,
-                )?
-            } else if local["proxy"] != "ok" || local["tun"] != "ok" {
-                sessions.mark_failure(
-                    id.as_deref(),
-                    now,
-                    "proxy_or_tun_unconfirmed",
-                    "代理或TUN连续未能确认",
-                    false,
                 )?
             } else {
                 let launcher_live = current
@@ -459,27 +512,76 @@ impl Controller {
                     } else {
                         Identity::Matches
                     };
-                sessions.check_verified(
+                let egress = system.egress();
+                let checked_at = system.now();
+                let confirmed_exit = current
+                    .as_ref()
+                    .and_then(|s| {
+                        session::Egress::fresh(&egress, checked_at, session::GUARD_EGRESS_TTL)
+                            .map(|e| e.country == "CN" || e.ip != s.baseline.ip)
+                    })
+                    .unwrap_or(false);
+                let local_unknown = local["proxy"] != "ok" || local["tun"] != "ok";
+                match sessions.check_verified_local(
                     &receipts,
                     id.as_deref(),
-                    now,
+                    checked_at,
                     launcher_live,
                     identity,
-                    system.egress(),
-                )?
+                    egress,
+                    local_unknown,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) if confirmed_exit && error.code == "state_io_failed" => {
+                        receipt["status"] = json!("degraded");
+                        receipt["session_id"] = json!(id);
+                        receipt["session_guard"] = json!({"state":"risk", "reason":{"code":"egress_risk_persist_failed", "detail":"出口风险已确认，会话记录写入失败"}});
+                        receipt["persistence_error"] = json!(error.code);
+                        *self.failed_persistence_session.lock().map_err(|_| {
+                            CoreError::new("guard_memory_unavailable", "保护内存状态不可用")
+                        })? = id.clone();
+                        match sessions.close_if_current_before(
+                            id.as_deref(),
+                            system.now(),
+                            checked_at,
+                            || system.quit_desktop(),
+                        ) {
+                            Ok(Some(())) => {
+                                receipt["action"] = json!("close-desktop");
+                                receipt["stop_state"] = json!("confirmed");
+                            }
+                            Ok(None) => {
+                                *self.failed_persistence_session.lock().map_err(|_| {
+                                    CoreError::new("guard_memory_unavailable", "保护内存状态不可用")
+                                })? = None;
+                                receipt["stop_state"] = json!("session_changed");
+                            }
+                            Err(stop_error) => {
+                                receipt["stop_state"] = json!("failed");
+                                receipt["stop_error"] = json!(stop_error.code);
+                            }
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
             };
+            receipt["session_id"] = json!(id);
             receipt["session_guard"] = serde_json::to_value(&outcome)
                 .map_err(|_| CoreError::new("guard_encoding_failed", "保护状态无法编码"))?;
             if matches!(outcome.state.as_str(), "risk" | "locked") {
                 let expected = outcome.session.as_ref().map(|s| s.session_id.as_str());
-                if sessions
-                    .close_if_current(expected, now, || system.quit_desktop())?
-                    .is_some()
-                {
-                    receipt["action"] = json!("close-desktop");
-                    self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"),&json!({"stopped_at":system.now(),"session_id":expected,"reason":outcome.reason}))?;
-                } else {
-                    receipt["session_guard"] = json!({"state":"unknown","reason":{"code":"session_changed","detail":"已建立新受控会话，未退出Claude"}});
+                match sessions.close_if_current(expected, system.now(), || system.quit_desktop()) {
+                    Ok(Some(())) => {
+                        receipt["action"] = json!("close-desktop");
+                        receipt["stop_state"] = json!("confirmed");
+                        self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"), &json!({"stopped_at":system.now(),"session_id":expected,"reason":outcome.reason}))?;
+                    }
+                    Ok(None) => receipt["stop_state"] = json!("session_changed"),
+                    Err(error) => {
+                        receipt["stop_state"] = json!("failed");
+                        receipt["stop_error"] = json!(error.code);
+                    }
                 }
             }
             Ok(())
@@ -511,14 +613,63 @@ impl Controller {
             Err(_) => {
                 receipt["session_guard"] = json!({"state":"risk","reason":{"code":"session_state_invalid","detail":"会话记录无法验证，未允许无保护运行"}});
                 match sessions.close_if_unreadable(system.now(), || system.quit_desktop()) {
-                    Ok(Some(_)) => receipt["action"] = json!("close-desktop"),
-                    Err(error) => receipt["stop_error"] = json!(error.code),
+                    Ok(Some(_)) => {
+                        receipt["action"] = json!("close-desktop");
+                        receipt["stop_state"] = json!("confirmed");
+                    }
+                    Err(error) => {
+                        receipt["stop_error"] = json!(error.code);
+                        receipt["stop_state"] = json!("failed");
+                    }
                     _ => {}
                 }
                 return Ok(());
             }
         };
         let id = current.as_ref().map(|s| s.session_id.clone());
+        receipt["session_id"] = json!(id);
+        let latched = self
+            .failed_persistence_session
+            .lock()
+            .map_err(|_| CoreError::new("guard_memory_unavailable", "保护内存状态不可用"))?
+            .as_ref()
+            .is_some_and(|v| Some(v) == id.as_ref());
+        if latched {
+            receipt["status"] = json!("protection_triggered");
+            receipt["persistence_error"] = json!("state_io_failed");
+            receipt["session_guard"] = json!({"state":"locked", "phase":"locked", "reason":{"code":"egress_risk_persist_failed", "detail":"出口风险已确认，会话记录写入失败"}});
+            match sessions.close_if_current(id.as_deref(), system.now(), || system.quit_desktop()) {
+                Ok(Some(())) => {
+                    receipt["action"] = json!("close-desktop");
+                    receipt["stop_state"] = json!("confirmed");
+                }
+                Ok(None) => receipt["stop_state"] = json!("session_changed"),
+                Err(error) => {
+                    receipt["stop_error"] = json!(error.code);
+                    receipt["stop_state"] = json!("failed");
+                }
+            }
+            return Ok(());
+        }
+        if let Some(value) = current
+            .as_ref()
+            .filter(|s| s.state == session::Phase::Locked)
+        {
+            receipt["status"] = json!("protection_triggered");
+            receipt["session_guard"] = session::status(value, system.now(), Some(true));
+            match sessions.close_if_current(id.as_deref(), system.now(), || system.quit_desktop()) {
+                Ok(Some(())) => {
+                    receipt["action"] = json!("close-desktop");
+                    receipt["stop_state"] = json!("confirmed");
+                }
+                Ok(None) => receipt["stop_state"] = json!("session_changed"),
+                Err(error) => {
+                    receipt["stop_error"] = json!(error.code);
+                    receipt["stop_state"] = json!("failed");
+                }
+            }
+            return Ok(());
+        }
         match sessions.mark_failure(
             id.as_deref(),
             system.now(),
@@ -533,8 +684,14 @@ impl Controller {
                     match sessions
                         .close_if_current(id.as_deref(), system.now(), || system.quit_desktop())
                     {
-                        Ok(Some(_)) => receipt["action"] = json!("close-desktop"),
-                        Err(error) => receipt["stop_error"] = json!(error.code),
+                        Ok(Some(_)) => {
+                            receipt["action"] = json!("close-desktop");
+                            receipt["stop_state"] = json!("confirmed");
+                        }
+                        Err(error) => {
+                            receipt["stop_error"] = json!(error.code);
+                            receipt["stop_state"] = json!("failed");
+                        }
                         _ => {}
                     }
                 }

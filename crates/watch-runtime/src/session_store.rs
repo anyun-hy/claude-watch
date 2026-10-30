@@ -108,11 +108,20 @@ impl SessionStore {
         Ok(value)
     }
     /// A stale probe may never overwrite or close a newer controlled session.
+    #[cfg(test)]
     fn apply_check(&self, id: Option<&str>, input: &CheckInput) -> Result<Outcome> {
         if !input.now.is_finite() || input.now <= 0.0 {
             return Err(CoreError::new("clock_unavailable", "无法核对检测时间"));
         }
         let _lock = self.storage.lock("session-guard", None)?;
+        self.apply_check_locked(id, input, false)
+    }
+    fn apply_check_locked(
+        &self,
+        id: Option<&str>,
+        input: &CheckInput,
+        local_unknown: bool,
+    ) -> Result<Outcome> {
         let current = self.load(input.now)?;
         if current.as_ref().map(|v| v.session_id.as_str()) != id {
             return Ok(Outcome::changed(input.now));
@@ -131,7 +140,17 @@ impl SessionStore {
                 "更晚的会话检测已保存，未用迟到结果覆盖",
             ));
         }
-        let mut outcome = session::check(&current, input);
+        let checked = session::check(&current, input);
+        let mut outcome = if local_unknown && !matches!(checked.state.as_str(), "risk" | "locked") {
+            session::uncertain(
+                current.clone(),
+                "proxy_or_tun_unconfirmed",
+                "代理或TUN连续未能确认",
+                input.now,
+            )
+        } else {
+            checked
+        };
         if let Some(value) = &outcome.session {
             let mut value = value.clone();
             value
@@ -155,12 +174,40 @@ impl SessionStore {
         identity: claude_watch_core::session::Identity,
         egress: Value,
     ) -> Result<Outcome> {
-        let context = self
+        self.check_verified_local(receipts, id, now, launcher_live, identity, egress, false)
+    }
+    pub fn check_verified_local(
+        &self,
+        receipts: &crate::receipt_store::ReceiptStore,
+        id: Option<&str>,
+        now: f64,
+        launcher_live: bool,
+        identity: claude_watch_core::session::Identity,
+        egress: Value,
+        local_unknown: bool,
+    ) -> Result<Outcome> {
+        if !now.is_finite() || now <= 0.0 {
+            return Err(CoreError::new("clock_unavailable", "无法核对检测时间"));
+        }
+        let _lock = self.storage.lock("session-guard", None)?;
+        let current = self
             .load(now)?
-            .and_then(|v| (v.session_id.as_str() == id.unwrap_or("")).then_some(v.context_id))
-            .unwrap_or_default();
-        let risk = receipts.session_risk(&context, egress.get("ip").and_then(Value::as_str), now);
-        self.apply_check(
+            .filter(|v| Some(v.session_id.as_str()) == id);
+        let immediate = current.as_ref().is_some_and(|s| {
+            s.state == Phase::Locked
+                || session::Egress::fresh(&egress, now, session::GUARD_EGRESS_TTL)
+                    .is_some_and(|e| e.country == "CN" || e.ip != s.baseline.ip)
+        }) || identity == claude_watch_core::session::Identity::Changed;
+        let risk = if immediate {
+            json!({"state":"unknown"})
+        } else {
+            let context = current
+                .as_ref()
+                .map(|s| s.context_id.as_str())
+                .unwrap_or_default();
+            receipts.session_risk(context, egress.get("ip").and_then(Value::as_str), now)
+        };
+        self.apply_check_locked(
             id,
             &CheckInput {
                 now,
@@ -169,6 +216,7 @@ impl SessionStore {
                 egress,
                 risk,
             },
+            local_unknown,
         )
     }
     pub fn close_if_current<T>(
@@ -179,6 +227,30 @@ impl SessionStore {
     ) -> Result<Option<T>> {
         let _lock = self.storage.lock("session-guard", None)?;
         if self.load(now)?.as_ref().map(|v| v.session_id.as_str()) != id {
+            return Ok(None);
+        }
+        closer().map(Some)
+    }
+    /// A failed write must not allow a superseded probe to stop a newer observation.
+    pub fn close_if_current_before<T>(
+        &self,
+        id: Option<&str>,
+        now: f64,
+        checked_at: f64,
+        closer: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let _lock = self.storage.lock("session-guard", None)?;
+        let current = self.load(now)?;
+        if current.as_ref().map(|v| v.session_id.as_str()) != id
+            || current.as_ref().is_some_and(|v| {
+                v.extra
+                    .get("guard_checked_at")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|t| {
+                        t > checked_at || (t == checked_at && v.state != Phase::Locked)
+                    })
+            })
+        {
             return Ok(None);
         }
         closer().map(Some)
@@ -218,7 +290,18 @@ impl SessionStore {
         {
             return Err(CoreError::new("superseded_check", "更晚的会话检测已经保存"));
         }
-        let mut outcome = if confirmed {
+        let mut outcome = if current.state == Phase::Locked {
+            session::check(
+                &current,
+                &CheckInput {
+                    now,
+                    launcher_live: false,
+                    identity: claude_watch_core::session::Identity::Unavailable,
+                    egress: Value::Null,
+                    risk: Value::Null,
+                },
+            )
+        } else if confirmed {
             let locked = session::lock(current, code, detail, now, None, None);
             let reason = locked.reason.clone();
             Outcome {

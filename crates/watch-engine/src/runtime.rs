@@ -121,6 +121,34 @@ pub(crate) fn process_component() -> Result<PathBuf> {
         ))
     }
 }
+fn project_session_heartbeat(
+    status: &mut Value,
+    session_id: &str,
+    running: Option<bool>,
+    heartbeat: &Value,
+) {
+    let matching = heartbeat["session_id"].as_str() == Some(session_id);
+    let applicable = matching && heartbeat["stop_state"] != "session_changed";
+    if applicable
+        && heartbeat["persistence_error"] == "state_io_failed"
+        && heartbeat["session_guard"]["reason"]["code"] == "egress_risk_persist_failed"
+    {
+        status["state"] = json!("locked");
+        status["phase"] = json!("locked");
+        status["reason"] = heartbeat["session_guard"]["reason"].clone();
+    }
+    if status["state"] == "locked" {
+        if running == Some(false) {
+            status["stop_state"] = json!("confirmed");
+        } else if applicable {
+            if heartbeat["stop_state"] != "confirmed" {
+                status["stop_state"] = heartbeat["stop_state"].clone();
+                status["stop_error"] = heartbeat["stop_error"].clone();
+            }
+        }
+    }
+}
+
 pub fn session_view(host: &Host) -> Value {
     let session = SessionStore::new(host.storage.clone()).load(native::now());
     let running = NativeDesktop::new(
@@ -132,7 +160,18 @@ pub fn session_view(host: &Host) -> Value {
     .and_then(|d| d.desktops().ok())
     .map(|v| !v.is_empty());
     match session {
-        Ok(Some(s)) => claude_watch_core::session::status(&s, native::now(), running),
+        Ok(Some(s)) => {
+            let mut status = claude_watch_core::session::status(&s, native::now(), running);
+            let heartbeat = host
+                .storage
+                .read_json(
+                    &host.storage.paths.base().join("guard-heartbeat.json"),
+                    Value::Null,
+                )
+                .unwrap_or(Value::Null);
+            project_session_heartbeat(&mut status, &s.session_id, running, &heartbeat);
+            status
+        }
         Ok(None) => {
             json!({"state":if running==Some(false){"idle"}else{"missing"},"detail":if running==Some(false){"后台保护待命，无需操作"}else{"尚无受控启动会话"}})
         }
@@ -526,5 +565,57 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
         Ok(Some(OperationOutcome::Receipt(
             controller.guard_tick(&mut desktop_runtime)?,
         )))
+    }
+}
+
+#[cfg(test)]
+mod session_heartbeat_projection_tests {
+    use super::*;
+    fn heartbeat(id: &str, stop: &str) -> Value {
+        json!({"session_id":id,"persistence_error":"state_io_failed", "stop_state":stop,
+            "stop_error":"quit_failed", "session_guard":{"reason":{"code":"egress_risk_persist_failed","detail":"risk"}}})
+    }
+    #[test]
+    fn projection_binds_risk_and_stop_to_current_session_and_observation() {
+        let safe = json!({"state":"safe"});
+        let mut other = safe.clone();
+        project_session_heartbeat(&mut other, "new", Some(true), &heartbeat("old", "failed"));
+        assert_eq!(other, safe);
+        let mut superseded = safe.clone();
+        project_session_heartbeat(
+            &mut superseded,
+            "same",
+            Some(true),
+            &heartbeat("same", "session_changed"),
+        );
+        assert_eq!(superseded, safe);
+        let mut failed = safe.clone();
+        project_session_heartbeat(
+            &mut failed,
+            "same",
+            Some(true),
+            &heartbeat("same", "failed"),
+        );
+        assert_eq!(failed["state"], "locked");
+        assert_eq!(failed["stop_state"], "failed");
+        for running in [Some(true), None] {
+            let mut current = safe.clone();
+            project_session_heartbeat(
+                &mut current,
+                "same",
+                running,
+                &heartbeat("same", "confirmed"),
+            );
+            assert_eq!(current["state"], "locked");
+            assert!(current.get("stop_state").is_none());
+        }
+        let mut stopped = safe.clone();
+        project_session_heartbeat(
+            &mut stopped,
+            "same",
+            Some(false),
+            &heartbeat("same", "confirmed"),
+        );
+        assert_eq!(stopped["stop_state"], "confirmed");
     }
 }

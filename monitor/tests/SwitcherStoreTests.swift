@@ -43,9 +43,10 @@ struct SwitcherStoreTests {
         var service = BackgroundServiceReceipt(observed_at: 1000, backend_healthy: true, update_source_ready: false,
             guard_backend_healthy: true, backend_sampling_state: "complete",
             services: [.init(id: "guard", title: "保护", state: "running", detail: "", source: "fixture", desired: true, last_checked: 1000)],
-            policy_issues: [], session_guard: .init(state: "safe", phase: "active", baseline: reference, current: reference))
+            policy_issues: [], session_guard: .init(state: "safe", phase: "active", baseline: reference, current: reference, sampled_at: 1000, valid_until: 1010))
         expect(SessionBaselinePresentation.make(service, now: 1005).tone == "success", "automatic session baseline drives overview without legacy file")
         expect(SessionBaselinePresentation.make(service, now: 1036).title == "上次会话基准", "old receipt cannot present current safety")
+        expect(SessionBaselinePresentation.make(service, now: 1011).tone != "success", "active safety expires at guard deadline")
         expect(SessionBaselinePresentation.make(service, error: "read failed", now: 1005).tone != "success", "read failure preserves history without green safety")
         service.session_guard = .init(state: "idle", phase: "active", baseline: reference, current: reference)
         expect(SessionBaselinePresentation.make(service, now: 1005).title == "后台保护待命", "closed app displays standby with session history")
@@ -69,7 +70,7 @@ struct SwitcherStoreTests {
         expect(SessionProtectionEvidence.fromBackground(backgroundReceipt(at: 1000, sampling: true, guardReady: nil))?.backendReady == true &&
                SessionProtectionEvidence.fromBackground(backgroundReceipt(at: 1000, sampling: false, guardReady: nil))?.backendReady == false,
                "older receipts without guard-specific health use the general health fallback")
-        expect(SessionProtectionEvidence.fromBackground(partial, error: "read failed")?.presentation(at: 1005).title == "正在更新保护状态" &&
+        expect(SessionProtectionEvidence.fromBackground(partial, error: "read failed")?.presentation(at: 1005).title == "保护状态读取失败" &&
                idle.presentation(at: 999).title == "正在更新保护状态", "read errors and future-dated evidence are not shown as current")
         let received = SwitcherStore(isFixture: true)
         let sampleTime = Date().timeIntervalSince1970
@@ -85,9 +86,9 @@ struct SwitcherStoreTests {
         received.publishBackgroundForFixture(backgroundReceipt(at: sampleTime, sampling: false, guardReady: true))
         expect(received.sessionDisplay.title == SessionProtectionPresentation.idleTitle, "valid observation can recover after a future-dated receipt")
         expect(SessionProtectionPresentation.make(service.session_guard!, backendReady: false).tone == "warning", "disabled or failed backend is not mislabeled healthy idle")
-        let active = SessionProtectionEvidence(session: .init(state: "safe"), observedAt: 990, backendReady: true)
-        expect(SessionProtectionEvidence.latest([idle, active])?.session.state == "idle", "older active sample cannot overwrite newer closed-app observation")
-        expect(SessionProtectionEvidence.latest([idle, .init(session: .init(state: "safe"), observedAt: 1010, backendReady: true)])?.session.state == "safe", "new controlled run replaces idle display")
+        var closed = backgroundReceipt(at: 1010, sampling: true, guardReady: true)
+        closed.session_guard = .init(state: "idle", sampled_at: 1)
+        expect(SessionProtectionEvidence.fromBackground(closed)!.presentation(at: 1015).title == SessionProtectionPresentation.idleTitle, "fresh process observation keeps idle current despite old session sample")
         let locked = SessionGuardStatus(state: "locked", phase: "locked", reason: .init(code: "dns_risk", detail: "DNS 风险"))
         expect(SessionProtectionPresentation.make(locked, stale: true, backendReady: false).tone == "danger", "latched real risk wins over stale or missing backend state")
         expect(SessionProtectionPresentation.make(.init(state: "idle", phase: "locked")).tone == "danger", "contradictory idle cannot mask locked phase")
@@ -109,7 +110,21 @@ struct SwitcherStoreTests {
         sharedEnvironment.observed_at = 1020
         sharedEnvironment.session_guard = locked
         shared.loadReviewReceipts(sharedEnvironment, background: service)
-        expect(shared.sessionDisplay.tone == "danger", "newer risk is never hidden behind an older idle receipt")
+        expect(shared.sessionDisplay.tone != "danger", "environment copy cannot override authoritative background session")
+        service.session_guard = locked
+        sharedEnvironment.session_guard = .init(state: "safe")
+        sharedEnvironment.observed_at = 1030
+        shared.loadReviewReceipts(sharedEnvironment, background: service)
+        expect(shared.sessionDisplay.tone == "danger", "background locked session wins over environment copy")
+        var oldActive = backgroundReceipt(at: 2000, sampling: true, guardReady: true)
+        oldActive.session_guard = .init(state: "safe", sampled_at: 1000)
+        expect(SessionProtectionEvidence.fromBackground(oldActive)!.presentation(at: 2001).tone != "success", "status read cannot renew old active evidence")
+        expect(SessionProtectionEvidence.fromBackground(oldActive, error: "read failed")!.presentation(at: 2001).title == "保护状态读取失败", "read failure remains explicit")
+        for (state, text) in [("failed", "退出失败"), ("confirmed", "已确认退出"), ("waiting", "等待退出确认")] {
+            let value = SessionGuardStatus(state: "locked", phase: "locked", stop_state: state)
+            let evidence = SessionProtectionEvidence(session: value, observedAt: 1000, backendReady: true)
+            expect(evidence.presentation(at: 1005).detail.contains(text) && SessionBaselinePresentation.make(evidence: evidence, now: 1005).detail.contains(text), "stop result agrees in both presentations")
+        }
         service.session_guard = .init(state: "locked", phase: "locked", baseline: reference, current: reference)
         expect(SessionBaselinePresentation.make(service, now: 5000).tone == "danger", "latched stop remains visible even with old receipt")
         service.session_guard = .init(state: "missing")

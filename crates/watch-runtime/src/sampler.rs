@@ -300,7 +300,7 @@ impl<R: ReadRunner> Sampler<R> {
         if round.targets.is_empty() {
             return Ok(SocketRound {
                 flows: Vec::new(),
-                receipt: json!({"schema":1,"round_id":round.id,"observed_at":native::now(),"collector_state":if round.complete{"no_targets"}else{"unknown"},"target_count":0,"parsed_count":0,"accepted_count":0,"correlated_count":0,"unconfirmed_count":0,"dropped":{},"detail":"没有已确认的受监控目标；未读取套接字"}),
+                receipt: json!({"schema":1,"round_id":round.id,"observed_at":native::now(),"collector_state":if round.complete{"no_targets"}else{"unknown"},"target_count":0,"confirmed_exited_count":0,"parsed_count":0,"accepted_count":0,"correlated_count":0,"unconfirmed_count":0,"dropped":{},"detail":"没有已确认的受监控目标；未读取套接字"}),
             });
         }
         let ids: Vec<_> = round.targets.iter().map(|p| p.identity.clone()).collect();
@@ -333,7 +333,7 @@ impl<R: ReadRunner> Sampler<R> {
             "ok"
         };
         let receipt = json!({"schema":1,"round_id":round.id,"observed_at":result.observed_at,"collector_state":state,"target_count":ids.len(),"parsed_count":result.parsed_count,"accepted_count":result.accepted_count,
-            "correlated_count":0,"unconfirmed_count":0,"dropped":result.dropped,"detail":if complete{"已按进程启动身份读取本轮可见套接字；空样本不证明没有网络活动"}else{"本轮部分原生采样未完成；未判定为网络变化"}});
+            "correlated_count":0,"unconfirmed_count":0,"confirmed_exited_count":result.confirmed_exited_count,"dropped":result.dropped,"detail":if complete{"已按进程启动身份读取本轮可见套接字；空样本不证明没有网络活动"}else{"本轮部分原生采样未完成；未判定为网络变化"}});
         Ok(SocketRound { flows, receipt })
     }
     pub fn tag_report(
