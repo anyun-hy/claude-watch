@@ -82,6 +82,12 @@ pub fn current_values(network: &Value, local: &Value) -> Value {
 /// Fail closed before any online candidate creation.  TAG evidence must bind
 /// the private listener to a currently observed owner and its control API.
 pub fn require_transport(local: &Value) -> Result<()> {
+    if text(local, "proxy") != "ok" {
+        return Err(err(
+            "proxy_unverified",
+            "代理身份或本轮必要证据未确认；未联网",
+        ));
+    }
     if text(local, "mode") == "tag" {
         let entry = &local["tag"]["entry"];
         let api = &local["tag"]["api"];
@@ -118,14 +124,20 @@ pub fn require_transport(local: &Value) -> Result<()> {
                 "监听者与当前运行进程身份不一致；未联网",
             ));
         }
-    } else if text(local, "proxy") != "ok" {
+    }
+    if text(local, "tun") != "ok" {
+        return Err(err("proxy_unverified", "TUN 网卡或路由未确认；未联网"));
+    }
+    // The same native daemon liveness used by service-status and first-run
+    // step 2: fresh heartbeat + matching PID/start identity + launchd/worker
+    // identity + native runtime path. Complete monitoring of unrelated sockets
+    // is a separate fact and cannot veto this transport-specific prerequisite.
+    // Missing/unknown liveness fails closed; strict sampling is never a fallback.
+    if local["guard_backend_healthy"] != true {
         return Err(err(
             "proxy_unverified",
-            "代理身份不完整或有多个候选，请先明确选择客户端",
+            "采集后台的原生进程身份或有效心跳未确认；未联网",
         ));
-    }
-    if text(local, "tun") != "ok" || local["backend_healthy"] == false {
-        return Err(err("proxy_unverified", "TUN 或保护后台健康未确认；未联网"));
     }
     Ok(())
 }
@@ -181,6 +193,7 @@ pub fn detect<S: OnboardingSystem>(
     .load()?;
     let after_net = system.network()?;
     let after = system.local(&after_cfg)?;
+    require_transport(&after)?;
     if policy_digest(&cfg.value()?)? != policy_digest(&after_cfg.value()?)?
         || context(&net, &local)? != context(&after_net, &after)?
     {

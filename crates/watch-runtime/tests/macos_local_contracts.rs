@@ -91,6 +91,8 @@ fn guard_liveness_survives_a_degraded_monitoring_round_without_claiming_complete
     assert!(!claude_watch_runtime::services::ServiceSystem::backend_healthy(&host));
     assert!(claude_watch_runtime::services::ServiceSystem::guard_backend_healthy(&host));
     assert!(claude_watch_runtime::services::ServiceSystem::guard_status(&host, &config).unwrap());
+    assert!(claude_watch_runtime::onboarding::require_transport(&local).is_ok(),
+        "initialization must use the same native liveness as service-status despite monitoring incompleteness");
 }
 struct NoNetwork;
 impl Transport for NoNetwork {
@@ -222,6 +224,39 @@ fn path_mismatch_never_counts_as_guard_liveness_even_when_sampling_is_complete()
     assert_eq!(local["guard_backend_healthy"], false);
     assert_eq!(local["guard"], false);
     assert!(!claude_watch_runtime::services::ServiceSystem::guard_status(&host, &config).unwrap());
+    assert!(
+        claude_watch_runtime::onboarding::require_transport(&local).is_err(),
+        "complete socket sampling must never hide a wrong native runtime identity"
+    );
+}
+
+#[test]
+fn initialization_rejects_missing_stale_and_wrong_identity_heartbeats() {
+    let home = Home::new();
+    let host = home.host("surge", Some("interface: utun4\n"));
+    let config = Config::default();
+    let path = host.storage.paths.watch().join("state/heartbeat");
+    let now = native::now();
+    assert!(claude_watch_runtime::onboarding::require_transport(
+        &AuditSystem::local(&host, &config).unwrap()
+    )
+    .is_err());
+    for heartbeat in [
+        format!("77|Mon Oct 26 01:02:03 2026|{}|ok|GUARD\n", now - 31.0),
+        format!("77|Mon Oct 26 01:02:03 2026|{}|ok|GUARD\n", now + 30.0),
+        format!("88|Mon Oct 26 01:02:03 2026|{now}|ok|GUARD\n"),
+        format!("77|different-process-start|{now}|ok|GUARD\n"),
+        format!("77|Mon Oct 26 01:02:03 2026|{now}|invalid|GUARD\n"),
+    ] {
+        host.storage
+            .atomic_bytes(&path, heartbeat.as_bytes(), 0o600)
+            .unwrap();
+        let local = AuditSystem::local(&host, &config).unwrap();
+        assert_eq!(local["proxy"], "ok");
+        assert_eq!(local["tun"], "ok");
+        assert_eq!(local["guard_backend_healthy"], false);
+        assert!(claude_watch_runtime::onboarding::require_transport(&local).is_err());
+    }
 }
 impl Drop for Home {
     fn drop(&mut self) {

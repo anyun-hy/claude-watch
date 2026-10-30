@@ -166,6 +166,25 @@ struct InitializationTests {
         for id in ["rules", "reload_proxy", "enable_tun", "start_proxy", "legacy_stop", "original"] {
             expect(!FirstRunChecks.allowed([.init(id: id, title: id, scope: "proxy")]), "\(id) cannot enter the setup apply path")
         }
+        func backendEvidence(at time: Double, sampling: Bool, native: Bool?) -> BackgroundServiceReceipt {
+            .init(observed_at: time, backend_healthy: sampling, update_source_ready: false,
+                  guard_backend_healthy: native, backend_sampling_state: sampling ? "complete" : "incomplete",
+                  services: [.init(id: "guard", title: "Watch", state: "inactive", detail: "", source: "fixture", desired: false, last_checked: time)],
+                  policy_issues: [], facts: .init(state: "ok", risks: []))
+        }
+        expect(FirstRunChecks.backendEvidenceIsCurrent(backendEvidence(at: 100, sampling: false, native: true), now: 101),
+               "partial monitoring cannot veto verified native daemon identity and heartbeat")
+        for native in [false, nil] as [Bool?] {
+            expect(!FirstRunChecks.backendEvidenceIsCurrent(backendEvidence(at: 100, sampling: true, native: native), now: 101),
+                   "complete sampling cannot substitute for missing or false native liveness")
+        }
+        for time in [69.0, 101.0, .nan, .infinity] {
+            expect(!FirstRunChecks.backendEvidenceIsCurrent(backendEvidence(at: time, sampling: true, native: true), now: 100),
+                   "stale, future or invalid service evidence cannot pass initialization")
+        }
+        expect(!FirstRunChecks.backendEvidenceIsCurrent(backendEvidence(at: 100, sampling: true, native: true), error: "read failed", now: 101),
+               "failed status refresh cannot reuse an older green liveness result")
+        expect(!FirstRunChecks.backendEvidenceIsCurrent(nil, now: 101), "missing service evidence cannot pass initialization")
         let published = MonitorStore(leakChecks: LeakCheckStore(isFixture: true), aiChecks: AIProbeStore(isFixture: true), switcher: SwitcherStore(isFixture: true))
         published.beginInitialization(startSnapshotPolling: false)
         published.switcher.loadReviewScenario(.normal)
@@ -183,6 +202,17 @@ struct InitializationTests {
         published.acceptSnapshot(firstSnapshot, receivedAt: Date())
         expect(published.initializationContext != nil && published.initializing && !published.leakChecks.dns.running && !published.leakChecks.rtc.running,
                "first-run snapshot polling updates shared context without starting independent diagnostic jobs")
+        let partialBackend = backendEvidence(at: Date().timeIntervalSince1970, sampling: false, native: true)
+        published.switcher.loadReviewReceipts(published.switcher.currentEnvironment!, background: partialBackend)
+        let connectionChecks = FirstRunChecks(store: published, componentCheck: {}, accessibilityTrusted: { true }, requestAccessibility: {})
+        let connectionRead = Task { await connectionChecks.check(.connection) }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        published.acceptSnapshot(snapshot(node: "A", at: Date().timeIntervalSince1970), receivedAt: Date())
+        let connectionResult = await connectionRead.value
+        expect(passed(connectionResult) && published.switcher.background?.backend_healthy == false,
+               "actual step 2 uses native liveness during the installed-315 partial-sampling case")
+        expect(published.switcher.settings["guard_enabled"] as? Bool != true && !published.leakChecks.dns.running,
+               "passing local readiness never enables protection or starts a network probe")
         published.switcher.fixtureEnvironmentReadDelayNanoseconds = 100_000_000
         let oldRead = Task { await published.switcher.detectCurrentEnvironment() }
         try await Task.sleep(nanoseconds: 10_000_000)

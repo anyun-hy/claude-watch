@@ -18,10 +18,19 @@ struct Fake {
     network: Value,
     network_after_baseline: Option<Value>,
     baseline_read: Cell<bool>,
+    local_reads: Cell<usize>,
+    egress_reads: Cell<usize>,
+    lose_backend_after_first_read: bool,
 }
 impl RepairSystem for Fake {
     fn local(&self, _: &Config) -> Result<Value> {
-        Ok(self.local.clone())
+        let reads = self.local_reads.get();
+        self.local_reads.set(reads + 1);
+        let mut value = self.local.clone();
+        if self.lose_backend_after_first_read && reads > 0 {
+            value["guard_backend_healthy"] = json!(false);
+        }
+        Ok(value)
     }
     fn apply(&mut self, a: &Value) -> Result<()> {
         if self.fail_action.as_deref() == a["id"].as_str() {
@@ -55,6 +64,7 @@ impl RepairSystem for Fake {
         Ok(true)
     }
     fn egress_reference(&self, _: &Config) -> Result<Value> {
+        self.egress_reads.set(self.egress_reads.get() + 1);
         Ok(
             json!({"trace":{"ip":"1.1.1.1","loc":"JP"},"geo":{"ip":"1.1.1.1","country":"JP","timezone":"Asia/Tokyo"}}),
         )
@@ -87,7 +97,7 @@ fn store() -> (PathBuf, StateStore) {
 fn fake() -> Fake {
     Fake {
         now: 100.0,
-        local: json!({"proxy":"ok","tun":"ok","backend_healthy":true,"mode":"tag","context":"same","timezone":"America/New_York","locale":"en_US","language":"zh-CN","app_language":["zh-CN"],"ipv6":"ok","processes":[{"pid":7,"executable":"/TAG","uid":501,"start_stamp":"s"}],"tag":{"entry":{"state":"verified","public_listener":false,"owners":[{"pid":7,"executable":"/TAG","uid":501,"stamp":"s"}]},"api":{"state":"available","covers_7890":true,"mode":"rule"}}}),
+        local: json!({"proxy":"ok","tun":"ok","backend_healthy":true,"guard_backend_healthy":true,"mode":"tag","context":"same","timezone":"America/New_York","locale":"en_US","language":"zh-CN","app_language":["zh-CN"],"ipv6":"ok","processes":[{"pid":7,"executable":"/TAG","uid":501,"start_stamp":"s"}],"tag":{"entry":{"state":"verified","public_listener":false,"owners":[{"pid":7,"executable":"/TAG","uid":501,"stamp":"s"}]},"api":{"state":"available","covers_7890":true,"mode":"rule"}}}),
         applied: vec![],
         fail_action: None,
         restore_ok: true,
@@ -95,7 +105,109 @@ fn fake() -> Fake {
         network: json!({"service":"Wi-Fi","interface":"en0"}),
         network_after_baseline: None,
         baseline_read: Cell::new(false),
+        local_reads: Cell::new(0),
+        egress_reads: Cell::new(0),
+        lose_backend_after_first_read: false,
     }
+}
+
+#[test]
+fn initialization_uses_native_liveness_through_detection_preview_and_apply() {
+    let (home, store) = store();
+    let zones: ZoneCatalog = serde_json::from_value(json!({"JP":["Asia/Tokyo"]})).unwrap();
+    let mut system = fake();
+    system.local["backend_healthy"] = json!(false);
+    // Exactly the installed-315 case: complete proxy/TUN evidence and live
+    // native daemon, while an unrelated process exited during socket sampling.
+    assert!(onboarding::require_transport(&system.local).is_ok());
+    let candidate = onboarding::detect(&store, &system, "auto", true, &zones).unwrap();
+    let options = json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false});
+    let plan = onboarding::preview(
+        &store,
+        &system,
+        candidate["id"].as_str().unwrap(),
+        &options,
+        None,
+    )
+    .unwrap();
+    let result = onboarding::apply(
+        &store,
+        &mut system,
+        candidate["id"].as_str().unwrap(),
+        &options,
+        plan["id"].as_str().unwrap(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(result["status"], "ok");
+    assert!(system.applied.iter().all(|a| !matches!(
+        a["id"].as_str(),
+        Some("rules" | "enable_tun" | "reload_proxy" | "legacy_stop")
+    )));
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn initialization_real_transport_faults_block_before_any_egress_probe() {
+    let zones: ZoneCatalog = serde_json::from_value(json!({"JP":["Asia/Tokyo"]})).unwrap();
+    for (path, replacement) in [
+        ("/guard_backend_healthy", json!(false)),
+        ("/guard_backend_healthy", Value::Null),
+        ("/guard_backend_healthy", json!("true")),
+        ("/proxy", json!("fail")),
+        ("/proxy", json!("unknown")),
+        ("/tun", json!("fail")),
+        ("/tun", json!("unknown")),
+        ("/tag/entry/state", json!("mismatch")),
+        ("/tag/entry/public_listener", json!(true)),
+        ("/tag/api/state", json!("unavailable")),
+        ("/tag/api/covers_7890", json!(false)),
+        ("/tag/entry/owners/0/stamp", json!("reused-pid")),
+        ("/tag/entry/owners/0/uid", json!(999)),
+    ] {
+        let (home, store) = store();
+        let mut system = fake();
+        *system.local.pointer_mut(path).unwrap() = replacement;
+        assert!(
+            onboarding::detect(&store, &system, "auto", true, &zones).is_err(),
+            "{path}"
+        );
+        assert_eq!(system.egress_reads.get(), 0, "{path}");
+        assert!(!store
+            .paths
+            .base()
+            .join("environment-candidate.json")
+            .exists());
+        assert!(!store.paths.config().exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+    let mut missing = fake();
+    missing
+        .local
+        .as_object_mut()
+        .unwrap()
+        .remove("guard_backend_healthy");
+    assert!(
+        onboarding::require_transport(&missing.local).is_err(),
+        "sampling health cannot substitute for missing native liveness"
+    );
+}
+
+#[test]
+fn initialization_losing_native_heartbeat_during_detection_discards_candidate() {
+    let (home, store) = store();
+    let zones: ZoneCatalog = serde_json::from_value(json!({"JP":["Asia/Tokyo"]})).unwrap();
+    let mut system = fake();
+    system.lose_backend_after_first_read = true;
+    assert!(onboarding::detect(&store, &system, "auto", true, &zones).is_err());
+    assert_eq!(system.egress_reads.get(), 1);
+    assert!(!store
+        .paths
+        .base()
+        .join("environment-candidate.json")
+        .exists());
+    assert!(system.applied.is_empty());
+    fs::remove_dir_all(home).unwrap();
 }
 #[test]
 fn candidate_plan_is_expiring_and_context_bound_without_system_commands() {

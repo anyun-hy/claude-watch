@@ -49,17 +49,22 @@ final class FirstRunChecks: InitializationChecking {
             // Two separate reads of verified current context, while the normal
             // snapshot-only timer keeps long DNS checks bound to fresh evidence.
             while Date() < deadline && !Task.isCancelled {
-                if let context = store.initializationContext, snapshotIsCurrent {
+                await store.switcher.refreshBackground()
+                if let context = store.initializationContext, snapshotIsCurrent,
+                   Self.backendEvidenceIsCurrent(store.switcher.background, error: store.switcher.backgroundError) {
                     let sampled = store.snapshot?.proxy?.observedAt ?? 0
                     if candidate == context, let previous = candidateSample, sampled > previous {
                         boundContext = context
-                        return .passed("采集后台、代理入口与控制接口已确认；持续读取同一网络上下文。")
+                        let detail = store.switcher.background?.backend_healthy == false
+                            ? "原生采集后台身份、心跳及代理入口已确认。连接监控采样存在缺口，单独记录其完整性。"
+                            : "原生采集后台身份、心跳及代理入口已确认；持续读取同一网络上下文。"
+                        return .passed(detail)
                     }
                     if candidate != context { candidate = context; candidateSample = sampled }
                 } else { candidate = nil; candidateSample = nil }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
-            return .failed(code: "connection_unverified", detail: "采集后台或代理入口尚未持续确认。请确认 TAG 已运行并开启所需网络模式，然后重试；向导不会修改 TAG。")
+            return .failed(code: "connection_unverified", detail: "原生采集后台身份、有效心跳或代理入口尚未持续确认。请查看检查记录后重试。")
         case .environment:
             return await prepareEnvironment(enableProtection: false)
         case .accessibility:
@@ -239,15 +244,24 @@ final class FirstRunChecks: InitializationChecking {
         return MonitorSnapshotTiming.isCurrent(capturedAt: snapshot.capturedAt, now: Date().timeIntervalSince1970)
     }
     private var backgroundIsCurrent: Bool {
-        guard let value = store.switcher.background, store.switcher.backgroundError.isEmpty,
-              (0..<30).contains(Date().timeIntervalSince1970 - value.observed_at),
-              value.guard_backend_healthy ?? value.backend_healthy,
+        guard let value = store.switcher.background,
+              Self.backendEvidenceIsCurrent(value, error: store.switcher.backgroundError),
               value.services.first(where: { $0.id == "guard" })?.healthy == true,
               value.services.first(where: { $0.id == "guard" })?.desired == true,
               value.services.first(where: { $0.id == "watchdog" })?.healthy == true,
               value.services.first(where: { $0.id == "watchdog" })?.desired == true,
               value.facts?.state != "fail" else { return false }
         return true
+    }
+    /// `guard_backend_healthy` already binds native runtime identity, launchd
+    /// registration and a <=30s heartbeat. This is the exact backend predicate
+    /// used by onboarding::require_transport, independent of monitoring quality
+    /// and of whether the guard policy has been enabled yet.
+    static func backendEvidenceIsCurrent(_ value: BackgroundServiceReceipt?, error: String = "",
+                                         now: Double = Date().timeIntervalSince1970) -> Bool {
+        guard let value, error.isEmpty, now.isFinite, value.observed_at.isFinite,
+              value.guard_backend_healthy == true else { return false }
+        return (0..<30).contains(now - value.observed_at)
     }
     private var changedFailure: InitializationResult {
         .failed(code: "context_changed", detail: "检查期间网络、代理、设置或采样状态变化。此前的通过结果不能合并放行，请重新检查。")
