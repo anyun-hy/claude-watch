@@ -215,7 +215,9 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
                 "watch-native-collector.zsh",
             ];
             if claude_watch_runtime::background_evidence::supported_manifest(&manifest)? {
-                required.extend(claude_watch_runtime::background_evidence::EXTRA_FILES);
+                required.extend_from_slice(claude_watch_runtime::background_evidence::extra_files(
+                    &manifest,
+                )?);
             }
             for name in required {
                 let path = resources.join(name);
@@ -303,9 +305,15 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
             let (mut audit, guard_diagnostics) = if environment {
                 store.collect_environment(&mut host, &zones, request.launch_target(), options)?
             } else if scope == AuditScope::Full {
-                (store.collect_target(&mut host, &zones, request.launch_target(), options)?, None)
+                (
+                    store.collect_target(&mut host, &zones, request.launch_target(), options)?,
+                    None,
+                )
             } else {
-                (store.collect_scope(&mut host, &zones, scope, options)?, None)
+                (
+                    store.collect_scope(&mut host, &zones, scope, options)?,
+                    None,
+                )
             };
             audit["grants_launch_permission"] = json!(false);
             if !environment && scope == AuditScope::Full {

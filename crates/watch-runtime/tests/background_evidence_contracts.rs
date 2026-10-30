@@ -16,6 +16,69 @@ struct Fixture {
     root: PathBuf,
     store: StateStore,
 }
+
+#[test]
+fn failed_worker_persists_only_validated_lifecycle_diagnostics() {
+    use claude_watch_runtime::{
+        background_evidence::{ProbeExecutor, WORKER},
+        release_native::{FixedCommand, FixedCommandExecutor},
+    };
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::{atomic::AtomicBool, Arc},
+        time::Duration,
+    };
+    let f = Fixture::new();
+    let script = f.root.join(WORKER);
+    fs::write(
+        &script,
+        r##"#!/bin/sh
+printf '%s\n' '{"cw_trace":"navigation_finished","attached":true,"elapsed_ms":40}' >&2
+printf '%s\n' '{"cw_trace":"dns_retry","attached":true,"elapsed_ms":45}' >&2
+printf '%s\n' '{"cw_trace":"secret-203.0.113.9","attached":true,"elapsed_ms":50}' >&2
+printf '%s\n' 'unstructured secret-token' >&2
+printf '%s\n' '{"status":"timeout"}'
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = ProbeExecutor::new(Arc::new(AtomicBool::new(false)))
+        .with_diagnostics(f.store.clone())
+        .run(FixedCommand {
+            program: script,
+            args: vec!["--dns".into()],
+            timeout: Duration::from_secs(3),
+        })
+        .unwrap();
+    assert!(
+        output.stderr.is_empty(),
+        "raw stderr never crosses the output contract"
+    );
+    let log = fs::read_to_string(f.store.paths.base().join("diagnostic-events.jsonl")).unwrap();
+    assert!(log.contains("navigation_finished"));
+    assert!(log.contains("dns_retry"));
+    assert!(log.contains("background-leak-trace"));
+    assert!(!log.contains("203.0.113.9") && !log.contains("secret-token"));
+    assert_eq!(log.lines().count(), 2);
+
+    let script = f.root.join(WORKER);
+    fs::write(&script, "#!/bin/sh\nprintf '%s\\n' '{\"cw_trace\":\"phase_dns\",\"attached\":true,\"elapsed_ms\":40}' >&2\n/bin/sleep 5\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let timeout = ProbeExecutor::new(Arc::new(AtomicBool::new(false)))
+        .with_diagnostics(f.store.clone())
+        .run(FixedCommand {
+            program: script,
+            args: vec!["--dns".into()],
+            timeout: Duration::from_secs(1),
+        })
+        .unwrap_err();
+    assert_eq!(timeout.code, "evidence_probe_timeout");
+    let log = fs::read_to_string(f.store.paths.base().join("diagnostic-events.jsonl")).unwrap();
+    assert!(
+        log.contains("phase_dns"),
+        "phase evidence survives the supervisor timeout"
+    );
+}
 impl Fixture {
     fn new() -> Self {
         let root =
@@ -86,10 +149,11 @@ fn probe(kind: ProbeKind, now: f64, country: &str) -> Value {
         ProbeKind::WebRtc => json!({"kind":"srflx","address":if country=="CN"{"8.8.8.8"}else{"1.1.1.1"},"country":country}),
     });
     if kind == ProbeKind::Dns {
-        value["externalJSON"] = json!(serde_json::to_string(&json!([
-            {"kind":"geoip","status":"complete","query":"1.1.1.1","data":{"country_code":"JP"}},
-            {"kind":"geoip","status":"complete","query":"8.8.8.8","data":{"country_code":country}}
-        ]))
+        value["externalJSON"] = json!(serde_json::to_string(&json!({
+            "session":"a".repeat(40),"dns_servers":{"8.8.8.8":5},
+            "http":{"address":"1.1.1.1","country":"JP"},
+            "geoip":[{"ip":"8.8.8.8","country_code":country}]
+        }))
         .unwrap());
     }
     value
@@ -260,6 +324,31 @@ fn dns_refreshes_before_its_thirty_second_gate_while_webrtc_remains_fresh() {
         .dns_status("ctx", true, system.now, |t| format!("{t}"))["state"],
         "ok"
     );
+}
+
+#[test]
+fn dns_refresh_begins_at_ten_seconds_without_renewing_the_old_receipt() {
+    let f = Fixture::new();
+    f.active(1000.);
+    let path = f.store.paths.base().join("dns-leak-receipt.json");
+    let original = fs::read(&path).unwrap();
+    let mut system = Fake {
+        now: 1009.0,
+        ..Default::default()
+    };
+    assert_eq!(
+        background_evidence::refresh_active_session(&f.store, &mut system).unwrap()["count"],
+        0
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+    system.now = 1010.0;
+    assert_eq!(
+        background_evidence::refresh_active_session(&f.store, &mut system).unwrap()["count"],
+        1
+    );
+    let updated: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(updated["finished_at"], json!(1011.0));
+    assert_eq!(updated["provider"], "ipleak");
 }
 
 #[test]

@@ -126,7 +126,7 @@ fn stale_response_timeout_invalid_uid_and_missing_token_do_not_grant_permission(
     f.store
         .atomic_json(
             &f.store.paths.base().join("dns-leak-receipt.json"),
-            &json!({"finished_at":native::now()}),
+            &json!({"provider":"ipleak","finished_at":native::now()}),
         )
         .unwrap();
     assert_eq!(

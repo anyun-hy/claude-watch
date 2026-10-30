@@ -23,10 +23,10 @@ private struct LeakInspectorPage: View {
     @State private var detailsExpanded = false
     @State private var localExpanded = false
     private var isDNS: Bool { kind == .dns }
-    private var isIPLeak: Bool { isDNS && store.dnsSource == .ipLeak }
-    private var state: LeakCheckState { isIPLeak ? store.ipLeakDNS : isDNS ? store.dns : store.rtc }
-    private var currentProgress: String? { isIPLeak ? store.ipLeakProgress : store.progress[kind] }
-    private var currentBrowser: WKWebView? { isIPLeak ? store.ipLeakBrowserView : store.browserViews[kind] }
+    private var isIPLeak: Bool { isDNS }
+    private var state: LeakCheckState { isDNS ? store.dns : store.rtc }
+    private var currentProgress: String? { store.progress[kind] }
+    private var currentBrowser: WKWebView? { store.browserViews[kind] }
     // The latest result remains authoritative for the verdict and backend record.
     // The display result may be the previous good sample after a collector failure.
     private var latestResult: LeakProbeResult? { state.result }
@@ -49,8 +49,7 @@ private struct LeakInspectorPage: View {
                 symbol: isDNS ? "network" : "antenna.radiowaves.left.and.right",
                 color: isDNS ? style.network : style.location, p: p) {
                     Button {
-                        if isIPLeak { state.running ? store.cancelIPLeakDNS() : store.startIPLeakDNS() }
-                        else { state.running ? store.cancel(kind) : store.start(kind) }
+                        state.running ? store.cancel(kind) : store.start(kind)
                     } label: {
                         Label(state.running ? "取消检测" : "开始检测", systemImage: state.running ? "stop.fill" : "play.fill")
                             .font(.body.weight(.medium)).padding(.horizontal, 4).frame(minHeight: 28)
@@ -58,24 +57,21 @@ private struct LeakInspectorPage: View {
                         .accessibilityLabel(state.running ? "取消\(title)" : "开始\(title)")
                 }
             HStack(spacing:16) {
-                if isDNS {
-                    Picker("检测来源",selection:Binding(get:{store.dnsSource},set:{store.changeDNSSource($0)})) {
-                        ForEach(DNSProbeSource.allCases,id: \.self) { Text($0.rawValue).tag($0) }
-                    }.pickerStyle(.segmented).frame(width:280)
-                } else {
+                if !isDNS {
                     Picker("检测来源",selection:Binding(get:{store.source},set:{store.changeSource($0)})) {
                         ForEach(LeakProbeSource.allCases,id: \.self) { Text($0.rawValue).tag($0) }
                     }.pickerStyle(.segmented).frame(width:280).disabled(store.dns.running || store.rtc.running)
                 }
                 if isDNS {
-                    Picker("查询轮次",selection:isIPLeak ? $store.ipLeakDeepDNS : $store.deepDNS) { Text("标准 · 5 轮").tag(false); Text("深度 · 8 轮").tag(true) }
+                    Picker("查询轮次",selection:$store.deepDNS) { Text("标准 · 5 轮").tag(false); Text("深度 · 8 轮").tag(true) }
                         .frame(width:180).disabled(state.running)
                 }
                 Spacer(minLength:0)
             }
             if state.running, let progress = currentProgress { Label(progress,systemImage:"arrow.triangle.2.circlepath").font(.callout).foregroundStyle(style.network) }
             if let browser = currentBrowser {
-                CoffeeCollectorView(browser: browser).frame(height:72).clipShape(RoundedRectangle(cornerRadius:10))
+                CoffeeCollectorView(browser: browser, onDetach: isDNS ? { store.reattachDNSBrowser($0) } : nil)
+                    .frame(height:72).clipShape(RoundedRectangle(cornerRadius:10))
             }
             InspectorStatus(verdict: state.verdict, running: state.running, finishedAt: latestResult?.finishedAt, p: p)
             if showingPreviousSuccessfulResult, let previous = result {
@@ -97,13 +93,10 @@ private struct LeakInspectorPage: View {
                 }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
             }
             details
-            if isIPLeak {
-                Text("IPLeak 为备用对照，不参与环境状态或启动保护；Net.Coffee 主检测独立运行。")
-                    .font(.caption).foregroundStyle(p.secondary)
-            } else if isDNS || store.source == .netCoffee {
+            if isDNS || store.source == .netCoffee {
                 Text("检测结果在环境状态、DNS 与 WebRTC 页面共享；离开本页不会取消正在进行的采样。").font(.caption).foregroundStyle(p.secondary)
             }
-            Label(isDNS ? (isIPLeak ? "本机 WebView 发起查询，IPLeak 返回 DNS 观测；不代表所有 AI 应用。" : "本机 WebView 发起查询，Net.Coffee 返回权威 DNS 观测；不代表所有 AI 应用。")
+            Label(isDNS ? "本机 WebView 发起查询，IPLeak 返回 DNS 观测；不代表所有 AI 应用。"
                   : "仅代表当前检测 WebView，不代表 AI 应用或其他浏览器。", systemImage: "info.circle")
                 .font(.caption).foregroundStyle(p.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -181,9 +174,9 @@ private struct LeakInspectorPage: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Divider().overlay(style.border)
-            Label(isIPLeak ? "IPLeak DNS · IPLeak HTTP · 本机采样" : store.source == .netCoffee || isDNS ? "Net.Coffee 归属 · Cloudflare HTTP · 本机采样" : "Google / Cloudflare STUN", systemImage: "server.rack")
+            Label(isDNS ? "IPLeak DNS · IPLeak HTTP · 本机采样" : store.source == .netCoffee ? "Net.Coffee 归属 · Cloudflare HTTP · 本机采样" : "Google / Cloudflare STUN", systemImage: "server.rack")
                 .font(.caption).foregroundStyle(style.transport)
-            Text(isDNS ? (isIPLeak ? "DNS 与 HTTP 参考均通过当前检测 WebView。" : "DNS 遵循 WebView 路由；API / HTTP 经 7890。") : "按当前系统路由检测，不强制 UDP 走 7890。")
+            Text(isDNS ? "DNS 与 HTTP 参考均通过当前检测 WebView。" : "按当前系统路由检测，不强制 UDP 走 7890。")
                 .font(.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -320,6 +313,13 @@ private struct LeakInspectorPage: View {
 
 struct CoffeeCollectorView: NSViewRepresentable {
     let browser: WKWebView
+    var onDetach: ((WKWebView) -> Void)? = nil
+    final class Coordinator {
+        let onDetach: ((WKWebView) -> Void)?
+        init(_ onDetach: ((WKWebView) -> Void)?) { self.onDetach = onDetach }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator(onDetach) }
     func makeNSView(context: Context) -> WKWebView { browser }
     func updateNSView(_ nsView: WKWebView, context: Context) {}
+    static func dismantleNSView(_ nsView: WKWebView, coordinator: Coordinator) { coordinator.onDetach?(nsView) }
 }

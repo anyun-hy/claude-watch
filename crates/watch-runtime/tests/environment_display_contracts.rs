@@ -79,6 +79,36 @@ fn receipt_keeps_same_round_display_window_without_mutating_launch_audit() {
 }
 
 #[test]
+fn initialization_receipt_evidence_uses_current_backend_receipts_not_display_cache() {
+    let (home, store) = store();
+    let mut observed = audit();
+    observed["display_facts"]["online"]["dns"] = json!({
+        "state":"unknown", "receipt":{"context_id":"new", "finished_at":NOW-5.0},
+        "display_receipt":{"context_id":"old", "finished_at":NOW-20.0}
+    });
+    observed["display_facts"]["online"]["webrtc"] = json!({
+        "state":"ok", "receipt":{"context_id":"new", "sampled_at":NOW-3.0}
+    });
+    let out = receipt(&store, observed, session(), false).unwrap();
+    assert_eq!(out["initialization_receipts"]["dns"]["state"], "unknown");
+    assert_eq!(out["initialization_receipts"]["dns"]["context_id"], "new");
+    assert_eq!(
+        out["initialization_receipts"]["dns"]["sampled_at"],
+        json!(NOW - 5.0)
+    );
+    assert_eq!(out["initialization_receipts"]["webrtc"]["state"], "ok");
+    assert_eq!(
+        out["initialization_receipts"]["webrtc"]["context_id"],
+        "new"
+    );
+    assert_eq!(
+        out["initialization_receipts"]["webrtc"]["sampled_at"],
+        json!(NOW - 3.0)
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn conflicts_never_fall_back_and_session_baseline_remains_visible() {
     let (home, store) = store();
     receipt(&store, audit(), session(), true).unwrap();

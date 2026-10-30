@@ -14,3 +14,7 @@ xcrun swiftc -swift-version 5 -parse-as-library -D UI_REVIEW -target "arm64-appl
   -module-cache-path "$TEST_ROOT/cache" -framework SwiftUI -framework AppKit -framework WebKit \
   "$ROOT"/Sources/*.swift "$ROOT/tests/InitializationTests.swift" -o "$TEST_ROOT/initialization-tests"
 "$TEST_ROOT/initialization-tests"
+xcrun swiftc -swift-version 5 -parse-as-library -D UI_REVIEW -target "arm64-apple-macosx$CW_MACOS_MINIMUM" \
+  -module-cache-path "$TEST_ROOT/cache" -framework SwiftUI -framework AppKit -framework WebKit \
+  "$ROOT"/Sources/*.swift "$ROOT/tests/InitializationStabilityTests.swift" -o "$TEST_ROOT/initialization-stability-tests"
+"$TEST_ROOT/initialization-stability-tests"

@@ -196,6 +196,10 @@ final class MonitorStore: ObservableObject {
             guard let self, !self.initializing else { return }
             Task { await self.switcher.refreshBackground() }
         }
+        self.switcher.onReceiptDiagnostic = { kind, event in
+            guard case .rustCandidate? = BundledBackendVariant.current() else { return }
+            LeakDiagnosticTrace.shared.record(kind: kind.rawValue, event: event)
+        }
         self.aiChecks.contextProvider = bindingContext
         self.aiChecks.onResult = { [weak self] result in
             let ip = result.exitIP
@@ -225,10 +229,17 @@ final class MonitorStore: ObservableObject {
         // Login freshness is a display fact and must age even while automatic
         // network/environment detection is paused.
         switcher.advanceLoginClock(date)
-        guard automatic else { return }
+        guard automatic else {
+            if case .rustCandidate? = BundledBackendVariant.current() { LeakDiagnosticTrace.shared.schedule(kind: "all", event: "schedule_disabled") }
+            return
+        }
         if initializing {
-            // Fresh local context is needed while a DNS probe takes tens of
-            // seconds. This poll never starts diagnostics or changes settings.
+            if case .rustCandidate? = BundledBackendVariant.current() { LeakDiagnosticTrace.shared.schedule(kind: "all", event: "schedule_initializing") }
+            // Initialization also validates the service receipt while waiting
+            // for the user. Keep it fresh using the same read-only scheduler as
+            // the main view; otherwise a healthy service always appears stale
+            // 30 seconds after the final check.
+            refreshBackgroundIfNeeded(at: date)
             refresh(full: date.timeIntervalSince(lastFull) >= 15)
             return
         }
@@ -253,14 +264,15 @@ final class MonitorStore: ObservableObject {
             // tick. Advance the display clock before deriving `live` through
             // `proxy` or starting any context-bound diagnostic.
             let completedAt = Date()
-            now = completedAt
-            leakChecks.now = completedAt
-            aiChecks.now = completedAt
             switch result {
             case .success(let value):
                 acceptSnapshot(value, receivedAt: completedAt)
             case .failure(let message):
+                if case .rustCandidate? = BundledBackendVariant.current() { LeakDiagnosticTrace.shared.schedule(kind: "all", event: "snapshot_failed") }
                 error = message
+                now = completedAt
+                leakChecks.now = completedAt
+                aiChecks.now = completedAt
             }
             synchronizeNetworkSelection()
             let repeatManual = refreshGate.complete()
@@ -272,10 +284,13 @@ final class MonitorStore: ObservableObject {
         // A single publication path is shared by first-run and normal polling.
         // Backend capture time remains authoritative; rereads cannot renew it.
         now = max(receivedAt, Date(timeIntervalSince1970: value.capturedAt))
-        leakChecks.now = now; aiChecks.now = now
         error = nil
         let transition = observeDiagnosticContext(from: value, at: receivedAt)
         snapshot = value
+        // Re-evaluate only after both the tracker and snapshot describe this
+        // observation. Otherwise a recovered sampler can leave a fresh
+        // receipt marked incomplete until an unrelated later clock tick.
+        leakChecks.now = now; aiChecks.now = now
         if automatic && transition == .changed { switcher.invalidateCurrentEnvironmentRequest() }
         if automatic && !initializing {
             leakChecks.refreshWebRTCIfNeeded()
@@ -283,7 +298,8 @@ final class MonitorStore: ObservableObject {
         }
     }
     private func refreshBackgroundIfNeeded(at date: Date, force: Bool = false) {
-        guard !backgroundReadRunning, force || date.timeIntervalSince(lastBackgroundRead) >= 15 else { return }
+        guard !backgroundReadRunning, !switcher.busy,
+              force || date.timeIntervalSince(lastBackgroundRead) >= 15 else { return }
         backgroundReadRunning = true
         lastBackgroundRead = date
         Task { @MainActor in
@@ -294,8 +310,13 @@ final class MonitorStore: ObservableObject {
     private func refreshEnvironmentIfNeeded() {
         guard !initializing else { return }
         let usableContext = currentDiagnosticContext()
-        guard environmentRefreshScheduler.claim(context: usableContext, now: Date(),
-                                                switcherBusy: switcher.readingEnvironment || switcher.busy) != nil else { return }
+        let busy = switcher.readingEnvironment || switcher.busy
+        guard environmentRefreshScheduler.claim(context: usableContext, now: Date(), switcherBusy: busy) != nil else {
+            if case .rustCandidate? = BundledBackendVariant.current() {
+                LeakDiagnosticTrace.shared.schedule(kind: "dns", event: usableContext == nil ? "schedule_context_missing" : busy ? "schedule_busy" : "schedule_deferred")
+            }
+            return
+        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             let dnsRecorded = await self.leakChecks.ensureFreshDNSReceipt()
@@ -349,7 +370,11 @@ final class MonitorStore: ObservableObject {
     }
     private func retainedDiagnosticContext() -> String? {
         guard !hasExplicitProxyFailure else { return nil }
-        return diagnosticContext.retained(at: now)
+        // A directly verified, still-current snapshot is stronger than the
+        // short grace used only when an observation is unavailable. Do not
+        // discard its identity merely because the producer's next sample has
+        // not arrived within that grace window.
+        return currentDiagnosticContext() ?? diagnosticContext.retained(at: now)
     }
     private var hasExplicitProxyFailure: Bool {
         guard let value = freshRawProxy(in: snapshot, at: now) else { return false }

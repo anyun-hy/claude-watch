@@ -72,7 +72,7 @@ PY
   BACKEND_VERSION=$("$RUST_COMPONENTS_DIR/watch-engine" --version | python3 -c 'import json,sys; print(json.load(sys.stdin)["backend_version"])')
   BACKEND_SHA256=$(/usr/bin/shasum -a 256 "$RUST_COMPONENTS_DIR/watch-engine" | /usr/bin/awk '{print $1}')
   RUNTIME_SCHEMA=2
-  BACKGROUND_EVIDENCE_SCHEMA=1
+  BACKGROUND_EVIDENCE_SCHEMA=2
 fi
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$ROOT/build/module-cache"
@@ -93,7 +93,7 @@ for CW_TARGET_ARCH in $CW_TARGETS; do
     "$SWIFTC" -swift-version 5 -O -parse-as-library -D BACKGROUND_LEAK_WORKER \
       -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
       -framework AppKit -framework WebKit "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" \
-      "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" \
+      "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/Sources/IPLeakDNSRunner.swift" "$ROOT/Sources/IPLeakDNSRetryRunner.swift" \
       "$ROOT/tools/BackgroundLeakWorker.swift" -o "$ROOT/build/watch-leak-worker.$CW_TARGET_ARCH"
   fi
 done
@@ -186,7 +186,7 @@ value = plistlib.loads(manifest.read_bytes())
 if value.get("BackendVariant") == "rust-candidate":
     forbidden = [p for p in root.rglob("*") if p.suffix == ".py" or p.name in ("claude-watch.sh", "snapshot.sh")]
     if forbidden: raise SystemExit("Rust candidate still contains legacy business resources")
-    files = [root / n for n in ("watch-engine", "watch-native-observer", "watch-admin.sh", "watch-process-control", "watch-native-collector.zsh", "watch-leak-worker", "netcoffee_probe.html", "netcoffee_probe.js", "netcoffee_probe.css")]
+    files = [root / n for n in ("watch-engine", "watch-native-observer", "watch-admin.sh", "watch-process-control", "watch-native-collector.zsh", "watch-leak-worker", "netcoffee_probe.html", "netcoffee_probe.js", "netcoffee_probe.css", "ipleak_probe.html", "ipleak_probe.js")]
 else:
     files = [root / n for n in ("switcher.py", "watch-admin.sh", "watch-process-control", "dns_probe.py", "netcoffee_client.py")]
     files += sorted((root / "watch_switcher").glob("*.py"))

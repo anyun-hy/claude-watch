@@ -328,6 +328,37 @@ fn background_evidence_bundle_requires_all_nine_hashed_files_and_arm64_worker() 
                 .is_some_and(|path| path.ends_with("watch-leak-worker"))
     }));
 
+    for name in ["ipleak_probe.html", "ipleak_probe.js"] {
+        fs::write(resources.join(name), []).unwrap();
+    }
+    let mut manifest_v2: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    manifest_v2["BackgroundEvidenceSchema"] = serde_json::json!(2);
+    for name in ["ipleak_probe.html", "ipleak_probe.js"] {
+        manifest_v2["RuntimeHashes"][name] = serde_json::json!(empty_hash);
+    }
+    let manifest_v2 = manifest_v2.to_string();
+    let replies_v2 = || {
+        vec![
+            ok(info),
+            ok(""),
+            ok("arm64"),
+            ok("arm64"),
+            ok("arm64"),
+            ok("arm64"),
+            ok(&manifest_v2),
+            ok("arm64"),
+        ]
+    };
+    assert_eq!(
+        native(replies_v2()).validate_bundle(&app).unwrap().version,
+        "2.5.0"
+    );
+    fs::remove_file(resources.join("ipleak_probe.js")).unwrap();
+    assert_eq!(
+        native(replies_v2()).validate_bundle(&app).unwrap_err().code,
+        "release_identity_mismatch"
+    );
+
     fs::remove_file(resources.join("netcoffee_probe.js")).unwrap();
     let mut missing = native(vec![
         ok(info),

@@ -103,7 +103,7 @@ fn scoped_commands_share_policy_and_receipts_without_full_probes_or_audit_writes
         .unwrap();
     assert_eq!(missing["state"], "unknown");
     assert_eq!(system.dns_refreshes, 0);
-    storage.atomic_json(&storage.paths.base().join("dns-leak-receipt.json"),&json!({"schema":1,"status":"complete","finished_at":1700000000.,"recorded_at":1700000000.,"launch_expires_at":1700000030.,"display_expires_at":1700000300.,"context":"ctx","comparison":{"state":"ok"},"errors":[],"dns":{"egress_ips":["8.8.8.8"],"countries":["JP"]},"http":{"egress_ips":["1.1.1.1"],"countries":["JP"]}})).unwrap();
+    storage.atomic_json(&storage.paths.base().join("dns-leak-receipt.json"),&json!({"schema":1,"provider":"ipleak","status":"complete","finished_at":1700000000.,"recorded_at":1700000000.,"launch_expires_at":1700000030.,"display_expires_at":1700000300.,"context":"ctx","comparison":{"state":"ok"},"errors":[],"dns":{"egress_ips":["8.8.8.8"],"countries":["JP"]},"http":{"egress_ips":["1.1.1.1"],"countries":["JP"]}})).unwrap();
     let dns = store
         .collect_scope(&mut system, &zones, AuditScope::Dns, options)
         .unwrap();
@@ -392,7 +392,7 @@ fn persisted_audit_has_context_and_observation_identity() {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir(&root).unwrap();
     let storage = StateStore::new(Paths::new(&root).unwrap());
-    storage.atomic_json(&storage.paths.base().join("dns-leak-receipt.json"),&json!({"schema":1,"status":"complete","finished_at":1_700_000_000.,"recorded_at":1_700_000_000.,"launch_expires_at":1_700_000_030.,"display_expires_at":1_700_000_300.,"context":"ctx","comparison":{"state":"ok"},"errors":[],"dns":{"egress_ips":["1.1.1.1"],"countries":["JP"]},"http":{"egress_ips":["1.1.1.1"],"countries":["JP"]}})).unwrap();
+    storage.atomic_json(&storage.paths.base().join("dns-leak-receipt.json"),&json!({"schema":1,"provider":"ipleak","status":"complete","finished_at":1_700_000_000.,"recorded_at":1_700_000_000.,"launch_expires_at":1_700_000_030.,"display_expires_at":1_700_000_300.,"context":"ctx","comparison":{"state":"ok"},"errors":[],"dns":{"egress_ips":["1.1.1.1"],"countries":["JP"]},"http":{"egress_ips":["1.1.1.1"],"countries":["JP"]}})).unwrap();
     storage.atomic_json(&storage.paths.base().join("webrtc-risk-receipt.json"),&json!({"schema":1,"status":"complete","sampled_at":1_700_000_000.,"recorded_at":1_700_000_000.,"context_id":"ctx","risk":{"state":"ok","detail":"same"},"observations":[{"kind":"http","address":"1.1.1.1","country":"JP"},{"kind":"srflx","address":"1.1.1.1","country":"JP"}]})).unwrap();
     let out = AuditStore::new(storage.clone())
         .collect(

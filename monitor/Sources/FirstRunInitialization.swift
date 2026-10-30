@@ -50,6 +50,10 @@ enum InitializationResult {
     case approval(InitializationApproval)
     case failed(code: String, detail: String)
 }
+enum InitializationRefreshOutcome {
+    case passed(validUntil: Double)
+    case failed(step: InitializationStep, code: String, detail: String)
+}
 
 @MainActor
 protocol InitializationChecking: AnyObject {
@@ -57,12 +61,18 @@ protocol InitializationChecking: AnyObject {
     func check(_ step: InitializationStep) async -> InitializationResult
     func approve(_ request: InitializationApproval, progress: @escaping SetupProgressObserver) async -> InitializationResult
     func validateCurrentEvidence() -> InitializationResult
+    func refreshWaitingEvidence() async -> InitializationRefreshOutcome
+    func currentEvidenceFailures() -> [InitializationStep: InitializationResult]
     var connectionDiagnosticReport: String { get }
     func finish()
 }
 extension InitializationChecking {
     func approve(_ request: InitializationApproval) async -> InitializationResult {
         await approve(request, progress: { _ in })
+    }
+    func currentEvidenceFailures() -> [InitializationStep: InitializationResult] { [:] }
+    func refreshWaitingEvidence() async -> InitializationRefreshOutcome {
+        .failed(step: .verification, code: "refresh_unavailable", detail: "自动刷新不可用，请重新检查。")
     }
     var connectionDiagnosticReport: String { "" }
 }
@@ -134,6 +144,8 @@ final class FirstRunInitialization: ObservableObject {
     private let saveCompletion: () throws -> Void
     private var started = false
     private var approvalOperation: UUID?
+    private var automaticRefreshEligible = false
+    private var nextAutomaticRefresh: Date?
 
     init(checks: InitializationChecking, completed: Bool, saveCompletion: @escaping () throws -> Void) {
         self.checks = checks; self.entered = completed; self.saveCompletion = saveCompletion
@@ -155,6 +167,7 @@ final class FirstRunInitialization: ObservableObject {
         // a network/permission change with results obtained after it.
         rows = InitializationStep.allCases.map { InitializationRow(step: $0) }
         approval = nil; validUntil = nil
+        automaticRefreshEligible = false; nextAutomaticRefresh = nil
         await run(from: 0)
     }
     private func run(from index: Int) async {
@@ -180,7 +193,12 @@ final class FirstRunInitialization: ObservableObject {
             rows[index].status = .passed; rows[index].detail = detail; rows[index].code = "passed"
             if let expiry { validUntil = expiry }
             approval = nil
-            return true
+            let current = reconcilePassedEvidence()
+            if current && rows[index].step == .verification && allPassed {
+                automaticRefreshEligible = true
+                nextAutomaticRefresh = Date().addingTimeInterval(EnvironmentRefreshScheduler.interval)
+            }
+            return current
         case .approval(let request):
             rows[index].status = .authorization; rows[index].detail = request.detail
             rows[index].code = request.action == .accessibility ? "authorization_required" : "confirmation_required"
@@ -190,7 +208,39 @@ final class FirstRunInitialization: ObservableObject {
             approval = nil
         }
         validUntil = nil
+        _ = reconcilePassedEvidence()
         return false
+    }
+    /// Passed rows represent usable evidence, not an immutable history. If a
+    /// dependency is lost, revoke its green state and any pending confirmation.
+    @discardableResult
+    private func reconcilePassedEvidence() -> Bool {
+        let failures = checks.currentEvidenceFailures()
+        var invalidated = false
+        var invalidSteps = Set<InitializationStep>()
+        for index in rows.indices where rows[index].status == .passed {
+            guard case .failed(let code, let detail)? = failures[rows[index].step] else { continue }
+            rows[index].status = .failed; rows[index].code = code; rows[index].detail = detail
+            rows[index].checkedAt = Date().timeIntervalSince1970
+            invalidated = true
+            invalidSteps.insert(rows[index].step)
+        }
+        if invalidated {
+            validUntil = nil
+            if automaticRefreshEligible {
+                let retry = Date().addingTimeInterval(30)
+                if nextAutomaticRefresh.map({ retry < $0 }) ?? true { nextAutomaticRefresh = retry }
+            }
+            var dependent: Set<InitializationStep> = [.protection, .verification]
+            if invalidSteps.contains(.connection) { dependent.formUnion([.environment, .dns, .webrtc]) }
+            for index in rows.indices where dependent.contains(rows[index].step) &&
+                    (rows[index].status == .passed || rows[index].status == .authorization) {
+                rows[index].status = .pending; rows[index].code = "dependency_invalidated"
+                rows[index].detail = "依赖的检查状态已变化，请重新检查。"
+            }
+            if approval != nil { approval = nil }
+        }
+        return !invalidated
     }
     func authorize(_ request: InitializationApproval) async {
         guard !running, !entered, request == approval,
@@ -219,14 +269,106 @@ final class FirstRunInitialization: ObservableObject {
         running = false
         if accepted { await run(from: index + 1) }
     }
-    func refreshReadiness() {
-        guard !entered, !running, allPassed else { return }
+    func refreshReadiness(at now: Date = Date()) {
+        guard !entered, !running else { return }
+        guard reconcilePassedEvidence() else { return }
         let index = rows.count - 1
-        if let expiry = validUntil, Date().timeIntervalSince1970 >= expiry {
+        // A transient service-read failure may recover without discarding the
+        // whole round. Only restore readiness after every prerequisite and the
+        // complete current joint validation pass again.
+        if !allPassed {
+            if automaticRefreshEligible, approval == nil, canRetryAutomaticRefresh,
+               let nextAutomaticRefresh, now >= nextAutomaticRefresh {
+                beginAutomaticRefresh()
+                return
+            }
+            guard rows[index].status == .failed, rows[index].code == "protection_not_ready",
+                  rows[..<index].allSatisfy({ $0.status == .passed }), approval == nil else { return }
+            let result = checks.validateCurrentEvidence()
+            if case .passed = result { accept(result, at: index) }
+            return
+        }
+        if let expiry = validUntil, now.timeIntervalSince1970 >= expiry {
             accept(.failed(code: "evidence_expired", detail: "检查结果已过期，请重新检查。"), at: index)
         } else {
             let result = checks.validateCurrentEvidence()
-            if case .failed = result { accept(result, at: index) }
+            if case .failed = result { accept(result, at: index); return }
+            if automaticRefreshEligible, let nextAutomaticRefresh, now >= nextAutomaticRefresh {
+                beginAutomaticRefresh()
+            }
+        }
+    }
+    private var canRetryAutomaticRefresh: Bool {
+        guard rows[0].status == .passed, rows[3].status == .passed else { return false }
+        let connection = rows[1]
+        let connectionReady = connection.status == .passed ||
+            (connection.status == .failed && ["context_unavailable", "snapshot_unavailable"].contains(connection.code))
+        let environment = rows[2]
+        let environmentReady = environment.status == .passed ||
+            (environment.status == .pending && environment.code == "dependency_invalidated")
+        return connectionReady && environmentReady
+    }
+    private func beginAutomaticRefresh() {
+        guard !running, !entered, approval == nil else { return }
+        running = true
+        validUntil = nil
+        for step in [InitializationStep.dns, .webrtc, .verification] {
+            guard let index = rows.firstIndex(where: { $0.step == step }) else { continue }
+            rows[index].status = .running; rows[index].code = "automatic_refresh"
+            rows[index].detail = "正在自动刷新并核对本轮结果…"
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let outcome = await self.checks.refreshWaitingEvidence()
+            guard !self.entered else { self.running = false; return }
+            switch outcome {
+            case .passed(let expiry):
+                if self.rows[1].status == .failed && ["context_unavailable", "snapshot_unavailable"].contains(self.rows[1].code) {
+                    self.rows[1].status = .passed; self.rows[1].code = "passed"
+                    self.rows[1].detail = "已重新确认原有代理上下文和后台采样。"
+                }
+                if self.rows[2].status == .pending && self.rows[2].code == "dependency_invalidated" {
+                    self.rows[2].status = .passed; self.rows[2].code = "passed"
+                    self.rows[2].detail = "已确认的环境设置与当前状态保持一致。"
+                }
+                for step in [InitializationStep.dns, .webrtc] {
+                    let index = self.rows.firstIndex { $0.step == step }!
+                    self.rows[index].status = .passed; self.rows[index].code = "passed"
+                    self.rows[index].detail = "自动检测通过，结果已提交后台并与环境状态同步。"
+                    self.rows[index].checkedAt = Date().timeIntervalSince1970
+                }
+                let protection = self.rows.firstIndex { $0.step == .protection }!
+                self.rows[protection].status = .passed; self.rows[protection].code = "passed"
+                self.rows[protection].detail = "守护设置与实际后台状态已重新核对。"
+                let verification = self.rows.count - 1
+                _ = self.accept(.passed("本轮自动刷新已完成；网络、配置与保护状态一致。", validUntil: expiry), at: verification)
+            case .failed(let step, let code, let detail):
+                if step == .connection && self.rows[2].status == .passed {
+                    self.rows[2].status = .pending; self.rows[2].code = "dependency_invalidated"
+                    self.rows[2].detail = "代理状态暂不可确认，等待重新核对环境。"
+                }
+                for item in [InitializationStep.dns, .webrtc, .protection, .verification] {
+                    let index = self.rows.firstIndex { $0.step == item }!
+                    self.rows[index].status = .pending; self.rows[index].code = "dependency_invalidated"
+                    self.rows[index].detail = "自动刷新未完成，等待重新核对。"
+                }
+                // Steps completed earlier in this round remain visible, but
+                // cannot grant entry without the final joint verification.
+                if step == .webrtc || step == .verification {
+                    let index = self.rows.firstIndex { $0.step == .dns }!
+                    self.rows[index].status = .passed; self.rows[index].code = "passed"
+                    self.rows[index].detail = "本轮 DNS 已更新，等待联合复核。"
+                }
+                if step == .verification {
+                    let index = self.rows.firstIndex { $0.step == .webrtc }!
+                    self.rows[index].status = .passed; self.rows[index].code = "passed"
+                    self.rows[index].detail = "本轮 WebRTC 已更新，等待联合复核。"
+                }
+                let index = self.rows.firstIndex { $0.step == step }!
+                _ = self.accept(.failed(code: code, detail: detail), at: index)
+                self.nextAutomaticRefresh = Date().addingTimeInterval(30)
+            }
+            self.running = false
         }
     }
     func enter() async {

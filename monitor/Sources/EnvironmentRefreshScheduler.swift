@@ -3,6 +3,7 @@ import Foundation
 /// Debounces snapshot-derived proxy context before starting a costly
 /// environment observation. Empty/transient contexts never count as a change.
 struct EnvironmentRefreshScheduler {
+    static let interval: TimeInterval = 60
     enum Trigger: Equatable { case initial, changed, interval, retry }
     private(set) var stableContext: String?
     private var candidateContext: String?
@@ -32,7 +33,7 @@ struct EnvironmentRefreshScheduler {
             trigger = .retry
         } else if stableContext == nil { trigger = .initial }
         else if stableContext != context { trigger = .changed }
-        else if lastSuccess.map({ now.timeIntervalSince($0) >= 60 }) ?? true { trigger = .interval }
+        else if lastSuccess.map({ now.timeIntervalSince($0) >= Self.interval }) ?? true { trigger = .interval }
         else { return nil }
         inFlight = true
         return trigger

@@ -402,14 +402,21 @@ pub fn evaluate_target(
             text(dns, "detail")
         },
         true,
-        "Net.Coffee DNS 泄漏采样；不代表所有应用或浏览器 DoH",
+        "IPLeak.net DNS 泄漏采样；不代表所有应用或浏览器 DoH",
     ));
     let stun = &online["stun"];
-    let candidates: BTreeSet<_> = stun["observations"]
+    let observed_candidates: BTreeSet<_> = stun["observations"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|v| v["status"] == "ok")
+        .filter_map(|v| v["address"].as_str().and_then(public_unicast))
+        .collect();
+    let candidates: BTreeSet<_> = stun["observations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|v| v["status"] == "ok" && v["accepted"] != false && v["deadline_exceeded"] != true)
         .filter_map(|v| v["address"].as_str().and_then(public_unicast))
         .collect();
     let reference: BTreeSet<_> = if address.is_empty() {
@@ -417,20 +424,17 @@ pub fn evaluate_target(
     } else {
         BTreeSet::from([address.clone()])
     };
-    // Upstream `stun-probe.py` prints `RESULT:<ip>` as soon as *any* server
-    // answers, and `claude-switch.sh` reads `RESULT:NONE` as "UDP 不出网,
-    // 零暴露".  Judging the same way: an empty candidate set is a pass, not a
-    // gap — no UDP answer means no observed egress — while any answered
-    // address that differs from the trace reference stays a fail.  `complete`
-    // no longer vetoes an answered round; it is reported as coverage detail.
+    // No response does not prove UDP is blocked. A pass requires at least one
+    // accepted public response. Partial coverage remains visible in the detail;
+    // even a late mismatching observed address remains risk evidence.
     let state = if reference.is_empty() {
         "unknown"
-    } else if candidates.is_empty() {
-        "ok"
-    } else if candidates.is_subset(&reference) {
-        "ok"
-    } else {
+    } else if !observed_candidates.is_subset(&reference) {
         "fail"
+    } else if candidates.is_empty() {
+        "unknown"
+    } else {
+        "ok"
     };
     let (detail, sampled, observations) = p::stun(stun, &candidates, &reference, &stamp);
     let mut stun_row = row(

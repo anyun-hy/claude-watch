@@ -161,7 +161,7 @@ def observe(paths, system, *, online=False, mode="auto", persist=False):
                     transition.update(state="sampling_unavailable", unavailable=sorted(set(transition.get("unavailable", []) + [exc.code])))
                     local["context_transition"] = transition
                     local["context_changed"] = False
-    # DNS is intentionally read from the same Net.Coffee receipt used by the
+    # DNS is intentionally read from the same IPLeak receipt used by the
     # controlled launch path.  ``system.online`` must not create a second,
     # different resolver observation here.
     values["dns"] = dns_receipt_status(paths, local.get("context", ""))
@@ -244,7 +244,7 @@ def observe(paths, system, *, online=False, mode="auto", persist=False):
     else:
         dns_current = "未知"
     detail("dns", dns_current, "同轮 HTTP 出口国家 " + (", ".join(http_countries) or "未确认"),
-           "Net.Coffee 权威 DNS 记录 + 同轮 HTTP 参考；DNS 采样 " + sampled_text)
+           "IPLeak.net 权威 DNS 记录 + 同轮 HTTP 参考；DNS 采样 " + sampled_text)
     rows_by_id["dns"]["detail"] = values["dns"].get("detail", "DNS 泄漏检测尚未完成")
     if countries:
         rows_by_id["dns"]["detail"] += "；DNS 国家 " + ", ".join(countries)
@@ -256,7 +256,9 @@ def observe(paths, system, *, online=False, mode="auto", persist=False):
         rows_by_id["dns"]["reference"] = "上次有效 DNS · " + sampled_text
         rows_by_id["dns"]["detail"] += "；此为历史显示，最新失败仍阻止受控启动"
     stun = values.get("stun", {}) if isinstance(values.get("stun"), dict) else {}
-    stun_candidates = {public_ip(x.get("address")) for x in stun.get("observations", []) if isinstance(x, dict) and x.get("status") == "ok"} - {""}
+    stun_candidates = {public_ip(x.get("address")) for x in stun.get("observations", [])
+                       if isinstance(x, dict) and x.get("status") == "ok"
+                       and x.get("accepted") is not False and x.get("deadline_exceeded") is not True} - {""}
     stun_detail, stun_sampled_at, stun_observations = stun_presentation(stun, stun_candidates, {address} if matched else set())
     detail("stun", ", ".join(sorted(stun_candidates)),
            address if matched else "本轮 HTTP 出口未确认",
@@ -391,6 +393,14 @@ def observe(paths, system, *, online=False, mode="auto", persist=False):
                    message="本轮实测结果；未知项保留未知。受控启动仍需独立预检。" + ("\n" + reason if reason else ""))
     if policy_preview:
         policy_preview.update(observation_id=receipt["observation_id"], context_id=receipt["context_id"])
+    receipt["initialization_receipts"] = {}
+    for kind, timestamp in (("dns", "finished_at"), ("webrtc", "sampled_at")):
+        status = values.get(kind) if isinstance(values.get(kind), dict) else {}
+        recorded = status.get("receipt") if isinstance(status.get("receipt"), dict) else {}
+        receipt["initialization_receipts"][kind] = {
+            "state": status.get("state"), "context_id": recorded.get("context_id"),
+            "sampled_at": recorded.get(timestamp),
+        }
     if persist:
         with operation_lock(paths, "observations"):
             current = read_json(paths.base / "environment-history.json", [])

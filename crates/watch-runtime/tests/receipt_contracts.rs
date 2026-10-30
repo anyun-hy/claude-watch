@@ -19,13 +19,20 @@ fn local() -> Value {
 fn probe(kind: &str, now: f64) -> Value {
     let candidates = if kind == "dns" { "resolver" } else { "srflx" };
     let address = if kind == "dns" { "8.8.8.8" } else { "1.1.1.1" };
+    let evidence = if kind == "dns" {
+        json!({"session":"a".repeat(40), "dns_servers":{"8.8.8.8":5},
+               "http":{"address":"1.1.1.1","country":"JP"},
+               "geoip":[{"ip":"8.8.8.8","country_code":"JP"}]})
+    } else {
+        json!([
+            {"kind":"geoip","status":"complete","query":"1.1.1.1","data":{"country_code":"jp"}},
+            {"kind":"geoip","status":"complete","query":address,"data":{"country_code":"jp"}}
+        ])
+    };
     json!({"kind":kind,"status":"complete","startedAt":now-2.0,"finishedAt":now,"contextChanged":false,"errors":[],
         "observations":[{"kind":"http","address":"1.1.1.1","country":"Japan","source":"fixture"},
                         {"kind":candidates,"address":address,"country":"Japan","source":"fixture"}],
-        "externalJSON":serde_json::to_string(&json!([
-            {"kind":"geoip","status":"complete","query":"1.1.1.1","data":{"country_code":"jp"}},
-            {"kind":"geoip","status":"complete","query":address,"data":{"country_code":"jp"}}
-        ])).unwrap()})
+        "externalJSON":serde_json::to_string(&evidence).unwrap()})
 }
 fn oracle(operation: &str, cases: &[Value]) -> Vec<Value> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -98,10 +105,15 @@ fn receipt_generation_matches_mature_dns_and_webrtc_behavior() {
             cases.push(case);
         }
         let mut cn = good.clone();
-        cn["probe"]["externalJSON"]=json!(serde_json::to_string(&json!([
-            {"kind":"geoip","status":"complete","query":"1.1.1.1","data":{"country_code":"JP"}},
-            {"kind":"geoip","status":"complete","query":if kind=="dns"{"8.8.8.8"}else{"1.1.1.1"},"data":{"country_code":"CN"}}
-        ])).unwrap());
+        let cn_evidence = if kind == "dns" {
+            json!({"session":"a".repeat(40),"dns_servers":{"8.8.8.8":5},"http":{"address":"1.1.1.1","country":"JP"},"geoip":[{"ip":"8.8.8.8","country_code":"CN"}]})
+        } else {
+            json!([
+                {"kind":"geoip","status":"complete","query":"1.1.1.1","data":{"country_code":"JP"}},
+                {"kind":"geoip","status":"complete","query":if kind=="dns"{"8.8.8.8"}else{"1.1.1.1"},"data":{"country_code":"CN"}}
+            ])
+        };
+        cn["probe"]["externalJSON"] = json!(serde_json::to_string(&cn_evidence).unwrap());
         cases.push(cn);
         let mut expected = good.clone();
         expected["expected_context"] = json!("wrong");
@@ -130,6 +142,95 @@ fn receipt_generation_matches_mature_dns_and_webrtc_behavior() {
             assert_eq!(actual, expected, "kind={kind}, case={case}");
         }
     }
+}
+
+#[test]
+fn ipleak_evidence_is_bound_to_the_session_and_observed_addresses() {
+    let good = probe("dns", NOW);
+    let receipt = receipts::record_dns(&good, &local(), None, NOW + 1.0).unwrap();
+    assert_eq!(receipt["provider"], "ipleak");
+    assert_eq!(receipt["comparison"]["state"], "ok");
+    let source: Value = serde_json::from_str(good["externalJSON"].as_str().unwrap()).unwrap();
+    for (path, replacement) in [
+        ("/session", json!("invalid")),
+        ("/dns_servers", json!({"8.8.8.8":0})),
+        ("/dns_servers", json!({"9.9.9.9":1})),
+        ("/http/address", json!("9.9.9.9")),
+        ("/http/country", json!("")),
+        ("/geoip/0/country_code", json!("")),
+        ("/geoip/0/ip", json!("9.9.9.9")),
+    ] {
+        let mut raw = source.clone();
+        *raw.pointer_mut(path).unwrap() = replacement;
+        let mut value = good.clone();
+        value["externalJSON"] = json!(raw.to_string());
+        assert_ne!(
+            receipts::record_dns(&value, &local(), None, NOW + 1.0).unwrap()["comparison"]["state"],
+            "ok",
+            "{path}"
+        );
+    }
+    let mut omitted = good.clone();
+    let mut raw = source.clone();
+    raw["dns_servers"]["9.9.9.9"] = json!(1);
+    raw["geoip"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"ip":"9.9.9.9","country_code":"JP"}));
+    omitted["externalJSON"] = json!(raw.to_string());
+    assert_eq!(
+        receipts::record_dns(&omitted, &local(), None, NOW + 1.0).unwrap()["comparison"]["state"],
+        "unknown"
+    );
+    let mut extra = good.clone();
+    extra["observations"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"kind":"resolver", "address":"10.0.0.1"}));
+    assert_ne!(
+        receipts::record_dns(&extra, &local(), None, NOW + 1.0).unwrap()["comparison"]["state"],
+        "ok"
+    );
+    let mut old = receipt.clone();
+    old.as_object_mut().unwrap().remove("provider");
+    assert_eq!(
+        receipts::dns_status(&old, &json!({}), "ctx", true, NOW + 2.0, |v| v.to_string())["state"],
+        "unknown"
+    );
+}
+
+#[test]
+fn real_ipleak_collector_payload_reaches_the_backend_gate() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let output = Command::new("node")
+        .arg(root.join("monitor/tests/test_ipleak_probe.cjs"))
+        .arg("--emit-fixture")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let probe: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let now = probe["finishedAt"].as_f64().unwrap() + 1.0;
+    let receipt = receipts::record_dns(&probe, &local(), None, now).unwrap();
+    assert_eq!(receipt["provider"], "ipleak");
+    assert_eq!(receipt["comparison"]["state"], "ok");
+    assert_eq!(
+        receipts::dns_status(&receipt, &json!({}), "ctx", true, now, |v| v.to_string())["state"],
+        "ok"
+    );
+    let mut invalid = probe;
+    invalid["contextChanged"] = json!(true);
+    assert_ne!(
+        receipts::record_dns(&invalid, &local(), None, now).unwrap()["comparison"]["state"],
+        "ok"
+    );
 }
 #[test]
 fn stored_receipt_status_matches_legacy_ttl_and_history_contract() {
@@ -259,10 +360,11 @@ fn dns_history_never_hides_new_mismatch_or_context_change_and_never_authorizes_l
         false
     );
     let mut foreign = probe("dns", now + 10.0);
-    foreign["externalJSON"] = json!(serde_json::to_string(&json!([
-        {"kind":"geoip","status":"complete","query":"1.1.1.1","data":{"country_code":"JP"}},
-        {"kind":"geoip","status":"complete","query":"8.8.8.8","data":{"country_code":"US"}}
-    ]))
+    foreign["externalJSON"] = json!(serde_json::to_string(&json!({
+        "session":"a".repeat(40), "dns_servers":{"8.8.8.8":5},
+        "http":{"address":"1.1.1.1","country":"JP"},
+        "geoip":[{"ip":"8.8.8.8","country_code":"US"}]
+    }))
     .unwrap());
     foreign["status"] = json!("partial");
     foreign["errors"] = json!([{"stage":"lookup","code":"timeout"}]);

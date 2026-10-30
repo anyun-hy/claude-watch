@@ -24,10 +24,16 @@ xcrun swiftc -swift-version 5 -parse-as-library -D IPLEAK_BRIDGE_TEST -target "a
   -module-cache-path "$TEST_DIR/module-cache" -framework AppKit -framework WebKit \
   "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" \
   "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" \
-  "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/Sources/IPLeakDNSRunner.swift" \
+  "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/Sources/IPLeakDNSRunner.swift" "$ROOT/Sources/IPLeakDNSRetryRunner.swift" \
   "$ROOT/Sources/EventDiagnostics.swift" "$ROOT/Sources/LeakCheckStore.swift" "$ROOT/tests/IPLeakBridgeTests.swift" \
   -o "$APP/Contents/MacOS/IPLeakBridgeTests"
 /usr/bin/codesign --force --sign - "$APP" >/dev/null
+xcrun swiftc -swift-version 5 -parse-as-library -target "arm64-apple-macosx$CW_MACOS_MINIMUM" \
+  -module-cache-path "$TEST_DIR/module-cache" -framework AppKit -framework WebKit \
+  "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/LeakCheckModels.swift" \
+  "$ROOT/Sources/IPLeakDNSRunner.swift" "$ROOT/Sources/IPLeakDNSRetryRunner.swift" "$ROOT/tests/IPLeakRetryTests.swift" \
+  -o "$TEST_DIR/IPLeakRetryTests"
+"$TEST_DIR/IPLeakRetryTests"
 "$APP/Contents/MacOS/IPLeakBridgeTests" --fixture
 if [[ "${1:---fixture}" == --live ]]; then
   "$APP/Contents/MacOS/IPLeakBridgeTests" --live

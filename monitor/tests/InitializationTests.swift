@@ -12,8 +12,11 @@ private final class ScriptedInitializationChecks: InitializationChecking {
     var calls: [InitializationStep] = []
     var overrides: [InitializationStep: InitializationResult] = [:]
     var validation = InitializationResult.passed("current", validUntil: Date().timeIntervalSince1970 + 120)
+    var evidenceFailures: [InitializationStep: InitializationResult] = [:]
     var approvalResult = InitializationResult.passed("authorized")
     var begins = 0, approvals = 0, finishes = 0
+    var automaticRefreshes = 0
+    var automaticRefreshDelay: UInt64 = 0
     var delayStep: InitializationStep?
     var previousProgress: SetupProgressObserver?
     func begin() { begins += 1 }
@@ -26,6 +29,12 @@ private final class ScriptedInitializationChecks: InitializationChecking {
         approvals += 1; previousProgress = progress; progress(.verifyEgress); return approvalResult
     }
     func validateCurrentEvidence() -> InitializationResult { validation }
+    func currentEvidenceFailures() -> [InitializationStep: InitializationResult] { evidenceFailures }
+    func refreshWaitingEvidence() async -> InitializationRefreshOutcome {
+        automaticRefreshes += 1
+        if automaticRefreshDelay > 0 { try? await Task.sleep(nanoseconds: automaticRefreshDelay) }
+        return .passed(validUntil: Date().timeIntervalSince1970 + 120)
+    }
     func finish() { finishes += 1 }
 }
 
@@ -47,6 +56,15 @@ struct InitializationTests {
                "notification destinations resolve to the corresponding Watch pages")
         expect(AppDelegate.notificationPage("unexpected") == nil && AppDelegate.notificationPage(nil) == nil,
                "unknown notification destinations cannot navigate")
+        for (kind, timestamp, verdict) in [(LeakKind.dns, "finished_at", "comparison"), (.webrtc, "sampled_at", "risk")] {
+            let valid: [String: Any] = ["status": "ok", "receipt": ["context_id": "context", timestamp: 123.5, verdict: ["state": "ok"]]]
+            expect(SwitcherStore.initializationReceiptMetadata(valid, kind: kind, sampledAt: 123.5)?.context == "context",
+                   "real backend response binds its context and verdict to the exact probe time")
+            expect(SwitcherStore.initializationReceiptMetadata(valid, kind: kind, sampledAt: 124) == nil,
+                   "backend response for a different probe cannot be accepted")
+            expect(SwitcherStore.initializationReceiptMetadata(["status": "ok", "receipt": [:]], kind: kind, sampledAt: 123.5) == nil,
+                   "a missing backend context or verdict cannot be accepted")
+        }
         if case .failed(let code, let detail) = FirstRunChecks.networkContextFailure(bound: "A", current: nil, timeoutStage: "dns_images") {
             expect(code == "context_unavailable" && detail.contains("超时") && !detail.contains("已变化"),
                    "a sampling gap does not hide the DNS timeout or claim a confirmed change")
@@ -123,8 +141,38 @@ struct InitializationTests {
         expect(staged.approval == protectionApproval && stagedChecks.calls.suffix(3) == [.dns, .webrtc, .protection],
                "new protection requires a separate confirmation after DNS and WebRTC have passed")
         expect(!staged.allPassed && !staged.entered && !stagedChecks.calls.contains(.verification), "pending guard approval cannot reach the final gate")
+        staged.refreshReadiness(at: Date().addingTimeInterval(600))
+        expect(staged.approval == protectionApproval && stagedChecks.automaticRefreshes == 0,
+               "waiting for authorization never starts automatic collection or bypasses confirmation")
         await staged.authorize(protectionApproval)
         expect(staged.allPassed && !staged.entered, "authorized guard step still requires final joint verification")
+
+        let concurrentChecks = ScriptedInitializationChecks()
+        concurrentChecks.automaticRefreshDelay = 100_000_000
+        let concurrentInit = FirstRunInitialization(checks: concurrentChecks, completed: false, saveCompletion: {})
+        await concurrentInit.start()
+        concurrentInit.refreshReadiness(at: Date().addingTimeInterval(61))
+        concurrentInit.refreshReadiness(at: Date().addingTimeInterval(61))
+        await concurrentInit.enter()
+        try await Task.sleep(nanoseconds: 20_000_000)
+        expect(concurrentChecks.automaticRefreshes == 1 && concurrentInit.running && !concurrentInit.entered,
+               "overlapping timer ticks and entry cannot start duplicate refreshes or bypass an in-flight round")
+        for _ in 0..<100 where concurrentInit.running { try await Task.sleep(nanoseconds: 10_000_000) }
+        expect(concurrentInit.allPassed && !concurrentInit.running, "one completed automatic refresh restores readiness")
+
+        let changingChecks = ScriptedInitializationChecks()
+        changingChecks.overrides[.protection] = .approval(protectionApproval)
+        let changing = FirstRunInitialization(checks: changingChecks, completed: false, saveCompletion: {})
+        await changing.start()
+        changingChecks.evidenceFailures[.dns] = .failed(code: "dns_expired", detail: "DNS expired")
+        changing.refreshReadiness()
+        expect(changing.rows[4].status == .failed && changing.rows[4].code == "dns_expired" && changing.rows[5].status == .passed,
+               "a revoked DNS receipt updates its own previously green row without mislabelling WebRTC")
+        expect(changing.approval == nil && changing.rows[6].status == .pending,
+               "invalidated prerequisite withdraws pending protection approval")
+        await changing.authorize(protectionApproval)
+        expect(changingChecks.approvals == 0 && !changing.canEnter(at: Date().timeIntervalSince1970),
+               "a withdrawn approval cannot enable protection or enter")
 
         let persistenceChecks = ScriptedInitializationChecks()
         let unwritable = FirstRunInitialization(checks: persistenceChecks, completed: false, saveCompletion: { throw CocoaError(.fileWriteNoPermission) })
@@ -176,6 +224,8 @@ struct InitializationTests {
         expect(!leaks.initializationReceiptIsCurrent(.dns) && !leaks.initializationReceiptIsCurrent(.webrtc), "changed proxy context invalidates both receipts")
         context = "fixture-A"
         expect(!leaks.initializationReceiptIsCurrent(.dns, at: Date(timeIntervalSince1970: dnsSampleTime + 301)), "cache use never extends evidence lifetime")
+        expect(leaks.initializationReceiptProblem(.dns, at: Date(timeIntervalSince1970: dnsSampleTime + 301))?.code == "dns_expired",
+               "expired evidence identifies the specific failing prerequisite")
         leaks.fixtureScenario = .difference
         let realRisk = await leaks.ensureInitializationReceipt(.dns, maximumWait: 1)
         // Force a new round rather than reusing the recent passing receipt.
@@ -310,6 +360,129 @@ struct InitializationTests {
         published.acceptSnapshot(firstSnapshot, receivedAt: Date())
         expect(published.initializationContext != nil && published.initializing && !published.leakChecks.dns.running && !published.leakChecks.rtc.running,
                "first-run snapshot polling updates shared context without starting independent diagnostic jobs")
+        let recovery = MonitorStore(leakChecks: LeakCheckStore(isFixture: true), aiChecks: AIProbeStore(isFixture: true), switcher: SwitcherStore(isFixture: true))
+        recovery.beginInitialization(startSnapshotPolling: false)
+        recovery.automatic = false
+        recovery.leakChecks.fixtureDelayNanoseconds = 1_000_000
+        recovery.leakChecks.onDNSComplete = { _ in true }
+        let base = Date()
+        recovery.acceptSnapshot(snapshot(node: "A", at: base.timeIntervalSince1970 - 9), receivedAt: base)
+        let acceptedBeforeGap = await recovery.leakChecks.ensureInitializationReceipt(.dns, maximumWait: 1)
+        expect(acceptedBeforeGap, "fresh receipt starts in the verified proxy context")
+        let afterGap = base.addingTimeInterval(2)
+        recovery.monitorTick(at: afterGap)
+        expect(recovery.initializationContext != nil && recovery.leakChecks.dns.verdict.state == .matched &&
+               recovery.leakChecks.initializationReceiptIsCurrent(.dns),
+               "a directly verified current proxy remains usable after the separate ten-second gap grace")
+        let noProxy = MonitorSnapshot(capturedAt: afterGap.timeIntervalSince1970, health: firstSnapshot.health,
+            installed: true, autoStart: true, keepAlive: true, hasBaseline: false,
+            stderrBytes: 0, processes: [], events: [], proxy: nil, proxyError: nil,
+            logPath: "/fixture/log", backendVersion: "fixture", monitoredApps: ["claude"])
+        recovery.acceptSnapshot(noProxy, receivedAt: afterGap)
+        expect(recovery.leakChecks.dns.verdict.state == .incomplete && !recovery.leakChecks.initializationReceiptIsCurrent(.dns),
+               "a genuinely unavailable proxy beyond the grace window cannot keep a green verdict")
+        recovery.acceptSnapshot(snapshot(node: "A", at: afterGap.timeIntervalSince1970), receivedAt: afterGap)
+        expect(recovery.leakChecks.dns.verdict.state == .matched && recovery.leakChecks.initializationReceiptIsCurrent(.dns),
+               "same-context recovery re-evaluates the receipt against the newly published snapshot immediately")
+
+        // Exercise the real coordinator, checks and shared stores end-to-end;
+        // all external inputs, authorizations and writes stay in fixtures.
+        let fullSwitcher = SwitcherStore(isFixture: true)
+        fullSwitcher.fullInitializationFixture = true
+        let fullLeaks = LeakCheckStore(isFixture: true)
+        fullLeaks.fixtureDelayNanoseconds = 1_000_000
+        let fullStore = MonitorStore(leakChecks: fullLeaks, aiChecks: AIProbeStore(isFixture: true), switcher: fullSwitcher)
+        var fullNode = "A"
+        fullStore.acceptSnapshot(snapshot(node: "A", at: Date().timeIntervalSince1970), receivedAt: Date())
+        let fullChecks = FirstRunChecks(store: fullStore, componentCheck: {}, accessibilityTrusted: { true },
+            requestAccessibility: {}, waitForConnectionPoll: {
+                try? await Task.sleep(nanoseconds: 5_000_000)
+                fullStore.acceptSnapshot(snapshot(node: fullNode, at: Date().timeIntervalSince1970), receivedAt: Date())
+            }, startSnapshotPolling: false)
+        var fullWrites = 0
+        let full = FirstRunInitialization(checks: fullChecks, completed: false, saveCompletion: { fullWrites += 1 })
+        await full.start()
+        expect(full.approval?.action == .environment && full.passedCount == 2,
+               "full flow stops at the real environment confirmation before any DNS or guard changes")
+        if let request = full.approval { await full.authorize(request) }
+        expect(full.approval?.action == .protection && full.passedCount == 6 &&
+               fullLeaks.initializationReceiptIsCurrent(.dns) && fullLeaks.initializationReceiptIsCurrent(.webrtc),
+               "full flow carries the actual two accepted fixture receipts into guard confirmation")
+        let mismatchedApproval = full.approval!
+        fullSwitcher.setInitializationReceiptForFixture(.webrtc, context: "different-backend-network", state: "ok")
+        full.refreshReadiness()
+        expect(full.rows[4].status == .passed && full.rows[5].code == "webrtc_backend_context_changed" && full.approval == nil,
+               "backend network change revokes the affected receipt even when the visible proxy signature is unchanged")
+        await full.authorize(mismatchedApproval)
+        expect(fullSwitcher.settings["guard_enabled"] as? Bool != true, "a backend context mismatch cannot use the old approval")
+        await full.retry()
+        if full.approval?.action == .environment, let request = full.approval { await full.authorize(request) }
+        expect(full.approval?.action == .protection, "new matching backend receipts permit a fresh guard confirmation")
+        fullSwitcher.setInitializationReadbackForFixture(.dns, sampled: 1)
+        full.refreshReadiness()
+        expect(full.rows[4].code == "dns_backend_receipt_changed" && full.approval == nil,
+               "a replaced persisted DNS receipt revokes the old green and guard confirmation")
+        await full.retry()
+        if full.approval?.action == .environment, let request = full.approval { await full.authorize(request) }
+        expect(full.approval?.action == .protection, "retry obtains a new persisted receipt after the backend readback changes")
+        let oldGuardApproval = full.approval!
+        fullNode = "B"
+        fullStore.acceptSnapshot(snapshot(node: fullNode, at: Date().timeIntervalSince1970), receivedAt: Date())
+        full.refreshReadiness()
+        expect(full.approval == nil && full.rows[1].status == .failed && full.rows[4].status == .failed &&
+               full.rows[5].status == .failed && full.rows[6].status == .pending,
+               "changing the real shared context revokes both receipt greens and the pending guard approval")
+        await full.authorize(oldGuardApproval)
+        expect(fullSwitcher.settings["guard_enabled"] as? Bool != true, "old approval cannot enable guard after a context change")
+        await full.retry()
+        expect(full.approval?.action == .environment, "new context requires a new environment confirmation")
+        if let request = full.approval { await full.authorize(request) }
+        expect(full.approval?.action == .protection && fullLeaks.initializationReceiptIsCurrent(.dns) &&
+               fullLeaks.initializationReceiptIsCurrent(.webrtc),
+               "retry obtains new-context receipts before presenting a new guard confirmation")
+        if let request = full.approval { await full.authorize(request) }
+        expect(full.allPassed && !full.entered && fullStore.switcher.settings["guard_enabled"] as? Bool == true,
+               "confirmed fixture guard still runs the real final verification before entry")
+        // Advance six scheduled intervals without waiting six real minutes;
+        // the real shared stores and fixture collectors produce new receipts.
+        for _ in 0..<6 {
+            let oldDNS = fullLeaks.dns.result!.finishedAt, oldRTC = fullLeaks.rtc.result!.finishedAt
+            full.refreshReadiness(at: Date().addingTimeInterval(61))
+            expect(full.running && !full.canEnter(at: Date().timeIntervalSince1970), "automatic refresh cannot grant entry while evidence is in flight")
+            for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
+            expect(!full.running && full.allPassed && fullLeaks.dns.result!.finishedAt > oldDNS && fullLeaks.rtc.result!.finishedAt > oldRTC,
+                   "each scheduled cycle refreshes DNS and WebRTC before restoring ready state")
+            let readback = fullSwitcher.currentEnvironment?.initialization_receipts
+            expect(readback?.dns?.sampled_at == fullLeaks.dns.result?.finishedAt && readback?.webrtc?.sampled_at == fullLeaks.rtc.result?.finishedAt,
+                   "the environment page uses the exact newly submitted receipts")
+        }
+        fullLeaks.fixtureScenario = .timeout
+        full.refreshReadiness(at: Date().addingTimeInterval(61))
+        for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
+        expect(full.rows[4].status == .failed && !full.canEnter(at: Date().timeIntervalSince1970),
+               "an automatic DNS failure is visible and cannot reuse the previous green")
+        fullLeaks.fixtureScenario = .matched
+        full.refreshReadiness(at: Date().addingTimeInterval(31))
+        for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
+        expect(full.allPassed && full.canEnter(at: Date().timeIntervalSince1970),
+               "automatic retry restores readiness only after new checks and joint verification")
+        let gapAt = Date().timeIntervalSince1970
+        let gap = MonitorSnapshot(capturedAt: gapAt, health: firstSnapshot.health,
+            installed: true, autoStart: true, keepAlive: true, hasBaseline: false,
+            stderrBytes: 0, processes: [], events: [], proxy: nil, proxyError: nil,
+            logPath: "/fixture/log", backendVersion: "fixture", monitoredApps: ["claude"])
+        fullStore.acceptSnapshot(gap, receivedAt: Date())
+        full.refreshReadiness()
+        expect(full.rows[1].code == "context_unavailable" && full.rows[2].status == .pending && !full.allPassed,
+               "a temporary proxy sampling gap revokes dependent green states")
+        fullStore.acceptSnapshot(snapshot(node: fullNode, at: Date().timeIntervalSince1970), receivedAt: Date())
+        full.refreshReadiness(at: Date().addingTimeInterval(31))
+        for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
+        expect(full.allPassed && full.canEnter(at: Date().timeIntervalSince1970),
+               "the same recovered context automatically rechecks both receipts and environment")
+        await full.enter()
+        expect(full.entered && fullWrites == 1 && !fullStore.initializing,
+               "full flow revalidates, saves once and hands the same stores to the main view")
         let partialBackend = backendEvidence(at: Date().timeIntervalSince1970, sampling: false, native: true)
         published.switcher.loadReviewReceipts(published.switcher.currentEnvironment!, background: partialBackend)
         let connectionChecks = FirstRunChecks(store: published, componentCheck: {}, accessibilityTrusted: { true }, requestAccessibility: {})

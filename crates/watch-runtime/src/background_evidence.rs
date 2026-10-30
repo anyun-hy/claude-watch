@@ -32,13 +32,29 @@ pub const ASSETS: [&str; 3] = [
     "netcoffee_probe.css",
 ];
 pub const EXTRA_FILES: [&str; 4] = [WORKER, ASSETS[0], ASSETS[1], ASSETS[2]];
+pub const EXTRA_FILES_V2: [&str; 6] = [
+    WORKER,
+    ASSETS[0],
+    ASSETS[1],
+    ASSETS[2],
+    "ipleak_probe.html",
+    "ipleak_probe.js",
+];
 
 /// Legacy five-component bundles remain recognizable for rollback. A new
 /// bundle must explicitly advertise and contain the complete background set.
 pub fn supported_manifest(manifest: &Value) -> Result<bool> {
     match manifest.get("BackgroundEvidenceSchema") {
         None => Ok(false),
-        Some(v) if v == 1 => Ok(true),
+        Some(v) if v == 1 || v == 2 => Ok(true),
+        _ => Err(err("evidence_runtime_invalid", "后台检测组件版本无效")),
+    }
+}
+pub fn extra_files(manifest: &Value) -> Result<&'static [&'static str]> {
+    match manifest.get("BackgroundEvidenceSchema") {
+        None => Ok(&[]),
+        Some(v) if v == 1 => Ok(&EXTRA_FILES),
+        Some(v) if v == 2 => Ok(&EXTRA_FILES_V2),
         _ => Err(err("evidence_runtime_invalid", "后台检测组件版本无效")),
     }
 }
@@ -63,7 +79,9 @@ impl ProbeKind {
     }
     fn refresh_age(self) -> f64 {
         match self {
-            Self::Dns => 20.0,
+            // Start early enough for the complete, bounded IPLeak round to
+            // finish before the existing launch evidence expires.
+            Self::Dns => 10.0,
             Self::WebRtc => 60.0,
         }
     }
@@ -273,10 +291,15 @@ pub fn refresh_active_session<S: EvidenceSystem>(
 /// inherit this group and cannot outlive a timeout or daemon shutdown.
 pub struct ProbeExecutor {
     stop: Arc<AtomicBool>,
+    diagnostics: Option<StateStore>,
 }
 impl ProbeExecutor {
     pub fn new(stop: Arc<AtomicBool>) -> Self {
-        Self { stop }
+        Self { stop, diagnostics: None }
+    }
+    pub fn with_diagnostics(mut self, store: StateStore) -> Self {
+        self.diagnostics = Some(store);
+        self
     }
 }
 fn stop_group(job: &Job) {
@@ -308,13 +331,15 @@ impl FixedCommandExecutor for ProbeExecutor {
             .stderr(Redirection::Pipe)
             .start()
             .map_err(|_| err("evidence_worker_unavailable", "后台检测组件无法启动"))?;
+        let started_at = crate::native::now();
+        let mut error_output = Vec::new();
         let result = (|| -> Result<FixedOutput> {
             let mut io = job
                 .communicate()
                 .map_err(|_| err("evidence_probe_failed", "后台检测通道不可用"))?
                 .limit_time(Duration::from_millis(100));
             let deadline = Instant::now() + command.timeout;
-            let (mut out, mut error_output) = (Vec::new(), Vec::new());
+            let mut out = Vec::new();
             loop {
                 if self.stop.load(Ordering::Acquire) {
                     return Err(err("evidence_cancelled", "后台检测已停止"));
@@ -354,6 +379,31 @@ impl FixedCommandExecutor for ProbeExecutor {
         if result.is_err() {
             stop_group(&job);
         }
+        // Keep detailed worker phases only for an unsuccessful collection.
+        // stderr can contain system output: accept only the fixed JSON fields
+        // and event vocabulary, never persist arbitrary stderr text.
+        let incomplete = result.as_ref().map_or(true, |output| {
+            output.status != 0 || serde_json::from_str::<Value>(&output.stdout).ok()
+                .and_then(|value| value["status"].as_str().map(str::to_owned))
+                .as_deref() != Some("complete")
+        });
+        if incomplete {
+            if let Some(store) = &self.diagnostics {
+                let events = crate::events::EventStore::new(store.clone());
+                let run = uuid::Uuid::new_v4().to_string();
+                let kind = if command.args == ["--dns"] { "dns" } else { "webrtc" };
+                let mut recorded = 0;
+                for line in error_output.split(|b| *b == b'\n').take(4096) {
+                    if recorded >= 64 { break; }
+                    let Ok(value) = serde_json::from_slice::<Value>(line) else { continue };
+                    let (Some(event), Some(attached), Some(ms)) = (value["cw_trace"].as_str(), value["attached"].as_bool(), value["elapsed_ms"].as_f64()) else { continue };
+                    if !(0.0..=120_000.0).contains(&ms) { continue; }
+                    if events.record_worker_trace(kind, &run, event, attached, ms / 1000.0, started_at + ms / 1000.0).is_ok() {
+                        recorded += 1;
+                    }
+                }
+            }
+        }
         result
     }
 }
@@ -390,7 +440,11 @@ pub fn collect_native<R: ReadRunner, E: FixedCommandExecutor>(
     {
         return Err(err("evidence_runtime_invalid", "后台检测运行清单无效"));
     }
-    for name in [WORKER, "watch-engine", ASSETS[0], ASSETS[1], ASSETS[2]] {
+    for name in extra_files(&manifest)?
+        .iter()
+        .copied()
+        .chain(["watch-engine"])
+    {
         let path = runtime.join(name);
         store.guarded(&path)?;
         let metadata = fs::symlink_metadata(&path)

@@ -47,7 +47,17 @@ enum CountryIdentity {
     /// Country codes already present in the retained GeoIP receipts. Read only.
     static func geoCodes(_ raw: String?) -> [String:String] {
         guard let raw, let bytes = raw.data(using:.utf8),
-              let receipts = try? JSONSerialization.jsonObject(with:bytes) as? [[String:Any]] else { return [:] }
+              let object = try? JSONSerialization.jsonObject(with:bytes) else { return [:] }
+        if let evidence = object as? [String: Any], let values = evidence["geoip"] as? [[String: Any]] {
+            var result: [String: String] = [:]
+            for row in values {
+                if let ip = row["ip"] as? String, let country = code(row["country_code"] as? String, country: nil) { result[ip] = country }
+            }
+            if let http = evidence["http"] as? [String: Any], let ip = http["address"] as? String,
+               let country = code(http["country"] as? String, country: nil) { result[ip] = country }
+            return result
+        }
+        guard let receipts = object as? [[String:Any]] else { return [:] }
         var result: [String:String] = [:]
         for r in receipts where r["kind"] as? String == "geoip" && r["status"] as? String == "complete" {
             guard let ip = r["query"] as? String, let data = r["data"] as? [String:Any],

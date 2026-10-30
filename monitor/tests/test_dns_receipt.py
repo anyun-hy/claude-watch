@@ -1,4 +1,4 @@
-"""Offline contracts for the shared Net.Coffee DNS-leak receipt."""
+"""Offline contracts for the shared IPLeak DNS-leak receipt."""
 import copy
 import json
 import io
@@ -38,10 +38,9 @@ def probe(now, dns_country="jp", *, status="complete", errors=None, changed=Fals
         {"address": "222.10.87.169", "kind": "http", "source": "fixture", "family": 4},
         {"address": "8.8.8.8", "kind": "resolver", "source": "fixture", "family": 4},
     ]
-    records = [
-        {"kind": "geoip", "status": "complete", "query": "222.10.87.169", "data": {"country_code": "jp"}},
-        {"kind": "geoip", "status": "complete", "query": "8.8.8.8", "data": {"country_code": dns_country}},
-    ]
+    records = {"session": "a" * 40, "dns_servers": {"8.8.8.8": 5},
+               "http": {"address": "222.10.87.169", "country": "jp"},
+               "geoip": [{"ip": "8.8.8.8", "country_code": dns_country}]}
     return {"kind": "dns", "status": status, "startedAt": now - 2, "finishedAt": now,
             "scope": "fixture", "observations": observations, "errors": errors or [],
             "contextChanged": changed, "externalJSON": json.dumps(records)}
@@ -56,7 +55,7 @@ class DNSReceiptTests(unittest.TestCase):
         self.config = dict(DEFAULT_CONFIG, enabled=True, country="JP", timezone="Asia/Tokyo",
                            locale="ja_JP", online_enabled=True, guard_enabled=True)
 
-    def test_lowercase_netcoffee_country_codes_make_one_shared_passing_receipt(self):
+    def test_lowercase_ipleak_country_codes_make_one_shared_passing_receipt(self):
         now = time.time()
         receipt = record_dns_leak(self.paths, self.system, probe(now), now=now + 1)
         self.assertEqual(receipt["comparison"]["state"], "ok")

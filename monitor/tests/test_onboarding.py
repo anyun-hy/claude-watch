@@ -336,6 +336,16 @@ class CurrentEnvironmentTests(Fixture):
     def observe(self, **kwargs): return setup.observe(self.paths, self.system, online=True, **kwargs)
     def row(self, receipt, key): return next(r for r in receipt["rows"] if r["id"] == key)
 
+    def test_initialization_readback_uses_current_receipts_not_display_cache(self):
+        dns = {"state": "unknown", "receipt": {"context_id": "new", "finished_at": 101.0},
+               "display_receipt": {"context_id": "old", "finished_at": 90.0}}
+        webrtc = {"state": "ok", "receipt": {"context_id": "new", "sampled_at": 102.0}}
+        with patch.object(setup, "dns_receipt_status", return_value=dns), \
+             patch("watch_switcher.audit.webrtc_receipt_status", return_value=webrtc):
+            receipts = self.observe()["initialization_receipts"]
+        self.assertEqual(receipts["dns"], {"state": "unknown", "context_id": "new", "sampled_at": 101.0})
+        self.assertEqual(receipts["webrtc"], {"state": "ok", "context_id": "new", "sampled_at": 102.0})
+
     def test_unconfigured_machine_can_run_all_fourteen_live_checks(self):
         result = self.observe()
         self.assertEqual(len(result["rows"]), 14)
@@ -415,12 +425,28 @@ class CurrentEnvironmentTests(Fixture):
         self.assertFalse(self.paths.config.exists())
         self.assertFalse((self.paths.base / "confirmed-environment.json").exists())
 
-    def test_missing_shared_dns_receipt_and_partial_stun_remain_unknown(self):
+    def test_missing_shared_dns_receipt_and_partial_stun_are_independent(self):
         self.system.online_value["stun"]["complete"] = False
         result = self.observe()
         self.assertEqual(self.row(result, "dns")["current"], "未知")
         self.assertEqual(self.row(result, "dns")["state"], "unknown")
-        self.assertEqual(self.row(result, "stun")["state"], "unknown")
+        self.assertEqual(self.row(result, "stun")["state"], "ok")  # One accepted matching response remains usable.
+
+    def test_stun_requires_accepted_public_response(self):
+        for observations in ([], [{"status": "timeout"}],
+                             [{"status": "ok", "address": "10.0.0.1"}],
+                             [{"status": "ok", "address": "8.8.8.8", "accepted": False}],
+                             [{"status": "ok", "address": "8.8.8.8", "deadline_exceeded": True}]):
+            with self.subTest(observations=observations):
+                self.system.online_value["stun"] = {"complete": False, "observations": observations}
+                row = self.row(self.observe(), "stun")
+                self.assertEqual(row["state"], "unknown")
+                self.assertIn("无法确认 UDP 出口", row["detail"])
+        self.system.online_value["stun"]["observations"] = [
+            {"status": "ok", "address": "8.8.8.8"},
+            {"status": "ok", "address": "1.1.1.1", "accepted": False, "deadline_exceeded": True},
+        ]
+        self.assertEqual(self.row(self.observe(), "stun")["state"], "fail")
 
     def test_verified_web_challenge_and_keyless_api_are_shown_as_reachable(self):
         now = time.time()
@@ -466,7 +492,7 @@ class CurrentEnvironmentTests(Fixture):
                                "status": "ok", "error_code": "", "error": "", "stage": "receive"}]}]}
         result = self.observe(persist=True)
         row = self.row(result, "stun")
-        self.assertEqual(row["state"], "unknown")  # unchanged policy: partial never passes
+        self.assertEqual(row["state"], "ok")  # One accepted matching response remains usable.
         self.assertEqual(row["sampled_at"], finished)
         self.assertEqual(row["stun_probe"]["finished_at"], finished)
         self.assertIn("第1次", row["detail"])

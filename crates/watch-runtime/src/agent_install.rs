@@ -355,7 +355,7 @@ fn install_mode<E: FixedCommandExecutor>(
         }
     }
     if crate::background_evidence::supported_manifest(&manifest)? {
-        for name in crate::background_evidence::EXTRA_FILES {
+        for &name in crate::background_evidence::extra_files(&manifest)? {
             if !hashes.contains_key(name) {
                 return Err(err("runtime_missing", "缺少后台DNS/WebRTC检测组件校验项"));
             }

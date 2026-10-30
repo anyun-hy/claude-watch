@@ -690,7 +690,7 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
             "watch-native-collector.zsh",
         ];
         if crate::background_evidence::supported_manifest(&manifest)? {
-            required.extend(crate::background_evidence::EXTRA_FILES);
+            required.extend_from_slice(crate::background_evidence::extra_files(&manifest)?);
             let out = self.require(
                 "/usr/bin/lipo",
                 &[

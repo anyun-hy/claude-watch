@@ -61,6 +61,8 @@ final class WebRTCProbeRunner: NSObject, WKScriptMessageHandler, WKNavigationDel
     private var runID: String?
     private var documentURL: URL?
     private var watchdog: DispatchWorkItem?
+    var onDiagnostic: ((String, Bool) -> Void)?
+    private func trace(_ event: String) { onDiagnostic?(event, webView?.window != nil) }
 
     func start(id: UUID, completion: @escaping (LeakProbeResult) -> Void) {
         self.runID = id.uuidString; self.completion = completion
@@ -80,6 +82,7 @@ final class WebRTCProbeRunner: NSObject, WKScriptMessageHandler, WKNavigationDel
         let view = WKWebView(frame: .zero, configuration: configuration)
         view.navigationDelegate = self; webView = view
         let work = DispatchWorkItem { [weak self] in
+            self?.trace("watchdog_timeout")
             self?.finish(.failure(.webrtc, code: "timeout", message: "WebRTC 页面未在时限内完成；没有结果不代表无泄漏。"))
         }
         watchdog = work; DispatchQueue.main.asyncAfter(deadline: .now() + 22, execute: work)
@@ -104,19 +107,28 @@ final class WebRTCProbeRunner: NSObject, WKScriptMessageHandler, WKNavigationDel
     }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard webView === self.webView, let runID else { return }
+        trace("navigation_finished")
         // Return a plain scalar to WebKit; the probe sends its async receipt via
         // the native handler instead of asking evaluateJavaScript to bridge a Promise.
         let script = "if (!window.ClaudeWatchProbe) { throw new Error('probe missing'); } window.ClaudeWatchProbe.run({runID:'\(runID)', timeoutMs:8000}); true;"
         webView.evaluateJavaScript(script) { [weak self] _, error in
-            guard let self, self.runID == runID, error != nil else { return }
+            guard let self, self.runID == runID else { return }
+            if error == nil { self.trace("script_started"); return }
+            self.trace("script_failed")
             self.finish(.failure(.webrtc, code: "javascript_unavailable", message: "WebRTC 检测脚本不可用，未完成采样。"))
         }
     }
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        trace("navigation_failed")
         finish(.failure(.webrtc, code: "page_failed", message: "本地 WebRTC 检测页加载失败。"))
     }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        trace("navigation_failed")
         finish(.failure(.webrtc, code: "page_failed", message: "本地 WebRTC 检测页未能打开。"))
+    }
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        guard webView === self.webView else { return }
+        trace("webcontent_terminated")
     }
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         decisionHandler(navigationAction.request.url == documentURL ? .allow : .cancel)
@@ -124,16 +136,16 @@ final class WebRTCProbeRunner: NSObject, WKScriptMessageHandler, WKNavigationDel
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard let view = webView, let expectedID = runID,
               message.frameInfo.isMainFrame, message.webView === view,
-              let body = message.body as? [String: Any], body["runID"] as? String == expectedID,
-              let payload = body["payload"], JSONSerialization.isValidJSONObject(payload),
+              let body = message.body as? [String: Any], body["runID"] as? String == expectedID else { trace("message_rejected"); return }
+        guard let payload = body["payload"], JSONSerialization.isValidJSONObject(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload), data.count <= 65_536,
-              let result = try? JSONDecoder().decode(LeakProbeResult.self, from: data) else { return }
+              let result = try? JSONDecoder().decode(LeakProbeResult.self, from: data) else { trace("payload_invalid"); return }
+        trace("payload_received")
         finish(result)
     }
 }
 
 enum LeakProbeSource: String, CaseIterable { case netCoffee = "Net.Coffee", original = "原有检测" }
-enum DNSProbeSource: String, CaseIterable { case netCoffee = "Net.Coffee", ipLeak = "IPLeak.net" }
 
 enum LeakFixtureScenario: String, CaseIterable {
     case matched = "样本一致", difference = "出口差异", timeout = "检测超时", empty = "没有结果"
@@ -144,18 +156,13 @@ enum LeakFixtureScenario: String, CaseIterable {
 final class LeakCheckStore: ObservableObject {
     @Published var source: LeakProbeSource = .netCoffee
     @Published var deepDNS = false
-    @Published private(set) var dnsSource: DNSProbeSource = .netCoffee
-    @Published var ipLeakDeepDNS = false
-    @Published private(set) var ipLeakDNS = LeakCheckState()
-    @Published private(set) var ipLeakProgress: String?
-    @Published private(set) var ipLeakBrowserView: WKWebView?
     @Published private(set) var progress: [LeakKind: String] = [:]
     @Published private(set) var browserViews: [LeakKind: WKWebView] = [:]
     private var coffeeRunners: [LeakKind: NetCoffeeLeakRunner] = [:]
     @Published var rtcExpected = "" { didSet { reevaluate(.webrtc) } }
     @Published private(set) var dns = LeakCheckState()
     @Published private(set) var rtc = LeakCheckState()
-    @Published var now = Date() { didSet { reevaluate(.dns); reevaluate(.webrtc); reevaluateIPLeak(at: now) } }
+    @Published var now = Date() { didSet { reevaluate(.dns); reevaluate(.webrtc) } }
     let isFixture: Bool
     var fixtureDelayNanoseconds: UInt64 = 350_000_000
     var fixtureScenario: LeakFixtureScenario = .matched
@@ -187,10 +194,7 @@ final class LeakCheckStore: ObservableObject {
     private var webRTCReceiptSubmitting = false
     private var lastRecordedWebRTCAt: Date?
     private var lastRecordedWebRTCContext: String?
-    private var ipLeakRunner: IPLeakDNSRunner?
-    private var ipLeakRun: UUID?
-    private var ipLeakContext: ContextSnapshot?
-    private var ipLeakFixtureTask: Task<Void, Never>?
+    private var ipLeakRunner: IPLeakDNSRetryRunner?
 
     init(isFixture: Bool = false) {
         #if UI_REVIEW
@@ -200,6 +204,14 @@ final class LeakCheckStore: ObservableObject {
         #endif
     }
     private func state(_ kind: LeakKind) -> LeakCheckState { kind == .dns ? dns : rtc }
+    private func trace(_ kind: LeakKind, _ event: String, run: UUID? = nil, attached: Bool? = nil) {
+        guard !isFixture, case .rustCandidate? = BundledBackendVariant.current() else { return }
+        LeakDiagnosticTrace.shared.record(kind: kind.rawValue, event: event, run: run, attached: attached)
+    }
+    private func traceSchedule(_ kind: LeakKind, _ event: String) {
+        guard !isFixture, case .rustCandidate? = BundledBackendVariant.current() else { return }
+        LeakDiagnosticTrace.shared.schedule(kind: kind.rawValue, event: event)
+    }
     private func expected(_ kind: LeakKind) -> String { kind == .dns ? "" : rtcExpected }
     private func set(_ state: LeakCheckState, for kind: LeakKind) { if kind == .dns { dns = state } else { rtc = state } }
     private func automaticContext() -> String? {
@@ -223,73 +235,6 @@ final class LeakCheckStore: ObservableObject {
         cancel(.webrtc); set(LeakCheckState(), for: .webrtc)
         source = value
     }
-    func changeDNSSource(_ value: DNSProbeSource) {
-        dnsSource = value
-    }
-    func startIPLeakDNS() {
-        guard !ipLeakDNS.running else { return }
-        let id = UUID(); ipLeakRun = id
-        ipLeakContext = ContextSnapshot(required: contextProvider != nil, value: contextProvider?())
-        ipLeakDNS = .init(running: true, verdict: .running)
-        if isFixture {
-            ipLeakFixtureTask = Task { [weak self] in
-                guard let delay = self?.fixtureDelayNanoseconds else { return }
-                do { try await Task.sleep(nanoseconds: delay) } catch { return }
-                guard let self else { return }
-                let sample = Self.fixture(.dns, scenario: self.fixtureScenario, at: Date())
-                let observations = sample.observations.map { item in
-                    LeakObservation(address: item.address, kind: item.kind,
-                                    source: item.kind == "resolver" ? "IPLeak DNS（模拟）" : "IPLeak HTTP（模拟）",
-                                    family: item.family, country: item.country)
-                }
-                let comparison = LeakProbeResult(kind: sample.kind, status: sample.status,
-                    startedAt: sample.startedAt, finishedAt: sample.finishedAt, scope: "IPLeak.net · 本机 WebView DNS 对照（模拟）",
-                    observations: observations, errors: sample.errors, contextChanged: sample.contextChanged, details: sample.details)
-                self.completeIPLeakDNS(id: id, result: comparison)
-            }
-            return
-        }
-        let runner = IPLeakDNSRunner(); ipLeakRunner = runner
-        ipLeakProgress = "准备 IPLeak 备用检测"
-        runner.start(rounds: ipLeakDeepDNS ? 8 : 5, id: id, progress: { [weak self] text in
-            guard self?.ipLeakRun == id else { return }; self?.ipLeakProgress = text
-        }) { [weak self] result in self?.completeIPLeakDNS(id: id, result: result) }
-        ipLeakBrowserView = runner.browserView
-    }
-    func cancelIPLeakDNS() {
-        guard ipLeakDNS.running else { return }
-        ipLeakRun = nil; ipLeakFixtureTask?.cancel(); ipLeakFixtureTask = nil
-        ipLeakRunner?.cancel(); ipLeakRunner = nil; ipLeakBrowserView = nil; ipLeakProgress = nil
-        ipLeakContext = nil; ipLeakDNS = .init(verdict: .cancelled)
-    }
-    private func completeIPLeakDNS(id: UUID, result: LeakProbeResult) {
-        guard ipLeakRun == id else { return }
-        ipLeakRun = nil; ipLeakFixtureTask = nil; ipLeakRunner = nil; ipLeakBrowserView = nil; ipLeakProgress = nil
-        var sample = result
-        if let context = ipLeakContext, context.required {
-            if let original = context.value, let current = contextProvider?() {
-                if original != current { sample.contextChanged = true }
-            } else { sample.contextChanged = true }
-        }
-        ipLeakDNS = .init(result: sample)
-        reevaluateIPLeak(at: Date())
-        if !isFixture, let event = EventDiagnosticInput.make(kind: .dns, source: "ipleak", result: ipLeakDNS.result ?? sample,
-                                                              verdict: ipLeakDNS.verdict.state) {
-            EventDiagnosticLogger.submit(event)
-        }
-    }
-    private func reevaluateIPLeak(at date: Date) {
-        guard !ipLeakDNS.running, var sample = ipLeakDNS.result else { return }
-        if let context = ipLeakContext, context.required {
-            guard let original = context.value, let current = contextProvider?() else {
-                ipLeakDNS.verdict = .init(state: .incomplete, title: "检测未完成", detail: "本轮代理上下文暂不可确认。")
-                return
-            }
-            if original != current { sample.contextChanged = true }
-        }
-        ipLeakDNS.result = sample
-        ipLeakDNS.verdict = LeakPolicy.evaluate(sample, kind: .dns, expected: "", now: date.timeIntervalSince1970)
-    }
     func start(_ kind: LeakKind) {
         guard !state(kind).running else { return }
         discardHistoricalResultIfContextChanged(kind)
@@ -300,7 +245,9 @@ final class LeakCheckStore: ObservableObject {
         }
         now = Date()
         let id = UUID(); runs[kind] = id
-        runLogSources[kind] = kind == .dns || source == .netCoffee ? "netcoffee" : "local"
+        runLogSources[kind] = kind == .dns ? "ipleak" : source == .netCoffee ? "netcoffee" : "local"
+        trace(kind, "start", run: id)
+        trace(kind, "source_" + (runLogSources[kind] ?? "local"), run: id)
         contexts[kind] = ContextSnapshot(required: contextProvider != nil, value: contextProvider?())
         // Keep the last receipt visible while a periodic refresh is in flight.
         // A running verdict still makes clear that the previous receipt cannot
@@ -316,15 +263,29 @@ final class LeakCheckStore: ObservableObject {
                 guard let self else { return }
                 self.complete(kind, id: id, result: Self.fixture(kind, scenario: self.fixtureScenario, at: Date()))
             }
-        } else if kind == .dns || source == .netCoffee {
+        } else if kind == .dns {
+            let runner = IPLeakDNSRetryRunner(); ipLeakRunner = runner
+            runner.onDiagnostic = { [weak self] event, attached in self?.trace(kind, event, run: id, attached: attached) }
+            runner.onViewChanged = { [weak self] browser in
+                guard self?.runs[kind] == id else { return }; self?.browserViews[kind] = browser
+            }
+            progress[kind] = "准备 IPLeak DNS 采集"
+            runner.start(rounds: deepDNS ? 8 : 5, id: id, progress: { [weak self] text in
+                guard self?.runs[kind] == id else { return }; self?.progress[kind] = text
+            }) { [weak self] result in self?.complete(kind, id: id, result: result) }
+        } else if source == .netCoffee {
             let runner = NetCoffeeLeakRunner(); coffeeRunners[kind] = runner
+            runner.onDiagnostic = { [weak self] event, attached in self?.trace(kind, event, run: id, attached: attached) }
             progress[kind] = "准备 Net.Coffee 采集"
             runner.start(kind: kind, rounds: deepDNS ? 8 : 5, id: id, progress: { [weak self] text in
                 guard self?.runs[kind] == id else { return }; self?.progress[kind] = text
             }) { [weak self] result in self?.complete(kind, id: id, result: result) }
             browserViews[kind] = runner.browserView
+            trace(kind, runner.browserView?.window == nil ? "host_detached" : "host_attached", run: id,
+                  attached: runner.browserView?.window != nil)
         } else {
             let runner = WebRTCProbeRunner(); rtcRunner = runner
+            runner.onDiagnostic = { [weak self] event, attached in self?.trace(kind, event, run: id, attached: attached) }
             runner.start(id: id) { [weak self] result in self?.complete(kind, id: id, result: result) }
         }
     }
@@ -347,21 +308,24 @@ final class LeakCheckStore: ObservableObject {
         if !rtc.running { start(.webrtc) }
     }
     func refreshWebRTCIfNeeded(interval: TimeInterval = 60) {
-        guard source == .netCoffee, !state(.webrtc).running else { return }
+        guard source == .netCoffee else { traceSchedule(.webrtc, "schedule_source_manual"); return }
+        guard !state(.webrtc).running else { traceSchedule(.webrtc, "schedule_running"); return }
         let context = automaticContext()
-        guard (automaticContextProvider == nil && contextProvider == nil) || (context?.isEmpty == false) else { return }
+        guard (automaticContextProvider == nil && contextProvider == nil) || (context?.isEmpty == false) else { traceSchedule(.webrtc, "schedule_context_missing"); return }
         let changed = context != lastAutomaticWebRTCContext
         let elapsed = lastAutomaticWebRTCAt.map { Date().timeIntervalSince($0) } ?? .infinity
-        guard changed || elapsed >= interval else { return }
+        guard changed || elapsed >= interval else { traceSchedule(.webrtc, "schedule_wait_interval"); return }
+        traceSchedule(.webrtc, "schedule_ready")
         lastAutomaticWebRTCAt = Date(); lastAutomaticWebRTCContext = context
         start(.webrtc)
     }
     func ensureFreshDNSReceipt(maximumWait: TimeInterval = 80) async -> Bool {
         let context = automaticContext()
-        guard (automaticContextProvider == nil && contextProvider == nil) || (context?.isEmpty == false) else { return false }
+        guard (automaticContextProvider == nil && contextProvider == nil) || (context?.isEmpty == false) else { traceSchedule(.dns, "schedule_context_missing"); return false }
         let age = lastRecordedDNSAt.map { Date().timeIntervalSince($0) } ?? .infinity
         if age <= 10, context == lastRecordedDNSContext, !dnsReceiptSubmitting { return true }
-        if !state(.dns).running { start(.dns) }
+        if !state(.dns).running { traceSchedule(.dns, "schedule_ready"); start(.dns) }
+        else { traceSchedule(.dns, "schedule_running") }
         let deadline = Date().addingTimeInterval(maximumWait)
         while Date() < deadline {
             if !state(.dns).running && !dnsReceiptSubmitting {
@@ -375,20 +339,44 @@ final class LeakCheckStore: ObservableObject {
     /// First-run requires both a real passing result and its accepted backend
     /// receipt. A completed WebView alone is not enough to open the main UI.
     func initializationReceiptIsCurrent(_ kind: LeakKind, at date: Date = Date()) -> Bool {
+        initializationReceiptProblem(kind, at: date) == nil
+    }
+    func invalidateInitializationReceipt(_ kind: LeakKind) {
+        if kind == .dns { lastRecordedDNSAt = nil; lastRecordedDNSContext = nil }
+        else { lastRecordedWebRTCAt = nil; lastRecordedWebRTCContext = nil }
+    }
+    func initializationReceiptProblem(_ kind: LeakKind, at date: Date = Date()) -> (code: String, detail: String)? {
+        let label = kind == .dns ? "DNS" : "WebRTC"
+        func problem(_ code: String, _ detail: String) -> (code: String, detail: String) {
+            (kind.rawValue + "_" + code, label + "：" + detail)
+        }
         let value = state(kind)
-        guard !value.running, value.verdict.state == .matched,
-              let result = value.result, !result.contextChanged,
-              let context = automaticContext(), contexts[kind]?.value == context else { return false }
+        guard !value.running else { return problem("running", "检测仍在进行。") }
+        guard let result = value.result else { return problem("missing", "没有本轮检测结果。") }
+        guard let context = automaticContext(), !context.isEmpty else {
+            return problem("context_unavailable", "当前代理上下文暂不可确认。")
+        }
+        guard contexts[kind]?.value == context, !result.contextChanged else {
+            return problem("context_changed", "检测结果与当前代理上下文不一致。")
+        }
+        let age = date.timeIntervalSince1970 - result.finishedAt
+        guard age >= 0 && age < 300 else { return problem("expired", "检测结果已过期或时间无效。") }
+        guard value.verdict.state == .matched else {
+            return problem("not_passed", value.verdict.detail.isEmpty ? "当前检测结果未通过。" : value.verdict.detail)
+        }
         let submitted = kind == .dns ? lastRecordedDNSAt : lastRecordedWebRTCAt
         let submittedContext = kind == .dns ? lastRecordedDNSContext : lastRecordedWebRTCContext
         let submitting = kind == .dns ? dnsReceiptSubmitting : webRTCReceiptSubmitting
-        guard !submitting, let submitted, submittedContext == context,
-              submitted.timeIntervalSince1970 == result.finishedAt else { return false }
-        return (0..<300).contains(date.timeIntervalSince1970 - result.finishedAt)
+        guard !submitting else { return problem("submitting", "检测结果正在提交后台。") }
+        guard let submitted, submittedContext == context,
+              submitted.timeIntervalSince1970 == result.finishedAt else {
+            return problem("not_recorded", "当前检测结果尚未被后台确认。")
+        }
+        return nil
     }
-    func ensureInitializationReceipt(_ kind: LeakKind, maximumWait: TimeInterval = 85) async -> Bool {
+    func ensureInitializationReceipt(_ kind: LeakKind, maximumWait: TimeInterval = 85, forceNew: Bool = false) async -> Bool {
         now = Date()
-        if initializationReceiptIsCurrent(kind) { return true }
+        if !forceNew && initializationReceiptIsCurrent(kind) { return true }
         guard automaticContext()?.isEmpty == false else { return false }
         if !state(kind).running { start(kind) }
         let deadline = Date().addingTimeInterval(maximumWait)
@@ -408,26 +396,29 @@ final class LeakCheckStore: ObservableObject {
     }
     func cancel(_ kind: LeakKind) {
         guard state(kind).running else { return }
+        trace(kind, "cancelled", run: runs[kind])
         browserViews[kind] = nil; coffeeRunners[kind]?.cancel(); coffeeRunners[kind] = nil; progress[kind] = nil
         runs[kind] = nil; fixtureTasks[kind]?.cancel(); fixtureTasks[kind] = nil
         runLogSources[kind] = nil
-        if kind == .dns { dnsRunner?.cancel(); dnsRunner = nil }
+        if kind == .dns { dnsRunner?.cancel(); dnsRunner = nil; ipLeakRunner?.cancel(); ipLeakRunner = nil }
         else { rtcRunner?.cancel(); rtcRunner = nil }
         var cancelled = state(kind)
         cancelled.running = false; cancelled.result = nil; cancelled.verdict = .cancelled; cancelled.inputError = nil
         set(cancelled, for: kind)
     }
+    func reattachDNSBrowser(_ browser: WKWebView) { ipLeakRunner?.reattachIfNeeded(browser) }
     private func complete(_ kind: LeakKind, id: UUID, result: LeakProbeResult) {
         guard runs[kind] == id else { return }
         let logSource = runLogSources.removeValue(forKey: kind)
         browserViews[kind] = nil; runs[kind] = nil; fixtureTasks[kind] = nil; coffeeRunners[kind] = nil; progress[kind] = nil
-        if kind == .dns { dnsRunner = nil } else { rtcRunner = nil }
+        if kind == .dns { dnsRunner = nil; ipLeakRunner = nil } else { rtcRunner = nil }
         now = Date()
         var completed = result
         if let context = contexts[kind], context.required {
             if let original = context.value, let current = contextProvider?() {
-                if current != original { completed.contextChanged = true }
+                if current != original { completed.contextChanged = true; trace(kind, "context_changed", run: id) }
             } else {
+                trace(kind, "context_missing", run: id)
                 // Missing evidence is not proof that the proxy changed. The
                 // error keeps the receipt incomplete even if sampling resumes.
                 if completed.errors.count >= 32 { completed.errors.removeLast() }
@@ -442,17 +433,25 @@ final class LeakCheckStore: ObservableObject {
                            verdict: .idle, inputError: nil), for: kind)
         reevaluate(kind)
         rememberSuccessfulResult(kind)
+        let verdict = state(kind).verdict.state
+        trace(kind, verdict == .matched ? "result_matched" : verdict == .difference ? "result_difference" : verdict == .incomplete || verdict == .unconfigured ? "result_incomplete" : "result_other", run: id)
         if !isFixture, let logSource,
            let event = EventDiagnosticInput.make(kind: kind, source: logSource, result: state(kind).result ?? completed,
                                                  verdict: state(kind).verdict.state) {
             EventDiagnosticLogger.submit(event)
         }
         if kind == .dns, let onDNSComplete {
+            trace(kind, "receipt_submitting", run: id)
             dnsReceiptSubmitting = true
             let boundContext = contextProvider?()
             Task { [weak self] in
                 let stored = await onDNSComplete(completed)
                 guard let self else { return }
+                self.trace(kind, stored ? "receipt_accepted" : "receipt_rejected", run: id)
+                if !stored {
+                    if self.contextProvider?() == nil { self.trace(kind, "context_missing", run: id) }
+                    else if self.contextProvider?() != boundContext { self.trace(kind, "context_changed", run: id) }
+                }
                 self.dnsReceiptSubmitting = false
                 if stored {
                     self.lastRecordedDNSAt = Date(timeIntervalSince1970: completed.finishedAt)
@@ -463,11 +462,17 @@ final class LeakCheckStore: ObservableObject {
             }
         }
         if kind == .webrtc, let onWebRTCComplete {
+            trace(kind, "receipt_submitting", run: id)
             webRTCReceiptSubmitting = true
             let boundContext = contextProvider?()
             Task { [weak self] in
                 let stored = await onWebRTCComplete(completed)
                 guard let self else { return }
+                self.trace(kind, stored ? "receipt_accepted" : "receipt_rejected", run: id)
+                if !stored {
+                    if self.contextProvider?() == nil { self.trace(kind, "context_missing", run: id) }
+                    else if self.contextProvider?() != boundContext { self.trace(kind, "context_changed", run: id) }
+                }
                 self.webRTCReceiptSubmitting = false
                 self.lastRecordedWebRTCAt = stored ? Date(timeIntervalSince1970: completed.finishedAt) : nil
                 self.lastRecordedWebRTCContext = stored ? boundContext : nil

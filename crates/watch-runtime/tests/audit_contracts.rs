@@ -419,13 +419,10 @@ fn cli_proxy_overrides_must_match_the_measured_child_endpoint_without_leaking_va
     );
 }
 
-/// 2026-10-29 主公拍板：对齐上游原版 claude-switcher 的 STUN 语义。
-/// 上游 `core/stun-probe.py` 任一台回包即 `RESULT:<ip>`，`core/claude-switch.sh:298`
-/// 把 `RESULT:NONE` 读作 "UDP 不出网, 零暴露"。本仓 2.9.5 曾把判据改严为
-/// "全部服务器完成"，一台境外服务器超时就把整行拖成 unknown，界面随之
-/// 每分钟翻转。严格面不变：任何一台返回的地址与出口参考不一致仍判 fail。
+/// A partial round with a valid accepted response remains usable; absence of
+/// an accepted response is unknown, not evidence that UDP cannot leave.
 #[test]
-fn a_partially_answering_stun_round_is_not_a_gap_and_no_answer_is_zero_exposure() {
+fn stun_requires_a_public_accepted_response_and_preserves_mismatch_risk() {
     assert_eq!(row(&evaluate(&case()), "stun")["state"], "ok");
 
     let mut partial = case();
@@ -452,12 +449,35 @@ fn a_partially_answering_stun_round_is_not_a_gap_and_no_answer_is_zero_exposure(
     let mut none = case();
     none["online"]["stun"]["observations"] = json!([]);
     none["online"]["stun"]["complete"] = json!(false);
-    // No UDP answer means no observed egress, which is a pass upstream.
-    assert_eq!(row(&evaluate(&none), "stun")["state"], "ok");
+    assert_eq!(row(&evaluate(&none), "stun")["state"], "unknown");
+    assert!(evaluate(&none)["blocked"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("stun")));
     assert!(row(&evaluate(&none), "stun")["detail"]
         .as_str()
         .unwrap()
-        .contains("零暴露"));
+        .contains("无法确认 UDP 出口"));
+
+    for observation in [
+        json!({"status":"timeout","address":""}),
+        json!({"status":"ok","address":"10.0.0.1"}),
+        json!({"status":"ok","address":"1.1.1.1","accepted":false}),
+        json!({"status":"ok","address":"1.1.1.1","deadline_exceeded":true}),
+    ] {
+        let mut unavailable = case();
+        unavailable["online"]["stun"]["observations"] = json!([observation]);
+        assert_eq!(row(&evaluate(&unavailable), "stun")["state"], "unknown");
+        assert!(evaluate(&unavailable)["blocked"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("stun")));
+    }
+
+    let mut late_leak = partial.clone();
+    late_leak["online"]["stun"]["observations"][1] =
+        json!({"status":"ok","address":"8.8.8.8","accepted":false,"deadline_exceeded":true});
+    assert_eq!(row(&evaluate(&late_leak), "stun")["state"], "fail");
 
     let mut leak = case();
     leak["online"]["stun"]["observations"][0]["address"] = json!("8.8.8.8");

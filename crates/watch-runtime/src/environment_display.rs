@@ -172,7 +172,7 @@ fn present_rows(audit: &Value) -> Vec<Value> {
             "dns" => (
                 text(&online["dns"], "current"),
                 "同轮 HTTP 出口国家".into(),
-                "Net.Coffee 权威 DNS 记录 + 同轮 HTTP 参考".into(),
+                "IPLeak.net 权威 DNS 记录 + 同轮 HTTP 参考".into(),
             ),
             "stun" => (
                 "".into(),
@@ -451,6 +451,16 @@ pub fn receipt(store: &StateStore, audit: Value, session: Value, persist: bool) 
     output["rows"] = json!(rows);
     output["candidates"] = json!([]);
     output["session_guard"] = session;
+    // Keep the same audit's current persisted receipts available to the
+    // initialization gate without exposing the rest of display_facts.
+    output["initialization_receipts"] = json!({
+        "dns": {"state": output["display_facts"]["online"]["dns"]["state"],
+                "context_id": output["display_facts"]["online"]["dns"]["receipt"]["context_id"],
+                "sampled_at": output["display_facts"]["online"]["dns"]["receipt"]["finished_at"]},
+        "webrtc": {"state": output["display_facts"]["online"]["webrtc"]["state"],
+                   "context_id": output["display_facts"]["online"]["webrtc"]["receipt"]["context_id"],
+                   "sampled_at": output["display_facts"]["online"]["webrtc"]["receipt"]["sampled_at"]}
+    });
     output["source_notices"] = presentation::source_notices(&output["display_facts"]["online"]);
     output["message"] = json!("本轮实测结果；未知项保留未知。受控启动仍需独立预检。");
     output["policy_evaluation"] = preview;

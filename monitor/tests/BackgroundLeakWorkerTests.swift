@@ -34,7 +34,7 @@ struct BackgroundLeakWorkerTests {
               BackgroundLeakWorker.kind(arguments: ["watch-leak-worker", "--bad"]) == nil,
               BackgroundLeakWorker.resources(executable: resources.appendingPathComponent("watch-leak-worker")) == resources,
               BackgroundLeakWorker.verifiedResources(executable: resources.appendingPathComponent("watch-leak-worker")) == resources,
-              BundledBackendVariant.backgroundEvidenceSchema(from: resources) == 1 else {
+              BundledBackendVariant.backgroundEvidenceSchema(from: resources) == 2 else {
             fputs("FAIL: background helper fixed arguments/resources\n", stderr)
             exit(1)
         }
@@ -47,6 +47,16 @@ struct BackgroundLeakWorkerTests {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: watchdog)
         let runner = NetCoffeeLeakRunner(resourceDirectory: resources, backendVariant: .rustCandidate)
+        let dnsRunner = IPLeakDNSRunner(resourceDirectory: resources)
+        dnsRunner.testBootstrap = #"""
+        document.addEventListener('DOMContentLoaded', function() { window.IPLeakProbe.run = function(options) {
+          window.webkit.messageHandlers.ipLeakProbe.postMessage({runID:options.runID,payload:{
+            kind:'dns',status:'complete',startedAt:1,finishedAt:2,
+            scope:'test',observations:[{address:'8.8.4.4',kind:'http',source:'test',family:4}],
+            errors:[],contextChanged:false,details:['mocked']
+          }});
+        }; });
+        """#
         runner.testBootstrap = #"""
         window.NetCoffeeProbe.run = function(options) {
           window.webkit.messageHandlers.coffeeProbe.postMessage({runID:options.runID,payload:{
@@ -61,7 +71,7 @@ struct BackgroundLeakWorkerTests {
                 result.observations.count == 1 && result.observations[0].address == "8.8.4.4"
         }
         func startRunner() {
-            runner.start(kind: .dns, id: UUID(), progress: { _ in }) { dns in
+            dnsRunner.start(rounds: 5, id: UUID(), progress: { _ in }) { dns in
                 guard check(dns, kind: .dns) else {
                     fputs("FAIL: background helper WebKit bridge\n", stderr)
                     exit(1)
@@ -78,8 +88,6 @@ struct BackgroundLeakWorkerTests {
                 host.contentView = runner.browserView
                 host.orderFront(nil)
             }
-            host.contentView = runner.browserView
-            host.orderFront(nil)
         }
         let inline = WKWebView(frame: .zero)
         let diagnostic = WebKitDiagnosticProbe { success in
@@ -94,6 +102,6 @@ struct BackgroundLeakWorkerTests {
         host.orderFront(nil)
         inline.loadHTMLString("<html><body>ok</body></html>", baseURL: nil)
         app.run()
-        _ = (runner, diagnostic)
+        _ = (runner, dnsRunner, diagnostic)
     }
 }

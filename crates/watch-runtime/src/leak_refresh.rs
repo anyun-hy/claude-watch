@@ -50,9 +50,10 @@ pub fn refresh_for_launch(
     let receipt = store
         .read_json(&store.paths.base().join("dns-leak-receipt.json"), json!({}))
         .unwrap_or(json!({}));
-    if receipt["finished_at"]
-        .as_f64()
-        .is_some_and(|v| v.is_finite() && (0.0..=8.0).contains(&(crate::native::now() - v)))
+    if receipt["provider"] == "ipleak"
+        && receipt["finished_at"]
+            .as_f64()
+            .is_some_and(|v| v.is_finite() && (0.0..=8.0).contains(&(crate::native::now() - v)))
     {
         return Ok(Outcome::AlreadyFresh);
     }

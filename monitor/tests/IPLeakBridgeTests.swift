@@ -10,10 +10,12 @@ struct IPLeakBridgeTests {
         app.setActivationPolicy(.accessory)
         let window = NSWindow(contentRect: NSRect(x: 120, y: 120, width: 640, height: 120),
                               styleMask: [.titled], backing: .buffered, defer: false)
-        window.title = live ? "IPLeak 备用检测 · 临时实测" : "IPLeak 备用检测 · 隔离测试"
+        window.title = live ? "IPLeak DNS · 临时实测" : "IPLeak DNS · 隔离测试"
 
         if !live {
             let runner = IPLeakDNSRunner()
+            var diagnostics: [(String, Bool)] = []
+            runner.onDiagnostic = { diagnostics.append(($0, $1)) }
             runner.testBootstrap = #"""
             window.fetch = async function(raw) {
               const u = new URL(raw); let data;
@@ -37,11 +39,15 @@ struct IPLeakBridgeTests {
                     fputs("FAIL: IPLeak isolated WebKit bridge: \(result.status) \(result.errors) \(verdict.detail)\n", stderr)
                     exit(1)
                 }
+                guard diagnostics.contains(where: { $0.0 == "host_attached" && $0.1 }),
+                      diagnostics.contains(where: { $0.0 == "navigation_finished" }),
+                      diagnostics.contains(where: { $0.0 == "phase_dns" }),
+                      diagnostics.contains(where: { $0.0 == "payload_received" }) else {
+                    fputs("FAIL: IPLeak bridge lifecycle diagnostics missing\n", stderr); exit(1)
+                }
                 print("IPLeakBridgeTests: local page, WebKit, JS and native result passed with mocked network")
                 exit(0)
             }
-            window.contentView = runner.browserView
-            window.orderFront(nil)
             app.run()
             _ = runner
             return
@@ -67,29 +73,31 @@ struct IPLeakBridgeTests {
         }
         store.onDNSComplete = { _ in dnsCallbacks += 1; return false }
         store.onWebRTCComplete = { _ in rtcCallbacks += 1; return false }
-        store.changeDNSSource(.ipLeak)
-        store.startIPLeakDNS()
-        window.contentView = store.ipLeakBrowserView
+        store.start(.dns)
+        window.contentView = store.browserViews[.dns]
         window.orderFront(nil)
         Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { timer in
             Task { @MainActor in
-                guard !store.ipLeakDNS.running else { return }
+                if let browser = store.browserViews[.dns], window.contentView !== browser {
+                    window.contentView = browser; window.orderFront(nil)
+                }
+                guard !store.dns.running, dnsCallbacks > 0 else { return }
                 timer.invalidate()
-                guard let result = store.ipLeakDNS.result else { fputs("FAIL: IPLeak produced no result\n", stderr); exit(1) }
+                guard let result = store.dns.result else { fputs("FAIL: IPLeak produced no result\n", stderr); exit(1) }
                 let resolvers = result.observations.filter { $0.kind == "resolver" }
                 let http = result.observations.filter { $0.kind == "http" }
-                print("IPLeakLive: status=\(result.status), verdict=\(store.ipLeakDNS.verdict.state), DNS=\(resolvers.count), HTTP=\(http.count)")
+                print("IPLeakLive: status=\(result.status), verdict=\(store.dns.verdict.state), DNS=\(resolvers.count), HTTP=\(http.count)")
                 print("DNS countries=\(Array(Set(resolvers.compactMap(\.country))).sorted()); HTTP countries=\(Array(Set(http.compactMap(\.country))).sorted())")
                 if !result.errors.isEmpty { print("Errors: \(result.errors.map(\.message))") }
-                guard dnsCallbacks == 0, rtcCallbacks == 0, store.source == .netCoffee,
-                      store.dns.result == nil, store.rtc.result == nil else {
-                    fputs("FAIL: backup touched a primary DNS or WebRTC receipt\n", stderr); exit(1)
+                guard dnsCallbacks == 1, rtcCallbacks == 0, store.source == .netCoffee,
+                      store.rtc.result == nil else {
+                    fputs("FAIL: primary DNS callback or WebRTC isolation\n", stderr); exit(1)
                 }
                 guard result.status == "complete", !resolvers.isEmpty, !http.isEmpty,
-                      store.ipLeakDNS.verdict.state == .matched || store.ipLeakDNS.verdict.state == .difference else {
+                      store.dns.verdict.state == .matched || store.dns.verdict.state == .difference else {
                     fputs("FAIL: live IPLeak observation was incomplete or context was unavailable\n", stderr); exit(4)
                 }
-                print("IPLeakLive: actual WebView result observed; primary DNS and WebRTC callbacks untouched")
+                print("IPLeakLive: actual WebView result observed; simulated DNS callback only")
                 exit(0)
             }
         }

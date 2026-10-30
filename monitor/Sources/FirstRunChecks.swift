@@ -11,11 +11,13 @@ final class FirstRunChecks: InitializationChecking {
     private var acceptedSettings: Data?
     private var setupWasApproved = false
     private var approvedContext: String?
+    private var requireBackendContextMatch = false
     private let componentCheck: () async throws -> Void
     private let accessibilityTrusted: () -> Bool
     private let requestAccessibility: () -> Void
     private let connectionNow: () -> Double
     private let waitForConnectionPoll: () async -> Void
+    private let startSnapshotPolling: Bool
     private let connectionLog: InitializationConnectionLog
 
     init(store: MonitorStore,
@@ -24,10 +26,12 @@ final class FirstRunChecks: InitializationChecking {
          requestAccessibility: (() -> Void)? = nil,
          connectionNow: @escaping () -> Double = { Date().timeIntervalSince1970 },
          waitForConnectionPoll: @escaping () async -> Void = { try? await Task.sleep(nanoseconds: 1_000_000_000) },
+         startSnapshotPolling: Bool = true,
          connectionLog: InitializationConnectionLog? = nil) {
         self.store = store
         self.connectionNow = connectionNow
         self.waitForConnectionPoll = waitForConnectionPoll
+        self.startSnapshotPolling = startSnapshotPolling
         self.connectionLog = connectionLog ?? (store.switcher.isFixture
             ? InitializationConnectionLog(directory: nil) : InitializationConnectionLog())
         self.componentCheck = componentCheck ?? {
@@ -41,7 +45,7 @@ final class FirstRunChecks: InitializationChecking {
         self.accessibilityTrusted = accessibilityTrusted ?? { AccessibilityPermission.trusted }
         self.requestAccessibility = requestAccessibility ?? { store.switcher.openClaudeWatchAccessibilitySettings() }
     }
-    func begin() { store.beginInitialization() }
+    func begin() { store.beginInitialization(startSnapshotPolling: startSnapshotPolling) }
     func check(_ step: InitializationStep) async -> InitializationResult {
         switch step {
         case .components:
@@ -61,7 +65,7 @@ final class FirstRunChecks: InitializationChecking {
                 return result
             }
             traceConnection(event: "start", phase: phase, code: "started")
-            boundContext = nil; acceptedSettings = nil
+            boundContext = nil; acceptedSettings = nil; requireBackendContextMatch = false
             guard await store.switcher.refreshInitializationStatus() else {
                 return finish(.failed(code: "status_unavailable", detail: "后台状态读取未完成，请重试。"))
             }
@@ -118,28 +122,13 @@ final class FirstRunChecks: InitializationChecking {
         case .accessibility:
             return accessResult
         case .dns, .webrtc:
-            guard contextMatches else {
-                return Self.networkContextFailure(bound: boundContext, current: store.initializationContext, timeoutStage: nil)
-            }
-            let kind: LeakKind = step == .dns ? .dns : .webrtc
-            let accepted = await store.leakChecks.ensureInitializationReceipt(kind)
-            let value = kind == .dns ? store.leakChecks.dns : store.leakChecks.rtc
-            let timeoutStage = value.result?.errors.first(where: { $0.code == "timeout" })?.stage
-            guard contextMatches else {
-                return Self.networkContextFailure(bound: boundContext, current: store.initializationContext, timeoutStage: timeoutStage)
-            }
-            guard accepted else {
-                let error = kind == .dns ? store.switcher.dnsReceiptError : store.switcher.webRTCReceiptError
-                let timeoutDetail = timeoutStage.map { Self.timeoutDescription($0) + value.verdict.detail }
-                return .failed(code: kind == .dns ? "dns_not_passed" : "webrtc_not_passed",
-                               detail: timeoutDetail ?? (error.isEmpty ? value.verdict.detail : error))
-            }
-            return .passed("检测通过，结果已提交后台；主界面与保护检查共用本次回执。")
+            return await checkNetwork(step, forceNew: false)
         case .protection:
             guard contextMatches, acceptedSettings != nil, acceptedSettings == settingsData else { return changedFailure }
             guard await store.switcher.detectCurrentEnvironment() else {
                 return .failed(code: "environment_unstable", detail: "启用守护前的环境预检未完成，请重试。")
             }
+            requireBackendContextMatch = true
             let precheck = preProtectionEvidence()
             if case .failed = precheck { return precheck }
             return await prepareEnvironment(enableProtection: true)
@@ -167,6 +156,61 @@ final class FirstRunChecks: InitializationChecking {
                 return .failed(code: "status_unavailable", detail: "最终配置与后台状态回读未完成，请重试。")
             }
             return validateCurrentEvidence()
+        }
+    }
+    private func checkNetwork(_ step: InitializationStep, forceNew: Bool) async -> InitializationResult {
+        guard contextMatches else {
+            return Self.networkContextFailure(bound: boundContext, current: store.initializationContext, timeoutStage: nil)
+        }
+        let kind: LeakKind = step == .dns ? .dns : .webrtc
+        let accepted = await store.leakChecks.ensureInitializationReceipt(kind, forceNew: forceNew)
+        let value = kind == .dns ? store.leakChecks.dns : store.leakChecks.rtc
+        let timeoutStage = value.result?.errors.first(where: { $0.code == "timeout" })?.stage
+        guard contextMatches else {
+            return Self.networkContextFailure(bound: boundContext, current: store.initializationContext, timeoutStage: timeoutStage)
+        }
+        guard accepted else {
+            let error = kind == .dns ? store.switcher.dnsReceiptError : store.switcher.webRTCReceiptError
+            let timeoutDetail = timeoutStage.map { Self.timeoutDescription($0) + value.verdict.detail }
+            return .failed(code: kind == .dns ? "dns_not_passed" : "webrtc_not_passed",
+                           detail: timeoutDetail ?? (error.isEmpty ? value.verdict.detail : error))
+        }
+        if let failure = backendReceiptFailure(kind) {
+            store.leakChecks.invalidateInitializationReceipt(kind)
+            return failure
+        }
+        return .passed("检测通过，结果已提交后台；主界面与保护检查共用本次回执。")
+    }
+    func refreshWaitingEvidence() async -> InitializationRefreshOutcome {
+        guard contextMatches else {
+            let result = Self.networkContextFailure(bound: boundContext, current: store.initializationContext, timeoutStage: nil)
+            if case .failed(let code, let detail) = result { return .failed(step: .connection, code: code, detail: detail) }
+            return .failed(step: .connection, code: "context_unavailable", detail: "代理上下文暂不可确认，请重新检查。")
+        }
+        guard snapshotIsCurrent else {
+            return .failed(step: .connection, code: "snapshot_unavailable", detail: "后台或代理采样状态暂不可确认，请重新检查。")
+        }
+        guard acceptedSettings != nil, acceptedSettings == settingsData else {
+            return .failed(step: .environment, code: "settings_changed", detail: "已确认的 Watch 设置发生变化，请重新检查。")
+        }
+        guard accessibilityTrusted() else {
+            return .failed(step: .accessibility, code: "permission_missing", detail: "辅助功能权限当前未确认，请重新检查。")
+        }
+        for step in [InitializationStep.dns, .webrtc] {
+            let result = await checkNetwork(step, forceNew: true)
+            guard !Task.isCancelled else { return .failed(step: step, code: "cancelled", detail: "自动刷新已取消，请重新检查。") }
+            if case .failed(let code, let detail) = result {
+                let failingStep: InitializationStep = ["context_unavailable", "context_changed"].contains(code) ? .connection : step
+                return .failed(step: failingStep, code: code, detail: detail)
+            }
+        }
+        let result = await check(.verification)
+        switch result {
+        case .passed(_, let expiry):
+            guard let expiry else { return .failed(step: .verification, code: "evidence_expired", detail: "自动刷新未取得有效期，请重新检查。") }
+            return .passed(validUntil: expiry)
+        case .failed(let code, let detail): return .failed(step: .verification, code: code, detail: detail)
+        case .approval: return .failed(step: .verification, code: "unexpected_approval", detail: "自动刷新需要重新确认，请重新检查。")
         }
     }
     func approve(_ request: InitializationApproval, progress: @escaping SetupProgressObserver) async -> InitializationResult {
@@ -242,12 +286,10 @@ final class FirstRunChecks: InitializationChecking {
             return .failed(code: "policy_not_enabled", detail: "环境设置与启动策略尚未确认，请重新检查。")
         }
         guard accessibilityTrusted() else { return .failed(code: "permission_missing", detail: "辅助功能权限未确认，请重新授权。") }
-        guard store.leakChecks.initializationReceiptIsCurrent(.dns), store.leakChecks.initializationReceiptIsCurrent(.webrtc) else {
-            return .failed(code: "receipt_not_current", detail: "启用守护前，DNS 与 WebRTC 必须都已通过、提交后台且仍有效。请重新检查。")
-        }
         guard let environment = store.switcher.currentEnvironment else {
             return .failed(code: "environment_not_ready", detail: "尚未取得启用守护前的环境预检结果。")
         }
+        if let failure = receiptFailure(environmentContext: environment.context_id) { return failure }
         return InitializationEnvironmentGate.evaluate(environment,
             policy: store.switcher.currentPolicyEvaluation, settings: store.switcher.settings,
             historical: store.switcher.currentEnvironmentIsHistorical, unsavedSettings: store.switcher.hasUnsavedSettings,
@@ -260,13 +302,10 @@ final class FirstRunChecks: InitializationChecking {
         guard accessibilityTrusted() else { return .failed(code: "permission_missing", detail: "辅助功能授权尚未确认或已被撤销。") }
         guard !recoveryRequired else { return recoveryFailure }
         guard protectionSettingsEnabled, backgroundIsCurrent else { return backgroundFailure }
-        guard store.leakChecks.initializationReceiptIsCurrent(.dns),
-              store.leakChecks.initializationReceiptIsCurrent(.webrtc) else {
-            return .failed(code: "receipt_not_current", detail: "DNS 或 WebRTC 结果未通过、已过期或未被后台接受，请重新检查。")
-        }
         guard let environment = store.switcher.currentEnvironment else {
             return .failed(code: "environment_not_ready", detail: "尚未取得本轮环境回执。")
         }
+        if let failure = receiptFailure(environmentContext: environment.context_id) { return failure }
         let environmentResult = InitializationEnvironmentGate.evaluate(environment,
             policy: store.switcher.currentPolicyEvaluation, settings: store.switcher.settings,
             historical: store.switcher.currentEnvironmentIsHistorical,
@@ -276,6 +315,69 @@ final class FirstRunChecks: InitializationChecking {
                       (store.leakChecks.dns.result?.finishedAt ?? 0) + 300,
                       (store.leakChecks.rtc.result?.finishedAt ?? 0) + 300].min()!
         return .passed("所有检查均已通过，网络、配置及证据时效一致。进入后继续使用这些检测结果。", validUntil: expiry)
+    }
+    private func backendReceiptFailure(_ kind: LeakKind, environmentContext: String? = nil,
+                                       requireEnvironment: Bool = false) -> InitializationResult? {
+        let label = kind == .dns ? "DNS" : "WebRTC"
+        let receipt = kind == .dns ? store.switcher.initializationDNSReceipt : store.switcher.initializationWebRTCReceipt
+        guard let receipt else {
+            return .failed(code: kind.rawValue + "_backend_missing", detail: label + "：没有本轮后台回执，请重新检查。")
+        }
+        guard receipt.state == "ok" else {
+            return .failed(code: kind.rawValue + "_backend_not_passed", detail: label + "：后台对本轮回执的判定未通过，请重新检查。")
+        }
+        if requireEnvironment {
+            guard let environmentContext, !environmentContext.isEmpty else {
+                return .failed(code: "environment_context_unavailable", detail: "环境回执缺少网络上下文，无法核对检测结果。")
+            }
+            guard receipt.context == environmentContext else {
+                return .failed(code: kind.rawValue + "_backend_context_changed", detail: label + "：后台回执与本轮环境的网络上下文不一致，请重新检查。")
+            }
+            let observed = kind == .dns ? store.switcher.currentEnvironment?.initialization_receipts?.dns
+                                        : store.switcher.currentEnvironment?.initialization_receipts?.webrtc
+            guard let observed, observed.state == "ok", observed.context_id == environmentContext,
+                  observed.sampled_at == receipt.sampled else {
+                return .failed(code: kind.rawValue + "_backend_receipt_changed", detail: label + "：本轮环境回读的后台回执已变化、未通过或不可用，请重新检查。")
+            }
+        }
+        return nil
+    }
+    private func receiptFailure(environmentContext: String?) -> InitializationResult? {
+        let problems = [LeakKind.dns, .webrtc].compactMap { store.leakChecks.initializationReceiptProblem($0) }
+        if let first = problems.first {
+            return .failed(code: first.code, detail: problems.map(\.detail).joined(separator: "\n") + " 请重新检查。")
+        }
+        for kind in [LeakKind.dns, .webrtc] {
+            if let failure = backendReceiptFailure(kind, environmentContext: environmentContext, requireEnvironment: true) {
+                store.leakChecks.invalidateInitializationReceipt(kind)
+                return failure
+            }
+        }
+        return nil
+    }
+    func currentEvidenceFailures() -> [InitializationStep: InitializationResult] {
+        var failures: [InitializationStep: InitializationResult] = [:]
+        if boundContext != nil && !contextMatches {
+            failures[.connection] = Self.networkContextFailure(bound: boundContext, current: store.initializationContext, timeoutStage: nil)
+        } else if boundContext != nil && !snapshotIsCurrent {
+            failures[.connection] = .failed(code: "snapshot_unavailable", detail: "后台或代理采样状态暂不可确认，请重新检查。")
+        }
+        if let acceptedSettings, acceptedSettings != settingsData {
+            failures[.environment] = .failed(code: "settings_changed", detail: "已确认的 Watch 设置发生变化，请重新检查。")
+        }
+        if !accessibilityTrusted() {
+            failures[.accessibility] = .failed(code: "permission_missing", detail: "辅助功能权限当前未确认，请重新检查。")
+        }
+        for (kind, step) in [(LeakKind.dns, InitializationStep.dns), (.webrtc, .webrtc)] {
+            if let failure = backendReceiptFailure(kind, environmentContext: store.switcher.currentEnvironment?.context_id,
+                                                    requireEnvironment: requireBackendContextMatch) {
+                store.leakChecks.invalidateInitializationReceipt(kind)
+                failures[step] = failure
+            } else if let problem = store.leakChecks.initializationReceiptProblem(kind) {
+                failures[step] = .failed(code: problem.code, detail: problem.detail + " 请重新检查。")
+            }
+        }
+        return failures
     }
     func finish() { store.finishInitialization() }
     static func allowed(_ actions: [SwitcherRepairAction]) -> Bool {
@@ -406,7 +508,25 @@ final class FirstRunChecks: InitializationChecking {
         .failed(code: "context_changed", detail: "检查期间网络、代理、设置或采样状态变化。此前的通过结果不能合并放行，请重新检查。")
     }
     private var backgroundFailure: InitializationResult {
-        .failed(code: "protection_not_ready", detail: "Watch 保镖或时区守护的实际运行状态尚未通过核对；设置为开启不等于后台就绪。请重试。")
+        .failed(code: "protection_not_ready", detail: Self.backgroundFailureDetail(
+            store.switcher.background, error: store.switcher.backgroundError, settingsEnabled: protectionSettingsEnabled))
+    }
+    static func backgroundFailureDetail(_ value: BackgroundServiceReceipt?, error: String, settingsEnabled: Bool,
+                                        now: Double = Date().timeIntervalSince1970) -> String {
+        guard settingsEnabled else { return "Watch 保护设置尚未全部开启，请重新检查。" }
+        guard error.isEmpty else { return "后台状态读取失败，暂时无法确认保护是否运行；正在等待重新读取。" }
+        guard let value else { return "尚未取得后台状态，暂时无法确认保护是否运行；正在等待读取。" }
+        guard now.isFinite, value.observed_at.isFinite, (0..<30).contains(now - value.observed_at) else {
+            return "后台状态已过期或时间异常，暂时无法确认保护是否运行；正在等待重新读取。"
+        }
+        guard value.guard_backend_healthy == true else { return "采集后台身份或心跳当前未确认，无法确认保护状态。" }
+        guard let guardService = value.services.first(where: { $0.id == "guard" }), guardService.healthy, guardService.desired == true else {
+            return "Watch 保镖的运行状态当前未确认。"
+        }
+        guard let watchdog = value.services.first(where: { $0.id == "watchdog" }), watchdog.healthy, watchdog.desired == true else {
+            return "时区守护的运行状态当前未确认。"
+        }
+        return "后台保护证据存在风险或未通过核对，请重新检查。"
     }
     private var recoveryFailure: InitializationResult {
         .failed(code: "recovery_required", detail: "Watch 存在未完成事务，需要先按操作记录恢复。本次未覆盖事务或扩大修复范围。")

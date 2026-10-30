@@ -195,13 +195,15 @@ def _time_text(value):
 def _dns_receipt_state(receipt, context, *, launch=False, now=None):
     """Return one bounded DNS-leak receipt state for display or launch.
 
-    The receipt is derived by ``record_dns_leak`` from the existing Net.Coffee
+    The receipt is derived by ``record_dns_leak`` from the current IPLeak
     WebView result.  It is deliberately not reconstructed from resolv.conf,
     a hand-entered resolver list, or a fresh unrelated GeoIP request.
     """
     now = time.time() if now is None else now
     if not isinstance(receipt, dict) or receipt.get("schema") != DNS_RECEIPT_SCHEMA:
         return "unknown", "DNS 泄漏检测尚未完成"
+    if receipt.get("provider") != "ipleak":
+        return "unknown", "请使用 IPLeak 重新检测 DNS 出口"
     try:
         finished = float(receipt["finished_at"])
         recorded = float(receipt["recorded_at"])
@@ -232,6 +234,7 @@ def _valid_cached_dns_receipt(receipt, context, *, now=None):
     now = time.time() if now is None else now
     if not isinstance(receipt, dict) or receipt.get("schema") != DNS_RECEIPT_SCHEMA:
         return False
+    if receipt.get("provider") != "ipleak": return False
     try:
         finished, recorded = float(receipt["finished_at"]), float(receipt["recorded_at"])
     except (KeyError, TypeError, ValueError):
@@ -293,9 +296,9 @@ def dns_row(status):
     if ips: detail += "；DNS 出口 " + "、".join(str(x) for x in ips[:128])
     if cached: detail += "；此为历史显示，最新失败仍阻止受控启动"
     return {"id": "dns", "name": "DNS", "state": "cached" if cached else status.get("state", "unknown"),
-            "detail": detail, "scope": "Net.Coffee DNS 泄漏采样；不代表所有应用或浏览器 DoH", "required": True,
+            "detail": detail, "scope": "IPLeak.net DNS 泄漏采样；不代表所有应用或浏览器 DoH", "required": True,
             "current": current, "reference": "同轮 HTTP 出口国家 " + ("、".join(http_countries) or "未确认"),
-            "source": "Net.Coffee 权威 DNS 记录 + 同轮 HTTP 参考", "sampled_at": receipt.get("finished_at"),
+            "source": "IPLeak.net 权威 DNS 记录 + 同轮 HTTP 参考", "sampled_at": receipt.get("finished_at"),
             "query_error": status.get("detail") if status.get("state") == "unknown" else "",
             "display_cached": cached, "last_valid": bool(status.get("last_valid", {}).get("available"))}
 
@@ -367,8 +370,32 @@ def _probe_error(errors):
     return ""
 
 
+def _ipleak_evidence(raw):
+    try:
+        if not isinstance(raw, str) or len(raw.encode("utf-8")) > 512000: return None
+        value = __import__("json").loads(raw)
+        if not isinstance(value, dict) or not re.fullmatch(r"[0-9a-f]{40}", value.get("session", "")): return None
+        servers, rows, http = value.get("dns_servers"), value.get("geoip"), value.get("http")
+        if not isinstance(servers, dict) or len(servers) > 127 or not isinstance(rows, list) or len(rows) > 32 or not isinstance(http, dict): return None
+        resolvers = set()
+        for address, count in servers.items():
+            ip = public_ip(address)
+            if not ip or type(count) is not int or count <= 0: return None
+            resolvers.add(ip)
+        reference, code = public_ip(http.get("address")), _country_code(http.get("country"))
+        if not reference or not code: return None
+        countries = {reference: code}
+        for row in rows:
+            if not isinstance(row, dict): return None
+            address, code = public_ip(row.get("ip")), _country_code(row.get("country_code"))
+            if not address or address not in resolvers or not code or (address in countries and countries[address] != code): return None
+            countries[address] = code
+        return countries, resolvers, reference
+    except (ValueError, TypeError, AttributeError): return None
+
+
 def record_dns_leak(paths, system, probe, *, now=None, expected_context=None):
-    """Validate and persist one Net.Coffee DNS receipt under the backend lock."""
+    """Validate and persist one IPLeak DNS receipt under the backend lock."""
     now = time.time() if now is None else now
     if not isinstance(probe, dict):
         _dns_record_error("invalid_dns_receipt", "DNS 检测回执不是对象")
@@ -392,24 +419,28 @@ def record_dns_leak(paths, system, probe, *, now=None, expected_context=None):
     observations = probe.get("observations")
     if not isinstance(observations, list) or len(observations) > 128:
         _dns_record_error("invalid_dns_receipt", "DNS 检测地址列表无效")
-    countries = _netcoffee_country_codes(probe.get("externalJSON"))
+    evidence = _ipleak_evidence(probe.get("externalJSON"))
+    countries = evidence[0] if evidence else {}
     buckets = {"resolver": set(), "http": set()}
     seen = {"resolver": False, "http": False}
     missing_country = False
     for value in observations:
         if not isinstance(value, dict) or value.get("kind") not in buckets:
+            missing_country = True
             continue
         seen[value["kind"]] = True
         address = _public_observation(value)
         if not address:
+            missing_country = True
             continue
-        # The WebView keeps a display name in ``country``.  The retained
-        # Net.Coffee GeoIP receipt provides the stable ISO code used here.
-        country = countries.get(address)
+        belongs = bool(evidence and (address == evidence[2] if value["kind"] == "http" else address in evidence[1]))
+        country = countries.get(address) if belongs else None
         if not country:
             missing_country = True
             continue
         buckets[value["kind"]].add((address, country))
+    if not evidence or any(not any(ip == address for ip, _ in buckets["resolver"]) for address in evidence[1]) or not any(ip == evidence[2] for ip, _ in buckets["http"]):
+        missing_country = True
     dns_countries = sorted({country for _, country in buckets["resolver"]})
     http_countries = sorted({country for _, country in buckets["http"]})
     if len(http_countries) == 1 and any(country != http_countries[0] for country in dns_countries):
@@ -462,15 +493,15 @@ def record_dns_leak(paths, system, probe, *, now=None, expected_context=None):
         "started_at": started, "finished_at": finished, "sampled_at": finished,
         "display_expires_at": finished + DNS_DISPLAY_TTL,
         "launch_expires_at": finished + DNS_LAUNCH_TTL,
-        "context": context, "context_id": context,
+        "context": context, "context_id": context, "provider": "ipleak",
         "dns": {"egress_ips": sorted(address for address, _ in buckets["resolver"]),
-                "countries": dns_countries, "source": "Net.Coffee WebView authoritative DNS"},
+                "countries": dns_countries, "source": "IPLeak.net WebView authoritative DNS"},
         "http": {"egress_ips": sorted(address for address, _ in buckets["http"]),
-                 "countries": http_countries, "source": "Net.Coffee HTTP reference"},
+                 "countries": http_countries, "source": "IPLeak.net WebView HTTP reference"},
         "comparison": comparison,
         "errors": [dict(stage=str(x.get("stage", ""))[:80], code=str(x.get("code", ""))[:80], message=str(x.get("message", ""))[:240]) for x in probe["errors"] if isinstance(x, dict)][:32],
         "query_error": query_error,
-        "scope": probe.get("scope") if isinstance(probe.get("scope"), str) else "Net.Coffee DNS 泄漏检测",
+        "scope": probe.get("scope") if isinstance(probe.get("scope"), str) else "IPLeak.net DNS 泄漏检测",
     }
     with operation_lock(paths, "observations"):
         atomic_json(dns_receipt_path(paths), receipt)
@@ -597,12 +628,12 @@ def stun_presentation(stun, candidates, reference):
     # False 排在前面，所以键取"是否已应答"本身。
     rows = [o for o in observations if isinstance(o, dict)]
     def _answered(o):
-        return o.get("status") == "ok" and o.get("deadline_exceeded") is not True
+        return o.get("status") == "ok" and o.get("accepted") is not False and o.get("deadline_exceeded") is not True
     rows.sort(key=_answered)
     answered = sum(1 for o in rows if _answered(o))
     lines = ["汇总：%d 个公网候选；参考：%s；%s" % (
         len(candidates), ", ".join(sorted(reference)) or "无",
-        "UDP 未回包，按零暴露处理" if (not candidates and reference)
+        "未取得可用的公网 STUN 回包，无法确认 UDP 出口" if not candidates
         else "%d / %d 台服务器应答" % (answered, len(rows)))]
     for index, observation in enumerate(rows[:16], 1):
         if not isinstance(observation, dict): continue
@@ -709,21 +740,21 @@ def evaluate(config, local, online, history=(), now=None):
     if dns_state not in ("ok", "fail", "unknown"):
         dns_state = "unknown"
     # DNS remains mandatory for controlled launches.  The state comes solely
-    # from the stored Net.Coffee DNS-leak receipt, not from a resolver allow
+    # from the stored IPLeak DNS-leak receipt, not from a resolver allow
     # list or a new dig request made by this preflight.
     add("dns", dns_state, (dns.get("detail") if isinstance(dns, dict) else "") or "DNS 泄漏检测尚未完成",
-        required=True, scope="Net.Coffee DNS 泄漏采样；不代表所有应用或浏览器 DoH")
+        required=True, scope="IPLeak.net DNS 泄漏采样；不代表所有应用或浏览器 DoH")
     stun = online.get("stun", {})
-    candidates = {public_ip(x.get("address")) for x in stun.get("observations", []) if x.get("status") == "ok"} - {""}
+    observations = stun.get("observations", []) if isinstance(stun, dict) else []
+    observations = observations if isinstance(observations, list) else []
+    observed_candidates = {public_ip(x.get("address")) for x in observations if isinstance(x, dict) and x.get("status") == "ok"} - {""}
+    candidates = {public_ip(x.get("address")) for x in observations if isinstance(x, dict) and x.get("status") == "ok"
+                  and x.get("accepted") is not False and x.get("deadline_exceeded") is not True} - {""}
     reference = {address} if address else set()
-    # 2026-10-29 主公拍板：对齐上游原版 claude-switcher 的 STUN 语义。
-    # 上游 core/stun-probe.py 任一台回包即 RESULT:<ip>，core/claude-switch.sh:298
-    # 把 RESULT:NONE 读作 "UDP 不出网, 零暴露"。本仓 2.9.5 曾把它改严为
-    # "全部服务器完成"，单台超时就把整行拖成 unknown，界面每分钟翻转。
-    # 现在：无出口参考才 unknown；UDP 全不回按零暴露判 ok；任何一台返回的
-    # 地址与出口参考不一致仍判 fail（严格面不变）。
+    # 无回包不能证明 UDP 不出网；至少一个已采纳公网回包才可通过。
+    # 未采纳的迟到结果不能放行，但与出口不一致时仍保留为风险证据。
     stun_state = ("unknown" if not reference else
-                  ("ok" if not candidates or candidates <= reference else "fail"))
+                  ("fail" if not observed_candidates <= reference else "unknown" if not candidates else "ok"))
     stun_detail, stun_sampled_at, stun_observations = stun_presentation(stun, candidates, reference)
     add("stun", stun_state, stun_detail, required=True,
         scope="原生 UDP/STUN 探针，用于 AI 受控启动网络检查；不等于 Claude 实际 socket 或 WebRTC")

@@ -24,7 +24,7 @@ class DNSRefreshTests(unittest.TestCase):
         self.env.start(); self.addCleanup(self.env.stop)
 
     def test_fresh_receipt_does_not_duplicate_probe(self):
-        atomic_json(dns_receipt_path(self.paths), {"finished_at": time.time()})
+        atomic_json(dns_receipt_path(self.paths), {"provider": "ipleak", "finished_at": time.time()})
         refresh_for_launch(self.paths)
         self.assertFalse((self.channel / "request.json").exists())
 

@@ -15,19 +15,19 @@ TEST_PARENT=$(mktemp -d "${TMPDIR:-/private/tmp}/cw-background-leak-test.XXXXXX"
 trap 'rm -rf "$TEST_PARENT"' EXIT
 APP="$TEST_PARENT/Background Leak Worker Tests.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$TEST_PARENT/module-cache"
-cp "$ROOT/Resources/netcoffee_probe.html" "$ROOT/Resources/netcoffee_probe.js" "$ROOT/Resources/netcoffee_probe.css" "$APP/Contents/Resources/"
+cp "$ROOT/Resources/netcoffee_probe.html" "$ROOT/Resources/netcoffee_probe.js" "$ROOT/Resources/netcoffee_probe.css" "$ROOT/Resources/ipleak_probe.html" "$ROOT/Resources/ipleak_probe.js" "$APP/Contents/Resources/"
 cp "$ROOT/Resources/watch-native-collector.zsh" "$APP/Contents/Resources/watch-engine"
 chmod 700 "$APP/Contents/Resources/watch-engine"
 cat > "$APP/Contents/Resources/BuildInfo.plist" <<'PLIST'
-<?xml version="1.0"?><plist version="1.0"><dict><key>BackendVariant</key><string>rust-candidate</string><key>BackgroundEvidenceSchema</key><integer>1</integer></dict></plist>
+<?xml version="1.0"?><plist version="1.0"><dict><key>BackendVariant</key><string>rust-candidate</string><key>BackgroundEvidenceSchema</key><integer>2</integer></dict></plist>
 PLIST
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>io.local.watchpanel.background-leak-tests</string><key>CFBundleExecutable</key><string>BackgroundLeakWorkerTests</string><key>CFBundlePackageType</key><string>APPL</string><key>LSUIElement</key><true/></dict></plist>
 PLIST
-xcrun swiftc -swift-version 5 -parse-as-library -target "arm64-apple-macosx$CW_MACOS_MINIMUM" -D COFFEE_BRIDGE_TEST \
+xcrun swiftc -swift-version 5 -parse-as-library -target "arm64-apple-macosx$CW_MACOS_MINIMUM" -D COFFEE_BRIDGE_TEST -D IPLEAK_BRIDGE_TEST \
   -module-cache-path "$TEST_PARENT/module-cache" -framework AppKit -framework WebKit \
   "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" "$ROOT/Sources/LeakCheckModels.swift" \
-  "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/tools/BackgroundLeakWorker.swift" \
+  "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/Sources/IPLeakDNSRunner.swift" "$ROOT/Sources/IPLeakDNSRetryRunner.swift" "$ROOT/tools/BackgroundLeakWorker.swift" \
   "$ROOT/tests/BackgroundLeakWorkerTests.swift" -o "$APP/Contents/MacOS/BackgroundLeakWorkerTests"
 cp "$APP/Contents/MacOS/BackgroundLeakWorkerTests" "$APP/Contents/Resources/watch-leak-worker"
 chmod 700 "$APP/Contents/Resources/watch-leak-worker"
@@ -36,7 +36,7 @@ import hashlib, plistlib, sys
 root = __import__('pathlib').Path(sys.argv[1])
 manifest = root / 'BuildInfo.plist'
 value = plistlib.loads(manifest.read_bytes())
-names = ('watch-leak-worker', 'watch-engine', 'netcoffee_probe.html', 'netcoffee_probe.js', 'netcoffee_probe.css')
+names = ('watch-leak-worker', 'watch-engine', 'netcoffee_probe.html', 'netcoffee_probe.js', 'netcoffee_probe.css', 'ipleak_probe.html', 'ipleak_probe.js')
 value['RuntimeHashes'] = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names}
 manifest.write_bytes(plistlib.dumps(value))
 PY

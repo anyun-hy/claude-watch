@@ -190,14 +190,15 @@ class AuditTests(Fixture):
         self.assertEqual([r["id"] for r in result["rows"]], [k for k, _ in CHECKS])
         self.assertNotIn("reachability", result["blocked"])
         self.assertEqual(result["rows"][-1]["state"], "warn")
-    def test_none_stun_and_partial_results_never_pass(self):
-        for value in ({}, {"complete": True, "observations": []},
-                      {"complete": False, "observations": [{"status": "ok", "address": "8.8.8.8"}]}):
+    def test_no_stun_result_never_passes_but_an_accepted_partial_result_can(self):
+        for value in ({}, {"complete": True, "observations": []}):
             self.system.online_value["stun"] = value
             self.assertFalse(self.receipt()["ready"])
             self.assertEqual(self.receipt()["rows"][8]["state"], "unknown")
             self.assertIn("UDP/STUN 出口", self.receipt()["message"])
             self.assertNotIn("或功能未启用", self.receipt()["message"])
+        self.system.online_value["stun"] = {"complete": False, "observations": [{"status": "ok", "address": "8.8.8.8"}]}
+        self.assertEqual(self.receipt()["rows"][8]["state"], "ok")
 
     def test_last_audit_keeps_structured_stun_failure_evidence(self):
         started, finished = 1792713600.0, 1792713603.0

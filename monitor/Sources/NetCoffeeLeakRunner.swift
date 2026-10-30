@@ -20,6 +20,8 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
     private var phase = "collector"
     /// Only fixed phase names and relative timings; never addresses or tokens.
     var onPhase: ((String, Double) -> Void)?
+    var onDiagnostic: ((String, Bool) -> Void)?
+    private func trace(_ event: String) { onDiagnostic?(event, view?.window != nil) }
     private var requests: [String: CoffeeRequest] = [:]
     private var usedIDs = Set<String>()
     private let resourceDirectory: URL?
@@ -45,6 +47,7 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
         let w = WKWebView(frame: NSRect(x:0,y:0,width:640,height:100), configuration: c); view = w; w.navigationDelegate = self
         let timer = DispatchWorkItem { [weak self] in
             guard let self, self.id == id else { return }
+            self.trace("watchdog_timeout")
             self.finish(.init(kind: kind.rawValue, status: "timeout", startedAt: self.startedAt,
                               finishedAt: Date().timeIntervalSince1970, scope: "Net.Coffee · 本机 WebView",
                               observations: [], errors: [.init(stage: self.phase, code: "timeout", message: "本轮检测超过总时限；未完成不代表安全")],
@@ -78,6 +81,7 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
     }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard webView === view, let id else { return }
+        trace("navigation_finished")
         #if COFFEE_BRIDGE_TEST
         let bootstrap = testBootstrap ?? ""
         #else
@@ -88,7 +92,9 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
             #if COFFEE_BRIDGE_TEST
             if let error { print("NetCoffee bridge evaluate error: \(error.localizedDescription)") }
             #endif
-            guard let self, self.id == id, error != nil else { return }
+            guard let self, self.id == id else { return }
+            if error == nil { self.trace("script_started"); return }
+            self.trace("script_failed")
             self.finish(.failure(self.kind, code: "script_failed", message: "检测脚本未能执行"))
         }
     }
@@ -101,31 +107,41 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
         decisionHandler(allowed ? .allow : .cancel)
     }
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        trace("navigation_failed")
         #if COFFEE_BRIDGE_TEST
         print("NetCoffee bridge navigation failed: \(error.localizedDescription)")
         #endif
         finish(.failure(kind, code: "page_failed", message: "本地采集页加载失败"))
     }
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        guard webView === view else { return }
+        trace("webcontent_terminated")
+    }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        trace("navigation_failed")
         #if COFFEE_BRIDGE_TEST
         print("NetCoffee bridge provisional failure: \(error.localizedDescription)")
         #endif
         finish(.failure(kind, code: "page_failed", message: "本地采集页加载失败"))
     }
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard let id, message.webView === view, message.frameInfo.isMainFrame, let body = message.body as? [String:Any], body["runID"] as? String == id.uuidString else { return }
+        guard let id, message.webView === view, message.frameInfo.isMainFrame, let body = message.body as? [String:Any], body["runID"] as? String == id.uuidString else { trace("message_rejected"); return }
         if let phase = body["phase"] as? String,
            ["collector", "http", "dns_images", "dns_records", "geoip", "ice"].contains(phase),
            let elapsed = body["elapsedMs"] as? Double, elapsed.isFinite, (0...75_000).contains(elapsed) {
             self.phase = phase
+            trace("phase_" + phase)
             onPhase?(phase, elapsed)
         }
         if let cancel = body["cancelRequest"] as? [String: String], let key = cancel["id"] {
             requests.removeValue(forKey: key)?.cancel()
             return
         }
-        if let payload = body["payload"], JSONSerialization.isValidJSONObject(payload), let data = try? JSONSerialization.data(withJSONObject: payload), data.count < 1_048_576,
-           let r = try? JSONDecoder().decode(LeakProbeResult.self, from: data), r.kind == kind.rawValue { finish(r); return }
+        if let payload = body["payload"] {
+            guard JSONSerialization.isValidJSONObject(payload), let data = try? JSONSerialization.data(withJSONObject: payload), data.count < 1_048_576,
+                  let r = try? JSONDecoder().decode(LeakProbeResult.self, from: data), r.kind == kind.rawValue else { trace("payload_invalid"); return }
+            trace("payload_received"); finish(r); return
+        }
         if let text = body["progress"] as? String, text.utf8.count < 256 { progress?(text) }
         guard let request = body["request"] as? [String:String], let key = request["id"], key.count < 16, !key.isEmpty, key.allSatisfy({ $0.isASCII && $0.isNumber }), !usedIDs.contains(key), usedIDs.count < 32,
               let type = request["kind"], ["trace","geoip","dns"].contains(type), let query = request["query"], query.count < 80 else { return }

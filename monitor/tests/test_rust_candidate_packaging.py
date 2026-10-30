@@ -55,7 +55,7 @@ class RustCandidatePackagingTests(unittest.TestCase):
         self.assertIn('watch-leak-worker', text)
         self.assertIn('netcoffee_probe.html', text)
         self.assertIn('<key>BackgroundEvidenceSchema</key><integer>$BACKGROUND_EVIDENCE_SCHEMA</integer>', text)
-        self.assertIn('BACKGROUND_EVIDENCE_SCHEMA=1', text)
+        self.assertIn('BACKGROUND_EVIDENCE_SCHEMA=2', text)
 
     def test_background_runtime_helper_has_a_fixed_runtime_contract_test(self):
         test = ROOT / "monitor/tests/run_background_leak_worker_runtime_test.sh"
@@ -69,11 +69,9 @@ class RustCandidatePackagingTests(unittest.TestCase):
     def test_background_dns_pipeline_exercises_the_real_webkit_script_offline(self):
         test = ROOT / "monitor/tests/run_background_dns_pipeline_test.sh"
         text = test.read_text(encoding="utf-8")
-        self.assertIn("netcoffee_probe.js", text)
-        self.assertIn("Object.defineProperty(Image.prototype", text)
-        self.assertIn("coffee:trace", text)
-        self.assertIn("coffee:dns", text)
-        self.assertIn("coffee:geoip", text)
+        self.assertIn("ipleak_probe.js", text)
+        self.assertIn("dnsdetection/", text)
+        self.assertIn("window.fetch", text)
         self.assertIn("BACKGROUND_LEAK_WORKER_TEST", text)
 
     def test_component_builder_queries_paths_instead_of_hardcoding_native_sources(self):

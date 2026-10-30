@@ -45,7 +45,9 @@ struct FirstRunView: View {
                     if let policy = switcher.currentPolicyEvaluation {
                         Surface(p) {
                             VStack(alignment: .leading, spacing: 12) {
-                                Text("本轮环境必检项目").font(WatchTypography.section)
+                                Text("最近一次环境检测的必检项目").font(WatchTypography.section)
+                                Text("以下为该次采样结果；当前保护是否就绪以第 8 项联合复核为准。")
+                                    .font(WatchTypography.caption).foregroundStyle(p.secondary)
                                 ForEach(policy.rows.filter(\.required)) { row in
                                     HStack(alignment: .top, spacing: 12) {
                                         Image(systemName: row.state == "ok" ? "checkmark.circle.fill" : "exclamationmark.circle")
@@ -74,7 +76,10 @@ struct FirstRunView: View {
         .preferredColorScheme(dark ? .dark : .light)
         .frame(minWidth: 900, minHeight: 660)
         .navigationTitle("Claude Watch · 首次初始化")
-        .onChange(of: initialization.approval?.id) { presentApprovalIfNeeded() }
+        .onChange(of: initialization.approval?.id) {
+            if initialization.approval == nil { showingApproval = nil; lastPresentedApproval = nil }
+            else { presentApprovalIfNeeded() }
+        }
         .onAppear { presentApprovalIfNeeded() }
         .onReceive(clock) { _ in initialization.refreshReadiness() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
@@ -93,6 +98,8 @@ struct FirstRunView: View {
                 Text("首次初始化检查").font(WatchTypography.pageTitle)
                 Text("全部项目通过后，才能进入 Claude Watch。需要权限时会说明操作并弹出授权窗口。")
                     .font(WatchTypography.body).foregroundStyle(p.secondary)
+                Text("全部通过后，等待期间会自动刷新 DNS、WebRTC 和环境状态。")
+                    .font(WatchTypography.caption).foregroundStyle(p.secondary)
                 HStack(spacing: 12) {
                     Text("\(initialization.passedCount) / \(initialization.rows.count) 项已通过")
                         .font(WatchTypography.bodyStrong).foregroundStyle(p.mint)
@@ -127,7 +134,7 @@ struct FirstRunView: View {
                 }
                 if row.status == .running, row.step == .dns || row.step == .webrtc,
                    let browser = leakChecks.browserViews[row.step == .dns ? .dns : .webrtc] {
-                    CoffeeCollectorView(browser: browser).frame(height: 72)
+                    CoffeeCollectorView(browser: browser, onDetach: row.step == .dns ? { store.leakChecks.reattachDNSBrowser($0) } : nil).frame(height: 72)
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
                 if row.status == .authorization, let request = initialization.approval {

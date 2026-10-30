@@ -243,12 +243,15 @@ pub fn stun(
     // fold while every visible row reads "成功".  `false` sorts first.
     let mut ordered: Vec<&Value> = observations.iter().filter(|v| v.is_object()).collect();
     ordered.sort_by_key(|row| {
-        let answered = row["status"] == "ok" && row["deadline_exceeded"] != true;
+        let answered =
+            row["status"] == "ok" && row["accepted"] != false && row["deadline_exceeded"] != true;
         answered
     });
     let answered = ordered
         .iter()
-        .filter(|row| row["status"] == "ok" && row["deadline_exceeded"] != true)
+        .filter(|row| {
+            row["status"] == "ok" && row["accepted"] != false && row["deadline_exceeded"] != true
+        })
         .count();
     let mut lines = vec![format!(
         "汇总：{} 个公网候选；参考：{}；{}",
@@ -258,9 +261,8 @@ pub fn stun(
         } else {
             reference.iter().cloned().collect::<Vec<_>>().join(", ")
         },
-        if candidates.is_empty() && !reference.is_empty() {
-            // Upstream reads `RESULT:NONE` as "UDP 不出网, 零暴露".
-            "UDP 未回包，按零暴露处理".to_string()
+        if candidates.is_empty() {
+            "未取得可用的公网 STUN 回包，无法确认 UDP 出口".to_string()
         } else {
             format!("{answered} / {} 台服务器应答", ordered.len())
         }

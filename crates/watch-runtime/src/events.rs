@@ -224,6 +224,26 @@ impl EventStore {
         self.append_stream(stream, category, fields, at, false)?
             .ok_or_else(|| invalid("事件未写入"))
     }
+    /// A validated, bounded worker trace. No WebView payload or address is accepted.
+    pub fn record_worker_trace(&self, kind: &str, run: &str, event: &str, attached: bool, elapsed: f64, at: f64) -> Result<()> {
+        let allowed = ["host_attached", "host_detached", "navigation_finished", "navigation_failed",
+            "webcontent_terminated", "script_started", "script_failed", "message_rejected", "payload_invalid",
+            "payload_received", "watchdog_timeout", "dns_retry", "phase_http", "phase_dns", "phase_dns_images",
+            "phase_dns_records", "phase_geoip", "phase_ice", "phase_collector",
+            "dns_request_timeout", "dns_request_network", "dns_request_http_status", "dns_request_invalid_response",
+            "http_request_timeout", "http_request_network", "http_request_http_status", "http_request_invalid_response",
+            "geoip_request_timeout", "geoip_request_network", "geoip_request_http_status", "geoip_request_invalid_response"];
+        if !matches!(kind, "dns" | "webrtc") || uuid::Uuid::parse_str(run).is_err()
+            || !allowed.contains(&event) || !elapsed.is_finite() || !(0.0..=120.0).contains(&elapsed) {
+            return Err(invalid("后台检测诊断字段无效"));
+        }
+        self.append_stream("diagnostics", "background-leak-trace", EventFields {
+            operation: Some(kind.into()), action: Some(run.into()), code: Some(event.into()),
+            status: Some(if attached { "attached" } else { "detached" }.into()),
+            elapsed_seconds: Some(elapsed), ..Default::default()
+        }, at, false)?;
+        Ok(())
+    }
     pub fn record_diagnostic(&self, input: &DiagnosticEventInput, at: f64) -> Result<bool> {
         let valid_source = matches!(
             (input.kind.as_str(), input.source.as_str()),

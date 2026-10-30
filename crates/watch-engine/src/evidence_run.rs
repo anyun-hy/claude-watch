@@ -56,7 +56,7 @@ impl EvidenceSystem for NativeEvidence {
         background_evidence::collect_native(
             &self.host.storage,
             &self.host.runner,
-            &mut background_evidence::ProbeExecutor::new(self.stop.clone()),
+            &mut background_evidence::ProbeExecutor::new(self.stop.clone()).with_diagnostics(self.host.storage.clone()),
             kind,
         )
     }

@@ -23,7 +23,7 @@ def refresh_for_launch(paths, *, timeout=85, clock=time.monotonic, sleep=time.sl
         age = time.time() - float(receipt.get("finished_at", 0))
     except (ValueError, TypeError, AttributeError):
         age = float("inf")
-    if 0 <= age <= 8:
+    if isinstance(receipt, dict) and receipt.get("provider") == "ipleak" and 0 <= age <= 8:
         return
     request_id = uuid.uuid4().hex
     request, reply = directory / "request.json", directory / "reply.json"

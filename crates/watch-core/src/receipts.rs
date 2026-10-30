@@ -189,9 +189,58 @@ fn comparison(state: &str, reason: &str, detail: &str) -> Value {
     json!({"state":state,"reason":reason,"detail":detail})
 }
 
+/// The IPLeak response binds each resolver and the HTTP reference to one
+/// bounded session. Country values must come from that response, not the
+/// independently mutable presentation fields of the observations.
+fn ipleak_evidence(raw: &Value) -> Option<(BTreeMap<String, String>, BTreeSet<String>, String)> {
+    let text = raw.as_str().filter(|v| v.len() <= 512_000)?;
+    let value: Value = serde_json::from_str(text).ok()?;
+    let session = value["session"].as_str()?;
+    if session.len() != 40
+        || !session
+            .bytes()
+            .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+    {
+        return None;
+    }
+    let servers = value["dns_servers"]
+        .as_object()
+        .filter(|v| v.len() <= 127)?;
+    let mut resolvers = BTreeSet::new();
+    for (address, count) in servers {
+        if count.as_u64().filter(|v| *v > 0).is_none() {
+            return None;
+        }
+        resolvers.insert(public(&json!(address))?);
+    }
+    let http = public(&value["http"]["address"])?;
+    let http_country = country(&value["http"]["country"]);
+    if http_country.is_empty() {
+        return None;
+    }
+    let mut countries = BTreeMap::from([(http.clone(), http_country)]);
+    let rows = value["geoip"].as_array().filter(|v| v.len() <= 32)?;
+    for row in rows {
+        let address = public(&row["ip"])?;
+        if !resolvers.contains(&address) {
+            return None;
+        }
+        let code = country(&row["country_code"]);
+        if code.is_empty() {
+            return None;
+        }
+        if countries.get(&address).is_some_and(|old| old != &code) {
+            return None;
+        }
+        countries.insert(address, code);
+    }
+    Some((countries, resolvers, http))
+}
+
 pub fn record_dns(probe: &Value, local: &Value, expected: Option<&str>, now: f64) -> Result<Value> {
     let (started, finished) = check_probe(probe, "dns", now)?;
-    let codes = netcoffee_countries(&probe["externalJSON"]);
+    let evidence = ipleak_evidence(&probe["externalJSON"]);
+    let codes = evidence.as_ref().map(|v| &v.0);
     let mut dns = BTreeSet::new();
     let mut http = BTreeSet::new();
     let (mut seen_dns, mut seen_http, mut missing) = (false, false, false);
@@ -205,16 +254,38 @@ pub fn record_dns(probe: &Value, local: &Value, expected: Option<&str>, now: f64
                 seen_dns = true;
                 &mut dns
             }
-            _ => continue,
+            _ => {
+                missing = true;
+                continue;
+            }
         };
         let Some(address) = public(&row["address"]) else {
+            missing = true;
             continue;
         };
-        let Some(code) = codes.get(&address) else {
+        let in_evidence = evidence.as_ref().is_some_and(|(_, resolvers, reference)| {
+            if text(row, "kind") == "http" {
+                &address == reference
+            } else {
+                resolvers.contains(&address)
+            }
+        });
+        let Some(code) = codes.and_then(|v| v.get(&address)).filter(|_| in_evidence) else {
             missing = true;
             continue;
         };
         bucket.insert((address, code.clone()));
+    }
+    if let Some((_, resolvers, reference)) = &evidence {
+        if resolvers
+            .iter()
+            .any(|address| !dns.iter().any(|(ip, _)| ip == address))
+            || !http.iter().any(|(ip, _)| ip == reference)
+        {
+            missing = true;
+        }
+    } else {
+        missing = true;
     }
     let dns_countries: BTreeSet<_> = dns.iter().map(|v| v.1.clone()).collect();
     let http_countries: BTreeSet<_> = http.iter().map(|v| v.1.clone()).collect();
@@ -286,11 +357,11 @@ pub fn record_dns(probe: &Value, local: &Value, expected: Option<&str>, now: f64
         json!({"schema":1,"status":probe["status"],"observed_at":now,"recorded_at":now,
         "started_at":started,"finished_at":finished,"sampled_at":finished,
         "display_expires_at":finished+DNS_DISPLAY_TTL,"launch_expires_at":finished+DNS_LAUNCH_TTL,
-        "context":context,"context_id":context,
-        "dns":{"egress_ips":dns.iter().map(|v|v.0.clone()).collect::<Vec<_>>(),"countries":dns_countries,"source":"Net.Coffee WebView authoritative DNS"},
-        "http":{"egress_ips":http.iter().map(|v|v.0.clone()).collect::<Vec<_>>(),"countries":http_countries,"source":"Net.Coffee HTTP reference"},
+        "context":context,"context_id":context,"provider":"ipleak",
+        "dns":{"egress_ips":dns.iter().map(|v|v.0.clone()).collect::<Vec<_>>(),"countries":dns_countries,"source":"IPLeak.net WebView authoritative DNS"},
+        "http":{"egress_ips":http.iter().map(|v|v.0.clone()).collect::<Vec<_>>(),"countries":http_countries,"source":"IPLeak.net WebView HTTP reference"},
         "comparison":compare,"errors":errors(&probe["errors"]),"query_error":query_error(&probe["errors"]),
-        "scope":probe.get("scope").and_then(Value::as_str).unwrap_or("Net.Coffee DNS 泄漏检测")}),
+        "scope":probe.get("scope").and_then(Value::as_str).unwrap_or("IPLeak.net DNS 泄漏检测")}),
     )
 }
 pub fn dns_last_valid(receipt: &Value, context: &str, now: f64) -> bool {
@@ -302,6 +373,7 @@ pub fn dns_last_valid(receipt: &Value, context: &str, now: f64) -> bool {
                 && (0.0..=90.0).contains(&(recorded - finished))
         });
     receipt["schema"] == 1
+        && text(receipt, "provider") == "ipleak"
         && valid_time
         && !context.is_empty()
         && text(receipt, "context") == context
@@ -319,6 +391,9 @@ fn dns_state(
     let result = |state: &str, detail: &str| (state.into(), detail.into());
     if receipt["schema"] != 1 {
         return result("unknown", "DNS 泄漏检测尚未完成");
+    }
+    if text(receipt, "provider") != "ipleak" {
+        return result("unknown", "请使用 IPLeak 重新检测 DNS 出口");
     }
     let (Some(finished), Some(recorded), Some(expires)) = (
         number(&receipt["finished_at"]),
@@ -650,9 +725,9 @@ pub fn dns_row(status: &Value) -> Value {
         detail += "；此为历史显示，最新失败仍阻止受控启动";
     }
     json!({"id":"dns","name":"DNS","state":if cached{"cached"}else{status.get("state").and_then(Value::as_str).unwrap_or("unknown")},
-        "detail":detail,"scope":"Net.Coffee DNS 泄漏采样；不代表所有应用或浏览器 DoH","required":true,
+        "detail":detail,"scope":"IPLeak.net DNS 泄漏采样；不代表所有应用或浏览器 DoH","required":true,
         "current":current,"reference":format!("同轮 HTTP 出口国家 {}",if http_countries.is_empty(){"未确认"}else{&http_countries}),
-        "source":"Net.Coffee 权威 DNS 记录 + 同轮 HTTP 参考","sampled_at":receipt["finished_at"],
+        "source":"IPLeak.net 权威 DNS 记录 + 同轮 HTTP 参考","sampled_at":receipt["finished_at"],
         "query_error":if status["state"]=="unknown"{status.get("detail").cloned().unwrap_or(Value::Null)}else{json!("")},
         "display_cached":cached,"last_valid":truthy(&status["last_valid"]["available"])})
 }

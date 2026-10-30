@@ -37,9 +37,9 @@ impl Fixture {
             storage: self.storage.clone(),
         };
         let local = json!({"context":"ctx","context_id":"ctx","proxy":"ok","tun":"ok"});
-        let probe = json!({"kind":"dns","status":"complete","contextChanged":false,"startedAt":now-1.0,"finishedAt":now,"errors":[],"observations":[{"kind":"http","address":"1.1.1.1"},{"kind":"resolver","address":"8.8.8.8"}],"externalJSON":serde_json::to_string(&json!([
-            {"kind":"geoip","status":"complete","query":"1.1.1.1","data":{"country_code":"JP"}},{"kind":"geoip","status":"complete","query":"8.8.8.8","data":{"country_code":"JP"}}
-        ])).unwrap()});
+        let probe = json!({"kind":"dns","status":"complete","contextChanged":false,"startedAt":now-1.0,"finishedAt":now,"errors":[],"observations":[{"kind":"http","address":"1.1.1.1"},{"kind":"resolver","address":"8.8.8.8"}],"externalJSON":serde_json::to_string(&json!({
+            "session":"a".repeat(40),"dns_servers":{"8.8.8.8":5},"http":{"address":"1.1.1.1","country":"JP"},"geoip":[{"ip":"8.8.8.8","country_code":"JP"}]
+        })).unwrap()});
         receipts.record_dns(&probe, &local, None, now).unwrap();
         receipts.record_webrtc(&json!({"kind":"webrtc","status":"complete","contextChanged":false,"startedAt":now-1.0,"finishedAt":now,"errors":[],"observations":[{"kind":"http","address":"1.1.1.1","country":"JP"},{"kind":"srflx","address":"1.1.1.1","country":"JP"}]}),&local,None,now).unwrap();
     }

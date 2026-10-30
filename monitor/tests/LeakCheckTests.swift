@@ -169,68 +169,26 @@ struct LeakCheckTests {
         expect(!retainedOnly.dns.running && !retainedOnly.rtc.running && !freshDuringGap,
                "retained context only binds an in-flight probe and never starts or refreshes a new one")
 
-        let isolated = LeakCheckStore(isFixture: true)
-        isolated.loadFixture(.matched)
+        let primary = LeakCheckStore(isFixture: true)
+        primary.contextProvider = { "current" }
         var dnsWrites = 0, rtcWrites = 0
-        isolated.onDNSComplete = { _ in dnsWrites += 1; return true }
-        isolated.onWebRTCComplete = { _ in rtcWrites += 1; return true }
-        isolated.changeDNSSource(.ipLeak)
-        isolated.ipLeakDeepDNS = true
-        expect(!isolated.deepDNS, "IPLeak rounds cannot change the main Net.Coffee rounds")
-        expect(isolated.source == .netCoffee && isolated.rtc.verdict.state == .matched,
-               "switching DNS comparison leaves WebRTC source and result unchanged")
-        isolated.fixtureScenario = .difference; isolated.startIPLeakDNS()
+        primary.onDNSComplete = { _ in dnsWrites += 1; return true }
+        primary.onWebRTCComplete = { _ in rtcWrites += 1; return true }
+        let ready = await primary.ensureFreshDNSReceipt(maximumWait: 2)
+        expect(ready && dnsWrites == 1 && primary.dns.verdict.state == .matched,
+               "primary DNS completes through the shared backend receipt callback")
+        primary.start(.webrtc); primary.start(.dns); primary.cancel(.dns)
+        expect(primary.rtc.running, "cancelling DNS never cancels WebRTC")
         try await Task.sleep(nanoseconds: 450_000_000)
-        expect(isolated.ipLeakDNS.verdict.state == .difference, "IPLeak comparison keeps its own verdict")
-        expect(isolated.dns.verdict.state == .matched && isolated.rtc.verdict.state == .matched,
-               "IPLeak result cannot replace the primary DNS or WebRTC result")
-        expect(dnsWrites == 0 && rtcWrites == 0, "IPLeak completion never writes protection receipts")
-        isolated.fixtureScenario = .matched; isolated.startIPLeakDNS(); isolated.start(.webrtc)
-        isolated.changeDNSSource(.netCoffee)
-        expect(isolated.ipLeakDNS.running && isolated.rtc.running,
-               "switching the DNS display does not cancel either running comparison or WebRTC")
-        isolated.cancelIPLeakDNS()
-        expect(isolated.rtc.running, "cancelling IPLeak does not cancel WebRTC")
-        try await Task.sleep(nanoseconds: 450_000_000)
-        expect(rtcWrites == 1 && dnsWrites == 0, "only the WebRTC completion reaches its callback")
-        isolated.changeSource(.original); isolated.changeDNSSource(.ipLeak)
-        let mainReady = await isolated.ensureFreshDNSReceipt(maximumWait: 2)
-        expect(mainReady && dnsWrites == 1 && isolated.dns.verdict.state == .matched,
-               "primary DNS receipt remains available while IPLeak and original WebRTC are selected")
+        expect(rtcWrites == 1 && dnsWrites == 1, "cancelled DNS cannot submit a late receipt")
         let automatic = LeakCheckStore(isFixture: true)
-        automatic.changeDNSSource(.ipLeak)
         automatic.refreshLeakChecksIfNeeded(interval: 0)
-        expect(automatic.dns.running && automatic.rtc.running,
-               "viewing IPLeak does not stop automatic primary DNS or WebRTC sampling")
+        expect(automatic.dns.running && automatic.rtc.running, "DNS and WebRTC automatic probes remain independent")
         automatic.cancel(.dns); automatic.cancel(.webrtc)
         let manualRTC = LeakCheckStore(isFixture: true)
-        manualRTC.changeSource(.original); manualRTC.changeDNSSource(.ipLeak)
-        manualRTC.refreshLeakChecksIfNeeded(interval: 0)
-        expect(manualRTC.dns.running && !manualRTC.rtc.running,
-               "primary DNS stays automatic without changing original WebRTC's manual behavior")
+        manualRTC.changeSource(.original); manualRTC.refreshLeakChecksIfNeeded(interval: 0)
+        expect(manualRTC.dns.running && !manualRTC.rtc.running, "DNS remains automatic when original WebRTC is manual")
         manualRTC.cancel(.dns)
-        var comparisonContext = "A"
-        let comparison = LeakCheckStore(isFixture: true)
-        comparison.contextProvider = { comparisonContext }
-        comparison.startIPLeakDNS(); comparisonContext = "B"
-        try await Task.sleep(nanoseconds: 450_000_000)
-        expect(comparison.ipLeakDNS.verdict.state == .incomplete,
-               "IPLeak cannot pass if the proxy context changes during its sample")
-        let concurrent = LeakCheckStore(isFixture: true)
-        concurrent.contextProvider = { "same-context" }
-        var protectedDNSWrites = 0
-        concurrent.onDNSComplete = { _ in protectedDNSWrites += 1; return true }
-        concurrent.changeDNSSource(.ipLeak); concurrent.startIPLeakDNS()
-        let readyDuringComparison = await concurrent.ensureFreshDNSReceipt(maximumWait: 2)
-        expect(readyDuringComparison && protectedDNSWrites == 1 && concurrent.dns.verdict.state == .matched,
-               "startup can refresh the primary receipt while IPLeak is running")
-        expect(concurrent.ipLeakDNS.verdict.state == .matched,
-               "concurrent IPLeak result remains available only as a comparison")
-        let unknownContext = LeakCheckStore(isFixture: true)
-        unknownContext.contextProvider = { nil }; unknownContext.startIPLeakDNS()
-        try await Task.sleep(nanoseconds: 450_000_000)
-        expect(unknownContext.ipLeakDNS.verdict.state == .incomplete,
-               "IPLeak cannot pass when the proxy context is unavailable")
 
         if CommandLine.arguments.count == 2 {
             let bytes = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))

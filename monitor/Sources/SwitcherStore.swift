@@ -122,11 +122,19 @@ struct CurrentEnvironmentReceipt: Decodable {
     var facts: ProtectionFacts?
     var session_guard: SessionGuardStatus?
     var display_facts: EnvironmentDisplayFacts?
+    var initialization_receipts: InitializationReceiptEvidence?
     func count(_ state: String) -> Int { rows.filter { $0.state == state }.count }
     mutating func replaceDNSRow(_ row: EnvironmentCheckRow) {
         if let index = rows.firstIndex(where: { $0.id == "dns" }) { rows[index] = row }
         else { rows.append(row) }
     }
+}
+struct InitializationReceiptEvidence: Decodable {
+    var dns, webrtc: InitializationBackendReceipt?
+}
+struct InitializationBackendReceipt: Decodable {
+    var state, context_id: String?
+    var sampled_at: Double?
 }
 /// Engine-side evidence for the routing row.  The audit row itself only carries
 /// state and detail; the missing/bypass lists live here so the UI can name the
@@ -448,7 +456,10 @@ final class SwitcherStore: ObservableObject {
     var awaitFreshDNSReceipt: (() async -> Bool)?
     var onDNSReceiptRecorded: (() -> Void)?
     var onWebRTCRiskRecorded: (() -> Void)?
+    var onReceiptDiagnostic: ((LeakKind, String) -> Void)?
     var diagnosticContextProvider: (() -> String?)?
+    private(set) var initializationDNSReceipt: (context: String, state: String, sampled: Double)?
+    private(set) var initializationWebRTCReceipt: (context: String, state: String, sampled: Double)?
     @Published private(set) var activity = ""
     @Published private(set) var operationLog = ""
     @Published var setupApplyEnvironment = true { didSet { setupPlan = nil } }
@@ -475,6 +486,24 @@ final class SwitcherStore: ObservableObject {
     private var activityGeneration = 0
     var fixtureEnvironmentReadDelayNanoseconds: UInt64 = 0
     var environmentReadWaitTimeout: TimeInterval = 4
+    #if UI_REVIEW
+    var fullInitializationFixture = false
+    func setInitializationReceiptForFixture(_ kind: LeakKind, context: String, state: String) {
+        guard isFixture else { return }
+        if kind == .dns { initializationDNSReceipt = (context, state, initializationDNSReceipt?.sampled ?? 0) }
+        else { initializationWebRTCReceipt = (context, state, initializationWebRTCReceipt?.sampled ?? 0) }
+    }
+    func setInitializationReadbackForFixture(_ kind: LeakKind, sampled: Double) {
+        guard isFixture, var value = currentEnvironment, var receipts = value.initialization_receipts else { return }
+        if kind == .dns { receipts.dns?.sampled_at = sampled }
+        else { receipts.webrtc?.sampled_at = sampled }
+        value.initialization_receipts = receipts
+        currentEnvironment = value
+    }
+    #else
+    private let fullInitializationFixture = false
+    #endif
+    private var fixtureInitialized = false
 
     init(isFixture: Bool = false) {
         #if UI_REVIEW
@@ -721,7 +750,8 @@ final class SwitcherStore: ObservableObject {
             if isFixture, fixtureEnvironmentReadDelayNanoseconds > 0 {
                 try await Task.sleep(nanoseconds: fixtureEnvironmentReadDelayNanoseconds)
             }
-            let data = isFixture ? Self.fixtureCurrentEnvironment(settings: savedSettings) : try await Task.detached {
+            let data = isFixture ? Self.fixtureCurrentEnvironment(settings: savedSettings, initialization: fullInitializationFixture,
+                dnsReceipt: initializationDNSReceipt, webRTCReceipt: initializationWebRTCReceipt) : try await Task.detached {
                 try SwitcherCommandRunner.run(["environment", "--online", "--record", "--mode", "auto"], cancellation: cancellation)
             }.value
             try checkedSetupResult(data)
@@ -796,12 +826,28 @@ final class SwitcherStore: ObservableObject {
         currentPolicyEvaluation = nil
         if currentEnvironment != nil { currentEnvironmentIsHistorical = true }
     }
+    static func initializationReceiptMetadata(_ raw: [String: Any], kind: LeakKind,
+                                              sampledAt: Double) -> (context: String, state: String, sampled: Double)? {
+        guard raw["status"] as? String == "ok", let receipt = raw["receipt"] as? [String: Any],
+              let context = receipt["context_id"] as? String, !context.isEmpty,
+              let sampled = receipt[kind == .dns ? "finished_at" : "sampled_at"] as? Double,
+              sampled == sampledAt,
+              let verdict = receipt[kind == .dns ? "comparison" : "risk"] as? [String: Any],
+              let state = verdict["state"] as? String, ["ok", "fail", "unknown"].contains(state) else { return nil }
+        return (context, state, sampled)
+    }
     func recordDNSLeak(_ probe: LeakProbeResult) async -> Bool {
-        guard !isFixture else { return true }
+        initializationDNSReceipt = nil
+        guard !isFixture else {
+            initializationDNSReceipt = ("fixture-context-0001", "ok", probe.finishedAt)
+            return true
+        }
         guard let expectedContext = diagnosticContextProvider?(), !expectedContext.isEmpty else {
+            onReceiptDiagnostic?(.dns, "context_missing")
             dnsReceiptError = "DNS 检测时代理上下文未稳定，未记录为当前网络结果。"
             return false
         }
+        var backendRejected = false
         do {
             let payload = try JSONEncoder().encode(DNSLeakRecordInput(probe: probe, expected_context: expectedContext))
             let data = try await Task.detached {
@@ -809,13 +855,23 @@ final class SwitcherStore: ObservableObject {
             }.value
             let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
             guard raw["status"] as? String != "error" else {
+                backendRejected = true
+                let code = raw["code"] as? String
+                onReceiptDiagnostic?(.dns, code == "superseded_receipt" ? "receipt_superseded" : code == "receipt_conflict" ? "receipt_conflict" : "receipt_backend_error")
                 throw NSError(domain: "Switcher", code: 7, userInfo: [NSLocalizedDescriptionKey: raw["message"] as? String ?? "DNS 泄漏回执未保存"])
             }
             dnsReceiptError = ""
             guard diagnosticContextProvider?() == expectedContext else {
+                onReceiptDiagnostic?(.dns, "context_changed")
                 dnsReceiptError = "DNS 检测完成后代理上下文已变化，未接受该回执。"
                 return false
             }
+            guard let receipt = Self.initializationReceiptMetadata(raw, kind: .dns, sampledAt: probe.finishedAt) else {
+                onReceiptDiagnostic?(.dns, "receipt_invalid")
+                dnsReceiptError = "DNS 后台回执缺少本轮上下文、时间或判定。"
+                return false
+            }
+            initializationDNSReceipt = receipt
             // A DNS receipt cannot update only the environment card: the
             // same observation's display-only launch preview would retain its
             // previous DNS row. Keep both views atomic and request a fresh
@@ -823,6 +879,7 @@ final class SwitcherStore: ObservableObject {
             onDNSReceiptRecorded?()
             return true
         } catch {
+            if !backendRejected { onReceiptDiagnostic?(.dns, "receipt_transport_error") }
             dnsReceiptError = "DNS 泄漏结果未能提交给启动预检：" + error.localizedDescription
             return false
         }
@@ -830,11 +887,14 @@ final class SwitcherStore: ObservableObject {
     func recordWebRTCRisk(_ probe: LeakProbeResult) async -> Bool {
         webRTCReceiptGeneration += 1
         let generation = webRTCReceiptGeneration
+        initializationWebRTCReceipt = nil
         if isFixture {
             webRTCReceiptError = ""
+            initializationWebRTCReceipt = ("fixture-context-0001", "ok", probe.finishedAt)
             return true
         }
         guard let expectedContext = diagnosticContextProvider?(), !expectedContext.isEmpty else {
+            onReceiptDiagnostic?(.webrtc, "context_missing")
             if generation == webRTCReceiptGeneration {
                 webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: nil, hasContext: false, contextStillMatches: false)
             }
@@ -848,22 +908,32 @@ final class SwitcherStore: ObservableObject {
             let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
             let backendMessage = raw["message"] as? String
             guard raw["status"] as? String != "error" else {
+                let code = raw["code"] as? String
+                onReceiptDiagnostic?(.webrtc, code == "superseded_receipt" ? "receipt_superseded" : code == "receipt_conflict" ? "receipt_conflict" : "receipt_backend_error")
                 if generation == webRTCReceiptGeneration {
                     webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: backendMessage, hasContext: true, contextStillMatches: true)
                 }
                 return false
             }
             guard diagnosticContextProvider?() == expectedContext else {
+                onReceiptDiagnostic?(.webrtc, "context_changed")
                 if generation == webRTCReceiptGeneration {
                     webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: nil, hasContext: true, contextStillMatches: false)
                 }
                 return false
             }
-            guard generation == webRTCReceiptGeneration else { return false }
+            guard generation == webRTCReceiptGeneration else { onReceiptDiagnostic?(.webrtc, "receipt_superseded"); return false }
+            guard let receipt = Self.initializationReceiptMetadata(raw, kind: .webrtc, sampledAt: probe.finishedAt) else {
+                onReceiptDiagnostic?(.webrtc, "receipt_invalid")
+                webRTCReceiptError = "WebRTC 后台回执缺少本轮上下文、时间或判定。"
+                return false
+            }
+            initializationWebRTCReceipt = receipt
             webRTCReceiptError = ""
             onWebRTCRiskRecorded?()
             return true
         } catch {
+            onReceiptDiagnostic?(.webrtc, "receipt_transport_error")
             if generation == webRTCReceiptGeneration {
                 webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: error.localizedDescription, hasContext: true, contextStillMatches: true)
             }
@@ -911,7 +981,7 @@ final class SwitcherStore: ObservableObject {
         busy = true
         defer { busy = false }
         do {
-            let data = isFixture ? Self.fixtureStatus() : try await Task.detached {
+            let data = isFixture ? Self.fixtureStatus(settings: fullInitializationFixture && !savedSettings.isEmpty ? savedSettings : nil) : try await Task.detached {
                 try SwitcherCommandRunner.run(["status"])
             }.value
             try consumeStatus(data)
@@ -952,7 +1022,7 @@ final class SwitcherStore: ObservableObject {
         busy = true; candidate = nil; setupPlan = nil
         defer { busy = false }
         do {
-            let data = isFixture ? Self.fixtureEnvironment(settings: savedSettings) : try await Task.detached {
+            let data = isFixture ? Self.fixtureEnvironment(settings: savedSettings, initialized: fullInitializationFixture && fixtureInitialized) : try await Task.detached {
                 try SwitcherCommandRunner.run(["setup", "inspect", "--mode", "auto"])
             }.value
             try checkedSetupResult(data)
@@ -1101,6 +1171,13 @@ final class SwitcherStore: ObservableObject {
                     plan = .init(id: "fixture-plan", actions: [.init(id: "timezone", title: "设置时区（模拟）", scope: "administrator", detail: "Asia/Tokyo → Asia/Tokyo")])
                 }
                 else if args.starts(with: ["config", "set"]) { savedSettings = settings; hasUnsavedSettings = false }
+                else if fullInitializationFixture && args.starts(with: ["setup", "apply"]) {
+                    settings["enabled"] = setupEnablePolicy
+                    settings["guard_enabled"] = setupGuard
+                    settings["timezone_watchdog"] = setupWatchdog
+                    settings["auto_update"] = setupUpdater
+                    savedSettings = settings; hasUnsavedSettings = false; fixtureInitialized = true
+                }
                 else if args.starts(with: ["protection", "apply"]), let protectionChanges {
                     for (key, value) in protectionChanges { settings[key] = value }
                     if protectionChanges["guard_enabled"] == true { settings["enabled"] = true }
@@ -1219,13 +1296,15 @@ final class SwitcherStore: ObservableObject {
                   scope: "模拟", required: true)
         }, blocked: ["stun"], message: "模拟环境存在未知项，未启动真实应用")
     }
-    static func fixtureEnvironment(settings: [String: Any] = [:]) -> Data {
-        let value: [String: Any] = ["observed_at": Date().timeIntervalSince1970, "initialized": false,
+    static func fixtureEnvironment(settings: [String: Any] = [:], initialized: Bool = false) -> Data {
+        let value: [String: Any] = ["observed_at": Date().timeIntervalSince1970, "initialized": initialized,
             "candidates": ["tag"], "message": "隔离本机检测；没有联网或修改设置", "recovery_required": false,
             "rows": fixtureEnvironmentRows(settings: settings)]
         return try! JSONSerialization.data(withJSONObject: value)
     }
-    static func fixtureCurrentEnvironment(settings: [String: Any] = [:]) -> Data {
+    static func fixtureCurrentEnvironment(settings: [String: Any] = [:], initialization: Bool = false,
+        dnsReceipt: (context: String, state: String, sampled: Double)? = nil,
+        webRTCReceipt: (context: String, state: String, sampled: Double)? = nil) -> Data {
         let audit = fixtureAudit()
         let now = Date().timeIntervalSince1970
         let guardOn = settings["guard_enabled"] as? Bool == true && settings["enabled"] as? Bool == true
@@ -1236,13 +1315,19 @@ final class SwitcherStore: ObservableObject {
         let sources = ["进程清单 / 后台新鲜样本", "ifconfig / route", "Cloudflare + IPinfo", "独立检测历史", "/etc/localtime / IPinfo",
                        "Foundation 日期模板 / AppleLocale / 本轮 GeoIP", "networksetup Ethernet", "dig / Akamai", "原生 UDP/STUN", "保护心跳", "规则 / 连接证据", "系统 AppleLanguages", "IPinfo", "本轮 HTTPS"]
         let states = ["ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "unknown", guardOn ? "ok" : "fail", "unknown", "ok", "warn", "warn"]
+        let mandatory: Set<String> = ["proxy", "tun", "egress", "timezone", "locale", "dns", "stun", "guard", "reachability"]
         let rows: [[String: Any]] = audit.rows.enumerated().map { index, row in
-            ["id": row.id, "name": row.name, "state": states[index], "detail": "隔离检测样本；未读取目标配置",
-             "scope": row.scope, "required": false, "current": values[index], "reference": references[index], "source": sources[index]]
+            ["id": row.id, "name": row.name, "state": initialization ? (row.id == "guard" && !guardOn ? "fail" : "ok") : states[index], "detail": "隔离检测样本；未读取目标配置",
+             "scope": row.scope, "required": initialization && mandatory.contains(row.id), "current": values[index], "reference": references[index], "source": sources[index]]
+        }
+        func evidence(_ value: (context: String, state: String, sampled: Double)?) -> [String: Any] {
+            guard let value else { return [:] }
+            return ["context_id": value.context, "state": value.state, "sampled_at": value.sampled]
         }
         return try! JSONSerialization.data(withJSONObject: [
             "status": "ok", "purpose": "environment_detection", "grants_launch_permission": false,
             "observation_id": "fixture-observation-0001", "context_id": "fixture-context-0001",
+            "initialization_receipts": ["dns": evidence(dnsReceipt), "webrtc": evidence(webRTCReceipt)],
             // before/after are objects in the backend contract; Swift only
             // renders its stable/changed summary fields and safely ignores
             // opaque diagnostic objects.
@@ -1255,7 +1340,7 @@ final class SwitcherStore: ObservableObject {
             "policy_evaluation": ["purpose": "launch_requirements_preview", "grants_launch_permission": false,
                                   "observation_id": "fixture-observation-0001", "context_id": "fixture-context-0001",
                                   "observed_at": now, "expires_at": now + 300, "policy": "fixture",
-                                  "rows": rows, "blocked": ["stun"], "ready": false,
+                                  "rows": rows, "blocked": initialization ? (guardOn ? [] : ["guard"]) : ["stun"], "ready": initialization && guardOn,
                                   "egress_reference": ["ip": "8.8.8.8", "country": "JP", "timezone": "Asia/Tokyo", "checked_at": now, "context_id": "fixture-context-0001"],
                                   "facts": ["state": "ok", "risks": []],
                                   "message": "隔离同轮启动要求预览；不生成启动许可。"],
@@ -1283,9 +1368,9 @@ final class SwitcherStore: ObservableObject {
             "message": "隔离候选；尚未保存目标或修改系统"]
         return try! JSONSerialization.data(withJSONObject: value)
     }
-    static func fixtureStatus() -> Data {
+    static func fixtureStatus(settings: [String: Any]? = nil) -> Data {
         let raw: [String: Any] = [
-            "status": "ok", "config": ["schema": 1, "enabled": false, "proxy_mode": "auto",
+            "status": "ok", "config": settings ?? ["schema": 1, "enabled": false, "proxy_mode": "auto",
                                        "country": "", "timezone": "", "locale": "",
                                        "network_service": "Wi-Fi", "proxy_group": ""],
             "accounts": ["current": NSNull(), "recovery_required": false,
