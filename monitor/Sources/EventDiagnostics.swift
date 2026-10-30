@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import Darwin
 
 /// A bounded per-process trace, separate from the deduplicated event history.
@@ -100,6 +101,7 @@ struct EventDiagnosticInput: Encodable, Sendable {
     let kind, source, outcome, reason: String
     let stage: String?
     let elapsed_seconds: Double?
+    var run_id: String? = nil
 
     static func make(kind: LeakKind, source: String, result: LeakProbeResult,
                      verdict: LeakVerdictState) -> EventDiagnosticInput? {
@@ -133,29 +135,41 @@ struct EventDiagnosticInput: Encodable, Sendable {
     }
 }
 
+@MainActor final class DiagnosticLogStatus: ObservableObject {
+    static let shared = DiagnosticLogStatus()
+    @Published var error: String?
+}
+
+private final class DiagnosticSubmissionLimit: @unchecked Sendable {
+    private let lock = NSLock()
+    private var running = 0
+    func begin() -> Bool { lock.lock(); defer { lock.unlock() }; guard running < 8 else { return false }; running += 1; return true }
+    func end() { lock.lock(); running -= 1; lock.unlock() }
+}
 enum DiagnosticLogRunner {
+    private static let limit = DiagnosticSubmissionLimit()
+    private static func reportFailure() async {
+        await MainActor.run { DiagnosticLogStatus.shared.error = "本次运行曾发生诊断日志写入失败或丢弃，部分历史可能缺失；检测结果仍按实际证据判断。" }
+    }
     static func submit(_ data: Data, command: String) {
         guard case .rustCandidate? = BundledBackendVariant.current(),
-              let engine = Bundle.main.url(forResource: "watch-engine", withExtension: nil) else { return }
-        // Logging is independent of the detection and protection result.
+              let engine = Bundle.main.url(forResource: "watch-engine", withExtension: nil), limit.begin() else {
+            Task { await reportFailure() }
+            return
+        }
+        // This bounded process is a diagnostic write only; timeout never touches protection.
         Task.detached(priority: .utility) {
+            defer { limit.end() }
             do {
-                let task = Process(), incoming = Pipe(), outgoing = Pipe()
+                let task = Process(), cancellation = SwitcherReadCancellation()
                 task.executableURL = engine; task.arguments = [command, "--apply"]
-                task.standardInput = incoming; task.standardOutput = outgoing; task.standardError = FileHandle.nullDevice
-                try task.run()
-                incoming.fileHandleForWriting.write(data)
-                try? incoming.fileHandleForWriting.close()
-                let output = outgoing.fileHandleForReading.readDataToEndOfFile()
-                task.waitUntilExit()
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 8) { cancellation.cancel() }
+                let output = try SwitcherCommandRunner.execute(task, input: data, cancellation: cancellation)
                 guard let response = try JSONSerialization.jsonObject(with: output) as? [String: Any],
                       task.terminationStatus == 0, response["status"] as? String == "ok" else {
-                    NSLog("Claude Watch: diagnostic event could not be recorded.")
-                    return
+                    await reportFailure(); return
                 }
-            } catch {
-                NSLog("Claude Watch: diagnostic event could not be recorded.")
-            }
+            } catch { await reportFailure() }
         }
     }
 }

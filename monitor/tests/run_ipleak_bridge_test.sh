@@ -20,12 +20,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>LSUIElement</key><true/>
 </dict></plist>
 PLIST
-xcrun swiftc -swift-version 5 -parse-as-library -D IPLEAK_BRIDGE_TEST -target "arm64-apple-macosx$CW_MACOS_MINIMUM" \
-  -module-cache-path "$TEST_DIR/module-cache" -framework AppKit -framework WebKit \
-  "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" \
-  "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" \
-  "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/Sources/IPLeakDNSRunner.swift" "$ROOT/Sources/IPLeakDNSRetryRunner.swift" \
-  "$ROOT/Sources/EventDiagnostics.swift" "$ROOT/Sources/LeakCheckStore.swift" "$ROOT/tests/IPLeakBridgeTests.swift" \
+xcrun swiftc -swift-version 5 -parse-as-library -D UI_REVIEW -D IPLEAK_BRIDGE_TEST -target "arm64-apple-macosx$CW_MACOS_MINIMUM" \
+  -module-cache-path "$TEST_DIR/module-cache" -framework SwiftUI -framework AppKit -framework WebKit \
+  "$ROOT"/Sources/*.swift "$ROOT/tests/IPLeakBridgeTests.swift" \
   -o "$APP/Contents/MacOS/IPLeakBridgeTests"
 /usr/bin/codesign --force --sign - "$APP" >/dev/null
 xcrun swiftc -swift-version 5 -parse-as-library -target "arm64-apple-macosx$CW_MACOS_MINIMUM" \

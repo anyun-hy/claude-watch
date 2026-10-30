@@ -146,6 +146,8 @@ final class FirstRunInitialization: ObservableObject {
     private var approvalOperation: UUID?
     private var automaticRefreshEligible = false
     private var nextAutomaticRefresh: Date?
+    private var nextAccessibilityPoll: Date?
+    private var accessibilityGeneration = 0
 
     init(checks: InitializationChecking, completed: Bool, saveCompletion: @escaping () throws -> Void) {
         self.checks = checks; self.entered = completed; self.saveCompletion = saveCompletion
@@ -166,7 +168,7 @@ final class FirstRunInitialization: ObservableObject {
         // Rechecking all dependencies prevents combining greens from before
         // a network/permission change with results obtained after it.
         rows = InitializationStep.allCases.map { InitializationRow(step: $0) }
-        approval = nil; validUntil = nil
+        approval = nil; validUntil = nil; stopAccessibilityPolling()
         automaticRefreshEligible = false; nextAutomaticRefresh = nil
         await run(from: 0)
     }
@@ -257,6 +259,9 @@ final class FirstRunInitialization: ObservableObject {
             self.rows[index].code = "progress_" + phase.rawValue
         })
         approvalOperation = nil
+        if request.action == .accessibility, case .approval(let pending) = result, pending.action == .accessibility {
+            nextAccessibilityPoll = Date().addingTimeInterval(3)
+        } else { nextAccessibilityPoll = nil }
         let accepted = accept(result, at: index)
         running = false
         if accepted { await run(from: index + 1) }
@@ -265,9 +270,23 @@ final class FirstRunInitialization: ObservableObject {
         guard !running, approval?.action == .accessibility,
               let index = rows.firstIndex(where: { $0.step == .accessibility }) else { return }
         running = true
-        let accepted = accept(await checks.check(.accessibility), at: index)
+        let generation = accessibilityGeneration
+        let result = await checks.check(.accessibility)
+        guard generation == accessibilityGeneration, !entered, approval?.action == .accessibility else {
+            running = false
+            return
+        }
+        let accepted = accept(result, at: index)
         running = false
-        if accepted { await run(from: index + 1) }
+        if accepted { nextAccessibilityPoll = nil; await run(from: index + 1) }
+        else if approval?.action != .accessibility { nextAccessibilityPoll = nil }
+    }
+    func stopAccessibilityPolling() { nextAccessibilityPoll = nil; accessibilityGeneration += 1 }
+    func pollAccessibility(at now: Date = Date()) async {
+        guard !entered, !running, approval?.action == .accessibility,
+              let nextAccessibilityPoll, now >= nextAccessibilityPoll else { return }
+        self.nextAccessibilityPoll = now.addingTimeInterval(3)
+        await recheckAuthorization()
     }
     func refreshReadiness(at now: Date = Date()) {
         guard !entered, !running else { return }

@@ -436,8 +436,9 @@ final class LeakCheckStore: ObservableObject {
         let verdict = state(kind).verdict.state
         trace(kind, verdict == .matched ? "result_matched" : verdict == .difference ? "result_difference" : verdict == .incomplete || verdict == .unconfigured ? "result_incomplete" : "result_other", run: id)
         if !isFixture, let logSource,
-           let event = EventDiagnosticInput.make(kind: kind, source: logSource, result: state(kind).result ?? completed,
+           var event = EventDiagnosticInput.make(kind: kind, source: logSource, result: state(kind).result ?? completed,
                                                  verdict: state(kind).verdict.state) {
+            event.run_id = id.uuidString
             EventDiagnosticLogger.submit(event)
         }
         if kind == .dns, let onDNSComplete {

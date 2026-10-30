@@ -3,6 +3,7 @@ mod coffee_dispatch;
 mod daemon_run;
 mod evidence_run;
 mod diagnostics_dispatch;
+mod diagnostic_queue;
 mod dns_dispatch;
 mod install_dispatch;
 mod maintenance_dispatch;

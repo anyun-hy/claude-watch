@@ -117,6 +117,7 @@ pub fn capture_phase(store: &StateStore, config: &Config, local: &Value, now: f6
                         Some("degraded") => "degraded",
                         Some("unknown") => "unknown",
                         Some("disabled") => "disabled",
+                        Some("protection_triggered") => "protection_triggered",
                         _ => "invalid",
                     };
                     let matches_policy = guard_heartbeat_policy_matches(&value, config);
@@ -197,7 +198,7 @@ impl GuardPhase {
             "ok" | "error" | "missing" | "unreadable" | "invalid"
         ) && matches!(
             self.guard_heartbeat_status.as_str(),
-            "ok" | "degraded" | "unknown" | "disabled" | "missing" | "unreadable" | "invalid"
+            "ok" | "degraded" | "unknown" | "disabled" | "protection_triggered" | "missing" | "unreadable" | "invalid"
         ) && self.guard_heartbeat_code.as_deref().is_none_or(|code| {
             matches!(
                 code,

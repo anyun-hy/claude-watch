@@ -13,6 +13,9 @@ struct LeakDiagnosticTraceTests {
         let directory = root.appendingPathComponent("logs")
         let log = LeakDiagnosticTrace(directory: directory)
         let id = UUID()
+        let summary = EventDiagnosticInput(kind: "dns", source: "ipleak", outcome: "incomplete", reason: "timeout", stage: "http", elapsed_seconds: 8, run_id: id.uuidString)
+        let summaryObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(summary)) as! [String: Any]
+        expect(summaryObject["run_id"] as? String == id.uuidString, "diagnostic summary carries the trace run identity")
         log.record(kind: "dns", event: "start", run: id)
         log.record(kind: "dns", event: "phase_dns", run: id, attached: true)
         log.record(kind: "dns", event: "secret-ip-203.0.113.9", run: id)

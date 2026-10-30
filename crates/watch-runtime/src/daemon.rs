@@ -93,10 +93,13 @@ impl DaemonLease {
         })
     }
     pub fn publish(&self, sample: Result<Value>, now: f64) -> Result<Value> {
+        self.publish_with_log_health(sample, now, None)
+    }
+    pub fn publish_with_log_health(&self, sample: Result<Value>, now: f64, log_error: Option<&str>) -> Result<Value> {
         if !now.is_finite() || now <= 0.0 {
             return Err(CoreError::new("invalid_clock", "后台时钟无效"));
         }
-        let snapshot = match sample {
+        let mut snapshot = match sample {
             Ok(value) => value,
             Err(error) => {
                 let mut value = monitor_snapshot::empty(&self.storage, now, &error.message);
@@ -105,6 +108,10 @@ impl DaemonLease {
                 value
             }
         };
+        if let Some(error) = log_error {
+            let combined = snapshot["eventError"].as_str().map(|v| format!("{v}；{error}")).unwrap_or_else(|| error.to_owned());
+            snapshot["eventError"] = json!(combined);
+        }
         let quality = if snapshot["health"]["state"] == "running" {
             "ok"
         } else {

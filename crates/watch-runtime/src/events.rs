@@ -68,6 +68,26 @@ pub struct EventFields {
     pub service_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guard_diagnostics: Option<crate::guard_diagnostics::GuardRound>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmed_exited_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_counts: Option<BTreeMap<String, u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_sampled_at: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_sampled_at: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webrtc_sampled_at: Option<f64>,
 }
 impl EventFields {
     fn validate(&self) -> Result<()> {
@@ -95,6 +115,7 @@ impl EventFields {
         {
             return Err(invalid("后台任务名称无效"));
         }
+        if [self.egress_sampled_at, self.dns_sampled_at, self.webrtc_sampled_at].into_iter().flatten().any(|v| !v.is_finite() || v <= 0.0 || v > 1.0e12) { return Err(invalid("采样时间无效")); }
         if self
             .elapsed_seconds
             .is_some_and(|v| !v.is_finite() || v < 0.0)
@@ -104,6 +125,9 @@ impl EventFields {
         if self.pid.is_some_and(|v| v <= 1 || v > i32::MAX as u32) {
             return Err(invalid("事件进程身份无效"));
         }
+        if [&self.run_id, &self.session_id, &self.correlation_id, &self.round_id].into_iter().flatten().any(|v| uuid::Uuid::parse_str(v).is_err()) { return Err(invalid("运行标识无效")); }
+        if self.previous_state.as_ref().is_some_and(|v| !matches!(v.as_str(), "running" | "degraded" | "ok" | "partial" | "empty" | "no_targets" | "unknown" | "failed" | "idle" | "safe" | "risk" | "locked" | "missing" | "pending")) { return Err(invalid("前一状态无效")); }
+        if self.reason_counts.as_ref().is_some_and(|m| m.len() > 12 || m.keys().any(|k| !matches!(k.as_str(), "process_exited" | "identity_changed" | "missing_target_sample" | "fd_inventory_unavailable" | "socket_deadline" | "socket_info_unavailable" | "fd_closed_during_sample" | "fd_list_truncated" | "foreign_socket_pid" | "socket_sample_partial" | "other"))) { return Err(invalid("采样原因无效")); }
         if let Some(value) = &self.guard_diagnostics { value.validate()?; }
         Ok(())
     }
@@ -148,6 +172,15 @@ pub struct NotifyError {
     pub code: String,
     pub detail: String,
 }
+fn alert_purpose(title: &str) -> &'static str {
+    match title {
+        "Claude Watch：已触发保护" => "guard_stop",
+        "Claude Watch：保护采样异常" => "guard_sampling",
+        "Claude Watch：监控采样异常" => "monitor_sampling",
+        "Claude Watch：敏感目录文件描述符" => "sensitive_file",
+        _ => "other",
+    }
+}
 pub trait Notifier: Send + Sync {
     fn notify(&self, alert: &Alert) -> std::result::Result<(), NotifyError>;
 }
@@ -184,6 +217,7 @@ pub struct DiagnosticEventInput {
     pub reason: String,
     pub stage: Option<String>,
     pub elapsed_seconds: Option<f64>,
+    pub run_id: Option<String>,
 }
 impl EventStore {
     pub fn new(storage: StateStore) -> Self {
@@ -265,7 +299,8 @@ impl EventStore {
             ),
             _ => false,
         };
-        if !valid_source
+        if input.run_id.as_ref().is_some_and(|v| uuid::Uuid::parse_str(v).is_err())
+            || !valid_source
             || !valid_reason
             || input
                 .stage
@@ -293,6 +328,7 @@ impl EventStore {
                     code: Some(input.reason.clone()),
                     stage: input.stage.clone(),
                     elapsed_seconds: input.elapsed_seconds,
+                    run_id: input.run_id.clone(),
                     ..Default::default()
                 },
                 at,
@@ -341,6 +377,21 @@ impl EventStore {
             return Err(invalid("事件类别或时间无效"));
         }
         fields.validate()?;
+        if matches!(category, "sampling-state" | "guard-decision" | "guard-stop") {
+            let value = serde_json::to_value(&fields).map_err(|_| invalid("事件无法编码"))?;
+            let allowed: &[&str] = match category {
+                "sampling-state" => &["operation", "status", "action", "previous_state", "elapsed_seconds", "round_id", "confirmed_exited_count", "reason_counts"],
+                "guard-decision" => &["session_id", "status", "previous_state", "code", "action", "egress_sampled_at", "dns_sampled_at", "webrtc_sampled_at"],
+                _ => &["session_id", "correlation_id", "action", "status", "code", "elapsed_seconds"],
+            };
+            if value.as_object().is_none_or(|m| m.keys().any(|k| !allowed.contains(&k.as_str()))) { return Err(invalid("诊断事件包含不允许的字段")); }
+            let valid = match category {
+                "sampling-state" => matches!(fields.operation.as_deref(), Some("health" | "connection")) && matches!(fields.action.as_deref(), Some("transition" | "summary")) && matches!(fields.status.as_deref(), Some("running" | "degraded" | "ok" | "partial" | "empty" | "no_targets" | "failed" | "unknown")),
+                "guard-decision" => matches!(fields.action.as_deref(), Some("post_action")) && matches!(fields.status.as_deref(), Some("idle" | "safe" | "risk" | "locked" | "unknown" | "missing" | "pending")) && matches!(fields.code.as_deref(), Some("egress_ip_changed" | "egress_country_cn" | "session_identity_changed" | "proxy_or_tun_failed" | "egress_risk_persist_failed" | "evidence_expired" | "dns_risk" | "webrtc_risk" | "egress_unconfirmed" | "proxy_or_tun_unconfirmed" | "guard_sampling_failed" | "session_identity_unconfirmed" | "session_pending" | "risk_evidence_unavailable" | "risk_evidence_missing" | "none" | "other")),
+                _ => fields.correlation_id.is_some() && match fields.action.as_deref() { Some("request_post_action" | "retry_post_action") => fields.status.is_none(), Some("result_post_action") => matches!(fields.status.as_deref(), Some("confirmed" | "failed" | "session_changed")) && fields.code.as_deref().is_none_or(|c| matches!(c, "claude_still_running" | "permission_denied" | "component_unavailable" | "identity_unconfirmed" | "other")), _ => false },
+            };
+            if !valid { return Err(invalid("诊断事件状态无效")); }
+        }
         let lock_name = match stream {
             "traffic" => "traffic-events",
             "diagnostics" => "diagnostic-events",
@@ -362,6 +413,7 @@ impl EventStore {
                 .find(|event| event.category == category && event.fields.action == fields.action)
                 .is_some_and(|event| {
                     event.fields.status == fields.status
+                        && event.fields.run_id == fields.run_id
                         && event.fields.code == fields.code
                         && event.fields.stage == fields.stage
                         && match (&event.fields.guard_diagnostics, &fields.guard_diagnostics) {
@@ -658,6 +710,7 @@ impl EventStore {
                     "alert-dispatched",
                     EventFields {
                         status: Some("sent".into()),
+                        operation: Some(alert_purpose(&alert.title).into()),
                         action: Some(
                             match alert.severity {
                                 Severity::Critical => "critical",
@@ -673,10 +726,11 @@ impl EventStore {
                 Ok(AlertOutcome::Sent)
             }
             Err(error) => {
-                let _ = self.append(
+                self.append(
                     "alert-failed",
                     EventFields {
                         status: Some("failed".into()),
+                        operation: Some(alert_purpose(&alert.title).into()),
                         code: Some(if valid_label(&error.code, 80) {
                             error.code
                         } else {
@@ -685,7 +739,7 @@ impl EventStore {
                         ..Default::default()
                     },
                     at,
-                );
+                )?;
                 Ok(AlertOutcome::Failed("notification_failed".into()))
             }
         }

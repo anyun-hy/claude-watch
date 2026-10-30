@@ -379,6 +379,14 @@ impl Controller {
             diagnostic,
         })
     }
+    fn timed_guard_quit<S: DesktopSystem>(system: &mut S, receipt: &mut Value) -> Result<()> {
+        let started = std::time::Instant::now();
+        receipt["stop_started_at"] = json!(system.now());
+        let result = system.quit_desktop();
+        receipt["stop_completed_at"] = json!(system.now());
+        receipt["stop_elapsed_seconds"] = json!(started.elapsed().as_secs_f64());
+        result
+    }
     pub fn guard_tick<S: DesktopSystem>(&self, system: &mut S) -> Result<Value> {
         if !system.launch_target().protected() {
             return Err(CoreError::new(
@@ -434,7 +442,7 @@ impl Controller {
                     receipt["stop_state"] = json!("confirmed");
                 } else {
                     match sessions
-                        .close_if_current(id.as_deref(), system.now(), || system.quit_desktop())
+                        .close_if_current(id.as_deref(), system.now(), || Self::timed_guard_quit(system, &mut receipt))
                     {
                         Ok(Some(())) => {
                             receipt["action"] = json!("close-desktop");
@@ -459,7 +467,7 @@ impl Controller {
                 receipt["session_guard"] =
                     session::status(current.as_ref().unwrap(), system.now(), Some(true));
                 match sessions
-                    .close_if_current(id.as_deref(), system.now(), || system.quit_desktop())
+                    .close_if_current(id.as_deref(), system.now(), || Self::timed_guard_quit(system, &mut receipt))
                 {
                     Ok(Some(())) => {
                         receipt["action"] = json!("close-desktop");
@@ -544,7 +552,7 @@ impl Controller {
                             id.as_deref(),
                             system.now(),
                             checked_at,
-                            || system.quit_desktop(),
+                            || Self::timed_guard_quit(system, &mut receipt),
                         ) {
                             Ok(Some(())) => {
                                 receipt["action"] = json!("close-desktop");
@@ -571,7 +579,7 @@ impl Controller {
                 .map_err(|_| CoreError::new("guard_encoding_failed", "保护状态无法编码"))?;
             if matches!(outcome.state.as_str(), "risk" | "locked") {
                 let expected = outcome.session.as_ref().map(|s| s.session_id.as_str());
-                match sessions.close_if_current(expected, system.now(), || system.quit_desktop()) {
+                match sessions.close_if_current(expected, system.now(), || Self::timed_guard_quit(system, &mut receipt)) {
                     Ok(Some(())) => {
                         receipt["action"] = json!("close-desktop");
                         receipt["stop_state"] = json!("confirmed");
@@ -612,7 +620,7 @@ impl Controller {
             Ok(value) => value,
             Err(_) => {
                 receipt["session_guard"] = json!({"state":"risk","reason":{"code":"session_state_invalid","detail":"会话记录无法验证，未允许无保护运行"}});
-                match sessions.close_if_unreadable(system.now(), || system.quit_desktop()) {
+                match sessions.close_if_unreadable(system.now(), || Self::timed_guard_quit(system, receipt)) {
                     Ok(Some(_)) => {
                         receipt["action"] = json!("close-desktop");
                         receipt["stop_state"] = json!("confirmed");
@@ -638,7 +646,7 @@ impl Controller {
             receipt["status"] = json!("protection_triggered");
             receipt["persistence_error"] = json!("state_io_failed");
             receipt["session_guard"] = json!({"state":"locked", "phase":"locked", "reason":{"code":"egress_risk_persist_failed", "detail":"出口风险已确认，会话记录写入失败"}});
-            match sessions.close_if_current(id.as_deref(), system.now(), || system.quit_desktop()) {
+            match sessions.close_if_current(id.as_deref(), system.now(), || Self::timed_guard_quit(system, receipt)) {
                 Ok(Some(())) => {
                     receipt["action"] = json!("close-desktop");
                     receipt["stop_state"] = json!("confirmed");
@@ -657,7 +665,7 @@ impl Controller {
         {
             receipt["status"] = json!("protection_triggered");
             receipt["session_guard"] = session::status(value, system.now(), Some(true));
-            match sessions.close_if_current(id.as_deref(), system.now(), || system.quit_desktop()) {
+            match sessions.close_if_current(id.as_deref(), system.now(), || Self::timed_guard_quit(system, receipt)) {
                 Ok(Some(())) => {
                     receipt["action"] = json!("close-desktop");
                     receipt["stop_state"] = json!("confirmed");
@@ -682,7 +690,7 @@ impl Controller {
                     .map_err(|_| CoreError::new("guard_encoding_failed", "保护状态无法编码"))?;
                 if matches!(outcome.state.as_str(), "risk" | "locked") {
                     match sessions
-                        .close_if_current(id.as_deref(), system.now(), || system.quit_desktop())
+                        .close_if_current(id.as_deref(), system.now(), || Self::timed_guard_quit(system, receipt))
                     {
                         Ok(Some(_)) => {
                             receipt["action"] = json!("close-desktop");

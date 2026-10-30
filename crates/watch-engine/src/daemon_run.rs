@@ -106,6 +106,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
             Arc::new(NativeNotifier::system()),
         )))
     };
+    let diagnostic_queue = super::diagnostic_queue::DiagnosticQueue::new(storage.clone());
     let events = EventStore::new(storage.clone());
     events.append(
         "daemon-start",
@@ -151,6 +152,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
     let guard = if request.flag("observe-only") {
         None
     } else {
+        let guard_diagnostics = diagnostic_queue.clone();
         let mut host = super::runtime::host(paths.clone(), Authority::ExplicitPermit)?;
         let desktop = NativeDesktop::new(
             host.runner.clone(),
@@ -182,11 +184,13 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                     // "保护采样异常" dialog reappear after every dismissal, so
                     // it gets the same sustained-streak gate as the sampling
                     // alerts instead of firing immediately.
+                    let mut guard_history = super::diagnostic_queue::GuardHistory::default();
                     let mut unknown_gate =
                         AlertGate::new(SUSTAINED_SAMPLING_ROUNDS, SAMPLING_QUIET);
                     while !stop.load(Ordering::Acquire) {
                         let started = Instant::now();
                         let receipt=controller.guard_tick(&mut runtime)?;
+                        guard_history.observe(&guard_diagnostics, &receipt, native::now());
                         if let Some(alerts)=&guard_alerts {
                             if receipt["action"]=="close-desktop"{unknown_gate.observe(false);alerts.enqueue(Alert{title:"Claude Watch：已触发保护".into(),message:"检测到会话风险并关闭了 Claude。请查看具体检测结果；重新启动仍会执行完整校验。".into(),severity:Severity::Warning});}
                             else if unknown_gate.observe(receipt["status"]=="unknown"){alerts.enqueue(Alert{title:"Claude Watch：保护采样异常".into(),message:"本轮保护证据未能完整取得，后台正在重试。详情见环境状态；这不等于已检测到网络泄漏。".into(),severity:Severity::Critical});}
@@ -212,6 +216,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
             }
         }
     };
+    let mut sampling_history = super::diagnostic_queue::SamplingHistory::default();
     let mut sampling_gate = AlertGate::new(SUSTAINED_SAMPLING_ROUNDS, SAMPLING_QUIET);
     // Last reported sensitive-file evidence set.
     let mut reported_files: Option<String> = None;
@@ -250,7 +255,13 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                 ));
             }
             let sample = publisher.poll(&config.proxy_group, "", false);
-            let snapshot = owner.publish(sample, native::now())?;
+            let mut log_error = diagnostic_queue.health_message();
+            if let Some(count) = alerts.as_ref().map(|a| a.record_failures()).filter(|n| *n > 0) {
+                let note = format!("本次后台运行的通知事件记录或冷却写入失败 {count} 次。");
+                log_error = Some(log_error.map(|existing| format!("{existing}；{note}")).unwrap_or(note));
+            }
+            let snapshot = owner.publish_with_log_health(sample, native::now(), log_error.as_deref())?;
+            sampling_history.observe(&diagnostic_queue, &snapshot, native::now());
             if let Some(alerts) = &alerts {
                 // `quality` is a per-round verdict: one missing `lsof` sample
                 // or an empty traffic counter flips it to "degraded" and the

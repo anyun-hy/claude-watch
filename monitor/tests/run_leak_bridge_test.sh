@@ -26,9 +26,9 @@ cat > "$TEST_APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundlePackageType</key><string>APPL</string>
 </dict></plist>
 PLIST
-xcrun swiftc -swift-version 5 -parse-as-library -target "arm64-apple-macosx$CW_MACOS_MINIMUM" -D LEAK_BRIDGE_TEST \
-  -module-cache-path "$ROOT/build/test-module-cache" -framework AppKit -framework WebKit \
-  "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/Sources/IPLeakDNSRunner.swift" "$ROOT/Sources/IPLeakDNSRetryRunner.swift" "$ROOT/Sources/EventDiagnostics.swift" "$ROOT/Sources/LeakCheckStore.swift" "$ROOT/tests/LeakBridgeTests.swift" \
+xcrun swiftc -swift-version 5 -parse-as-library -target "arm64-apple-macosx$CW_MACOS_MINIMUM" -D UI_REVIEW -D LEAK_BRIDGE_TEST \
+  -module-cache-path "$ROOT/build/test-module-cache" -framework SwiftUI -framework AppKit -framework WebKit \
+  "$ROOT"/Sources/*.swift "$ROOT/tests/LeakBridgeTests.swift" \
   -o "$TEST_APP/Contents/MacOS/LeakBridgeTests"
 if [[ "$RUN_NATIVE" == 1 ]]; then
   "$TEST_APP/Contents/MacOS/LeakBridgeTests"

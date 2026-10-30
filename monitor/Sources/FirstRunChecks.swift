@@ -387,7 +387,7 @@ final class FirstRunChecks: InitializationChecking {
     private var accessResult: InitializationResult {
         if accessibilityTrusted() { return .passed("macOS 已确认 Claude Watch 的辅助功能授权。") }
         return .approval(.init(id: "accessibility", action: .accessibility, title: "授权辅助功能",
-            detail: "用于读取 Claude 界面的登录状态。请在 macOS 系统设置中允许 Claude Watch，返回后重新核对。",
+            detail: "用于读取 Claude 界面的登录状态。请在 macOS 系统设置中允许 Claude Watch；授权后将自动核对并继续，也可手动重新核对。",
             changes: ["在系统设置中开启 Claude Watch 的辅助功能权限", "授权状态以 macOS 实际回读为准；密码仅在系统窗口输入"]))
     }
     private var contextMatches: Bool { boundContext != nil && boundContext == store.initializationContext }

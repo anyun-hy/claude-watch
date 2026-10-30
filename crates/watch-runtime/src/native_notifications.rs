@@ -13,7 +13,7 @@ use crate::{
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{Arc, Condvar, Mutex},
+    sync::{atomic::{AtomicU64, Ordering}, Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -106,6 +106,7 @@ struct Queue {
 struct Shared {
     queue: Mutex<Queue>,
     ready: Condvar,
+    record_failures: AtomicU64,
 }
 
 /// An independent bounded worker for automatic notifications.
@@ -134,6 +135,7 @@ impl AlertDispatcher {
                 stopping: false,
             }),
             ready: Condvar::new(),
+            record_failures: AtomicU64::new(0),
         });
         let worker = thread::spawn({
             let worker_store = Arc::clone(&store);
@@ -173,6 +175,7 @@ impl AlertDispatcher {
         self.shared.ready.notify_one();
         true
     }
+    pub fn record_failures(&self) -> u64 { self.shared.record_failures.load(Ordering::Relaxed) }
     pub fn notifier(&self) -> &Arc<dyn Notifier> {
         &self.notifier
     }
@@ -216,7 +219,9 @@ fn worker_loop(store: Arc<EventStore>, notifier: Arc<dyn Notifier>, shared: Arc<
                 .duration_since(UNIX_EPOCH)
                 .map(|value| value.as_secs_f64())
                 .unwrap_or(0.0);
-            let _ = store.emit(notifier.as_ref(), &entry.alert, at);
+            if store.emit(notifier.as_ref(), &entry.alert, at).is_err() {
+                shared.record_failures.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if let Ok(mut queue) = shared.queue.lock() {
             queue.active_title = None;

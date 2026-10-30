@@ -20,6 +20,7 @@ private struct LeakInspectorPage: View {
     @ObservedObject var store: LeakCheckStore
     let p: Palette
     let managePolicy: () -> Void
+    @ObservedObject private var diagnosticLog = DiagnosticLogStatus.shared
     @State private var detailsExpanded = false
     @State private var localExpanded = false
     private var isDNS: Bool { kind == .dns }
@@ -74,6 +75,9 @@ private struct LeakInspectorPage: View {
                     .frame(height:72).clipShape(RoundedRectangle(cornerRadius:10))
             }
             InspectorStatus(verdict: state.verdict, running: state.running, finishedAt: latestResult?.finishedAt, p: p)
+            if let error = diagnosticLog.error ?? LeakDiagnosticTrace.shared.error {
+                Label(error, systemImage: "exclamationmark.triangle").font(WatchTypography.caption).foregroundStyle(p.amber)
+            }
             if showingPreviousSuccessfulResult, let previous = result {
                 Label("本轮查询未完成；下方保留上次有效样本（" + probeTime(previous.finishedAt) + "）供核对。当前判词与启动预检仍按本轮失败结果执行。", systemImage: "clock.arrow.circlepath")
                     .font(.callout).foregroundStyle(p.amber).fixedSize(horizontal: false, vertical: true)

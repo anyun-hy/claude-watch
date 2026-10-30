@@ -104,6 +104,7 @@ fn diagnostic_stream_is_minimal_deduplicated_and_rejects_untrusted_fields() {
         reason: "timeout".into(),
         stage: Some("dns".into()),
         elapsed_seconds: Some(2.0),
+        run_id: None,
     };
     assert!(events.record_diagnostic(&input, 1000.0).unwrap());
     assert!(!events.record_diagnostic(&input, 1001.0).unwrap());
@@ -133,7 +134,7 @@ fn dns_deadline_stages_are_specific_but_cannot_carry_addresses_or_tokens() {
     let f = Fixture::new();
     let events = EventStore::new(f.store.clone());
     let mut input = DiagnosticEventInput { kind:"dns".into(), source:"netcoffee".into(),
-        outcome:"incomplete".into(), reason:"timeout".into(), stage:None, elapsed_seconds:Some(69.0) };
+        outcome:"incomplete".into(), reason:"timeout".into(), stage:None, elapsed_seconds:Some(69.0), run_id:None };
     for (index,stage) in ["dns_images", "dns_records"].iter().enumerate() {
         input.stage=Some((*stage).into());
         assert!(events.record_diagnostic(&input,1000.0+index as f64).unwrap());
@@ -184,4 +185,38 @@ fn error_status_is_not_hidden_by_an_unrecognized_event_category() {
     let page = query(&f.store, "attention", "new-error-category", 0);
     assert_eq!(page["total"], 1);
     assert_eq!(page["events"][0]["severity"], "error");
+}
+
+#[test]
+fn diagnostic_run_id_is_bound_and_recovery_not_deduplicated() {
+    let f = Fixture::new();
+    let events = EventStore::new(f.store.clone());
+    let run = uuid::Uuid::new_v4().to_string();
+    let mut input = DiagnosticEventInput { kind:"dns".into(), source:"ipleak".into(), outcome:"incomplete".into(), reason:"timeout".into(), stage:Some("http".into()), elapsed_seconds:Some(8.0), run_id:Some(run.clone()) };
+    assert!(events.record_diagnostic(&input, 1000.0).unwrap());
+    assert!(!events.record_diagnostic(&input, 1000.1).unwrap());
+    let other_run = uuid::Uuid::new_v4().to_string();
+    input.run_id = Some(other_run.clone());
+    assert!(events.record_diagnostic(&input, 1000.2).unwrap());
+    input.run_id = Some(run.clone());
+    input.outcome = "matched".into(); input.reason = "matched".into(); input.stage = None;
+    assert!(events.record_diagnostic(&input, 1001.0).unwrap());
+    input.outcome = "incomplete".into(); input.reason = "timeout".into(); input.stage = Some("http".into());
+    assert!(events.record_diagnostic(&input, 1002.0).unwrap());
+    input.run_id = Some("198.51.100.1".into());
+    assert!(events.record_diagnostic(&input, 1003.0).is_err());
+    let history = events.history().unwrap().events;
+    assert_eq!(history.len(), 4);
+    assert_eq!(history.iter().filter(|e| e.fields.run_id.as_deref() == Some(run.as_str())).count(), 3);
+    assert_eq!(history.iter().filter(|e| e.fields.run_id.as_deref() == Some(other_run.as_str())).count(), 1);
+}
+#[test]
+fn structured_lifecycle_events_reject_unknown_or_private_fields() {
+    let f = Fixture::new(); let events = EventStore::new(f.store.clone());
+    let fields = EventFields { operation:Some("connection".into()), status:Some("partial".into()), action:Some("transition".into()), ..Default::default() };
+    assert!(events.append("sampling-state", fields.clone(), 1000.0).is_ok());
+    let mut invalid = fields.clone(); invalid.status = Some("private-address".into());
+    assert!(events.append("sampling-state", invalid, 1001.0).is_err());
+    let mut private = fields; private.account = Some("private-account".into());
+    assert!(events.append("sampling-state", private, 1002.0).is_err());
 }

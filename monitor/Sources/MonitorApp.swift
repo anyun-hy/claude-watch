@@ -81,25 +81,9 @@ struct MonitorView: View {
         .navigationSplitViewStyle(.balanced)
         .navigationTitle("Claude Watch")
         .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                HStack(spacing: 8) {
-                    Text("自动检测与刷新").font(WatchTypography.caption).foregroundStyle(p.secondary)
-                    Toggle("自动检测环境并刷新后台数据", isOn: $store.automatic).labelsHidden().toggleStyle(.switch)
-                        .controlSize(.mini)
-                }.fixedSize().help("自动更新环境、DNS、WebRTC 与后台数据；关闭后保镖仍继续运行。")
-                Button {
-                    if let refreshAction { refreshAction() }
-                    else { store.refresh(full: true, manual: true) }
-                } label: {
-                    HStack(spacing: 6) {
-                        ZStack {
-                            Image(systemName: "arrow.clockwise").opacity(store.refreshing ? 0 : 1)
-                            if store.refreshing { ProgressView().controlSize(.mini).scaleEffect(0.7) }
-                        }.frame(width: 14, height: 14)
-                        Text("刷新后台数据")
-                    }.font(WatchTypography.caption).frame(width: 104, height: 22)
-                }.disabled(store.refreshing).keyboardShortcut("r", modifiers: .command)
-                    .help("读取最新后台数据，自动同步不会改变按钮状态")
+            MonitorRefreshToolbar(automatic: $store.automatic, refreshing: store.refreshing, p: p) {
+                if let refreshAction { refreshAction() }
+                else { store.refresh(full: true, manual: true) }
             }
         }
         .foregroundStyle(p.text)
@@ -319,10 +303,11 @@ struct MonitorView: View {
                     Button("查看全部") { store.page = .events }.buttonStyle(.borderless)
                         .font(WatchTypography.caption).foregroundStyle(p.blue)
                 }.padding(.bottom, 8)
+                if let error = store.snapshot?.eventError {
+                    Text(error).font(WatchTypography.caption).foregroundStyle(p.amber).padding(.vertical, 8)
+                }
                 if let events = store.snapshot?.events, !events.isEmpty {
                     ForEach(Array(events.prefix(4))) { EventTimelineRow(event: $0, p: p, compact: true) }
-                } else if let error = store.snapshot?.eventError {
-                    Text(error).font(WatchTypography.body).foregroundStyle(p.amber).padding(.vertical, 16)
                 } else {
                     Text(store.snapshot == nil ? "正在读取事件记录…" : "暂无可显示的事件记录。")
                         .font(WatchTypography.body).foregroundStyle(p.secondary).padding(.vertical, 16)

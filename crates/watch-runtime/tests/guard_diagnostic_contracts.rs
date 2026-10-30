@@ -237,3 +237,18 @@ fn history_keeps_changes_but_deduplicates_repeated_rounds_and_rejects_untrusted_
     assert!(!raw.contains("secret-token-123"));
     assert!(!raw.contains(":null"));
 }
+
+#[test]
+fn triggered_heartbeat_is_preserved_and_unknown_still_rejected() {
+    let f = Fixture::new();
+    let config = Config::default();
+    f.store.atomic_json(&f.store.paths.base().join("guard-heartbeat.json"), &json!({"time":1000.0,"status":"protection_triggered"})).unwrap();
+    let phase = capture_phase(&f.store, &config, &json!({"guard_state":"unknown","guard_backend_healthy":true}), 1001.0);
+    assert_eq!(phase.guard_heartbeat_status, "protection_triggered");
+    assert_eq!(phase.guard_backend_healthy, Some(true));
+    let mut bad = phase.clone(); bad.guard_heartbeat_status = "private-address-1.2.3.4".into();
+    let round = GuardRound { observation_id: uuid::Uuid::new_v4().to_string(), before: phase.clone(), after: phase };
+    assert!(EventStore::new(f.store.clone()).record_guard_diagnostic(&round, 1001.0).is_ok());
+    let bad_round = GuardRound { after: bad, ..round };
+    assert!(EventStore::new(f.store.clone()).record_guard_diagnostic(&bad_round, 1002.0).is_err());
+}

@@ -141,11 +141,56 @@ struct InitializationTests {
         expect(staged.approval == protectionApproval && stagedChecks.calls.suffix(3) == [.dns, .webrtc, .protection],
                "new protection requires a separate confirmation after DNS and WebRTC have passed")
         expect(!staged.allPassed && !staged.entered && !stagedChecks.calls.contains(.verification), "pending guard approval cannot reach the final gate")
+        let beforeGuardPoll = stagedChecks.calls.count
+        await staged.pollAccessibility(at: Date().addingTimeInterval(600))
+        expect(stagedChecks.calls.count == beforeGuardPoll, "other authorization stages never poll accessibility")
         staged.refreshReadiness(at: Date().addingTimeInterval(600))
         expect(staged.approval == protectionApproval && stagedChecks.automaticRefreshes == 0,
                "waiting for authorization never starts automatic collection or bypasses confirmation")
         await staged.authorize(protectionApproval)
         expect(staged.allPassed && !staged.entered, "authorized guard step still requires final joint verification")
+
+        let axApproval = InitializationApproval(id: "ax", action: .accessibility, title: "access", detail: "waiting", changes: [])
+        let axChecks = ScriptedInitializationChecks()
+        axChecks.overrides[.accessibility] = .approval(axApproval)
+        axChecks.approvalResult = .approval(axApproval)
+        let axCoordinator = FirstRunInitialization(checks: axChecks, completed: false, saveCompletion: {})
+        await axCoordinator.start()
+        let initialAXChecks = axChecks.calls.filter { $0 == .accessibility }.count
+        await axCoordinator.pollAccessibility(at: Date().addingTimeInterval(100))
+        expect(axChecks.calls.filter { $0 == .accessibility }.count == initialAXChecks, "no polling before user opens settings")
+        await axCoordinator.authorize(axApproval)
+        let tick = Date().addingTimeInterval(10)
+        await axCoordinator.pollAccessibility(at: tick)
+        expect(axChecks.calls.filter { $0 == .accessibility }.count == initialAXChecks + 1 && axChecks.approvals == 1, "waiting poll reads trust without reopening settings")
+        await axCoordinator.pollAccessibility(at: tick.addingTimeInterval(1))
+        expect(axChecks.calls.filter { $0 == .accessibility }.count == initialAXChecks + 1, "poll is rate limited")
+        axChecks.overrides[.accessibility] = .passed("trusted")
+        await axCoordinator.pollAccessibility(at: tick.addingTimeInterval(3))
+        expect(axCoordinator.allPassed && axChecks.calls.filter { $0 == .dns }.count == 1, "real trust confirmation continues once")
+        await axCoordinator.pollAccessibility(at: tick.addingTimeInterval(30))
+        expect(axChecks.calls.filter { $0 == .dns }.count == 1 && axChecks.approvals == 1, "completed authorization never polls or continues twice")
+        let axRetryChecks = ScriptedInitializationChecks()
+        axRetryChecks.overrides[.accessibility] = .approval(axApproval)
+        axRetryChecks.approvalResult = .approval(axApproval)
+        let axRetry = FirstRunInitialization(checks: axRetryChecks, completed: false, saveCompletion: {})
+        await axRetry.start(); await axRetry.authorize(axApproval); await axRetry.retry()
+        let retryCount = axRetryChecks.calls.count
+        await axRetry.pollAccessibility(at: Date().addingTimeInterval(100))
+        expect(axRetryChecks.calls.count == retryCount, "retry requires a new explicit settings opening before polling")
+        await axRetry.authorize(axApproval)
+        axRetry.stopAccessibilityPolling()
+        let stoppedCount = axRetryChecks.calls.count
+        await axRetry.pollAccessibility(at: Date().addingTimeInterval(100))
+        expect(axRetryChecks.calls.count == stoppedCount, "declining again stops background trust polling")
+        await axRetry.authorize(axApproval)
+        axRetryChecks.overrides[.accessibility] = .passed("trusted")
+        axRetryChecks.delayStep = .accessibility
+        let latePoll = Task { await axRetry.pollAccessibility(at: Date().addingTimeInterval(100)) }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        axRetry.stopAccessibilityPolling()
+        await latePoll.value
+        expect(axRetry.approval == axApproval && !axRetryChecks.calls.contains(.dns), "declining cancels a late trust result before continuation")
 
         let concurrentChecks = ScriptedInitializationChecks()
         concurrentChecks.automaticRefreshDelay = 100_000_000

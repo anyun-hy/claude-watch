@@ -117,6 +117,15 @@ fn a_missing_notification_permission_is_not_reported_as_success() {
         .notify(&alert("warning", Severity::Warning))
         .unwrap_err();
     assert_eq!(error.code, "notification_not_authorized");
+    let store = storage("denied-purpose");
+    let notifier = NativeNotifier::new(Denied);
+    let events = claude_watch_runtime::events::EventStore::new(store.clone());
+    let result = events.emit(&notifier, &alert("Claude Watch：保护采样异常", Severity::Warning), 1000.0).unwrap();
+    assert!(matches!(result, claude_watch_runtime::events::AlertOutcome::Failed(_)));
+    let rows = events.history().unwrap().events;
+    assert_eq!(rows[0].fields.code.as_deref(), Some("notification_not_authorized"));
+    assert_eq!(rows[0].fields.operation.as_deref(), Some("guard_sampling"));
+    fs::remove_dir_all(&store.paths.home).unwrap();
 }
 
 #[test]
@@ -161,4 +170,26 @@ fn pending_duplicates_and_old_modes_are_dropped() {
     thread::sleep(Duration::from_millis(50));
     assert_eq!(commands.lock().unwrap().len(), 1);
     assert_eq!(dispatcher.store().mode(), Mode::Paused);
+}
+
+#[test]
+fn failed_notification_log_write_is_visible_to_dispatcher() {
+    struct Denied;
+    impl Notifier for Denied {
+        fn notify(&self, _: &Alert) -> std::result::Result<(), claude_watch_runtime::events::NotifyError> {
+            Err(claude_watch_runtime::events::NotifyError { code: "notification_not_authorized".into(), detail: "fixture".into() })
+        }
+    }
+    let store = storage("failed-log");
+    store.initialize().unwrap();
+    fs::create_dir(store.paths.base().join("events.jsonl")).unwrap();
+    let dispatcher = AlertDispatcher::new(store.clone(), Arc::new(Denied));
+    assert!(dispatcher.enqueue(alert("Claude Watch：保护采样异常", Severity::Warning)));
+    for _ in 0..100 {
+        if dispatcher.record_failures() > 0 { break; }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(dispatcher.record_failures(), 1);
+    drop(dispatcher);
+    fs::remove_dir_all(&store.paths.home).unwrap();
 }

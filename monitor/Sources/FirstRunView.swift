@@ -81,7 +81,10 @@ struct FirstRunView: View {
             else { presentApprovalIfNeeded() }
         }
         .onAppear { presentApprovalIfNeeded() }
-        .onReceive(clock) { _ in initialization.refreshReadiness() }
+        .onReceive(clock) { now in
+            initialization.refreshReadiness(at: now)
+            Task { await initialization.pollAccessibility(at: now) }
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await initialization.recheckAuthorization() }
         }
@@ -179,7 +182,10 @@ struct FirstRunView: View {
             Text("TAG 配置与独立原版保镖保持不变。")
                 .font(WatchTypography.caption).foregroundStyle(p.secondary)
             HStack {
-                Button(request.action == .accessibility ? "暂不授权" : "暂不应用") { showingApproval = nil }.frame(minHeight: 44)
+                Button(request.action == .accessibility ? "暂不授权" : "暂不应用") {
+                    if request.action == .accessibility { initialization.stopAccessibilityPolling() }
+                    showingApproval = nil
+                }.frame(minHeight: 44)
                 Spacer()
                 Button(request.action == .accessibility ? "打开系统授权" : "确认并应用") {
                     showingApproval = nil

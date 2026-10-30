@@ -246,10 +246,14 @@ fn present_event(e: Event) -> Value {
         "dns-diagnostic" => ("DNS 检测", "info", "network"),
         "webrtc-diagnostic" => ("WebRTC 检测", "info", "network"),
         "guard-diagnostic" => ("保护后台心跳检查", "info", "service"),
+        "guard-decision" => ("会话保护判定", "info", "service"),
+        "guard-stop" => ("会话保护退出", "info", "service"),
+        "sampling-state" => ("采样状态变化", "info", "network"),
         "background-evidence" => ("后台保护证据更新", "info", "service"),
         _ => ("监控记录", "info", "service"),
     };
     let fields = &e.fields;
+    if e.category == "guard-decision" && matches!(fields.status.as_deref(), Some("risk" | "locked")) { severity = "warning"; }
     if e.category == "background-evidence" && fields.status.as_deref() == Some("risk") {
         severity = "error";
     }
@@ -312,7 +316,16 @@ fn present_event(e: Event) -> Value {
             };
             summary.push(format!("来源：{source}"));
         } else {
-            summary.push(format!("操作：{source}"));
+            let label = match (e.category.as_str(), source) {
+                ("guard-stop", "request_post_action") => "退出请求（事后记录）",
+                ("guard-stop", "retry_post_action") => "重试退出（事后记录）",
+                ("guard-stop", "result_post_action") => "退出结果（事后记录）",
+                ("guard-decision", "post_action") => "保护判定（事后记录）",
+                ("sampling-state", "transition") => "状态变化",
+                ("sampling-state", "summary") => "稳定期摘要",
+                _ => source,
+            };
+            summary.push(format!("操作：{label}"));
         }
     }
     if let Some(status) = fields.status.as_deref() {
@@ -328,6 +341,14 @@ fn present_event(e: Event) -> Value {
             "disabled" => "未启用",
             "partial" => "部分完成",
             "sent" => "已发送",
+            "confirmed" => "已确认退出",
+            "risk" => "已确认风险",
+            "locked" => "会话已锁定",
+            "running" => "运行中",
+            "degraded" => "采样异常",
+            "empty" => "完整空样本",
+            "no_targets" => "无目标",
+            "failed" if e.category == "guard-stop" => "退出失败",
             "failed" => "失败",
             other => other,
         };
@@ -349,7 +370,7 @@ fn present_event(e: Event) -> Value {
     if let Some(code) = fields
         .code
         .as_deref()
-        .filter(|s| !matches!(*s, "matched" | "difference"))
+        .filter(|s| !matches!(*s, "matched" | "difference" | "none"))
     {
         let reason = match code {
             "timeout" => Some("超时"),
@@ -362,6 +383,10 @@ fn present_event(e: Event) -> Value {
             "incomplete" => Some("结果不完整"),
             "native_listener_worker_failed" => Some("系统监听通道中断"),
             "backend_error" => Some("后台执行异常"),
+            "claude_still_running" => Some("退出后进程仍在运行"),
+            "permission_denied" => Some("退出权限未确认"),
+            "component_unavailable" => Some("退出组件不可用"),
+            "identity_unconfirmed" => Some("进程身份未确认"),
             _ => None,
         };
         if let Some(reason) = reason {
@@ -372,6 +397,24 @@ fn present_event(e: Event) -> Value {
             summary.push(format!("类型：{code}"));
         } else {
             summary.push(format!("代码：{code}"));
+        }
+    }
+    if let Some(previous) = &fields.previous_state {
+        let label = match previous.as_str() { "ok" => "正常", "partial" => "部分完成", "running" => "运行中", "degraded" => "采样异常", "unknown" => "未确认", "safe" => "安全", "risk" => "风险", "locked" => "锁定", "empty" => "完整空样本", "no_targets" => "无目标", "failed" => "失败", "idle" => "待命", "missing" => "无会话", "pending" => "建立中", _ => "其他" };
+        summary.push(format!("先前状态：{label}"));
+    }
+    if let Some(count) = fields.confirmed_exited_count { summary.push(format!("确认退出目标：{count}")); }
+    if let Some(counts) = &fields.reason_counts {
+        for (reason, count) in counts {
+            let label = match reason.as_str() {
+                "process_exited" => "进程退出", "identity_changed" => "身份变化", "missing_target_sample" => "目标缺样", "fd_inventory_unavailable" => "描述符不可读", "socket_deadline" => "采样超时", "socket_info_unavailable" => "套接字不可读", "fd_closed_during_sample" => "采样时句柄关闭", "fd_list_truncated" => "描述符列表截断", "foreign_socket_pid" => "套接字身份不符", "socket_sample_partial" => "采样不完整", _ => "其他原因",
+            };
+            if *count > 0 { summary.push(format!("{label}：{count}")); }
+        }
+    }
+    if e.category == "guard-decision" {
+        for (name, sample) in [("出口采样", fields.egress_sampled_at), ("DNS采样", fields.dns_sampled_at), ("WebRTC采样", fields.webrtc_sampled_at)] {
+            summary.push(sample.map(|v| format!("{name}：本事件前 {:.1} 秒", (e.time - v).max(0.0))).unwrap_or_else(|| format!("{name}：未提供")));
         }
     }
     if let Some(pid) = fields.pid {
@@ -387,7 +430,7 @@ fn present_event(e: Event) -> Value {
         summary.push(format!("发送 {bytes} B"));
     }
     if let Some(seconds) = fields.elapsed_seconds {
-        summary.push(format!("耗时 {:.1} 秒", seconds));
+        summary.push(format!("{} {:.1} 秒", if e.category == "sampling-state" && fields.action.as_deref() == Some("summary") { "汇总区间" } else if e.category == "sampling-state" { "先前状态持续" } else { "耗时" }, seconds));
     }
     if let Some(version) = &fields.version {
         summary.push(format!("后台版本 {version}"));
@@ -400,7 +443,8 @@ fn present_event(e: Event) -> Value {
             e.category.as_str(),
             "dns-diagnostic" | "webrtc-diagnostic" | "guard-diagnostic"
         ) {
-            summary.push(format!("操作：{operation}"));
+            let label = match operation.as_str() { "health" => "总采样", "connection" => "连接采样", "guard_stop" => "保护退出通知", "guard_sampling" => "保护采样通知", "monitor_sampling" => "监控采样通知", "sensitive_file" => "敏感文件通知", _ => operation };
+            summary.push(format!("来源：{label}"));
         }
     }
     let raw = serde_json::to_string(fields).unwrap_or_default();
@@ -446,7 +490,7 @@ pub fn event_history(store: &StateStore, query: &EventHistoryQuery) -> Result<Va
     let mut page = Vec::new();
     let mut total = 0usize;
     for e in history.events {
-        let sample = e.category == "traffic-counter";
+        let sample = matches!(e.category.as_str(), "traffic-counter" | "sampling-state");
         let value = present_event(e);
         let severity = value["severity"].as_str().unwrap_or("");
         let category = value["category"].as_str().unwrap_or("");

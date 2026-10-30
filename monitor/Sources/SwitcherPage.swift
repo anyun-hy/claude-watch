@@ -93,26 +93,13 @@ struct SwitcherPage: View {
             }
             Spacer(minLength: 8)
             if section == .environment {
-                Button {
+                EnvironmentDetectionControl(reading: store.readingEnvironment, disabled: store.busy && !store.readingEnvironment) {
                     if store.readingEnvironment { store.cancelCurrentDetection() }
                     else { Task { await store.detectCurrentEnvironment() } }
-                } label: {
-                    HStack(spacing: 6) {
-                        ZStack {
-                            if store.readingEnvironment {
-                                ProgressView().controlSize(.small).accessibilityHidden(true)
-                            } else {
-                                Image(systemName: "arrow.clockwise")
-                            }
-                        }.frame(width: 16, height: 16)
-                        Text(store.readingEnvironment ? "取消检测" : "重新检测").lineLimit(1)
-                    }.frame(width: 100, height: 20)
                 }
-                    .disabled(store.busy && !store.readingEnvironment)
-                    .accessibilityLabel(store.readingEnvironment ? "取消检测" : "重新检测")
-                    .help(store.readingEnvironment
-                          ? (store.activity.isEmpty ? "正在检测环境；点击取消本轮检测。" : store.activity + "；点击取消本轮检测。")
-                          : "重新读取系统、检测出口并核对环境。")
+                .help(store.readingEnvironment
+                      ? (store.activity.isEmpty ? "正在检测环境；点击取消本轮检测。" : store.activity + "；点击取消本轮检测。")
+                      : "重新读取系统、检测出口并核对环境。")
             } else if section == .protection {
                 Button { Task { await store.refreshBackground() } } label: { Label("刷新状态", systemImage: "arrow.clockwise") }.disabled(store.busy)
             }

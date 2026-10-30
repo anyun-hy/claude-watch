@@ -4,6 +4,7 @@ import Foundation
 struct GuardDiagnosticPhase: Codable, Sendable {
     let decision, backend_reason: String
     let backend_healthy, backend_native: Bool?
+    var guard_backend_healthy: Bool? = nil
     let enabled, guard_enabled: Bool
     let sampled_at: Double
     let backend_heartbeat_status, guard_heartbeat_status: String

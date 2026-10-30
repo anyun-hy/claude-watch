@@ -7,10 +7,10 @@ struct GuardDiagnosticsTests {
             guard condition() else { fputs("FAIL: \(message)\n", stderr); exit(1) }
         }
         let phase: [String: Any] = [
-            "decision": "unknown", "backend_healthy": false, "backend_native": false,
+            "decision": "unknown", "backend_healthy": false, "guard_backend_healthy": true, "backend_native": false,
             "backend_reason": "sample_not_ok", "enabled": true, "guard_enabled": true,
             "sampled_at": 1000.0, "backend_heartbeat_status": "error", "backend_heartbeat_age_seconds": 1.0,
-            "guard_heartbeat_status": "ok", "guard_heartbeat_age_seconds": 2.0, "policy_matches": true,
+            "guard_heartbeat_status": "protection_triggered", "guard_heartbeat_age_seconds": 2.0, "policy_matches": true,
             "node": "private-node", "ip": "203.0.113.9"
         ]
         let response: [String: Any] = [
@@ -24,7 +24,7 @@ struct GuardDiagnosticsTests {
             expect(!text.contains(privateValue), "diagnostic payload excludes unrelated private fields")
         }
         let decoded = try JSONDecoder().decode(GuardDiagnosticRound.self, from: payload)
-        expect(decoded.before.decision == "unknown" && decoded.before.guard_heartbeat_status == "ok",
+        expect(decoded.before.decision == "unknown" && decoded.before.guard_heartbeat_status == "protection_triggered" && decoded.before.guard_backend_healthy == true,
                "the decision and subsequent heartbeat observation remain distinct")
         expect(GuardDiagnosticLogger.input(from: Data("{}".utf8)) == nil, "older responses produce no diagnostic")
         if CommandLine.arguments.count == 2 {

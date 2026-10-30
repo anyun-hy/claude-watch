@@ -163,3 +163,64 @@ struct EmptyState: View {
         }.frame(maxWidth: .infinity).padding(.vertical, 24)
     }
 }
+
+/// Compact controls share a fixed icon slot so the spinner never shifts the label.
+struct AutomaticRefreshControl: View {
+    @Binding var automatic: Bool
+    let p: Palette
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("自动检测与刷新").font(WatchTypography.caption).foregroundStyle(p.secondary)
+            Toggle("自动检测环境并刷新后台数据", isOn: $automatic).labelsHidden().toggleStyle(.switch).controlSize(.mini)
+        }.fixedSize().padding(.horizontal, 4)
+            .help("自动更新环境、DNS、WebRTC 与后台数据；关闭后保镖仍继续运行。")
+    }
+}
+struct RefreshActionLabel: View {
+    let title: String
+    let loading: Bool
+    var body: some View {
+        HStack(spacing: 7) {
+            ZStack {
+                Image(systemName: "arrow.clockwise").font(.system(size: 14, weight: .medium)).opacity(loading ? 0 : 1)
+                if loading { ProgressView().controlSize(.small).scaleEffect(0.8).accessibilityHidden(true) }
+            }.frame(width: 16, height: 16)
+            Text(title).font(WatchTypography.caption).lineLimit(1).fixedSize()
+        }.padding(.horizontal, 10).frame(minHeight: 28)
+    }
+}
+struct BackgroundRefreshControl: View {
+    let refreshing: Bool
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) { RefreshActionLabel(title: "刷新后台数据", loading: refreshing) }
+            .buttonStyle(.bordered).disabled(refreshing)
+    }
+}
+struct EnvironmentDetectionControl: View {
+    let reading: Bool
+    let disabled: Bool
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) { RefreshActionLabel(title: reading ? "取消检测" : "重新检测", loading: reading) }
+            .disabled(disabled).accessibilityLabel(reading ? "取消检测" : "重新检测")
+    }
+}
+
+struct MonitorRefreshToolbar: ToolbarContent {
+    @Binding var automatic: Bool
+    let refreshing: Bool
+    let p: Palette
+    let action: () -> Void
+    var body: some ToolbarContent {
+        ToolbarItem(placement: .automatic) {
+            AutomaticRefreshControl(automatic: $automatic, p: p)
+        }.sharedBackgroundVisibility(.hidden)
+        ToolbarSpacer(.fixed, placement: .primaryAction)
+        ToolbarItem(placement: .primaryAction) {
+            BackgroundRefreshControl(refreshing: refreshing, action: action)
+                .keyboardShortcut("r", modifiers: .command)
+                .help("读取最新后台数据，自动同步不会改变按钮状态")
+        }
+    }
+}
