@@ -1,9 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+CW_MACOS_MINIMUM=$(/bin/cat "$ROOT/macos-minimum.txt")
 APP="$ROOT/build/NetCoffee Integration Check.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx14.0 -module-cache-path "$ROOT/build/module-cache" -framework AppKit -framework WebKit "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/tests/NetCoffeeLiveCheck.swift" -o "$APP/Contents/MacOS/NetCoffeeIntegrationCheck"
+xcrun swiftc -swift-version 5 -parse-as-library -target "arm64-apple-macosx$CW_MACOS_MINIMUM" -module-cache-path "$ROOT/build/module-cache" -framework AppKit -framework WebKit "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/tests/NetCoffeeLiveCheck.swift" -o "$APP/Contents/MacOS/NetCoffeeIntegrationCheck"
 cp "$ROOT"/Resources/netcoffee_{client.py,probe.html,probe.js,probe.css} "$APP/Contents/Resources/"
 cat > "$APP/Contents/Resources/BuildInfo.plist" <<'BACKEND'
 <?xml version="1.0"?><plist version="1.0"><dict><key>BackendVariant</key><string>stable</string></dict></plist>

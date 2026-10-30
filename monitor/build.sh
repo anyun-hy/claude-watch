@@ -2,6 +2,7 @@
 # Build a local native app; does not install or change the monitor service.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd -P)
+CW_MACOS_MINIMUM=$(/bin/cat "$ROOT/macos-minimum.txt")
 REPOSITORY_ROOT=$(cd "$ROOT/.." && pwd -P)
 BACKEND_SOURCE="$REPOSITORY_ROOT/claude-watch.sh"
 APP_VERSION="${APP_VERSION:-2.9.5}"
@@ -80,17 +81,17 @@ CW_DEVELOPER=$(xcode-select -p)
 SDK="$CW_DEVELOPER/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
 if [[ ! -d "$SDK" ]]; then SDK=$(xcrun --sdk macosx --show-sdk-path); fi
 for CW_TARGET_ARCH in $CW_TARGETS; do
-  "$SWIFTC" -swift-version 5 -O -parse-as-library -target "$CW_TARGET_ARCH-apple-macosx13.0" \
+  "$SWIFTC" -swift-version 5 -O -parse-as-library -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" \
     -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
     -framework SwiftUI -framework AppKit -framework WebKit "$ROOT"/Sources/*.swift \
     -o "$ROOT/build/ClaudeWatchMonitor.$CW_TARGET_ARCH"
   "$SWIFTC" -swift-version 5 -O -parse-as-library -D PROCESS_HELPER \
-    -target "$CW_TARGET_ARCH-apple-macosx13.0" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
+    -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
     -framework AppKit "$ROOT/Sources/AIProcessControl.swift" "$ROOT/tools/ProcessHelper.swift" \
     -o "$ROOT/build/watch-process-control.$CW_TARGET_ARCH"
   if [[ "$CW_BACKEND_VARIANT" == rust-candidate ]]; then
     "$SWIFTC" -swift-version 5 -O -parse-as-library -D BACKGROUND_LEAK_WORKER \
-      -target "$CW_TARGET_ARCH-apple-macosx13.0" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
+      -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
       -framework AppKit -framework WebKit "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" \
       "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" \
       "$ROOT/tools/BackgroundLeakWorker.swift" -o "$ROOT/build/watch-leak-worker.$CW_TARGET_ARCH"
@@ -157,7 +158,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
 <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
-<key>LSMinimumSystemVersion</key><string>13.0</string>
+<key>LSMinimumSystemVersion</key><string>$CW_MACOS_MINIMUM</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
@@ -168,7 +169,7 @@ cat > "$APP/Contents/Resources/BuildInfo.plist" <<PLIST
 <key>ProductVersion</key><string>$APP_VERSION</string>
 <key>BackendVersion</key><string>$BACKEND_VERSION</string>
 <key>BackendSHA256</key><string>$BACKEND_SHA256</string>
-<key>MinimumSystemVersion</key><string>13.0</string>
+<key>MinimumSystemVersion</key><string>$CW_MACOS_MINIMUM</string>
 <key>Architecture</key><string>$CW_BUILD_ARCH</string>
 <key>BackendVariant</key><string>$CW_BACKEND_VARIANT</string>
 <key>SwitcherSchema</key><integer>1</integer>

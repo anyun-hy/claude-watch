@@ -4,6 +4,7 @@ set -euo pipefail
 case "${1:---fixture}" in --fixture|--live) ;; *) printf 'Usage: %s [--fixture|--live]\n' "$0" >&2; exit 2;; esac
 [[ $# -le 1 ]] || exit 2
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+CW_MACOS_MINIMUM=$(/bin/cat "$ROOT/macos-minimum.txt")
 TEST_DIR=$(mktemp -d /private/tmp/claude-watch-ipleak-test.XXXXXX)
 trap 'rm -rf "$TEST_DIR"' EXIT
 APP="$TEST_DIR/IPLeak Test.app"
@@ -19,7 +20,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>LSUIElement</key><true/>
 </dict></plist>
 PLIST
-xcrun swiftc -swift-version 5 -parse-as-library -D IPLEAK_BRIDGE_TEST -target arm64-apple-macosx13.0 \
+xcrun swiftc -swift-version 5 -parse-as-library -D IPLEAK_BRIDGE_TEST -target "arm64-apple-macosx$CW_MACOS_MINIMUM" \
   -module-cache-path "$TEST_DIR/module-cache" -framework AppKit -framework WebKit \
   "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" \
   "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" \

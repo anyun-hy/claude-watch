@@ -172,7 +172,7 @@ class ReinstallTests(unittest.TestCase):
         self.package = self.layout.project / "monitor/package-dmg.sh"
         self.package.parent.mkdir(parents=True)
         self.package.write_text("fixture package")
-        for relative in ["monitor/build.sh", "tools/build-rust-components.sh", "Cargo.toml", "Cargo.lock", "monitor/Resources/AppIcon.icns"]:
+        for relative in ["monitor/build.sh", "tools/build-rust-components.sh", "Cargo.toml", "Cargo.lock", "monitor/Resources/AppIcon.icns", "monitor/macos-minimum.txt"]:
             path = self.layout.project / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("fixture build input")
@@ -319,6 +319,15 @@ class ReinstallTests(unittest.TestCase):
     def test_missing_build_dependency_stops_before_any_uninstall(self):
         self.cargo.unlink()
         with self.assertRaisesRegex(module.Stop, "Cargo"):
+            self.perform()
+        self.assertTrue(self.layout.app.exists())
+        self.assertTrue(self.layout.base.exists())
+        self.assertEqual(self.runner.calls, [])
+        self.assert_preserved()
+
+    def test_missing_macos_minimum_stops_before_any_uninstall(self):
+        (self.layout.project / "monitor/macos-minimum.txt").unlink()
+        with self.assertRaisesRegex(module.Stop, "打包脚本"):
             self.perform()
         self.assertTrue(self.layout.app.exists())
         self.assertTrue(self.layout.base.exists())

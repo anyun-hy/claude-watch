@@ -104,7 +104,7 @@ struct ConnectionGraphView: View {
                     Picker("应用", selection: $store.networkSelection.product) {
                         ForEach(MonitoredProduct.allCases) { product in Text(product.title).tag(product) }
                     }.labelsHidden().pickerStyle(.segmented).frame(width: 252)
-                        .onChange(of: selectedProduct) { _ in
+                        .onChange(of: selectedProduct) {
                             store.synchronizeNetworkSelection(); expandedNode = nil
                         }
                     let platform = serviceGroups.filter { $0.purpose == .platform }

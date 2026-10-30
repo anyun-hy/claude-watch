@@ -3,6 +3,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+CW_MACOS_MINIMUM=$(/bin/cat "$ROOT/macos-minimum.txt")
 APP="${UI_REVIEW_APP:-$ROOT/build/Claude Watch UI Review.app}"
 SWIFTC=$(xcrun --find swiftc)
 REVIEW_OPTIMIZATION=${UI_REVIEW_OPTIMIZATION:--O}
@@ -12,7 +13,7 @@ SDK="$DEVELOPER/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
 if [[ ! -d "$SDK" ]]; then SDK=$(xcrun --sdk macosx --show-sdk-path); fi
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Icons" "$ROOT/build/ui-review-module-cache"
-"$SWIFTC" -swift-version 5 "$REVIEW_OPTIMIZATION" -parse-as-library -D UI_REVIEW -target arm64-apple-macosx13.0 \
+"$SWIFTC" -swift-version 5 "$REVIEW_OPTIMIZATION" -parse-as-library -D UI_REVIEW -target "arm64-apple-macosx$CW_MACOS_MINIMUM" \
   -sdk "$SDK" -module-cache-path "$ROOT/build/ui-review-module-cache" \
   -framework SwiftUI -framework AppKit -framework WebKit "$ROOT"/Sources/*.swift "$ROOT/tests/UIReviewApp.swift" \
   -o "$APP/Contents/MacOS/ClaudeWatchUIReview"
@@ -31,7 +32,7 @@ fi
 if [[ "${UI_REVIEW_INCLUDE_LIVE_REPORTS:-1}" == 1 && -f "$ROOT/reports/netcoffee/coffee-lookup-current.json" ]]; then
   cp "$ROOT/reports/netcoffee/coffee-lookup-current.json" "$APP/Contents/Resources/"
 fi
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -42,7 +43,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>1.0.0</string>
 <key>CFBundleVersion</key><string>1</string>
-<key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>LSMinimumSystemVersion</key><string>$CW_MACOS_MINIMUM</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST

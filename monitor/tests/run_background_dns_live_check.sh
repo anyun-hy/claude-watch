@@ -2,6 +2,7 @@
 # One-user-authorized, one-round live DNS check. All local state is temporary.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+CW_MACOS_MINIMUM=$(/bin/cat "$ROOT/macos-minimum.txt")
 CW_TEST_PARENT=$(mktemp -d "${TMPDIR:-/private/tmp}/cw-background-dns-live.XXXXXX")
 trap 'rm -rf "$CW_TEST_PARENT"' EXIT
 CW_TEST_RUNTIME="$CW_TEST_PARENT/runtime"
@@ -14,7 +15,7 @@ ENGINE="$ROOT/../target/debug/claude-watch-engine"
 cp "$ROOT/Resources/netcoffee_probe.html" "$ROOT/Resources/netcoffee_probe.js" "$ROOT/Resources/netcoffee_probe.css" "$CW_TEST_RUNTIME/"
 cp "$ENGINE" "$CW_TEST_RUNTIME/watch-engine"
 chmod 700 "$CW_TEST_RUNTIME/watch-engine"
-xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx14.0 -D BACKGROUND_LEAK_WORKER -D BACKGROUND_LEAK_WORKER_TEST -module-cache-path "$CW_TEST_CACHE" -framework AppKit -framework WebKit "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/tools/BackgroundLeakWorker.swift" -o "$CW_TEST_RUNTIME/watch-leak-worker"
+xcrun swiftc -swift-version 5 -parse-as-library -target "arm64-apple-macosx$CW_MACOS_MINIMUM" -D BACKGROUND_LEAK_WORKER -D BACKGROUND_LEAK_WORKER_TEST -module-cache-path "$CW_TEST_CACHE" -framework AppKit -framework WebKit "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/tools/BackgroundLeakWorker.swift" -o "$CW_TEST_RUNTIME/watch-leak-worker"
 chmod 700 "$CW_TEST_RUNTIME/watch-leak-worker"
 /usr/bin/codesign --force --sign - "$CW_TEST_RUNTIME/watch-leak-worker"
 cat > "$CW_TEST_RUNTIME/BuildInfo.plist" <<'PLIST'
@@ -40,7 +41,7 @@ FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: outpu
 }
 }
 SWIFT
-xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx14.0 -module-cache-path "$CW_TEST_CACHE" "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/LeakCheckModels.swift" "$CW_TEST_PARENT/LeakPolicyCheck.swift" -o "$CW_TEST_PARENT/leak-policy-check"
+xcrun swiftc -swift-version 5 -parse-as-library -target "arm64-apple-macosx$CW_MACOS_MINIMUM" -module-cache-path "$CW_TEST_CACHE" "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/LeakCheckModels.swift" "$CW_TEST_PARENT/LeakPolicyCheck.swift" -o "$CW_TEST_PARENT/leak-policy-check"
 python3 - "$CW_TEST_RUNTIME" "$CW_TEST_HOME" "$CW_TEST_PARENT/leak-policy-check" <<'PY'
 import json, os, signal, subprocess, sys, time
 from pathlib import Path

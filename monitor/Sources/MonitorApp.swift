@@ -108,7 +108,7 @@ struct MonitorView: View {
             if restoresNavigation { store.page = Page.restored(savedPage) }
             if startMonitoring { store.start() }
         }
-        .onChange(of: store.page) { page in if restoresNavigation { savedPage = page.rawValue } }
+        .onChange(of: store.page) { _, page in if restoresNavigation { savedPage = page.rawValue } }
     }
 
     private func taskPage(_ section: SwitcherSection) -> some View {

@@ -10,6 +10,7 @@ case "${1:---build-only}" in
 esac
 [[ $# -le 1 ]] || { printf 'Only one test mode is accepted.\n' >&2; exit 2; }
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+CW_MACOS_MINIMUM=$(/bin/cat "$ROOT/macos-minimum.txt")
 TEST_APP="${LEAK_BRIDGE_APP:-$ROOT/build/Leak Bridge Tests.app}"
 mkdir -p "$TEST_APP/Contents/MacOS" "$TEST_APP/Contents/Resources" "$ROOT/build/test-module-cache"
 cp "$ROOT/Resources/webrtc_probe.html" "$ROOT/Resources/webrtc_probe.js" "$TEST_APP/Contents/Resources/"
@@ -25,7 +26,7 @@ cat > "$TEST_APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundlePackageType</key><string>APPL</string>
 </dict></plist>
 PLIST
-xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx14.0 -D LEAK_BRIDGE_TEST \
+xcrun swiftc -swift-version 5 -parse-as-library -target "arm64-apple-macosx$CW_MACOS_MINIMUM" -D LEAK_BRIDGE_TEST \
   -module-cache-path "$ROOT/build/test-module-cache" -framework AppKit -framework WebKit \
   "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/Sources/IPLeakDNSRunner.swift" "$ROOT/Sources/EventDiagnostics.swift" "$ROOT/Sources/LeakCheckStore.swift" "$ROOT/tests/LeakBridgeTests.swift" \
   -o "$TEST_APP/Contents/MacOS/LeakBridgeTests"

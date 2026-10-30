@@ -72,7 +72,7 @@ struct FirstRunView: View {
         .preferredColorScheme(dark ? .dark : .light)
         .frame(minWidth: 900, minHeight: 660)
         .navigationTitle("Claude Watch · 首次初始化")
-        .onChange(of: initialization.approval?.id) { _ in presentApprovalIfNeeded() }
+        .onChange(of: initialization.approval?.id) { presentApprovalIfNeeded() }
         .onAppear { presentApprovalIfNeeded() }
         .onReceive(clock) { _ in initialization.refreshReadiness() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in

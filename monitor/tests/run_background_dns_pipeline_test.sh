@@ -3,6 +3,7 @@
 # local fixtures replace image loading and every Coffee child response.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+CW_MACOS_MINIMUM=$(/bin/cat "$ROOT/macos-minimum.txt")
 TEST_PARENT=$(mktemp -d "${TMPDIR:-/private/tmp}/cw-background-dns-pipeline.XXXXXX")
 trap 'rm -rf "$TEST_PARENT"' EXIT
 RUNTIME="$TEST_PARENT/runtime"
@@ -23,7 +24,7 @@ case "$1:$2" in
 esac
 SH
 chmod 700 "$RUNTIME/watch-engine"
-xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx14.0 -D BACKGROUND_LEAK_WORKER -D BACKGROUND_LEAK_WORKER_TEST \
+xcrun swiftc -swift-version 5 -parse-as-library -target "arm64-apple-macosx$CW_MACOS_MINIMUM" -D BACKGROUND_LEAK_WORKER -D BACKGROUND_LEAK_WORKER_TEST \
   -module-cache-path "$TEST_PARENT/module-cache" -framework AppKit -framework WebKit \
   "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" "$ROOT/Sources/LeakCheckModels.swift" \
   "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/tools/BackgroundLeakWorker.swift" \

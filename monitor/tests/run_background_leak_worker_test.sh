@@ -10,6 +10,7 @@ case "${1:---build-only}" in
 esac
 [[ $# -le 1 ]] || { printf 'Only one test mode is accepted.\n' >&2; exit 2; }
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+CW_MACOS_MINIMUM=$(/bin/cat "$ROOT/macos-minimum.txt")
 TEST_PARENT=$(mktemp -d "${TMPDIR:-/private/tmp}/cw-background-leak-test.XXXXXX")
 trap 'rm -rf "$TEST_PARENT"' EXIT
 APP="$TEST_PARENT/Background Leak Worker Tests.app"
@@ -23,7 +24,7 @@ PLIST
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>io.local.watchpanel.background-leak-tests</string><key>CFBundleExecutable</key><string>BackgroundLeakWorkerTests</string><key>CFBundlePackageType</key><string>APPL</string><key>LSUIElement</key><true/></dict></plist>
 PLIST
-xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx14.0 -D COFFEE_BRIDGE_TEST \
+xcrun swiftc -swift-version 5 -parse-as-library -target "arm64-apple-macosx$CW_MACOS_MINIMUM" -D COFFEE_BRIDGE_TEST \
   -module-cache-path "$TEST_PARENT/module-cache" -framework AppKit -framework WebKit \
   "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" "$ROOT/Sources/LeakCheckModels.swift" \
   "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/tools/BackgroundLeakWorker.swift" \

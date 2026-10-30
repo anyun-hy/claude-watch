@@ -375,7 +375,8 @@ def perform(layout: Layout, runner: Runner, version: str, build: str, *, dry_run
         raise Stop("build 编号必须是正整数。")
     package_script = layout.project / "monitor/package-dmg.sh"
     required_files = [package_script, layout.project / "monitor/build.sh", layout.project / "tools/build-rust-components.sh",
-                      layout.project / "Cargo.toml", layout.project / "Cargo.lock", layout.project / "monitor/Resources/AppIcon.icns"]
+                      layout.project / "Cargo.toml", layout.project / "Cargo.lock", layout.project / "monitor/Resources/AppIcon.icns",
+                      layout.project / "monitor/macos-minimum.txt"]
     if any(path.is_symlink() or not path.is_file() for path in required_files) or not Path(cargo).is_file() or not os.access(cargo, os.X_OK):
         raise Stop("未找到打包脚本或可执行的 Cargo。")
     tools = {name: runner.locate(name) for name in ("xcrun", "xcode-select", "hdiutil", "shasum", "plutil", "python3")}

@@ -37,12 +37,13 @@ done
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 REPOSITORY_ROOT=$(cd "$SCRIPT_DIR/.." && pwd -P)
+CW_MACOS_MINIMUM=$(/bin/cat "$REPOSITORY_ROOT/monitor/macos-minimum.txt")
 CW_CARGO_BIN=${CW_CARGO_BIN:-cargo}
 command -v "$CW_CARGO_BIN" >/dev/null 2>&1 || { echo 'Cargo is required to build the Rust candidate components.' >&2; exit 1; }
 
 # Cargo's package/bin name is verified in crates/watch-engine/Cargo.toml. The
 # native component locations are queried from the built engine, never guessed.
-"$CW_CARGO_BIN" build --manifest-path "$REPOSITORY_ROOT/Cargo.toml" --locked --release --target aarch64-apple-darwin \
+MACOSX_DEPLOYMENT_TARGET="$CW_MACOS_MINIMUM" "$CW_CARGO_BIN" build --manifest-path "$REPOSITORY_ROOT/Cargo.toml" --locked --release --target aarch64-apple-darwin \
   --package claude-watch-engine --bin claude-watch-engine
 
 ENGINE="$REPOSITORY_ROOT/target/aarch64-apple-darwin/release/claude-watch-engine"

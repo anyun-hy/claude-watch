@@ -36,7 +36,7 @@ Python 测试入口见项目首页。Swift 状态测试需要 macOS 14 以上的
 ```sh
 mkdir -p /private/tmp/claude-watch-tests/module-cache
 xcrun swiftc -swift-version 5 -Onone -parse-as-library -D UI_REVIEW \
-  -target arm64-apple-macosx14.0 \
+  -target arm64-apple-macosx26.0 \
   -module-cache-path /private/tmp/claude-watch-tests/module-cache \
   -framework SwiftUI -framework AppKit -framework WebKit \
   monitor/Sources/*.swift monitor/tests/SwitcherStoreTests.swift \

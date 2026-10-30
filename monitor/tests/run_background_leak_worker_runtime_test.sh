@@ -6,6 +6,7 @@ MODE="${1:---app}"
 case "$MODE" in --app|--bare) ;; *) printf 'Usage: %s [--app|--bare]\n' "$0" >&2; exit 2;; esac
 [[ $# -le 1 ]] || { printf 'Only one test mode is accepted.\n' >&2; exit 2; }
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+CW_MACOS_MINIMUM=$(/bin/cat "$ROOT/macos-minimum.txt")
 TEST_PARENT=$(mktemp -d "${TMPDIR:-/private/tmp}/cw-background-runtime-test.XXXXXX")
 trap 'rm -rf "$TEST_PARENT"' EXIT
 RUNTIME="$TEST_PARENT/runtime"
@@ -40,7 +41,7 @@ if [[ "$MODE" == --app ]]; then
   WORKER="$APP/Contents/MacOS/watch-leak-worker"
   WORKER_REL="WatchEvidence.app/Contents/MacOS/watch-leak-worker"
 fi
-xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx14.0 -D BACKGROUND_LEAK_WORKER \
+xcrun swiftc -swift-version 5 -parse-as-library -target "arm64-apple-macosx$CW_MACOS_MINIMUM" -D BACKGROUND_LEAK_WORKER \
   -module-cache-path "$TEST_PARENT/module-cache" -framework AppKit -framework WebKit \
   "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" "$ROOT/Sources/LeakCheckModels.swift" \
   "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/tools/BackgroundLeakWorker.swift" \
