@@ -141,6 +141,37 @@ struct GraphContinuityTests {
             let graph = ConnectionGraphProjection(proxy: p.proxy, processes: p.processes, selectedFlowID: "f", fresh: true, showConfigurationReference: false)
             expect(!graph.supportsPathAnimation && graph.sourceEdgeState == .pending, "ambiguous source role stays unconfirmed for both products")
         }
+        let cli = WatchedProcess(id: "cli", pid: 71, started: "cli-start", kind: "codex-cli", authorized: true)
+        let desktop = WatchedProcess(id: "desktop", pid: 72, started: "desktop-start", kind: "openai-child", authorized: true)
+        let cliFlow = flow(.openAI, pid: 71, id: "cli-flow", host: "api.openai.com")
+        let desktopFlow = flow(.openAI, pid: 72, id: "desktop-flow")
+        func dualDisplay(_ cliFlow: Flow, collector: String = "ok", automatic: Bool = true,
+                         selectedID: String = "desktop-flow") -> GraphDisplayState {
+            let snap = snapshot(.openAI, time: 2000, flows: [cliFlow, desktopFlow], processes: [cli, desktop], collector: collector)
+            var selection = NetworkGraphSelection()
+            selection.select(flowID: selectedID, product: .openAI)
+            selection.reconcile(proxy: snap.proxy, processes: snap.processes, fresh: true)
+            var timeline = GraphContinuityStore()
+            timeline.observe(snapshot: snap, selection: selection, now: 2000, error: nil, automatic: automatic)
+            return timeline.display(product: .openAI, snapshot: snap, selection: selection, now: 2000,
+                                    error: nil, automatic: automatic)
+        }
+        let dual = dualDisplay(cliFlow)
+        expect(dual.phase == .live && dual.projection.sourceKind == "desktop", "desktop remains the selected shared route")
+        expect(dual.sourceProjection(.desktop)?.sourcePID == 72, "desktop edge is bound to its own flow")
+        expect(dual.sourceProjection(.cli)?.sourcePID == 71 && dual.sourceProjection(.cli)?.sourceEdgeState == .confirmed,
+               "CLI also has an independently confirmed edge on the same route")
+        let selectedCLI = dualDisplay(cliFlow, selectedID: "cli-flow")
+        expect(selectedCLI.projection.sourceKind == "code" && selectedCLI.sourceProjection(.desktop)?.sourcePID == 72,
+               "desktop keeps its own confirmed edge when CLI is selected")
+        let otherRoute = flow(.openAI, pid: 71, id: "cli-flow", host: "api.openai.com", node: "OTHER")
+        expect(dualDisplay(otherRoute).sourceProjection(.cli) == nil, "another node never borrows the selected route")
+        let unknown = flow(.openAI, pid: 71, id: "cli-flow", host: "api.openai.com", association: "unconfirmed")
+        expect(dualDisplay(unknown).sourceProjection(.cli) == nil, "unconfirmed CLI evidence never draws a green edge")
+        let wrongPolicy = flow(.openAI, pid: 71, id: "cli-flow", host: "api.openai.com", policy: "mismatch")
+        expect(dualDisplay(wrongPolicy).sourceProjection(.cli) == nil, "a differing policy cannot borrow a green selected route")
+        expect(dualDisplay(cliFlow, collector: "partial").sourceProjection(.cli) == nil, "incomplete round never adds a live edge")
+        expect(dualDisplay(cliFlow, automatic: false).sourceProjection(.cli) == nil, "paused observation never adds a live edge")
         print("GraphContinuityTests: \(checks) assertions passed")
     }
 }

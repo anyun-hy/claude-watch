@@ -46,6 +46,33 @@ struct GraphDisplayState: Sendable {
     var canAnimate: Bool {
         phase == .live && !isHistorical && !safetyBlocked && projection.supportsPathAnimation
     }
+    /// Resolve each source against its own flow in the same complete round.
+    /// The common downstream canvas still describes the selected flow, so an
+    /// additional source may join it only when the evidenced route is the same.
+    func sourceProjection(_ role: ProcessSourceRole) -> ConnectionGraphProjection? {
+        let selected = projection
+        let expectedKind = role == .cli ? "code" : role == .desktop ? "desktop" : "other"
+        if selected.sourceKind == expectedKind, selected.flow != nil { return selected }
+        guard role != .child, phase == .live, !isHistorical, !safetyBlocked,
+              let sample, let proxy = currentProxy,
+              proxy.observedAt == sample.observedAt,
+              proxy.connectionObservationIsComplete,
+              proxy.connectionObservation?.roundID == sample.roundID,
+              let selectedFlow = selected.flow else { return nil }
+        let scope = ConnectionGraphScope(product: sample.product, processes: currentProcesses, flows: currentFlows)
+        for candidate in scope.platformFlows.sorted(by: { $0.id < $1.id }) {
+            guard scope.processes.first(where: { $0.pid == candidate.pid })?.sourceRole == role,
+                  candidate.chains == selectedFlow.chains else { continue }
+            let route = ConnectionGraphProjection(proxy: proxy, processes: scope.processes,
+                selectedFlowID: candidate.id, fresh: true, showConfigurationReference: false)
+            guard route.supportsPathAnimation,
+                  route.routePresentation == selected.routePresentation,
+                  route.gatewayEndpoint == selected.gatewayEndpoint,
+                  route.sourceEdgeState == selected.sourceEdgeState else { continue }
+            return route
+        }
+        return nil
+    }
     var platformFlowCount: Int? {
         guard countsAvailable else { return nil }
         return ConnectionGraphScope(product: sample?.product ?? currentProcesses.first?.product ?? .claude,

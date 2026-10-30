@@ -34,10 +34,10 @@ struct ConnectionGraphView: View {
     private var backendCoverageKnown: Bool { store.snapshot?.monitoredApps?.isEmpty == false }
     private var proxy: ProxySnapshot? { sample?.proxy }
     private var graph: ConnectionGraphProjection { display.projection }
-    private var codeSelected: Bool { graph.sourceKind == "code" }
-    private var desktopSelected: Bool {
-        graph.sourceKind == "desktop"
-    }
+    private var codeGraph: ConnectionGraphProjection? { display.sourceProjection(.cli) }
+    private var desktopGraph: ConnectionGraphProjection? { display.sourceProjection(.desktop) }
+    private var codeSelected: Bool { codeGraph != nil }
+    private var desktopSelected: Bool { desktopGraph != nil }
     private var codeProcess: WatchedProcess? {
         processes.first(where: { $0.sourceRole == .cli })
     }
@@ -292,11 +292,11 @@ struct ConnectionGraphView: View {
     @ViewBuilder private func sourceRibbons(sourceX: CGFloat, gatewayX: CGFloat, sourceWidth: CGFloat, gatewayWidth: CGFloat, sourceTop: CGFloat, sourceBottom: CGFloat, gatewayY: CGFloat) -> some View {
         let sourceRight = sourceX + sourceWidth / 2
         let gatewayLeft = gatewayX - gatewayWidth / 2
-        if codeSelected {
-            ribbon(from: CGPoint(x: sourceRight, y: sourceTop), to: CGPoint(x: gatewayLeft, y: gatewayY), c1: CGPoint(x: sourceRight + 28, y: sourceTop), c2: CGPoint(x: gatewayLeft - 28, y: gatewayY), state: graph.sourceEdgeState, animated: shouldAnimate)
+        if let source = codeGraph {
+            ribbon(from: CGPoint(x: sourceRight, y: sourceTop), to: CGPoint(x: gatewayLeft, y: gatewayY), c1: CGPoint(x: sourceRight + 28, y: sourceTop), c2: CGPoint(x: gatewayLeft - 28, y: gatewayY), state: source.sourceEdgeState, animated: shouldAnimate)
         }
-        if desktopSelected {
-            ribbon(from: CGPoint(x: sourceRight, y: sourceBottom), to: CGPoint(x: gatewayLeft, y: gatewayY), c1: CGPoint(x: sourceRight + 28, y: sourceBottom), c2: CGPoint(x: gatewayLeft - 28, y: gatewayY), state: graph.sourceEdgeState, animated: shouldAnimate)
+        if let source = desktopGraph {
+            ribbon(from: CGPoint(x: sourceRight, y: sourceBottom), to: CGPoint(x: gatewayLeft, y: gatewayY), c1: CGPoint(x: sourceRight + 28, y: sourceBottom), c2: CGPoint(x: gatewayLeft - 28, y: gatewayY), state: source.sourceEdgeState, animated: shouldAnimate)
         }
     }
 
@@ -358,7 +358,8 @@ struct ConnectionGraphView: View {
 
     private func sourceNode(_ id: GraphNodeID, title: String, symbol: String,
                             process: WatchedProcess?, active: Bool, width: CGFloat) -> some View {
-        let state: GraphEvidence = active ? graph.sourceEdgeState : .pending
+        let sourceGraph = id == .code ? codeGraph : desktopGraph
+        let state: GraphEvidence = sourceGraph?.sourceEdgeState ?? .pending
         let idleText = store.snapshot == nil ? (store.error == nil ? "读取中…" : "读取失败") : "未检测到进程"
         let role: ProcessSourceRole = id == .code ? .cli : .desktop
         let connectionCount = flows.filter { flow in processes.contains { $0.pid == flow.pid && $0.sourceRole == role } }.count
@@ -378,7 +379,7 @@ struct ConnectionGraphView: View {
                     Text(title).font(WatchTypography.bodyStrong).foregroundStyle(p.text).lineLimit(1)
                     Text(verbatim: sourceStatus)
                         .font(WatchTypography.small).foregroundStyle(p.secondary).lineLimit(1)
-                    Text(active ? graph.sourceLocal : "等待连接样本")
+                    Text(sourceGraph?.sourceLocal ?? (connectionCount > 0 ? "未归入当前路径" : "等待连接样本"))
                         .font(WatchTypography.small).foregroundStyle(p.secondary)
                         .lineLimit(2).truncationMode(.middle).fixedSize(horizontal: false, vertical: true)
                 }.frame(maxWidth: .infinity, alignment: .leading)
@@ -386,7 +387,7 @@ struct ConnectionGraphView: View {
                 .background(tileBackground(id, state: state))
                 .contentShape(RoundedRectangle(cornerRadius: 12))
         }.buttonStyle(.plain)
-            .help(active ? graph.sourceLocal + "\n" + graph.summary : (store.snapshot == nil ? "正在读取进程状态" : "当前没有关联到此设备的连接样本"))
+            .help(sourceGraph.map { $0.sourceLocal + "\n" + $0.summary } ?? (connectionCount > 0 ? "存在平台连接，但尚未归入当前显示的路径。" : (store.snapshot == nil ? "正在读取进程状态" : "当前没有关联到此设备的连接样本")))
             .accessibilityLabel("\(title)，\(sourceStatus)，\(evidenceLabel(state))")
     }
 
@@ -549,14 +550,16 @@ struct ConnectionGraphView: View {
         let text: String
         switch selectedNode {
         case .code, .desktop:
-            let active = selectedNode == .code ? codeSelected : desktopSelected
+            let sourceGraph = selectedNode == .code ? codeGraph : desktopGraph
             let sourceDetail = selectedProduct == .openAI
                 ? (selectedNode == .desktop ? "按桌面应用名称跟踪；Chromium 组件与 MCP 工具独立分组。\n" : "仅展示后台识别为独立 Codex CLI 的进程；桌面内置服务不重复计入。\n")
                 : ""
-            if active, let flow = graph.flow {
-                text = sourceDetail + "PID \(flow.pid) · \(flow.transport) · 本地端点 \(flow.local)\n" + graph.summary
+            if let sourceGraph, let flow = sourceGraph.flow {
+                text = sourceDetail + "PID \(flow.pid) · \(flow.transport) · 本地端点 \(flow.local)\n" + sourceGraph.summary
             } else {
-                text = sourceDetail + "尚无与此进程关联的连接样本。出现连接后，图中才会显示对应路径。"
+                let role: ProcessSourceRole = selectedNode == .code ? .cli : .desktop
+                let hasOtherPath = flows.contains { flow in processes.contains { $0.pid == flow.pid && $0.sourceRole == role } }
+                text = sourceDetail + (hasOtherPath ? "存在平台连接，但未归入当前显示的路径；可在连接列表中选择查看。" : "尚无与此进程关联的连接样本。出现连接后，图中才会显示对应路径。")
             }
         case .gateway:
             text = graph.gatewayDetail + (gatewayIsProxy ? "\n" + (proxy?.listenerPath ?? "监听者路径未取得") : "")
