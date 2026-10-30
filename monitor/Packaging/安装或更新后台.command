@@ -23,6 +23,20 @@ plist_value() {
 }
 
 EXPECTED_PRODUCT_VERSION=$(plist_value ProductVersion) || fail '无法读取产品版本。'
+BACKEND_VARIANT=$(plist_value BackendVariant 2>/dev/null || printf stable)
+if [[ "$BACKEND_VARIANT" == 'rust-candidate' ]]; then
+  ENGINE="$DMG_APP/Contents/Resources/watch-engine"
+  [[ -f "$ENGINE" && -x "$ENGINE" && ! -L "$ENGINE" ]] || fail '缺少原生安装组件。'
+  /usr/bin/codesign --verify --deep --strict "$DMG_APP" || fail '应用签名校验失败。'
+  "$ENGINE" app-install --source "$DMG_APP"
+  say "将安装产品 ${EXPECTED_PRODUCT_VERSION} 并更新自有后台。"
+  printf '%s\n' '旧应用移入废纸篓，清理本工具旧辅助功能授权；保留账号、登录、代理和保护设置。'
+  printf '%s' '输入“安装”并按回车以继续： '
+  IFS= read -r ANSWER
+  [[ "$ANSWER" == '安装' ]] || { say '已取消，未改变任何内容。'; exit 0; }
+  exec "$ENGINE" app-install --source "$DMG_APP" --apply
+fi
+[[ "$BACKEND_VARIANT" == 'stable' ]] || fail '未知后台类型，未执行安装。'
 EXPECTED_BACKEND_VERSION=$(plist_value BackendVersion) || fail '无法读取后台脚本版本。'
 EXPECTED_BACKEND_SHA=$(plist_value BackendSHA256) || fail '无法读取后台脚本校验值。'
 

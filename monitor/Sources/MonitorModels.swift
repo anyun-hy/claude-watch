@@ -105,6 +105,8 @@ struct Event: Decodable, Identifiable, Sendable {
     let id, timestamp: String
     let epoch: Double?
     let severity, category, title, detail: String
+    var rawDetail: String? = nil
+    var explanation: String? = nil
 }
 
 struct Flow: Decodable, Identifiable, Sendable {
@@ -190,5 +192,6 @@ struct MonitorSnapshot: Decodable, Sendable {
     /// Absent when an older installed script has not yet published multi-product capability.
     let backendVersion: String?
     let monitoredApps: [String]?
+    var eventError: String? = nil
 }
 

@@ -41,6 +41,7 @@ struct SwitcherStoreTests {
         let store = SwitcherStore(isFixture: true)
         let reference = EgressReference(ip: "222.10.87.169", country: "JP", timezone: nil, context_id: nil, checked_at: nil, observed_at: 900)
         var service = BackgroundServiceReceipt(observed_at: 1000, backend_healthy: true, update_source_ready: false,
+            guard_backend_healthy: true, backend_sampling_state: "complete",
             services: [.init(id: "guard", title: "保护", state: "running", detail: "", source: "fixture", desired: true, last_checked: 1000)],
             policy_issues: [], session_guard: .init(state: "safe", phase: "active", baseline: reference, current: reference))
         expect(SessionBaselinePresentation.make(service, now: 1005).tone == "success", "automatic session baseline drives overview without legacy file")

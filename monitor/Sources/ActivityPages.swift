@@ -70,12 +70,38 @@ struct EventTimelinePage: View {
     @ObservedObject var store: MonitorStore
     let p: Palette
     @State private var query = ""
-    @State private var filter = "全部"
+    @State private var filter = "关键"
+    @State private var history: [Event] = []
+    @State private var total = 0
+    @State private var nextOffset = 0
+    @State private var hasMore = false
+    @State private var invalidRecords = 0
+    @State private var historyError = false
+    @State private var loading = false
+    @State private var hasLoaded = false
+    @State private var showingOlder = false
+    @State private var requestID = UUID()
 
-    private let filters = ["全部", "需关注", "网络", "进程"]
+    private let filters = ["关键", "需关注", "网络", "进程", "采样", "全部"]
+
+    private var hasHistoryBackend: Bool {
+        if case .rustCandidate? = BundledBackendVariant.current() { return true }
+        return false
+    }
+    private var filterKey: String {
+        switch filter {
+        case "需关注": return "attention"
+        case "网络": return "network"
+        case "进程": return "process"
+        case "采样": return "sample"
+        case "全部": return "all"
+        default: return "key"
+        }
+    }
 
     private var filteredEvents: [Event] {
-        (store.snapshot?.events ?? []).filter { event in
+        if hasHistoryBackend { return history }
+        return (store.snapshot?.events ?? []).filter { event in
             matchesFilter(event) && matchesQuery(event)
         }
     }
@@ -85,13 +111,40 @@ struct EventTimelinePage: View {
             controls
             Surface(p) {
                 HStack(alignment: .firstTextBaseline) {
-                    SectionHeading(title: "事件记录", caption: "来自已有监控日志；最新记录在前。", p: p)
+                    SectionHeading(title: "事件记录", caption: hasHistoryBackend
+                                   ? "本地当前与上期记录；筛选后分页，最新记录在前。"
+                                   : "来自已有监控日志；最新记录在前。", p: p)
                     Spacer()
-                    if store.snapshot != nil { Text("\(filteredEvents.count) 条")
+                    if hasHistoryBackend && hasLoaded { Text("已显示 \(filteredEvents.count) / \(total) 条")
+                        .font(WatchTypography.caption).foregroundStyle(p.secondary) }
+                    else if !hasHistoryBackend && store.snapshot != nil { Text("\(filteredEvents.count) 条")
                         .font(WatchTypography.caption).foregroundStyle(p.secondary) }
                 }
 
-                if let snapshot = store.snapshot {
+                if hasHistoryBackend {
+                    if historyError {
+                        InlineNotice(title: "无法读取事件日志", detail: "请检查本地日志文件或稍后重试；这不表示没有事件。",
+                                     symbol: "exclamationmark.triangle", tint: p.amber, p: p).padding(.top, 12)
+                    }
+                    if invalidRecords > 0 {
+                        InlineNotice(title: "部分记录无法解析", detail: "有 \(invalidRecords) 条记录格式无效；其余记录仍可查看。",
+                                     symbol: "exclamationmark.triangle", tint: p.amber, p: p).padding(.top, 12)
+                    }
+                    if !hasLoaded && loading {
+                        EmptyState(symbol: "clock.arrow.circlepath", title: "正在读取事件记录", detail: "正在检查本地日志。", p: p)
+                    } else if filteredEvents.isEmpty && !historyError && hasLoaded {
+                        EmptyState(symbol: "line.3.horizontal.decrease.circle", title: "没有符合条件的记录",
+                                   detail: "可调整筛选条件或搜索内容。", p: p)
+                    } else {
+                        LazyVStack(spacing: 0) {
+                            ForEach(filteredEvents) { event in EventTimelineRow(event: event, p: p) }
+                        }.padding(.top, 12)
+                        if hasMore {
+                            Button(loading ? "正在读取…" : "加载更早记录") { Task { await loadHistory(reset: false) } }
+                                .buttonStyle(.bordered).disabled(loading).padding(.top, 12)
+                        }
+                    }
+                } else if let snapshot = store.snapshot {
                     if snapshot.events.isEmpty {
                         EmptyState(symbol: "text.alignleft", title: "尚无事件记录",
                                    detail: "当前快照已读取，但日志中没有可显示的事件。", p: p)
@@ -117,6 +170,17 @@ struct EventTimelinePage: View {
                 }
             }
         }
+        .task(id: filterKey + "\u{1f}" + query) {
+            guard hasHistoryBackend else { return }
+            requestID = UUID(); history = []; hasLoaded = false; hasMore = false
+            historyError = false; invalidRecords = 0; showingOlder = false; loading = true
+            do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
+            await loadHistory(reset: true)
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { return }
+                if store.automatic && !showingOlder { await loadHistory(reset: true) }
+            }
+        }
     }
 
     private var controls: some View {
@@ -124,11 +188,11 @@ struct EventTimelinePage: View {
             Picker("类型", selection: $filter) {
                 ForEach(filters, id: \.self) { Text($0).tag($0) }
             }
-            .pickerStyle(.segmented).labelsHidden().frame(width: 278)
+            .pickerStyle(.segmented).labelsHidden().frame(width: 390)
 
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").font(.system(size: 12)).foregroundStyle(p.secondary)
-                TextField("搜索记录、IP 或 PID", text: $query)
+                TextField("搜索事件、原因或 PID", text: $query)
                     .textFieldStyle(.plain).font(WatchTypography.caption)
                 if !query.isEmpty {
                     Button { query = "" } label: {
@@ -141,16 +205,33 @@ struct EventTimelinePage: View {
             .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(p.border, lineWidth: 1))
 
             Spacer(minLength: 8)
-            Button("打开日志") { openLog() }
-                .buttonStyle(.bordered).controlSize(.small).disabled(store.snapshot?.logPath.isEmpty != false)
+            if hasHistoryBackend {
+                Button("刷新") { Task { await loadHistory(reset: true) } }
+                    .buttonStyle(.bordered).controlSize(.small).disabled(loading)
+            }
+            if hasHistoryBackend {
+                Menu("打开日志") {
+                    Button("主事件日志") { openLog(named: "events.jsonl") }
+                    Button("检测摘要日志") { openLog(named: "diagnostic-events.jsonl") }
+                        .disabled(!logExists(named: "diagnostic-events.jsonl"))
+                    Button("流量采样日志") { openLog(named: "traffic-events.jsonl") }
+                        .disabled(!logExists(named: "traffic-events.jsonl"))
+                    Button("显示日志文件夹") { openLogFolder() }
+                }.controlSize(.small).disabled(store.snapshot?.logPath.isEmpty != false)
+            } else {
+                Button("打开日志") { openLog() }
+                    .buttonStyle(.bordered).controlSize(.small).disabled(store.snapshot?.logPath.isEmpty != false)
+            }
         }
     }
 
     private func matchesFilter(_ event: Event) -> Bool {
         switch filter {
+        case "关键": return event.title != "流量采样"
         case "需关注": return ["warning", "error", "notice"].contains(event.severity)
-        case "网络": return event.category == "network"
+        case "网络": return event.category == "network" && event.title != "流量采样"
         case "进程": return event.category == "process"
+        case "采样": return event.title == "流量采样"
         default: return true
         }
     }
@@ -164,6 +245,50 @@ struct EventTimelinePage: View {
     private func openLog() {
         guard let path = store.snapshot?.logPath, !path.isEmpty else { return }
         NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    }
+
+    private func logURL(named name: String) -> URL? {
+        guard let path = store.snapshot?.logPath, !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path).deletingLastPathComponent().appendingPathComponent(name)
+    }
+    private func logExists(named name: String) -> Bool {
+        guard let url = logURL(named: name) else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+    private func openLog(named name: String) {
+        guard let url = logURL(named: name) else { return }
+        NSWorkspace.shared.open(url)
+    }
+    private func openLogFolder() {
+        guard let url = logURL(named: "events.jsonl") else { return }
+        NSWorkspace.shared.open(url.deletingLastPathComponent())
+    }
+
+    private func loadHistory(reset: Bool) async {
+        if !reset && loading { return }
+        let id = UUID(); requestID = id
+        let requestedFilter = filterKey, requestedQuery = query
+        let offset = reset ? 0 : nextOffset
+        loading = true
+        let request = EventHistoryRequest(filter: requestedFilter, query: requestedQuery, offset: offset)
+        let result = await Task.detached(priority: .utility) { EventHistoryRunner.read(request) }.value
+        guard !Task.isCancelled, id == requestID, requestedFilter == filterKey, requestedQuery == query else { return }
+        loading = false
+        switch result {
+        case .failure:
+            historyError = true
+            history = []; hasMore = false; invalidRecords = 0
+            hasLoaded = true
+        case .success(let page):
+            historyError = false; invalidRecords = page.invalidRecords; hasLoaded = true
+            if reset { history = page.events; showingOlder = false }
+            else {
+                let existing = Set(history.map(\.id))
+                history.append(contentsOf: page.events.filter { !existing.contains($0.id) })
+                showingOlder = true
+            }
+            total = page.total; nextOffset = page.nextOffset; hasMore = page.hasMore
+        }
     }
 }
 
@@ -195,8 +320,15 @@ struct EventTimelineRow: View {
                     .lineLimit(2).textSelection(.enabled).padding(.leading, 26)
             } else {
                 DisclosureGroup(isExpanded: $expanded) {
-                    Text(detailText).font(WatchTypography.caption).foregroundStyle(p.secondary).lineSpacing(3)
-                        .textSelection(.enabled).padding(.top, 5)
+                    VStack(alignment: .leading, spacing: 8) {
+                        if let explanation = event.explanation, !explanation.isEmpty {
+                            Text(explanation).font(WatchTypography.caption).foregroundStyle(p.secondary).lineSpacing(3)
+                                .textSelection(.enabled)
+                            Text("原始记录").font(WatchTypography.small).foregroundStyle(p.secondary)
+                        }
+                        Text(event.rawDetail ?? detailText).font(WatchTypography.caption).foregroundStyle(p.secondary).lineSpacing(3)
+                            .textSelection(.enabled)
+                    }.padding(.top, 5)
                 } label: {
                     Text(expanded ? "收起原始记录" : detailText)
                         .font(WatchTypography.caption).foregroundStyle(expanded ? p.blue : p.secondary)
@@ -244,6 +376,7 @@ struct EventTimelineRow: View {
         switch event.category {
         case "network": return "网络"
         case "process": return "进程"
+        case "service": return "后台"
         default: return event.category
         }
     }

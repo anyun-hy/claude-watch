@@ -52,12 +52,12 @@ func drawIcon(size: Int) throws -> Data {
     context.saveGState()
     context.setShadow(offset: CGSize(width: 0, height: -10), blur: 22,
                       color: color(0x071C26, alpha: 0.24).cgColor)
-    color(0x8FE5C9).setFill()
+    color(0x6FA4EB).setFill()
     shield.fill()
     context.restoreGState()
-    NSGradient(starting: color(0xE3FFF5), ending: color(0x64CEAF))!
+    NSGradient(starting: color(0xD9E9FF), ending: color(0x2C74D6))!
         .draw(in: shield, angle: -90)
-    color(0xF3FFFA, alpha: 0.70).setStroke()
+    color(0xF0F6FF, alpha: 0.70).setStroke()
     shield.lineWidth = 4
     shield.stroke()
 
@@ -74,7 +74,7 @@ func drawIcon(size: Int) throws -> Data {
     for point in [NSPoint(x: 384, y: 558), NSPoint(x: 640, y: 478)] {
         color(0x24495A).setFill()
         NSBezierPath(ovalIn: NSRect(x: point.x - 25, y: point.y - 25, width: 50, height: 50)).fill()
-        color(0xD8FBEF).setFill()
+        color(0xDCEAFF).setFill()
         NSBezierPath(ovalIn: NSRect(x: point.x - 9, y: point.y - 9, width: 18, height: 18)).fill()
     }
     NSGraphicsContext.restoreGraphicsState()

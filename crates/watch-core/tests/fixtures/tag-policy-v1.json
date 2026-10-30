@@ -1,0 +1,713 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "00-global-match",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "match",
+        "code": "global_match"
+      }
+    },
+    {
+      "id": "01-global-explicit-correct",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "GLOBAL"
+        ],
+        "required_group": "GLOBAL",
+        "pinned_node": "JP-test",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "match",
+        "code": "global_match"
+      }
+    },
+    {
+      "id": "02-global-pinned-wrong",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "other",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "mismatch",
+        "code": "chain_or_pinned_node_mismatch"
+      }
+    },
+    {
+      "id": "03-global-group-conflict",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "GLOBAL"
+        ],
+        "required_group": "AI",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "mismatch",
+        "code": "explicit_group_mismatch"
+      }
+    },
+    {
+      "id": "04-wrong-node",
+      "evidence": {
+        "observed_chain": [
+          "other",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "mismatch",
+        "code": "chain_or_pinned_node_mismatch"
+      }
+    },
+    {
+      "id": "05-unexpected-intermediate",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "unexpected",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "mismatch",
+        "code": "chain_or_pinned_node_mismatch"
+      }
+    },
+    {
+      "id": "06-empty-chain",
+      "evidence": {
+        "observed_chain": [],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "unconfirmed",
+        "code": "missing_observed_chain"
+      }
+    },
+    {
+      "id": "07-empty-before-group-conflict",
+      "evidence": {
+        "observed_chain": [],
+        "required_group": "AI",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "unconfirmed",
+        "code": "missing_observed_chain"
+      }
+    },
+    {
+      "id": "08-missing-selection",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {}
+        }
+      },
+      "expected": {
+        "state": "unconfirmed",
+        "code": "unresolved_selection"
+      }
+    },
+    {
+      "id": "09-null-selection",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": null
+          }
+        }
+      },
+      "expected": {
+        "state": "unconfirmed",
+        "code": "unresolved_selection"
+      }
+    },
+    {
+      "id": "10-empty-selection",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": []
+          }
+        }
+      },
+      "expected": {
+        "state": "unconfirmed",
+        "code": "unresolved_selection"
+      }
+    },
+    {
+      "id": "11-different-selected-chain",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "other",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "mismatch",
+        "code": "chain_or_pinned_node_mismatch"
+      }
+    },
+    {
+      "id": "12-direct-mode-empty",
+      "evidence": {
+        "observed_chain": [],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "direct",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "mismatch",
+        "code": "direct_or_rejected_path"
+      }
+    },
+    {
+      "id": "13-unavailable-before-direct",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "unavailable",
+          "mode": "direct",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "unconfirmed",
+        "code": "mode_unconfirmed"
+      }
+    },
+    {
+      "id": "14-unknown-before-direct-hop",
+      "evidence": {
+        "observed_chain": [
+          "DIRECT"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "unknown",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "unconfirmed",
+        "code": "mode_unconfirmed"
+      }
+    },
+    {
+      "id": "15-missing-mode",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": null,
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "unconfirmed",
+        "code": "mode_unconfirmed"
+      }
+    },
+    {
+      "id": "16-incorrect-mode-case",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "GLOBAL",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "unconfirmed",
+        "code": "mode_unconfirmed"
+      }
+    },
+    {
+      "id": "17-reserved-direct",
+      "evidence": {
+        "observed_chain": [
+          "DIRECT",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "mismatch",
+        "code": "direct_or_rejected_path"
+      }
+    },
+    {
+      "id": "18-reserved-direct",
+      "evidence": {
+        "observed_chain": [
+          "direct",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "mismatch",
+        "code": "direct_or_rejected_path"
+      }
+    },
+    {
+      "id": "19-reserved-reject",
+      "evidence": {
+        "observed_chain": [
+          "REJECT",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "mismatch",
+        "code": "direct_or_rejected_path"
+      }
+    },
+    {
+      "id": "20-reserved-reject-drop",
+      "evidence": {
+        "observed_chain": [
+          "REJECT-DROP",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "mismatch",
+        "code": "direct_or_rejected_path"
+      }
+    },
+    {
+      "id": "21-reserved-pass",
+      "evidence": {
+        "observed_chain": [
+          "PASS",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "mismatch",
+        "code": "direct_or_rejected_path"
+      }
+    },
+    {
+      "id": "22-reserved-compatible",
+      "evidence": {
+        "observed_chain": [
+          "COMPATIBLE",
+          "GLOBAL"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "global",
+          "route_chains": {
+            "GLOBAL": [
+              "JP-test",
+              "GLOBAL"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "mismatch",
+        "code": "direct_or_rejected_path"
+      }
+    },
+    {
+      "id": "23-rule-match",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "AI"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": "DomainSuffix",
+        "api": {
+          "state": "available",
+          "mode": "rule",
+          "route_chains": {
+            "AI": [
+              "JP-test",
+              "AI"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "match",
+        "code": "rule_match"
+      }
+    },
+    {
+      "id": "24-rule-missing-rule",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "AI"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": null,
+        "api": {
+          "state": "available",
+          "mode": "rule",
+          "route_chains": {
+            "AI": [
+              "JP-test",
+              "AI"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "unconfirmed",
+        "code": "missing_matched_rule"
+      }
+    },
+    {
+      "id": "25-rule-unicode-whitespace",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "AI"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": " 　",
+        "api": {
+          "state": "available",
+          "mode": "rule",
+          "route_chains": {
+            "AI": [
+              "JP-test",
+              "AI"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "unconfirmed",
+        "code": "missing_matched_rule"
+      }
+    },
+    {
+      "id": "26-rule-explicit-missing-group",
+      "evidence": {
+        "observed_chain": [
+          "JP-test",
+          "AI"
+        ],
+        "required_group": "missing",
+        "pinned_node": "",
+        "matched_rule": "DomainSuffix",
+        "api": {
+          "state": "available",
+          "mode": "rule",
+          "route_chains": {
+            "AI": [
+              "JP-test",
+              "AI"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "unconfirmed",
+        "code": "unresolved_selection"
+      }
+    },
+    {
+      "id": "27-unicode-node-and-group",
+      "evidence": {
+        "observed_chain": [
+          "🇯🇵 日本テスト",
+          "テスト組"
+        ],
+        "required_group": "",
+        "pinned_node": "",
+        "matched_rule": "Match",
+        "api": {
+          "state": "available",
+          "mode": "rule",
+          "route_chains": {
+            "テスト組": [
+              "🇯🇵 日本テスト",
+              "テスト組"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "state": "match",
+        "code": "rule_match"
+      }
+    }
+  ]
+}

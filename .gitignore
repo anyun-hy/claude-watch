@@ -2,6 +2,7 @@
 /monitor/build/
 /monitor/dist/
 /monitor/preview/
+/target/
 *.app/
 *.dmg
 *.dmg.sha256

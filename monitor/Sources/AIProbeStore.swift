@@ -65,12 +65,25 @@ private final class AIProbeRunner: @unchecked Sendable {
         if task?.isRunning == true { task?.terminate() }
     }
     func run(_ service: AIService) -> AIProbeResult {
-        guard let url = Bundle.main.url(forResource: "ai_probe", withExtension: "py"),
-              let python = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"].first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-            return .failure(service, code: "component_missing", message: "AI 网络诊断组件或 Python 3 不可用。")
+        let candidate = Bundle.main.url(forResource: "BuildInfo", withExtension: "plist")
+            .flatMap { NSDictionary(contentsOf: $0)?["BackendVariant"] as? String } == "rust-candidate"
+        let executable: URL
+        let arguments: [String]
+        if candidate {
+            guard let engine = Bundle.main.url(forResource: "watch-engine", withExtension: nil),
+                  FileManager.default.isExecutableFile(atPath: engine.path) else {
+                return .failure(service, code: "component_missing", message: "Rust AI 网络诊断组件不可用。")
+            }
+            executable = engine; arguments = ["ai-probe", "--service", service.rawValue]
+        } else {
+            guard let script = Bundle.main.url(forResource: "ai_probe", withExtension: "py"),
+                  let python = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"].first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+                return .failure(service, code: "component_missing", message: "AI 网络诊断组件或 Python 3 不可用。")
+            }
+            executable = URL(fileURLWithPath: python); arguments = [script.path, "--service", service.rawValue]
         }
         let task = Process(), output = Pipe()
-        task.executableURL = URL(fileURLWithPath: python); task.arguments = [url.path, "--service", service.rawValue]
+        task.executableURL = executable; task.arguments = arguments
         task.standardOutput = output; task.standardError = FileHandle.nullDevice
         lock.lock()
         if cancelled { lock.unlock(); return .failure(service, code: "cancelled", message: "检测已取消。") }

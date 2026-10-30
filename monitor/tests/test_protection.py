@@ -1,12 +1,15 @@
 """Isolated service previews, commit/recovery and actual-vs-desired status."""
 import copy
 import json
+import plistlib
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 from test_switcher import Fixture, FakeSystem
 from watch_switcher.common import SwitcherError, load_config, save_config
-from watch_switcher.services import service_status, protection_preview, protection_apply, policy_issues
+from watch_switcher.services import guard_tick, service_status, protection_preview, protection_apply, policy_issues
+from watch_switcher.system import System
 from watch_switcher.onboarding import recover
 from watch_switcher.repair import make_plan
 
@@ -94,6 +97,28 @@ class ProtectionTests(Fixture):
         protection_apply(self.paths,self.system,changes,plan['id'])
         self.assertTrue(load_config(self.paths)['enabled'])
         self.assert_preserved()
+    def test_clock_target_change_keeps_only_a_fresh_healthy_guard_heartbeat(self):
+        receipt = guard_tick(self.paths, self.system)
+        self.assertEqual(receipt['status'], 'ok')
+        actual = System(self.paths)
+        actual.backend_healthy = lambda: True
+        changed = dict(self.config, timezone_watchdog=False, country='US', timezone='America/Los_Angeles')
+        self.assertTrue(actual.guard_status(changed))
+        self.assertFalse(actual.guard_status(dict(changed, proxy_mode='surge')))
+        actual.backend_healthy = lambda: False
+        self.assertFalse(actual.guard_status(changed))
+        actual.backend_healthy = lambda: True
+        receipt['status'] = 'degraded'
+        (self.paths.base/'guard-heartbeat.json').write_text(json.dumps(receipt))
+        self.assertFalse(actual.guard_status(changed))
+    def test_timezone_daemon_definition_runs_at_boot_and_remains_periodic(self):
+        source = (Path(__file__).resolve().parents[1]/'Resources/watch-admin.sh').read_text()
+        plist = source.split("<<'PLIST'\n", 1)[1].split('\nPLIST\n', 1)[0]
+        definition = plistlib.loads(plist.encode())
+        self.assertEqual(definition['Label'], 'io.local.claudewatch.timezone')
+        self.assertTrue(definition['RunAtLoad'])
+        self.assertEqual(definition['StartInterval'], 3600)
+        self.assertEqual(definition['ProgramArguments'][-1], 'tick')
     def test_disable_clock_keeps_current_system_timezone(self):
         changes={'timezone_watchdog':False}
         plan=protection_preview(self.paths,self.system,changes)

@@ -17,7 +17,7 @@ import switcher as runtime
 from watch_switcher.audit import record_dns_leak, record_webrtc_risk, require_ready
 from watch_switcher.accounts import AccountStore
 from watch_switcher.onboarding import observe
-from watch_switcher.common import SwitcherError, load_config, read_json
+from watch_switcher.common import SwitcherError, load_config, read_json, save_config
 from watch_switcher.services import guard_tick, service_status, protection_preview
 from watch_switcher.system import System
 
@@ -88,6 +88,9 @@ class ProtectionLifecycleTests(Fixture):
                 dict(kind="srflx", address=self.system.address, country="JP")]), now=now)
 
     def launch(self):
+        # These lifecycle contracts explicitly opt in to protection. Fresh
+        # product defaults intentionally keep the setting disabled.
+        save_config(self.paths, dict(self.config, enabled=True, online_enabled=True, guard_enabled=True))
         return runtime.dispatch(runtime.parser().parse_args(["launch", "--apply"]), self.paths, self.system)
 
     def state(self): return read_json(self.paths.base / "session-guard.json", {})
@@ -101,7 +104,7 @@ class ProtectionLifecycleTests(Fixture):
         self.assertEqual(self.state()["baseline"]["ip"], self.system.address)
         self.assertEqual(self.system.calls.count("online"), 1)
         self.assertEqual(len(list((self.paths.watch / "state/sessions").glob("*.session"))), 1)
-        self.assertFalse(self.paths.config.exists())
+        self.assertTrue(self.paths.config.exists())
 
     def test_same_country_change_latches_until_explicit_fresh_launch(self):
         self.launch()
@@ -150,7 +153,10 @@ class ProtectionLifecycleTests(Fixture):
         self.assertEqual(first["action"], "observe")
         self.assertEqual(first["session_guard"]["state"], "unknown")
         second = self.tick()
-        self.assertEqual(second["action"], "close-desktop")
+        self.assertEqual(second["action"], "observe")
+        with patch("watch_switcher.session_guard.time.time", return_value=time.time() + 16):
+            third = self.tick()
+        self.assertEqual(third["action"], "close-desktop")
         self.assertEqual(self.state()["reason"]["code"], "egress_unconfirmed")
 
     def test_transient_failure_and_recovery_agree_across_production_receipts(self):
@@ -210,7 +216,9 @@ class ProtectionLifecycleTests(Fixture):
         self.launch()
         with patch.object(self.system, "local", side_effect=SwitcherError("sample_unavailable", "进程采样超时")):
             self.assertEqual(self.tick()["action"], "observe")
-            self.assertEqual(self.tick()["action"], "close-desktop")
+            self.assertEqual(self.tick()["action"], "observe")
+            with patch("watch_switcher.session_guard.time.time", return_value=time.time() + 16):
+                self.assertEqual(self.tick()["action"], "close-desktop")
         self.assertEqual(self.state()["reason"]["code"], "guard_sampling_failed")
         self.assertIn("进程采样超时", self.state()["reason"]["detail"])
 

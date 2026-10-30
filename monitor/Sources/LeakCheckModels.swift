@@ -215,13 +215,22 @@ enum LeakPolicy {
             let resolvers = Set(normalized.filter { $0.0.kind == "resolver" && $0.1.isPublic }.map { $0.1.canonical })
             guard !resolvers.isEmpty else { return incomplete("没有取得有效 DNS 递归出口；空结果不能证明 DNS 已加密或没有泄漏。") }
             guard let httpCountry = httpCountries.first, httpCountries.count == 1 else {
-                return incomplete("未取得唯一的本轮公网出口国家，不能判断 DNS 是否随出口代理。")
+                // The egress address itself is on screen below; what is missing is
+                // only its attribution.  Saying so keeps a satisfied user from
+                // reading "no country" as "no evidence" — or the reverse.
+                return incomplete("本轮 HTTP 出口的归属地未取得（出口地址已取得，见下方证据）。归属地缺失时本判定刻意不放行：没有它无法判断 DNS 是否随出口代理。请稍后重新检测。")
             }
             if observedCountries.contains(where: { $0 != httpCountry }) {
                 return .init(state: .difference, title: "发现 DNS 出口地区差异", detail: "至少一个 DNS 递归出口国家与本轮公网出口 \(httpCountry) 不一致，存在 DNS 泄漏风险。")
             }
-            guard observedCountries.count == 1, let dnsCountry = observedCountries.first else {
-                return incomplete("未取得唯一的 DNS 递归出口国家，不能判断是否存在 DNS 泄漏。")
+            // A resolver whose attribution never arrived is not a resolver that
+            // agreed; counting only the enriched ones would let an unverified
+            // server pass silently next to verified ones.
+            let resolverRows = normalized.filter { comparedKinds.contains($0.0.kind) && $0.1.isPublic }
+            let unattributed = resolverRows.filter { CountryIdentity.code($0.0.country, country: $0.0.country) == nil }.count
+            guard observedCountries.count == 1, let dnsCountry = observedCountries.first, unattributed == 0 else {
+                let reason = unattributed > 0 ? "有 \(unattributed) 个 DNS 递归出口未取得归属地" : "未取得 DNS 递归出口的归属地"
+                return incomplete("\(reason)，不能判断是否存在 DNS 泄漏。地址证据已在下方展示；归属地查询失败时本判定刻意不放行。")
             }
             guard dnsCountry == httpCountry else {
                 return .init(state: .difference, title: "发现 DNS 出口地区差异", detail: "DNS 递归出口为 \(dnsCountry)，本轮公网出口为 \(httpCountry)。DNS 未随当前出口路径，存在泄漏风险。")

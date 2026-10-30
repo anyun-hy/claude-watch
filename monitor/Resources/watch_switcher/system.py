@@ -12,7 +12,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .common import LOCALES, SwitcherError, digest, load_config, read_json, reject_symlink, operation_lock
+from .common import LOCALES, SwitcherError, digest, guard_heartbeat_policy_matches, load_config, read_json, reject_symlink, operation_lock
 
 APP_BUNDLES = {
     "tag": "/Applications/TAG.app",
@@ -517,7 +517,7 @@ class System:
     def guard_status(self, config):
         heartbeat = read_json(self.paths.base / "guard-heartbeat.json", {})
         return bool(config["guard_enabled"] and 0 <= time.time() - heartbeat.get("time", 0) <= 35
-                    and heartbeat.get("status") == "ok" and heartbeat.get("policy") == digest(config)
+                    and heartbeat.get("status") == "ok" and guard_heartbeat_policy_matches(heartbeat, config)
                     and self.backend_healthy())
 
     def backend_healthy(self):

@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/watch-core", "crates/watch-shadow", "crates/watch-runtime", "crates/watch-engine"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99.1"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+url = "2.5"

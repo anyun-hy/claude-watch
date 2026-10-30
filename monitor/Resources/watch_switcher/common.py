@@ -37,7 +37,7 @@ DEFAULT_CONFIG = {
     "country": "", "timezone": "", "locale": "", "network_service": "Wi-Fi",
     "online_enabled": True, "require_ipv6_off": True, "require_english": True,
     "require_stun": True, "require_dns": True, "require_pinned_rules": False,
-    "guard_enabled": True, "timezone_watchdog": False, "auto_update": False,
+    "guard_enabled": False, "timezone_watchdog": False, "auto_update": False,
     "auto_check_on_open": True, "return_to_overview_after_launch": False,
     "expected_egress": [], "expected_resolvers": [], "allow_ip_change": True,
     "update_url": "", "update_public_key": "", "verified_claude_versions": [],
@@ -232,6 +232,19 @@ def save_config(paths, value):
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def guard_policy_digest(config):
+    # These fields belong to the independent timezone job. Launch and audit
+    # policy continue to use the complete configuration digest.
+    return digest({key: value for key, value in config.items()
+                   if key not in ("timezone_watchdog", "country", "timezone")})
+
+
+def guard_heartbeat_policy_matches(heartbeat, config):
+    if "guard_policy_v1" in heartbeat:
+        return heartbeat["guard_policy_v1"] == guard_policy_digest(config)
+    return heartbeat.get("policy") == digest(config)
 
 
 def event(paths, category, **fields):

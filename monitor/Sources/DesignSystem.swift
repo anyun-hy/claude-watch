@@ -16,7 +16,7 @@ struct Palette {
     // The two schemes share a deliberately quiet blue-gray base.
     // State colors remain more saturated so paths and evidence stay scannable.
     var background: Color { color(0x26323F, 0xF6F8FB) }
-    var sidebar: Color { color(0x2B3744, 0xEDF1F6) }
+    var sidebar: Color { color(0x2B3744, 0xFFFFFF) }
     var surface: Color { color(0x334150, 0xFFFFFF) }
     var elevated: Color { color(0x3A4959, 0xF1F4F8) }
     var graphBackground: Color { color(0x2A3745, 0xFAFBFE) }
@@ -131,10 +131,14 @@ struct InlineNotice: View {
     let symbol: String
     let tint: Color
     let p: Palette
+    var iconSize: CGFloat = 15
+    var iconWidth: CGFloat = 20
+    var iconWeight: Font.Weight = .regular
+    var iconTint: Color? = nil
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: symbol).font(.system(size: 15)).foregroundStyle(tint)
-                .frame(width: 20).padding(.top, 2)
+            Image(systemName: symbol).font(.system(size: iconSize, weight: iconWeight)).foregroundStyle(iconTint ?? tint)
+                .frame(width: iconWidth).padding(.top, 2)
             VStack(alignment: .leading, spacing: 4) {
                 Text(title).font(WatchTypography.bodyStrong).foregroundStyle(p.text)
                 if !detail.isEmpty {

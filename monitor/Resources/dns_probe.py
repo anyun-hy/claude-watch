@@ -26,9 +26,10 @@ HTTP_COMMAND = [
 CONTEXT_COMMANDS = [
     ("dns", ["/usr/sbin/scutil", "--dns"]),
     ("proxy", ["/usr/sbin/scutil", "--proxy"]),
-    ("route4", ["/usr/sbin/route", "-n", "get", "-inet", "default"]),
+    ("route4", ["/sbin/route", "-n", "get", "-inet", "default"]),
     ("route6", ["/usr/sbin/netstat", "-rn", "-f", "inet6"]),
 ]
+GEOIP_URL_PREFIX = "https://ip.net.coffee/api/geoip/"
 ACTIVE_CHILD = None
 
 
@@ -180,15 +181,66 @@ def parse_dns_ns(output, errors):
 
 
 def parse_http_ip(output, errors):
+    # The trace response carries the egress country for free (`loc=`); dropping
+    # it forced every downstream geography verdict into "incomplete" even when
+    # both addresses were observed.  Only a well-formed short code is kept —
+    # anything else stays absent so the verdict still fails closed.
+    country = None
+    for line in output.splitlines():
+        if not line.startswith("loc="):
+            continue
+        code = line.partition("=")[2].strip()
+        if code and len(code) <= 8 and code.isalnum() and code.isascii():
+            country = code
+            break
     for line in output.splitlines():
         if not line.startswith("ip="):
             continue
         address = public_address(line.partition("=")[2])
         if address is not None:
-            return {"address": address, "kind": "http", "source": "cloudflare-trace-via-7890", "family": ipaddress.ip_address(address).version}
+            row = {"address": address, "kind": "http", "source": "cloudflare-trace-via-7890", "family": ipaddress.ip_address(address).version}
+            if country:
+                row["country"] = country
+            return row
         errors.append(error("http", "invalid_ip", "HTTP 参考返回了非公网或无效 IP"))
         return None
     errors.append(error("http", "no_ip", "HTTP 参考未返回 IP"))
+    return None
+
+
+def geoip_command(address):
+    return [
+        "/usr/bin/curl", "-q", "-fsS", "--proto", "=https", "--proxy", "http://127.0.0.1:7890",
+        "--noproxy", "", "--connect-timeout", "3", "--max-time", "5", "--max-filesize", "32768",
+        GEOIP_URL_PREFIX + address,
+    ]
+
+
+def geoip_country(address, deadline):
+    """Attribution for one observed resolver address, through the same proxy as
+    the HTTP reference.  Enrichment only: any failure returns None and is never
+    recorded as an error, so a broken side channel cannot downgrade a complete
+    round — it only leaves the verdict failing closed on missing attribution."""
+    if not isinstance(address, str) or public_address(address) != address:
+        return None
+    output, problem = bounded_run(geoip_command(address), deadline, 5.0, "geoip")
+    if problem:
+        return None
+    try:
+        data = json.loads(output)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    # `/api/geoip/` reports the full country name in `country` and the ISO
+    # code in `country_code`, so the code wins; a name-shaped value must
+    # never be read as a country code.
+    for key in ("country_code", "countryCode", "country"):
+        value = data.get(key)
+        if isinstance(value, str):
+            code = value.strip().upper()
+            if len(code) == 2 and code.isascii() and code.isalpha():
+                return code
     return None
 
 
@@ -219,6 +271,16 @@ def collect():
             observations.append(http)
 
     after = context_snapshot(deadline, errors)
+    # Resolver attribution is enrichment, not evidence: a failed lookup stays
+    # out of `errors` so it cannot downgrade a complete round; it only leaves
+    # the verdict failing closed on missing attribution.
+    if time.monotonic() < deadline - 3.0:
+        for row in observations:
+            if row.get("kind") != "resolver":
+                continue
+            country = geoip_country(row.get("address"), deadline)
+            if country:
+                row["country"] = country
     context_known = before is not None and after is not None
     context_changed = context_known and before != after
 

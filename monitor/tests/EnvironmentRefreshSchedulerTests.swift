@@ -36,6 +36,24 @@ struct EnvironmentRefreshSchedulerTests {
                "failed observation retries after its bounded delay")
         scheduler.complete(context: "B", accepted: true, now: base.addingTimeInterval(201))
         expect(scheduler.stableContext == "B", "recovered observation commits the stable context")
+
+        // Model a continuous GUI refresh sequence. A missing or busy round must
+        // not turn the last verified context into a change, and recovery must
+        // still debounce before doing any new work.
+        expect(scheduler.claim(context: nil, now: base.addingTimeInterval(262), switcherBusy: false) == nil,
+               "an unavailable backend round never fabricates a context change")
+        expect(scheduler.stableContext == "B", "an unavailable round retains the last verified context")
+        expect(scheduler.claim(context: "B", now: base.addingTimeInterval(264), switcherBusy: true) == nil,
+               "a busy cross-page command defers automatic refresh")
+        expect(scheduler.claim(context: "B", now: base.addingTimeInterval(266), switcherBusy: false) == nil,
+               "the first recovered sample only re-establishes its candidate")
+        expect(scheduler.claim(context: "B", now: base.addingTimeInterval(268), switcherBusy: false) == .interval,
+               "a recovered stable context refreshes only on its normal interval")
+        scheduler.complete(context: "B", accepted: true, now: base.addingTimeInterval(269))
+        expect(scheduler.claim(context: "C", now: base.addingTimeInterval(271), switcherBusy: false) == nil,
+               "one changed sample never starts a second environment flow")
+        expect(scheduler.claim(context: "C", now: base.addingTimeInterval(273), switcherBusy: false) == .changed,
+               "two matching changed samples start one cross-page refresh")
         print("EnvironmentRefreshSchedulerTests: \(count) assertions passed")
     }
 }

@@ -10,6 +10,9 @@ struct EnvironmentCheckRow: Decodable, Identifiable {
     var reference: String? = nil
     var source: String? = nil
     var sampled_at: Double? = nil
+    /// True when this passing row's evidence is a reused observation (a receipt
+    /// hit or a cached query) rather than a probe from the current round.
+    var sample_reused: Bool? = nil
     var query_error: String? = nil
     var statusLabel: String {
         switch state {
@@ -118,10 +121,59 @@ struct CurrentEnvironmentReceipt: Decodable {
     var egress_reference: EgressReference?
     var facts: ProtectionFacts?
     var session_guard: SessionGuardStatus?
+    var display_facts: EnvironmentDisplayFacts?
     func count(_ state: String) -> Int { rows.filter { $0.state == state }.count }
     mutating func replaceDNSRow(_ row: EnvironmentCheckRow) {
         if let index = rows.firstIndex(where: { $0.id == "dns" }) { rows[index] = row }
         else { rows.append(row) }
+    }
+}
+/// Engine-side evidence for the routing row.  The audit row itself only carries
+/// state and detail; the missing/bypass lists live here so the UI can name the
+/// exact domains instead of showing a bare count.
+struct EnvironmentDisplayFacts: Decodable {
+    var local: EnvironmentLocalFacts?
+}
+struct EnvironmentLocalFacts: Decodable {
+    var rules: EnvironmentRulesEvidence?
+    var tag: EnvironmentTagEvidence?
+}
+struct EnvironmentRulesEvidence: Decodable {
+    var state: String?
+    var actual_mode: String?
+    var missing_domains: [String]?
+    var bypass_domains: [String]?
+    /// Rules the user switched off in the proxy client: present in the table,
+    /// matching nothing.  Named so the gap between written and effective stays
+    /// visible instead of reading as coverage.
+    var disabled_domains: [String]?
+    var covered_domains: [String]?
+    var detail: String?
+}
+struct EnvironmentTagEvidence: Decodable {
+    var pinned: Bool?
+    var expected_group: String?
+    var expected_node: String?
+    var api: EnvironmentTagAPI?
+}
+struct EnvironmentTagAPI: Decodable {
+    var mode: String?
+    var global_node: String?
+    var selected_node: String?
+}
+/// A neutral recommendation, deliberately not a gate.  When the proxy runs in
+/// rule mode the product suggests global mode, where one node handles every
+/// flow and leaks have no rule-table gap to slip through.  This never touches
+/// the routing audit row, the launch gate, or any required check: it is advice
+/// the user may ignore, not a verdict about their configuration.
+struct EnvironmentModeRecommendation {
+    let title: String
+    let detail: String
+    static func evaluate(_ evidence: EnvironmentRulesEvidence?) -> EnvironmentModeRecommendation? {
+        guard let evidence, let mode = evidence.actual_mode, !mode.isEmpty, mode != "global" else { return nil }
+        return EnvironmentModeRecommendation(
+            title: "推荐：切换到全局模式",
+            detail: "当前代理为 \(mode) 模式。规则模式下流量按规则表逐条匹配，任何未覆盖的域名都可能绕过代理暴露本机 IP；全局模式下全部流量统一走单一节点出口，更能避免 IP 等信息泄漏。请在代理客户端（如 TAG）的模式选择中切换为 Global/全局；本产品只作建议，不代改代理配置。")
     }
 }
 struct EnvironmentContextTransition: Decodable {
@@ -193,6 +245,8 @@ struct PolicyIssue: Decodable, Identifiable { let id, title, detail: String }
 struct BackgroundServiceReceipt: Decodable {
     let observed_at: Double
     let backend_healthy, update_source_ready: Bool
+    let guard_backend_healthy: Bool?
+    let backend_sampling_state: String?
     let services: [BackgroundServiceRow]
     let policy_issues: [PolicyIssue]
     var egress_reference: EgressReference?
@@ -270,15 +324,27 @@ struct ProxyDiagnosticReceipt: Decodable {
 enum SwitcherCommandRunner {
     static func run(_ args: [String], input: Data? = nil, cancellation: SwitcherReadCancellation? = nil,
                     dnsRefreshToken: String? = nil) throws -> Data {
-        guard let script = Bundle.main.url(forResource: "switcher", withExtension: "py") else {
-            throw NSError(domain: "Switcher", code: 1, userInfo: [NSLocalizedDescriptionKey: "缺少账号与环境组件，请使用完整构建包。"])
-        }
         let task = Process(), output = Pipe()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        task.arguments = ["python3", script.path] + args
+        guard let variant = BundledBackendVariant.current() else {
+            throw NSError(domain: "Switcher", code: 1, userInfo: [NSLocalizedDescriptionKey: "构建包未声明后台类型，请重新构建界面。"])
+        }
+        switch variant {
+        case .rustCandidate:
+            guard let engine = Bundle.main.url(forResource: "watch-engine", withExtension: nil) else {
+                throw NSError(domain: "Switcher", code: 1, userInfo: [NSLocalizedDescriptionKey: "缺少 Rust 账号与环境组件，请重新构建候选包。"])
+            }
+            task.executableURL = engine
+            task.arguments = args
+        case .stable:
+            guard let script = Bundle.main.url(forResource: "switcher", withExtension: "py") else {
+                throw NSError(domain: "Switcher", code: 1, userInfo: [NSLocalizedDescriptionKey: "缺少稳定版账号与环境组件，请重新构建界面。"])
+            }
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            task.arguments = ["python3", script.path] + args
+        }
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        if case .stable = variant { env["PYTHONDONTWRITEBYTECODE"] = "1" }
         env.removeValue(forKey: "BASH_ENV")
         env.removeValue(forKey: "CLAUDE_WATCH_DNS_REFRESH_TOKEN")
         if let dnsRefreshToken { env["CLAUDE_WATCH_DNS_REFRESH_TOKEN"] = dnsRefreshToken }
@@ -458,6 +524,7 @@ final class SwitcherStore: ObservableObject {
         currentPolicyEvaluation = Self.acceptsDisplayPolicy(preview, for: environment, hasUnsavedSettings: false) ? preview : nil
         let base = try! JSONDecoder().decode(BackgroundServiceReceipt.self, from: Self.fixtureBackground(settings: settings))
         background = .init(observed_at: now, backend_healthy: true, update_source_ready: base.update_source_ready,
+                           guard_backend_healthy: true, backend_sampling_state: "complete",
                            services: base.services, policy_issues: base.policy_issues, egress_reference: jp, facts: facts,
                            session_guard: .init(state: guardState, baseline: jp,
                                                 current: scenario == .ipChanged ? .init(ip: "8.8.4.4", country: "JP", timezone: "Asia/Tokyo", context_id: environment.context_id, checked_at: now) : jp,
@@ -554,7 +621,8 @@ final class SwitcherStore: ObservableObject {
         rows.map { row in
             guard row.id == id else { return row }
             return .init(id: row.id, name: row.name, state: state, detail: detail, scope: row.scope, required: row.required,
-                         current: current, reference: row.reference, source: row.source, sampled_at: row.sampled_at, query_error: row.query_error)
+                         current: current, reference: row.reference, source: row.source, sampled_at: row.sampled_at,
+                         sample_reused: row.sample_reused, query_error: row.query_error)
         }
     }
     private func normalizeReviewRows(_ rows: [EnvironmentCheckRow]) -> [EnvironmentCheckRow] {
@@ -638,6 +706,7 @@ final class SwitcherStore: ObservableObject {
             guard result.purpose == "environment_detection", !result.grants_launch_permission else {
                 throw NSError(domain: "Switcher", code: 6, userInfo: [NSLocalizedDescriptionKey: "检测结果类型不符，请重新检测。"])
             }
+            if !isFixture { GuardDiagnosticLogger.submit(from: data) }
             guard generation == environmentGeneration else { return false }
             currentEnvironment = result
             // A newly received failed/unavailable observation is still current;
@@ -1027,6 +1096,13 @@ final class SwitcherStore: ObservableObject {
                             + ["proxy_mode", "country", "timezone", "locale"].compactMap { key in config[key].map { key + " = " + $0 } }.joined(separator: "\n")
                             + "\n仅预览，尚未导入或停用旧后台。"
                     }
+                    // A preview that cannot be read as a plan must not report
+                    // success with an empty action list: the review sheet would
+                    // never open and the button would look unresponsive.
+                    if args.count >= 2, args[0] == "protection", args[1] == "preview", !failure {
+                        failure = true
+                        message = "预览回执未能识别为变更计划，未生成变更列表。请重新预览；若仍然如此，请查看操作记录。"
+                    }
                 }
                 if args.first == "logs" { operationLog = raw["message"] as? String ?? "暂无操作记录" }
                 if let result = raw["config"] as? [String: Any], args.first == "config", !failure {
@@ -1206,6 +1282,7 @@ final class SwitcherStore: ObservableObject {
                        "current": ["ip": "8.8.8.8", "country": "JP", "observed_at": now, "source": "fixture"]]
         }
         let raw: [String: Any] = ["observed_at": now, "backend_healthy": true,
+            "guard_backend_healthy": true, "backend_sampling_state": "complete",
             "update_source_ready": false, "policy_issues": issues,
             "egress_reference": ["ip": "8.8.8.8", "country": "JP", "timezone": "Asia/Tokyo", "checked_at": now, "context_id": "fixture-context-0001"],
             "facts": ["state": "ok", "risks": []],

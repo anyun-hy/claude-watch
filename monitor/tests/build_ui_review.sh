@@ -25,10 +25,10 @@ if [[ -d "$ROOT/tests/fixtures/review" ]]; then
   mkdir -p "$APP/Contents/Resources/review"
   cp "$ROOT"/tests/fixtures/review/*.json "$APP/Contents/Resources/review/"
 fi
-if [[ -f "$ROOT/reports/netcoffee/live-leak-results.json" ]]; then
+if [[ "${UI_REVIEW_INCLUDE_LIVE_REPORTS:-1}" == 1 && -f "$ROOT/reports/netcoffee/live-leak-results.json" ]]; then
   cp "$ROOT/reports/netcoffee/live-leak-results.json" "$APP/Contents/Resources/coffee-live-leak-results.json"
 fi
-if [[ -f "$ROOT/reports/netcoffee/coffee-lookup-current.json" ]]; then
+if [[ "${UI_REVIEW_INCLUDE_LIVE_REPORTS:-1}" == 1 && -f "$ROOT/reports/netcoffee/coffee-lookup-current.json" ]]; then
   cp "$ROOT/reports/netcoffee/coffee-lookup-current.json" "$APP/Contents/Resources/"
 fi
 cat > "$APP/Contents/Info.plist" <<'PLIST'

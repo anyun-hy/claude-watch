@@ -27,6 +27,11 @@ fi
 for tool in hdiutil shasum plutil; do
   command -v "$tool" >/dev/null 2>&1 || { printf 'Missing required macOS tool: %s\n' "$tool" >&2; exit 1; }
 done
+USE_DISKUTIL_IMAGE=0
+if /usr/sbin/diskutil image create from --help >/dev/null 2>&1 && \
+   /usr/sbin/diskutil image attach --help >/dev/null 2>&1; then
+  USE_DISKUTIL_IMAGE=1
+fi
 if [[ -e "$DMG" || -e "$SHA_FILE" ]]; then
   printf 'Refusing to overwrite an existing package: %s\n' "$DMG" >&2
   printf 'Move or rename the existing package before creating another one.\n' >&2
@@ -48,7 +53,11 @@ TEMP_DMG="$STAGE/$DMG_NAME"
 ATTACHED=0
 cleanup() {
   if [[ "$ATTACHED" == '1' ]]; then
-    hdiutil detach "$MOUNT" -quiet 2>/dev/null || true
+    if [[ "$USE_DISKUTIL_IMAGE" == '1' ]]; then
+      /usr/sbin/diskutil eject "$MOUNT" >/dev/null 2>&1 || true
+    else
+      hdiutil detach "$MOUNT" -quiet 2>/dev/null || true
+    fi
   fi
   rmdir "$MOUNT" 2>/dev/null || true
   rm -rf "$STAGE"
@@ -59,7 +68,10 @@ PAYLOAD="$STAGE/payload"
 mkdir -p "$PAYLOAD"
 cp -R "$APP" "$PAYLOAD/$APP_NAME"
 ln -s /Applications "$PAYLOAD/Applications"
-cp "$ROOT/Packaging/安装说明.txt" "$ROOT/Packaging/安装或更新后台.command" "$ROOT/Packaging/卸载应用.command" "$ROOT/Packaging/app_lifecycle.py" "$PAYLOAD/"
+cp "$ROOT/Packaging/安装说明.txt" "$ROOT/Packaging/安装或更新后台.command" "$ROOT/Packaging/卸载应用.command" "$PAYLOAD/"
+if [[ "$('/usr/libexec/PlistBuddy' -c 'Print :BackendVariant' "$APP/Contents/Resources/BuildInfo.plist")" == 'stable' ]]; then
+  cp "$ROOT/Packaging/app_lifecycle.py" "$PAYLOAD/"
+fi
 python3 - "$APP/Contents/Resources/BuildInfo.plist" "$PAYLOAD/安装说明.txt" "$ACTUAL_BUILD" <<'PY'
 from pathlib import Path
 import plistlib, sys
@@ -78,9 +90,17 @@ PY
 chmod 755 "$PAYLOAD/安装或更新后台.command"
 chmod 755 "$PAYLOAD/卸载应用.command"
 
-hdiutil create -volname "Claude Watch $APP_VERSION" -srcfolder "$PAYLOAD" -format UDZO -ov "$TEMP_DMG" >/dev/null
+if [[ "$USE_DISKUTIL_IMAGE" == '1' ]]; then
+  /usr/sbin/diskutil image create from --format UDZO --volumeName "Claude Watch $APP_VERSION" "$PAYLOAD" "$TEMP_DMG" >/dev/null
+else
+  hdiutil create -volname "Claude Watch $APP_VERSION" -srcfolder "$PAYLOAD" -format UDZO -ov "$TEMP_DMG" >/dev/null
+fi
 hdiutil verify "$TEMP_DMG" >/dev/null
-hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "$TEMP_DMG" >/dev/null
+if [[ "$USE_DISKUTIL_IMAGE" == '1' ]]; then
+  /usr/sbin/diskutil image attach --readOnly --nobrowse --mountPoint "$MOUNT" "$TEMP_DMG" >/dev/null
+else
+  hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "$TEMP_DMG" >/dev/null
+fi
 ATTACHED=1
 [[ -d "$MOUNT/$APP_NAME" ]] || { printf 'Mounted DMG is missing the app.\n' >&2; exit 1; }
 [[ -s "$MOUNT/$APP_NAME/Contents/Resources/AppIcon.icns" ]] || { printf 'Mounted DMG is missing the application icon.\n' >&2; exit 1; }
@@ -95,7 +115,11 @@ done
 FLAG_COUNT=$(find "$MOUNT/$APP_NAME/Contents/Resources/Identity/flags" -name '*.png' -type f | wc -l | tr -d ' ')
 [[ "$FLAG_COUNT" == '257' ]] || { printf 'Country flag count mismatch: %s\n' "$FLAG_COUNT" >&2; exit 1; }
 [[ -s "$MOUNT/$APP_NAME/Contents/Resources/Identity/FLAG-ICONS-LICENSE.txt" ]] || { printf 'Flag asset license missing.\n' >&2; exit 1; }
-hdiutil detach "$MOUNT" -quiet
+if [[ "$USE_DISKUTIL_IMAGE" == '1' ]]; then
+  /usr/sbin/diskutil eject "$MOUNT" >/dev/null
+else
+  hdiutil detach "$MOUNT" -quiet
+fi
 ATTACHED=0
 
 mkdir -p "$DIST"

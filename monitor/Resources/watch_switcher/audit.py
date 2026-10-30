@@ -60,9 +60,19 @@ def reconcile_observations(before, after):
         else:
             changed.add(key)
     for key in ("proxy", "tun"):
-        if after.get(key) in ("fail", "unknown"):
-            before[key] = after[key]
-            if key == "proxy": before["proxy_detail"] = after.get("proxy_detail", "代理采样未确认")
+        previous, next_value = before.get(key), after.get(key)
+        # A confirmed failure is sticky within this observation. A later
+        # missing sample cannot erase it; likewise one later OK sample cannot
+        # convert a prior unknown into a complete pass.
+        if next_value == "fail" or previous == "fail":
+            before[key] = "fail"
+            if key == "proxy" and next_value == "fail":
+                before["proxy_detail"] = after.get("proxy_detail", "代理已确认失效")
+        elif next_value == "unknown" or previous == "unknown":
+            before[key] = "unknown"
+            unavailable.add(key + "_sampling")
+            if key == "proxy" and next_value == "unknown":
+                before["proxy_detail"] = after.get("proxy_detail", "代理采样未确认")
     if not before.get("guard") or not after.get("guard"):
         before["guard"] = False
         disabled = before.get("guard_state") == "disabled" or after.get("guard_state") == "disabled"
@@ -567,7 +577,6 @@ def stun_presentation(stun, candidates, reference):
     stun = stun if isinstance(stun, dict) else {}
     observations = stun.get("observations", [])
     observations = observations if isinstance(observations, list) else []
-    complete = stun.get("complete") is True
     probe_started, probe_finished = stun.get("started_at"), stun.get("finished_at")
     try:
         probe_started, probe_finished = float(probe_started), float(probe_finished)
@@ -584,10 +593,18 @@ def stun_presentation(stun, candidates, reference):
     }
     stage_text = {"resolve": "域名解析", "send": "发送请求", "receive": "等待 UDP 回包",
                   "validation": "报文校验", "budget": "预算"}
+    # 失败项优先：没应答的服务器不能压在折页下面，只看见一屏"成功"。
+    # False 排在前面，所以键取"是否已应答"本身。
+    rows = [o for o in observations if isinstance(o, dict)]
+    def _answered(o):
+        return o.get("status") == "ok" and o.get("deadline_exceeded") is not True
+    rows.sort(key=_answered)
+    answered = sum(1 for o in rows if _answered(o))
     lines = ["汇总：%d 个公网候选；参考：%s；%s" % (
         len(candidates), ", ".join(sorted(reference)) or "无",
-        "全部服务器完成" if complete else "存在未完成或失败服务器，启动预检保持未知")]
-    for index, observation in enumerate(observations[:16], 1):
+        "UDP 未回包，按零暴露处理" if (not candidates and reference)
+        else "%d / %d 台服务器应答" % (answered, len(rows)))]
+    for index, observation in enumerate(rows[:16], 1):
         if not isinstance(observation, dict): continue
         server = str(observation.get("server") or "未知服务器")[:160]
         port = observation.get("port")
@@ -699,8 +716,14 @@ def evaluate(config, local, online, history=(), now=None):
     stun = online.get("stun", {})
     candidates = {public_ip(x.get("address")) for x in stun.get("observations", []) if x.get("status") == "ok"} - {""}
     reference = {address} if address else set()
-    stun_state = "unknown" if not candidates or not reference or not stun.get("complete") else (
-        "ok" if candidates <= reference else "fail")
+    # 2026-10-29 主公拍板：对齐上游原版 claude-switcher 的 STUN 语义。
+    # 上游 core/stun-probe.py 任一台回包即 RESULT:<ip>，core/claude-switch.sh:298
+    # 把 RESULT:NONE 读作 "UDP 不出网, 零暴露"。本仓 2.9.5 曾把它改严为
+    # "全部服务器完成"，单台超时就把整行拖成 unknown，界面每分钟翻转。
+    # 现在：无出口参考才 unknown；UDP 全不回按零暴露判 ok；任何一台返回的
+    # 地址与出口参考不一致仍判 fail（严格面不变）。
+    stun_state = ("unknown" if not reference else
+                  ("ok" if not candidates or candidates <= reference else "fail"))
     stun_detail, stun_sampled_at, stun_observations = stun_presentation(stun, candidates, reference)
     add("stun", stun_state, stun_detail, required=True,
         scope="原生 UDP/STUN 探针，用于 AI 受控启动网络检查；不等于 Claude 实际 socket 或 WebRTC")

@@ -124,13 +124,18 @@ struct ServerTargetPresentation {
 
 enum ServerReferenceRunner {
     static func run(_ request: ServerReferenceRequest) -> ServerReference? {
-        guard let script = Bundle.main.url(forResource: "server_reference", withExtension: "py") else { return nil }
-        let python = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
-            .first { FileManager.default.isExecutableFile(atPath: $0) }
-        guard let python else { return nil }
+        guard let variant=BundledBackendVariant.current() else { return nil }
         let process = Process(); let output = Pipe(); let errors = Pipe()
-        process.executableURL = URL(fileURLWithPath: python)
-        process.arguments = [script.path, "--host", request.host] + (request.observedIP.map { ["--ip", $0] } ?? [])
+        switch variant {
+        case .rustCandidate:
+            guard let runtime=Bundle.main.url(forResource:"watch-engine",withExtension:nil),FileManager.default.isExecutableFile(atPath:runtime.path) else{return nil}
+            process.executableURL=runtime
+            process.arguments=["server-reference","--host",request.host]+(request.observedIP.map{["--ip",$0]} ?? [])
+        case .stable:
+            guard let script=Bundle.main.url(forResource:"server_reference",withExtension:"py"),let python=["/opt/homebrew/bin/python3","/usr/local/bin/python3","/usr/bin/python3"].first(where:{FileManager.default.isExecutableFile(atPath:$0)}) else{return nil}
+            process.executableURL=URL(fileURLWithPath:python)
+            process.arguments=[script.path,"--host",request.host]+(request.observedIP.map{["--ip",$0]} ?? [])
+        }
         process.standardOutput = output; process.standardError = errors
         do { try process.run() } catch { return nil }
         let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }

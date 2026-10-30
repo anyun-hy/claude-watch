@@ -144,7 +144,11 @@ struct SwitcherPage: View {
                                  symbol: "antenna.radiowaves.left.and.right", tint: sourceNoticeTint(store.sourceNotices), p: p)
                 }
                 if let result = store.currentEnvironment {
-                    sessionGuardNotice(title: "受控会话状态")
+                    if let recommendation = EnvironmentModeRecommendation.evaluate(result.display_facts?.local?.rules) {
+                        InlineNotice(title: recommendation.title, detail: recommendation.detail,
+                                     symbol: "lightbulb", tint: p.blue, p: p)
+                    }
+                    sessionGuardNotice(title: "受控会话状态", prominent: true)
                     if let facts = result.facts, facts.state == "fail" {
                         InlineNotice(title: "当前环境风险", detail: facts.risks?.compactMap { $0.reason ?? $0.id }.joined(separator: "\n") ?? "本轮环境检测发现风险。",
                                      symbol: "exclamationmark.shield", tint: p.red, p: p)
@@ -189,6 +193,7 @@ struct SwitcherPage: View {
                     DisclosureGroup("检测范围与数据来源") {
                         Text(result.message).padding(.top, 6)
                         Text("本次检测会请求出口、DNS、STUN 与服务响应，不携带账号凭据，也不保存候选为目标。受控启动的联网预检有独立开关。")
+                        Text("DNS 与 UDP/STUN 为受控启动必检；国家相同不能替代实际出口与代理路径校验。WebRTC 检测只覆盖应用内 WebView，不能用来替其他应用作出无泄漏保证。")
                     }.font(WatchTypography.caption).foregroundStyle(p.secondary)
                     if !store.dnsReceiptError.isEmpty {
                         InlineNotice(title: "DNS 结果尚未同步到启动预检", detail: store.dnsReceiptError, symbol: "exclamationmark.triangle", tint: p.amber, p: p)
@@ -458,21 +463,17 @@ struct SwitcherPage: View {
                         Text(issue.detail).font(WatchTypography.caption)
                     }.foregroundStyle(p.amber)
                 }
-                Button("查看后台保护与启动要求") { navigate(.protection) }.buttonStyle(.borderless)
-                HStack {
-                    Button("打开 DNS 检测") { openLeakCheck(.dns) }
-                    Button("打开 WebRTC 检测") { openLeakCheck(.webrtc) }
-                }.buttonStyle(.borderless)
-                Text("DNS、UDP/STUN 为受控启动必检；国家相同不能替代实际出口与代理路径校验。WebRTC 页只检测当前 WebView，不能用来替其他应用作出无泄漏保证。")
-                    .font(WatchTypography.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
             }
         }
     }
     private var protectionContent: some View {
         Group {
             if !store.backgroundError.isEmpty { InlineNotice(title: "后台状态读取未完成", detail: store.backgroundError, symbol: "exclamationmark.triangle", tint: p.amber, p: p) }
+            if store.failure, store.plan == nil, !store.message.isEmpty {
+                InlineNotice(title: "后台操作未完成", detail: store.message, symbol: "exclamationmark.triangle", tint: p.amber, p: p)
+            }
             if let result = store.background {
-                Label("后台进程：\(result.backend_healthy ? "心跳正常" : "尚未确认") · 状态读取于 \(timeLabel(result.observed_at))", systemImage: "clock")
+                Label("保护后台：\((result.guard_backend_healthy ?? result.backend_healthy) ? "身份与心跳已确认" : "尚未确认") · 监控采样：\(result.backend_healthy ? "完整" : "待复核") · 状态读取于 \(timeLabel(result.observed_at))", systemImage: "clock")
                     .font(WatchTypography.caption).foregroundStyle(p.secondary)
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     LazyVGrid(columns: [GridItem(.flexible(minimum: 310), spacing: 14, alignment: .top),
@@ -531,10 +532,13 @@ struct SwitcherPage: View {
     private func serviceButton(_ title: String, key: String, enable: Bool) -> some View {
         Button(title) { Task { await store.previewProtection(key, enable: enable); showReview = store.plan != nil } }
     }
-    private func sessionGuardNotice(title: String) -> some View {
+    private func sessionGuardNotice(title: String, prominent: Bool = false) -> some View {
         let value = store.sessionDisplay
         return InlineNotice(title: title, detail: value.detail, symbol: value.symbol,
-                            tint: sessionGuardTint(value), p: p)
+                            tint: sessionGuardTint(value), p: p,
+                            iconSize: prominent ? 22 : 15, iconWidth: prominent ? 28 : 20,
+                            iconWeight: prominent ? .medium : .regular,
+                            iconTint: prominent && value.title == SessionProtectionPresentation.idleTitle ? p.mint : nil)
     }
     private func sessionGuardCard(_ evidence: SessionProtectionEvidence) -> some View {
         let session = evidence.session
@@ -784,7 +788,7 @@ struct EnvironmentCheckTile: View {
                             Text("要求：" + reference).font(WatchTypography.small).foregroundStyle(p.secondary).lineLimit(2)
                         }
                         if let sampled = row.sampled_at {
-                            Text((row.state == "cached" ? "上次有效采样：" : "采样时间：") + environmentSummaryTime(sampled))
+                            Text((row.state == "cached" ? "上次有效采样：" : (row.sample_reused == true ? "复用采样：" : "采样时间：")) + environmentSummaryTime(sampled))
                                 .font(WatchTypography.small).foregroundStyle(p.secondary)
                         }
                     }
@@ -923,10 +927,11 @@ struct EnvironmentCheckDetails: View {
         return current
     }
     private var copyText: String {
-        [row.name + " · " + (stale ? "历史样本" : row.statusLabel), "实测：" + value,
+        let stamp = row.state == "cached" ? "上次有效采样：" : (row.sample_reused == true ? "复用采样：" : "采样时间：")
+        return [row.name + " · " + (stale ? "历史样本" : row.statusLabel), "实测：" + value,
          "判定依据：" + (row.reference ?? "无独立参考值"), "说明：" + row.detail,
          "来源：" + (row.source ?? row.scope),
-         row.sampled_at.map { "采样时间：" + environmentSummaryTime($0) } ?? "",
+         row.sampled_at.map { stamp + environmentSummaryTime($0) } ?? "",
          row.query_error.map { "本次查询失败：" + $0 } ?? ""].filter { !$0.isEmpty }.joined(separator: "\n")
     }
     var body: some View {
@@ -974,7 +979,9 @@ struct EnvironmentCheckDetails: View {
             if let reference = row.reference { detail("判定依据", reference) }
             detail("说明", row.detail)
             detail("来源", row.source ?? row.scope)
-            if let sampled = row.sampled_at { detail("采样时间", environmentSummaryTime(sampled)) }
+            if let sampled = row.sampled_at {
+                detail(row.state == "cached" ? "上次有效采样" : (row.sample_reused == true ? "复用采样" : "采样时间"), environmentSummaryTime(sampled))
+            }
             if let error = row.query_error, !error.isEmpty { detail("本次查询失败", error) }
         }.frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
     }

@@ -2,6 +2,8 @@
 *.command text eol=lf
 *.py text eol=lf
 *.swift text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
 *.js text eol=lf
 *.cjs text eol=lf
 *.html text eol=lf

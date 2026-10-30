@@ -2,7 +2,10 @@ const vm=require('node:vm'),fs=require('node:fs'),assert=require('node:assert/st
 const code=fs.readFileSync(__dirname+'/../Resources/netcoffee_probe.js','utf8');
 async function run(kind,{empty=false,missingHTTP=false,rtcMissing=false,apiFailure=false}={}) {
  let context,done,requests=[],images=[];const result=new Promise(r=>done=r);
- const timer=(f,ms)=>setTimeout(f,Math.min(ms,20));
+ // The collector now has a real total-deadline timer. Keep that timer after
+ // this old real-time test's shortened internal waits, rather than making a
+ // 70-second watchdog fire after the same 20ms as every fixture response.
+ const timer=(f,ms)=>setTimeout(f,ms===70000?1000:Math.min(ms,20));
  class Image {set src(v){if(!v)return;images.push(v);queueMicrotask(()=>this.onload&&this.onload());}}
  class Peer {constructor(){this.iceGatheringState='new';}createDataChannel(){}createOffer(){return Promise.resolve({});}setLocalDescription(){queueMicrotask(()=>{this.onicecandidate({candidate:{address:'8.8.4.4',type:'srflx'}});this.onicecandidate({candidate:null});});return Promise.resolve();}close(){}}
  context=vm.createContext({document:{getElementById(){return null;}},console,URL,Map,Set,Uint8Array,Array,Math,Date,Promise,Image,setTimeout:timer,clearTimeout,crypto:require('node:crypto').webcrypto,RTCPeerConnection:rtcMissing?undefined:Peer,window:{webkit:{messageHandlers:{coffeeProbe:{postMessage(m){
@@ -18,10 +21,10 @@ async function run(kind,{empty=false,missingHTTP=false,rtcMissing=false,apiFailu
 }
 (async()=>{
  let r=await run('dns');assert.equal(r.p.status,'complete');assert.equal(r.images.length,5);assert(r.images.every(x=>/^https:\/\/[a-f0-9]{24}-[0-4]\.d\.ip\.net\.coffee\//.test(x)));assert.equal(r.p.observations.find(x=>x.kind==='resolver').isp,'Google');assert(JSON.parse(r.p.externalJSON).some(x=>x.kind==='dns'));
- r=await run('dns',{empty:true});assert.equal(r.p.status,'partial');assert(r.p.errors.some(x=>x.stage==='dns'));assert.equal(r.requests.filter(x=>x.kind==='dns').length,3);
+ r=await run('dns',{empty:true});assert.equal(r.p.status,'partial');assert(r.p.errors.some(x=>x.stage==='dns_records'));assert.equal(r.requests.filter(x=>x.kind==='dns').length,3);
  r=await run('webrtc');assert.equal(r.p.status,'complete');assert.equal(r.p.observations.filter(x=>x.kind==='srflx').length,3);
  r=await run('webrtc',{missingHTTP:true});assert.equal(r.p.status,'partial');assert(r.p.errors.some(x=>x.stage==='http'));
- r=await run('webrtc',{rtcMissing:true});assert.equal(r.p.status,'partial');assert.equal(r.p.errors.filter(x=>x.stage.startsWith('ice:')).length,3);
+ r=await run('webrtc',{rtcMissing:true});assert.equal(r.p.status,'partial');assert.equal(r.p.errors.filter(x=>x.stage==='ice').length,3);
  r=await run('dns',{apiFailure:true});assert.equal(r.p.status,'partial');assert(r.p.errors.some(x=>x.stage==='http'));
  console.log('NetCoffeeProbe: 6 isolated protocol scenarios passed; no real network');
 })().catch(e=>{console.error(e);process.exitCode=1;});

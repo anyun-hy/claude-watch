@@ -878,29 +878,35 @@ def published_rules(payload):
                      (fields[2] if len(fields) > 2 else "")}
         if not isinstance(value, dict):
             return None
+        # A rule the user switched off stays in the table but never matches;
+        # only a structured rule can prove it.  A plain string carries no
+        # extra block and is never assumed disabled.
+        extra = value.get("extra")
+        disabled = isinstance(extra, dict) and extra.get("disabled") is True
         raw_type, payload, proxy = value.get("type"), value.get("payload"), value.get("proxy")
         key = re.sub(r"[^a-z0-9]", "", raw_type.lower()) if isinstance(raw_type, str) else ""
         kind = type_map.get(key)
         if kind not in RULE_TYPES or not safe(proxy, 256):
             return None
         if kind == "MATCH":
-            return "MATCH," + proxy
+            return "MATCH," + proxy, disabled
         if kind in ("DOMAIN", "DOMAIN-SUFFIX"):
             if not safe(payload, 253):
                 return None
             subject = payload.lower().lstrip("+.")
             if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", subject):
                 return None
-            return kind + "," + subject + "," + proxy
+            return kind + "," + subject + "," + proxy, disabled
         # Broad entries convey precedence, but their payload can be a private
         # rule-set name or URI.  It is deliberately replaced before publishing.
-        return kind + ",*," + proxy
+        return kind + ",*," + proxy, disabled
 
-    entries, relevant, broad = [], 0, 0
+    entries, disabled_domains, relevant, broad = [], [], 0, 0
     for value in values:
-        value = canonical(value)
-        if value is None:
+        canonicalized = canonical(value)
+        if canonicalized is None:
             continue
+        value, disabled = canonicalized
         fields = [field.strip() for field in value.split(",")]
         if not fields or fields[0].upper() not in RULE_TYPES:
             continue
@@ -918,10 +924,33 @@ def published_rules(payload):
             # a particular watched domain's route.
             include = broad < 128
             broad += int(include)
+        if disabled:
+            # The rule exists but never matches.  Naming the ecosystem domain
+            # keeps the gap visible instead of silently reading as coverage.
+            if include and kind in ("DOMAIN", "DOMAIN-SUFFIX") and len(fields) >= 3:
+                disabled_domains.append(fields[1].lower().lstrip("+."))
+            continue
         if include:
             entries.append(value)
     return {"state": "available", "reason": "", "entries": entries,
-            "total": len(values), "relevant": relevant, "broad": broad}
+            "total": len(values), "relevant": relevant, "broad": broad,
+            "disabled_domains": disabled_domains}
+
+def group_is_direct(proxies, name, depth):
+    """A selector whose current selection ultimately lands on a bypass target
+    sends every rule pointing at it straight out.  Nested groups are followed;
+    a missing or cyclic chain is never guessed into a verdict."""
+    if depth == 0:
+        return False
+    value = proxies.get(name)
+    if not isinstance(value, dict):
+        return False
+    now = value.get("now")
+    if not isinstance(now, str):
+        return False
+    if now.upper() in ("DIRECT", "REJECT", "REJECT-DROP", "PASS"):
+        return True
+    return group_is_direct(proxies, now, depth - 1)
 
 def api_snapshot(config_path, group):
     report = {"state": "unavailable", "reason": "TAG 控制接口未验证"}
@@ -940,10 +969,12 @@ def api_snapshot(config_path, group):
             chain = connection.get("chains") if isinstance(connection, dict) else None
             if isinstance(chain, list) and chain and isinstance(chain[-1], str): roots.add(chain[-1])
         routes = {root: resolve_chain(proxies, root) for root in roots if root and len(root) <= 256}
+        direct_groups = sorted(name for name in proxies if group_is_direct(proxies, name, 8))
         report.update(state="available", controller=base, mode=configs["mode"],
                       covers_7890=PORT in ports, selected_node=resolve_selection(proxies, active_group),
                       route_chains=routes,
-                      global_node=resolve_selection(proxies, "GLOBAL"), reason="")
+                      global_node=resolve_selection(proxies, "GLOBAL"),
+                      direct_groups=direct_groups, reason="")
         try:
             report["rules"] = published_rules(api_get(base, secret, "/rules"))
         except urllib.error.HTTPError as error:

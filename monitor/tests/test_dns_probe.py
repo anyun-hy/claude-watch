@@ -1,6 +1,8 @@
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
+import sys
 import unittest
 from unittest import mock
 
@@ -10,7 +12,18 @@ probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
 
 
+def is_geoip_command(command):
+    return (isinstance(command, list) and bool(command) and command[0] == "/usr/bin/curl"
+            and isinstance(command[-1], str) and command[-1].startswith(probe.GEOIP_URL_PREFIX))
+
+
 class DNSProbeTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS system tools")
+    def test_default_route_context_command_is_executable(self):
+        command = next(command for name, command in probe.CONTEXT_COMMANDS if name == "route4")
+        self.assertTrue(Path(command[0]).is_file())
+        self.assertTrue(os.access(command[0], os.X_OK))
+
     class Process:
         def __init__(self, command, returncode=0, stdout=""):
             self.command = command
@@ -31,12 +44,14 @@ class DNSProbeTests(unittest.TestCase):
             self.terminated = True
             self.returncode = -9
 
-    def responses(self, dig='"ns" "8.8.8.8"\n"ns" "2606:4700:4700::1111"\n', curl='ip=1.1.1.1\n'):
+    def responses(self, dig='"ns" "8.8.8.8"\n"ns" "2606:4700:4700::1111"\n', curl='ip=1.1.1.1\n', geo='{"country_code":"US"}'):
         def popen(command, **kwargs):
             if command == probe.DNS_COMMAND:
                 return self.Process(command, 0, dig)
             if command == probe.HTTP_COMMAND:
                 return self.Process(command, 0, curl)
+            if is_geoip_command(command):
+                return self.Process(command, 0, geo)
             if command == probe.CONTEXT_COMMANDS[-1][1]:
                 return self.Process(command, 0, "Internet6:\nDestination Gateway Flags Netif\n")
             return self.Process(command, 0, "context\n")
@@ -104,6 +119,8 @@ class DNSProbeTests(unittest.TestCase):
         def popen(command, **kwargs):
             if command in (probe.DNS_COMMAND, probe.HTTP_COMMAND):
                 return self.responses()(command, **kwargs)
+            if is_geoip_command(command):
+                return self.Process(command, 0, '{"error":"not enriched"}')
             return self.Process(command, 0, next(contexts))
         with mock.patch.object(probe.subprocess, "Popen", side_effect=popen):
             result = probe.collect()
@@ -132,11 +149,36 @@ class DNSProbeTests(unittest.TestCase):
         def popen(command, **kwargs):
             if command in (probe.DNS_COMMAND, probe.HTTP_COMMAND):
                 return self.responses()(command, **kwargs)
+            if is_geoip_command(command):
+                return self.Process(command, 0, '{"error":"not enriched"}')
             return self.Process(command, 0, next(contexts))
         with mock.patch.object(probe.subprocess, "Popen", side_effect=popen):
             result = probe.collect()
         self.assertTrue(result["contextChanged"])
         self.assertEqual(result["status"], "partial")
+
+    def test_resolver_attribution_enriches_without_downgrading_the_round(self):
+        with mock.patch.object(probe.subprocess, "Popen", side_effect=self.responses(geo='{"country_code":"US"}')) as popen:
+            result = probe.collect()
+        resolvers = [row for row in result["observations"] if row["kind"] == "resolver"]
+        self.assertEqual([row["country"] for row in resolvers], ["US", "US"])
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["errors"], [])
+        geo_calls = [call.args[0] for call in popen.call_args_list if call.args[0][-1].startswith(probe.GEOIP_URL_PREFIX)]
+        self.assertEqual(len(geo_calls), 2)
+        self.assertIn("--proxy", geo_calls[0])
+        self.assertEqual(geo_calls[0][geo_calls[0].index("--proxy") + 1], "http://127.0.0.1:7890")
+
+    def test_failed_resolver_attribution_stays_silent_and_keeps_the_round_complete(self):
+        # A broken side channel must not write into `errors`: the geography
+        # verdict keeps failing closed on the missing attribution instead.
+        with mock.patch.object(probe.subprocess, "Popen", side_effect=self.responses(geo='{"error":"rate limited"}')):
+            result = probe.collect()
+        resolvers = [row for row in result["observations"] if row["kind"] == "resolver"]
+        self.assertTrue(resolvers)
+        self.assertTrue(all("country" not in row for row in resolvers))
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["errors"], [])
 
     def test_cancellation_terminates_only_active_child(self):
         child = self.Process(["/usr/bin/dig"])

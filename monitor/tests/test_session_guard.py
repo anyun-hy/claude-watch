@@ -74,13 +74,32 @@ class SessionGuardTests(unittest.TestCase):
         result = session_guard.check_session(self.paths, self.system, self.config)
         self.assertEqual(result["reason"]["code"], "session_identity_changed")
 
-    def test_short_egress_failure_is_unknown_then_fail_closed(self):
+    def test_short_egress_failure_requires_a_sustained_unknown_streak(self):
         self.active()
         self.system.egress = {"state": "unknown", "observed_at": 101.0, "source": "fixture"}
         first = session_guard.check_session(self.paths, self.system, self.config)
         second = session_guard.check_session(self.paths, self.system, self.config)
         self.assertEqual(first["state"], "unknown")
-        self.assertEqual((second["state"], second["reason"]["code"]), ("risk", "egress_unconfirmed"))
+        self.assertEqual(second["state"], "unknown")
+        with patch("watch_switcher.session_guard.time.time", return_value=time.time() + 16):
+            third = session_guard.check_session(self.paths, self.system, self.config)
+        self.assertEqual((third["state"], third["reason"]["code"]), ("risk", "egress_unconfirmed"))
+
+    def test_unknown_streak_clears_on_recovery_and_invalid_time_cannot_extend_it(self):
+        active = self.active()
+        start = time.time() + 1
+        with patch("watch_switcher.session_guard.time.time", return_value=start):
+            self.assertEqual(session_guard.record_uncertain(self.paths, "fixture", "temporary")["state"], "unknown")
+        recovered = session_guard.check_session(self.paths, self.system, self.config,
+                                                risk_reader=lambda *_: {"state": "safe", "observed_at": time.time()})
+        self.assertEqual(recovered["state"], "safe")
+        state = session_guard.read_session(self.paths)
+        self.assertEqual((state["unknown_count"], state["unknown_since"]), (0, None))
+        state["unknown_count"], state["unknown_since"] = 1, start + 999
+        session_guard._save(self.paths, state, active["session_id"])
+        with patch("watch_switcher.session_guard.time.time", return_value=start + 2):
+            result = session_guard.record_uncertain(self.paths, "fixture", "clock")
+        self.assertEqual((result["state"], result["reason"]["code"]), ("risk", "fixture"))
 
     def test_same_ip_multiple_safe_rounds_keep_the_original_baseline(self):
         state = self.active()

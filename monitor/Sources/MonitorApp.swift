@@ -8,6 +8,7 @@ struct MonitorView: View {
     let refreshAction: (() -> Void)?
     @AppStorage("darkAppearance") private var dark = true
     @AppStorage("selectedPage") private var savedPage = Page.environment.rawValue
+    @Environment(\.controlActiveState) private var controlActiveState
     @State private var sidebarVisibility: NavigationSplitViewVisibility = .all
     @State private var showProxyDetails = false
 
@@ -19,6 +20,11 @@ struct MonitorView: View {
     }
 
     private var p: Palette { Palette(dark: dark) }
+    private var sidebarIconTint: Color { Color(red: 0, green: 149.0 / 255, blue: 1) }
+    private func sidebarForeground(selected: Bool, icon: Bool = false) -> Color {
+        if selected && controlActiveState == .key { return .white }
+        return icon ? sidebarIconTint : p.text
+    }
     private var selection: Binding<Page?> {
         Binding(get: { store.page }, set: { if let page = $0 { store.page = page } })
     }
@@ -111,6 +117,22 @@ struct MonitorView: View {
         }, openLeakCheck: { kind in store.page = kind == .dns ? .dns : .webrtc }, leakChecks: store.leakChecks, netCoffee: store.netCoffee, finished: { store.page = .environment })
     }
 
+    private func navRow(_ page: Page) -> some View {
+        let selected = store.page == page
+        return HStack(spacing: 8) {
+            Image(systemName: page.symbol)
+                .font(.system(size: 14, weight: .regular))
+                .foregroundStyle(sidebarForeground(selected: selected, icon: true))
+                .frame(width: 18, height: 18)
+            Text(page.rawValue)
+        }
+        .font(WatchTypography.body)
+        .fontWeight(selected ? .semibold : .regular)
+        .foregroundStyle(sidebarForeground(selected: selected))
+        .padding(.vertical, 4)
+        .tag(page)
+    }
+
     private var sidebar: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 7) {
@@ -122,29 +144,33 @@ struct MonitorView: View {
                 Text("Claude · ChatGPT / Codex").font(WatchTypography.small).foregroundStyle(p.secondary).lineLimit(1)
             }.padding(.horizontal, 15).padding(.top, 16).padding(.bottom, 15)
             List(selection: selection) {
-                Section("日常使用") {
-                    ForEach(Page.primaryPages, id: \.self) { page in
-                        Label(page.rawValue, systemImage: page.symbol)
-                            .font(WatchTypography.body).padding(.vertical, 4).tag(page)
-                    }
+                Section {
+                    ForEach(Page.primaryPages, id: \.self) { page in navRow(page) }
+                } header: {
+                    Text("日常使用").foregroundStyle(p.secondary)
                 }
-                Section("监控与记录") {
-                    ForEach(Page.monitorPages, id: \.self) { page in
-                        Label(page.rawValue, systemImage: page.symbol)
-                            .font(WatchTypography.body).padding(.vertical, 4).tag(page)
-                    }
+                Section {
+                    ForEach(Page.monitorPages, id: \.self) { page in navRow(page) }
+                } header: {
+                    Text("监控与记录").foregroundStyle(p.secondary)
                 }
-                Section("网络检测") {
+                Section {
                     ForEach(Page.diagnosticPages, id: \.self) { page in
+                        let selected = store.page == page
                         HStack(spacing: 8) {
                             Group {
                                 if page == .claudeAI || page == .gptAI { BrandLogo(brand:page == .claudeAI ? .claude : .chatgpt,size:14) }
-                                else { InspectorIcon(name:page.symbol,color:InspectorStyle(p:p).pageIcon(page)) }
+                                else { InspectorIcon(name:page.symbol,color: sidebarForeground(selected: selected, icon: true)) }
                             }.frame(width:18,height:18)
                             Text(page.rawValue)
                         }
-                            .font(WatchTypography.body).padding(.vertical, 4).tag(page)
+                        .font(WatchTypography.body)
+                        .fontWeight(selected ? .semibold : .regular)
+                        .foregroundStyle(sidebarForeground(selected: selected))
+                        .padding(.vertical, 4).tag(page)
                     }
+                } header: {
+                    Text("网络检测").foregroundStyle(p.secondary)
                 }
             }.listStyle(.sidebar).scrollContentBackground(.hidden)
             VStack(alignment: .leading, spacing: 12) {
@@ -163,7 +189,8 @@ struct MonitorView: View {
                         .accessibilityLabel("切换外观")
                 }
             }.padding(.horizontal, 15).padding(.bottom, 15)
-        }.background(p.sidebar)
+        }
+        .background(p.sidebar)
     }
 
     private var pageHeader: some View {
@@ -293,6 +320,8 @@ struct MonitorView: View {
                 }.padding(.bottom, 8)
                 if let events = store.snapshot?.events, !events.isEmpty {
                     ForEach(Array(events.prefix(4))) { EventTimelineRow(event: $0, p: p, compact: true) }
+                } else if let error = store.snapshot?.eventError {
+                    Text(error).font(WatchTypography.body).foregroundStyle(p.amber).padding(.vertical, 16)
                 } else {
                     Text(store.snapshot == nil ? "正在读取事件记录…" : "暂无可显示的事件记录。")
                         .font(WatchTypography.body).foregroundStyle(p.secondary).padding(.vertical, 16)

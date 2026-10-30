@@ -1,0 +1,15 @@
+[package]
+name = "claude-watch-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Native Rust command interface for the full Claude Watch migration"
+
+[dependencies]
+claude-watch-core = { path = "../watch-core" }
+claude-watch-runtime = { path = "../watch-runtime" }
+serde_json.workspace = true
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }

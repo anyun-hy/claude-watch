@@ -1,0 +1,23 @@
+{
+  "netcoffee_lookup": {
+    "kind": "lookup",
+    "query": "1.1.1.1",
+    "sourceURL": "https://ip.net.coffee/api/ip/lookup/1.1.1.1",
+    "queriedAt": 1700000000.0,
+    "finishedAt": 1700000001.0,
+    "status": "complete",
+    "httpStatus": 200,
+    "raw": "{\"ip\":\"1.1.1.1\",\"countryCode\":\"JP\",\"timezone\":\"Asia/Tokyo\",\"asn\":13335,\"asOrganization\":\"Cloudflare, Inc.\"}",
+    "data": {
+      "ip": "1.1.1.1",
+      "countryCode": "JP",
+      "timezone": "Asia/Tokyo",
+      "asn": 13335,
+      "asOrganization": "Cloudflare, Inc."
+    },
+    "error": null,
+    "transport": "HTTPS CONNECT via explicit loopback proxy",
+    "cache_state": "miss",
+    "last_good": null
+  }
+}

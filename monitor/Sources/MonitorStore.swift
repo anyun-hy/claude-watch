@@ -8,14 +8,26 @@ enum ReadOutcome: Sendable {
 
 enum SnapshotRunner {
     static func run(full: Bool) -> ReadOutcome {
-        guard let url = Bundle.main.url(forResource: "snapshot", withExtension: "sh") else {
-            return .failure("找不到数据读取组件，请重新构建界面。")
-        }
         let task = Process()
         let output = Pipe()
         let errors = Pipe()
-        task.executableURL = URL(fileURLWithPath: "/bin/bash")
-        task.arguments = [url.path] + (full ? ["--full"] : [])
+        guard let variant = BundledBackendVariant.current() else {
+            return .failure("构建包未声明后台类型，请重新构建界面。")
+        }
+        switch variant {
+        case .rustCandidate:
+            guard let engine = Bundle.main.url(forResource: "watch-engine", withExtension: nil) else {
+                return .failure("找不到 Rust 数据读取组件，请重新构建候选包。")
+            }
+            task.executableURL = engine
+            task.arguments = ["snapshot"] + (full ? ["--full"] : [])
+        case .stable:
+            guard let script = Bundle.main.url(forResource: "snapshot", withExtension: "sh") else {
+                return .failure("找不到稳定版数据读取组件，请重新构建界面。")
+            }
+            task.executableURL = URL(fileURLWithPath: "/bin/bash")
+            task.arguments = [script.path] + (full ? ["--full"] : [])
+        }
         task.standardOutput = output
         task.standardError = errors
         do {
@@ -35,6 +47,50 @@ enum SnapshotRunner {
         do { return .success(try JSONDecoder().decode(MonitorSnapshot.self, from: data)) }
         catch { return .failure("检测数据暂时无法解析，将在下次刷新时重试。") }
     }
+}
+
+/// Keeps the last directly verified proxy identity through a short observer
+/// gap. A missing sampler result is not evidence that the proxy changed; a
+/// newly verified identity is. The retained value is only for binding an
+/// in-flight diagnostic to its existing network context, never for presenting
+/// the network as currently healthy or authorizing a launch.
+struct DiagnosticContextTracker: Equatable {
+    enum Transition: Equatable { case initial, stable, changed, unavailable }
+    private(set) var context: String?
+    private(set) var lastVerifiedAt: Date?
+    static let grace: TimeInterval = 10
+
+    mutating func observe(_ candidate: String?, observedAt: Date) -> Transition {
+        guard let candidate, !candidate.isEmpty else { return .unavailable }
+        guard let context else {
+            self.context = candidate
+            lastVerifiedAt = observedAt
+            return .initial
+        }
+        guard context != candidate else {
+            // Re-reading the same snapshot must not extend the retained
+            // binding window. Only a genuinely newer backend observation does.
+            if lastVerifiedAt.map({ observedAt > $0 }) ?? true { lastVerifiedAt = observedAt }
+            return .stable
+        }
+        self.context = candidate
+        lastVerifiedAt = observedAt
+        return .changed
+    }
+
+    func retained(at now: Date) -> String? {
+        guard let context, let lastVerifiedAt,
+              now.timeIntervalSince(lastVerifiedAt) >= 0,
+              now.timeIntervalSince(lastVerifiedAt) <= Self.grace else { return nil }
+        return context
+    }
+}
+
+/// Wire-compatible with Rust `receipts::tag_signature`. Keep all four fields:
+/// global mode still needs the selected-node field for receipt validation.
+func tagReceiptContext(endpoint: String, mode: String, selectedNode: String, globalNode: String) -> String? {
+    guard !endpoint.isEmpty, !mode.isEmpty, !selectedNode.isEmpty, !globalNode.isEmpty else { return nil }
+    return [endpoint, mode, selectedNode, globalNode].joined(separator: "|")
 }
 
 enum Page: String, CaseIterable {
@@ -72,7 +128,7 @@ enum Page: String, CaseIterable {
         case .overview: return "后台状态、入口与当前检测结果"
         case .network: return "区分代理设置与实际连接证据"
         case .processes: return "Claude 及关联进程的最近一次采样"
-        case .events: return "查看已有监控日志中的最近 100 条记录"
+        case .events: return "查看和筛选本地保留的事件与检测记录"
         case .dns: return "手动检查 DNS 递归出口与预期解析器"
         case .webrtc: return "手动检查当前 WebView 的公网候选和 HTTP 出口"
         case .switcher: return "启动条件、Claude 启动与本地资料槽位"
@@ -108,18 +164,16 @@ final class MonitorStore: ObservableObject {
     private var lastBackgroundRead: Date = .distantPast
     private var backgroundReadRunning = false
     private var environmentRefreshScheduler = EnvironmentRefreshScheduler()
-    private var lastValidSnapshotContext: String?
+    private var diagnosticContext = DiagnosticContextTracker()
     private var refreshGate = MonitorRefreshGate()
     init(leakChecks: LeakCheckStore? = nil, aiChecks: AIProbeStore? = nil) {
         self.leakChecks = leakChecks ?? LeakCheckStore()
         self.aiChecks = aiChecks ?? AIProbeStore()
-        let context: () -> String? = { [weak self] in
-            guard let proxy = self?.proxy, proxy.entryState == "verified",
-                  proxy.apiState == "available", proxy.coversProxy else { return nil }
-            return [proxy.endpoint, proxy.mode, proxy.selectedNode, proxy.globalNode].joined(separator: "|")
-        }
-        self.leakChecks.contextProvider = context
-        self.switcher.diagnosticContextProvider = context
+        let bindingContext: () -> String? = { [weak self] in self?.retainedDiagnosticContext() }
+        let currentContext: () -> String? = { [weak self] in self?.currentDiagnosticContext() }
+        self.leakChecks.contextProvider = bindingContext
+        self.leakChecks.automaticContextProvider = currentContext
+        self.switcher.diagnosticContextProvider = bindingContext
         self.leakChecks.onDNSComplete = { [weak self] result in
             guard let self else { return false }
             return await self.switcher.recordDNSLeak(result)
@@ -138,7 +192,7 @@ final class MonitorStore: ObservableObject {
         self.switcher.onWebRTCRiskRecorded = { [weak self] in
             Task { await self?.switcher.refreshBackground() }
         }
-        self.aiChecks.contextProvider = context
+        self.aiChecks.contextProvider = bindingContext
         self.aiChecks.onResult = { [weak self] result in
             let ip = result.exitIP
             guard !ip.isEmpty else { return }
@@ -195,10 +249,16 @@ final class MonitorStore: ObservableObject {
             aiChecks.now = completedAt
             switch result {
             case .success(let value):
-                snapshot = value
+                // The backend capture timestamp is authoritative for display
+                // freshness.  Move the clock before publishing the value so a
+                // just-arrived Native result cannot look "from the future".
+                let captured = Date(timeIntervalSince1970: value.capturedAt)
+                if captured > now { now = captured; leakChecks.now = captured; aiChecks.now = captured }
                 error = nil
+                let transition = observeDiagnosticContext(from: value, at: completedAt)
+                snapshot = value
                 if automatic {
-                    invalidateEnvironmentRequestForRealContextChange()
+                    if transition == .changed { switcher.invalidateCurrentEnvironmentRequest() }
                     leakChecks.refreshWebRTCIfNeeded()
                     refreshEnvironmentIfNeeded()
                 }
@@ -221,30 +281,65 @@ final class MonitorStore: ObservableObject {
         }
     }
     private func refreshEnvironmentIfNeeded() {
-        let usableContext = snapshotContext()
+        let usableContext = currentDiagnosticContext()
         guard environmentRefreshScheduler.claim(context: usableContext, now: Date(),
                                                 switcherBusy: switcher.readingEnvironment || switcher.busy) != nil else { return }
         Task { @MainActor [weak self] in
             guard let self else { return }
             let dnsRecorded = await self.leakChecks.ensureFreshDNSReceipt()
-            guard self.snapshotContext() == usableContext else {
+            guard self.currentDiagnosticContext() == usableContext else {
                 self.environmentRefreshScheduler.complete(context: usableContext, accepted: false, now: Date())
                 return
             }
             let accepted = await self.switcher.detectCurrentEnvironment()
+            // Do not let a read begun on an older proxy identity publish a
+            // complete environment/launch-preview pair after a new identity
+            // was confirmed while it was running.
+            guard self.currentDiagnosticContext() == usableContext else {
+                self.environmentRefreshScheduler.complete(context: usableContext, accepted: false, now: Date())
+                return
+            }
             self.environmentRefreshScheduler.complete(context: usableContext, accepted: dnsRecorded && accepted, now: Date())
         }
     }
-    private func snapshotContext() -> String? {
-        guard let value = proxy, value.entryState == "verified", value.apiState == "available",
-              value.coversProxy, !value.endpoint.isEmpty, !value.mode.isEmpty, !value.currentNode.isEmpty else { return nil }
-        return [value.endpoint, value.mode, value.currentNode].joined(separator: "|")
+    private func context(from value: ProxySnapshot?) -> String? {
+        guard let value, value.entryState == "verified", value.apiState == "available",
+              value.coversProxy else { return nil }
+        // Must exactly match receipts::tag_signature: DNS/WebRTC receipts bind
+        // themselves to both selected and global node values, not a collapsed
+        // mode-dependent display node.
+        return tagReceiptContext(endpoint: value.endpoint, mode: value.mode,
+                                 selectedNode: value.selectedNode, globalNode: value.globalNode)
     }
-    private func invalidateEnvironmentRequestForRealContextChange() {
-        guard let context = snapshotContext() else { return }
-        defer { lastValidSnapshotContext = context }
-        guard let previous = lastValidSnapshotContext, previous != context else { return }
-        switcher.invalidateCurrentEnvironmentRequest()
+    private func observeDiagnosticContext(from value: MonitorSnapshot, at date: Date) -> DiagnosticContextTracker.Transition {
+        let proxy = freshProxy(in: value, at: date)
+        let sourceTime = proxy.map { Date(timeIntervalSince1970: $0.observedAt) } ?? date
+        return diagnosticContext.observe(context(from: proxy), observedAt: sourceTime)
+    }
+    /// Only a directly verified identity can start a new environment round.
+    /// A short sampler gap can retain its predecessor for an in-flight probe,
+    /// but cannot create a new green environment receipt.
+    private func currentDiagnosticContext() -> String? {
+        context(from: freshProxy(in: snapshot, at: now))
+    }
+    private func retainedDiagnosticContext() -> String? {
+        guard !hasExplicitProxyFailure else { return nil }
+        return diagnosticContext.retained(at: now)
+    }
+    private var hasExplicitProxyFailure: Bool {
+        guard let value = freshRawProxy(in: snapshot, at: now) else { return false }
+        return value.entryState == "mismatch" || value.apiState == "mismatch" || value.selectionChanged
+    }
+    private func freshRawProxy(in snapshot: MonitorSnapshot?, at date: Date) -> ProxySnapshot? {
+        guard error == nil, let snapshot,
+              MonitorSnapshotTiming.isCurrent(capturedAt: snapshot.capturedAt, now: date.timeIntervalSince1970),
+              let value = snapshot.proxy else { return nil }
+        let age = date.timeIntervalSince1970 - value.observedAt
+        return (0...30).contains(age) ? value : nil
+    }
+    private func freshProxy(in snapshot: MonitorSnapshot?, at date: Date) -> ProxySnapshot? {
+        guard snapshot?.proxyError == nil else { return nil }
+        return freshRawProxy(in: snapshot, at: date)
     }
     private func requestEnvironmentRefreshAfterDNS() {
         // Do not merge a DNS-only receipt into a prior observation.  The next
@@ -328,9 +423,8 @@ final class MonitorStore: ObservableObject {
         }
     }
     var proxy: ProxySnapshot? {
-        guard live, snapshot?.proxyError == nil, let value = snapshot?.proxy else { return nil }
-        let age = now.timeIntervalSince1970 - value.observedAt
-        return age >= 0 && age <= 30 ? value : nil
+        guard live else { return nil }
+        return freshProxy(in: snapshot, at: now)
     }
     var proxyError: String? {
         if let error { return error }

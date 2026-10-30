@@ -21,6 +21,10 @@ struct ServerTargetTests {
         }
         expect(AITargetService.identify("API.Anthropic.com.:443") == .claude, "Claude exact domain family")
         expect(AITargetService.identify("ws.chatgpt.com") == .chatGPT, "ChatGPT service subdomain")
+        let rustWire = #"{"host":"api.chatgpt.com","basis":"dns_reference","address":"1.1.1.1","addresses":["1.1.1.1"],"countryCode":"AU","country":"","region":"Queensland","city":"South Brisbane","status":"ready","message":"DNS 解析与 IP 归属仅作参考，非这条连接的实测目标 IP。","queriedAt":100,"expiresAt":700,"dnsSource":"Cloudflare DoH","geoSource":"IPinfo"}"#
+        let decoded = try JSONDecoder().decode(ServerReference.self, from: Data(rustWire.utf8))
+        expect(decoded.host == "api.chatgpt.com" && decoded.queriedAt == 100 && decoded.expiresAt == 700,
+               "Rust server-reference wire fields decode in Swift")
         for host in ["chatgpt.com.evil.test", "fakechatgpt.com", "chatgpt.com@evil.test", "https://openai.com", "127.0.0.1", "openai.com:0"] {
             expect(AITargetService.identify(host) == nil, "reject spoof or invalid host \(host)")
         }

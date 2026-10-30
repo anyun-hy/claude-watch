@@ -1,0 +1,16 @@
+Claude Watch Rust migration
+
+Feature and behavior reference:
+https://github.com/YOURSJEYO/claude-switcher
+The pinned revisions and reference details are recorded in UPSTREAM.json.
+The upstream MIT notice is retained in LICENSE.
+
+The Rust candidate implements the adapted runtime behavior through Claude
+Watch's shared Rust services. It does not bundle or execute the former Python
+backend, the original account shell engine, or the legacy baseline/preflight
+commands. Existing account and transaction formats are read only as needed
+by the common account and recovery services.
+
+The fixed watch-admin.sh system adapter and native Swift components remain
+for privileged macOS actions and operating-system interfaces. They do not
+provide an alternate launch authorization or protection policy.

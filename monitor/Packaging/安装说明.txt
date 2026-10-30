@@ -90,16 +90,11 @@ io.local.claudewatch.agent；确认后保留既有账号、日志、自动会话
 从 Dock 或普通终端直接启动 Claude、Codex、ChatGPT，不会登记受控授权会话。
 Claude Watch 会停止没有有效受控会话的 Claude Desktop；请从“启动与账号”页的
 “检查并启动 Claude”进入。普通启动无需初始化 A/B 账号槽，也无需手工配置 IP。
-完成后台升级后，请在终端使用以下入口。每个入口都会先做后台健康检查和
-环境预检，通过后才登记受控会话：
-
-  "$HOME/Library/Application Support/ClaudeWatch/claude-watch.sh" launch-codex
-  "$HOME/Library/Application Support/ClaudeWatch/claude-watch.sh" launch-codex-cli -- [Codex CLI 参数]
-  "$HOME/Library/Application Support/ClaudeWatch/claude-watch.sh" launch-chatgpt
-
-Codex 桌面端与 ChatGPT 桌面端共用同一个 ChatGPT.app / com.openai.codex
-桌面外壳，因此不能同时登记两套桌面会话。CLI 可在 `--` 后附加正常的
-Codex CLI 参数。
+本节确认的受控保护入口是 Claude Watch 界面的“检查并启动 Claude”。
+Codex/ChatGPT 的进程观察、连接显示和退出管理，不等于已有 Claude 的整套会话 IP 保护。
+Rust 迁移候选的其他桌面/CLI 启动已接入统一服务，并通过替代进程隔离验证；
+真实AI服务与完整窗口验收仍未完成，不作为当前已安装版的可用入口承诺。
+这些入口不使用旧脚本、手工环境基线或旧预检，也不扩展 Claude 的自动退出保护。
 
 卸载后台
 ----------

@@ -10,9 +10,12 @@ case "${1:---build-only}" in
 esac
 [[ $# -le 1 ]] || { printf 'Only one test mode is accepted.\n' >&2; exit 2; }
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
-TEST_APP="$ROOT/build/Leak Bridge Tests.app"
+TEST_APP="${LEAK_BRIDGE_APP:-$ROOT/build/Leak Bridge Tests.app}"
 mkdir -p "$TEST_APP/Contents/MacOS" "$TEST_APP/Contents/Resources" "$ROOT/build/test-module-cache"
 cp "$ROOT/Resources/webrtc_probe.html" "$ROOT/Resources/webrtc_probe.js" "$TEST_APP/Contents/Resources/"
+cat > "$TEST_APP/Contents/Resources/BuildInfo.plist" <<'BACKEND'
+<?xml version="1.0"?><plist version="1.0"><dict><key>BackendVariant</key><string>stable</string></dict></plist>
+BACKEND
 cat > "$TEST_APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -24,7 +27,7 @@ cat > "$TEST_APP/Contents/Info.plist" <<'PLIST'
 PLIST
 xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx14.0 -D LEAK_BRIDGE_TEST \
   -module-cache-path "$ROOT/build/test-module-cache" -framework AppKit -framework WebKit \
-  "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/Sources/LeakCheckStore.swift" "$ROOT/tests/LeakBridgeTests.swift" \
+  "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/Sources/IPLeakDNSRunner.swift" "$ROOT/Sources/EventDiagnostics.swift" "$ROOT/Sources/LeakCheckStore.swift" "$ROOT/tests/LeakBridgeTests.swift" \
   -o "$TEST_APP/Contents/MacOS/LeakBridgeTests"
 if [[ "$RUN_NATIVE" == 1 ]]; then
   "$TEST_APP/Contents/MacOS/LeakBridgeTests"

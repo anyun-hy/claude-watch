@@ -4,7 +4,7 @@ import plistlib
 import time
 from pathlib import Path
 
-from .common import SwitcherError, atomic_json, digest, event, load_config, operation_lock, read_json, reject_symlink, sync_directory, validate_config
+from .common import SwitcherError, atomic_json, digest, event, guard_policy_digest, load_config, operation_lock, read_json, reject_symlink, sync_directory, validate_config
 
 UPDATE_LABEL = "io.local.claudewatch.update"
 TIMEZONE_LABEL = "io.local.claudewatch.timezone"
@@ -268,7 +268,7 @@ def guard_tick(paths, system):
                     session = {"state": "unknown", "reason": {"code": "session_changed",
                                "detail": "守护检查期间已建立新会话，未退出 Claude", "source": "本机守护", "observed_at": time.time()}}
         receipt = {"status": "ok" if healthy else "degraded", "action": action, "session_guard": session,
-                   "time": time.time(), "policy": digest(config)}
+                   "time": time.time(), "policy": digest(config), "guard_policy_v1": guard_policy_digest(config)}
     except SwitcherError as exc:
         receipt = {"status": "unknown", "code": exc.code, "message": str(exc), "time": time.time(),
                    "policy": digest(config or {}), "action": "observe"}

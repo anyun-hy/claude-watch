@@ -23,7 +23,10 @@ private struct LeakInspectorPage: View {
     @State private var detailsExpanded = false
     @State private var localExpanded = false
     private var isDNS: Bool { kind == .dns }
-    private var state: LeakCheckState { isDNS ? store.dns : store.rtc }
+    private var isIPLeak: Bool { isDNS && store.dnsSource == .ipLeak }
+    private var state: LeakCheckState { isIPLeak ? store.ipLeakDNS : isDNS ? store.dns : store.rtc }
+    private var currentProgress: String? { isIPLeak ? store.ipLeakProgress : store.progress[kind] }
+    private var currentBrowser: WKWebView? { isIPLeak ? store.ipLeakBrowserView : store.browserViews[kind] }
     // The latest result remains authoritative for the verdict and backend record.
     // The display result may be the previous good sample after a collector failure.
     private var latestResult: LeakProbeResult? { state.result }
@@ -46,7 +49,8 @@ private struct LeakInspectorPage: View {
                 symbol: isDNS ? "network" : "antenna.radiowaves.left.and.right",
                 color: isDNS ? style.network : style.location, p: p) {
                     Button {
-                        state.running ? store.cancel(kind) : store.start(kind)
+                        if isIPLeak { state.running ? store.cancelIPLeakDNS() : store.startIPLeakDNS() }
+                        else { state.running ? store.cancel(kind) : store.start(kind) }
                     } label: {
                         Label(state.running ? "取消检测" : "开始检测", systemImage: state.running ? "stop.fill" : "play.fill")
                             .font(.body.weight(.medium)).padding(.horizontal, 4).frame(minHeight: 28)
@@ -54,17 +58,23 @@ private struct LeakInspectorPage: View {
                         .accessibilityLabel(state.running ? "取消\(title)" : "开始\(title)")
                 }
             HStack(spacing:16) {
-                Picker("检测来源",selection:Binding(get:{store.source},set:{store.changeSource($0)})) {
-                    ForEach(LeakProbeSource.allCases,id: \.self) { Text($0.rawValue).tag($0) }
-                }.pickerStyle(.segmented).frame(width:280).disabled(store.dns.running || store.rtc.running)
-                if isDNS && store.source == .netCoffee {
-                    Picker("查询轮次",selection:$store.deepDNS) { Text("标准 · 5 轮").tag(false); Text("深度 · 8 轮").tag(true) }
+                if isDNS {
+                    Picker("检测来源",selection:Binding(get:{store.dnsSource},set:{store.changeDNSSource($0)})) {
+                        ForEach(DNSProbeSource.allCases,id: \.self) { Text($0.rawValue).tag($0) }
+                    }.pickerStyle(.segmented).frame(width:280)
+                } else {
+                    Picker("检测来源",selection:Binding(get:{store.source},set:{store.changeSource($0)})) {
+                        ForEach(LeakProbeSource.allCases,id: \.self) { Text($0.rawValue).tag($0) }
+                    }.pickerStyle(.segmented).frame(width:280).disabled(store.dns.running || store.rtc.running)
+                }
+                if isDNS {
+                    Picker("查询轮次",selection:isIPLeak ? $store.ipLeakDeepDNS : $store.deepDNS) { Text("标准 · 5 轮").tag(false); Text("深度 · 8 轮").tag(true) }
                         .frame(width:180).disabled(state.running)
                 }
                 Spacer(minLength:0)
             }
-            if state.running, let progress = store.progress[kind] { Label(progress,systemImage:"arrow.triangle.2.circlepath").font(.callout).foregroundStyle(style.network) }
-            if let browser = store.browserViews[kind] {
+            if state.running, let progress = currentProgress { Label(progress,systemImage:"arrow.triangle.2.circlepath").font(.callout).foregroundStyle(style.network) }
+            if let browser = currentBrowser {
                 CoffeeCollectorView(browser: browser).frame(height:72).clipShape(RoundedRectangle(cornerRadius:10))
             }
             InspectorStatus(verdict: state.verdict, running: state.running, finishedAt: latestResult?.finishedAt, p: p)
@@ -87,8 +97,13 @@ private struct LeakInspectorPage: View {
                 }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
             }
             details
-            if store.source == .netCoffee { Text("检测结果在环境状态、DNS 与 WebRTC 页面共享；离开本页不会取消正在进行的采样。").font(.caption).foregroundStyle(p.secondary) }
-            Label(isDNS ? (store.source == .netCoffee ? "本机 WebView 发起查询，Net.Coffee 返回权威 DNS 观测；不代表所有 AI 应用。" : "仅代表本机 dig / resolv.conf 的解析路径。")
+            if isIPLeak {
+                Text("IPLeak 为备用对照，不参与环境状态或启动保护；Net.Coffee 主检测独立运行。")
+                    .font(.caption).foregroundStyle(p.secondary)
+            } else if isDNS || store.source == .netCoffee {
+                Text("检测结果在环境状态、DNS 与 WebRTC 页面共享；离开本页不会取消正在进行的采样。").font(.caption).foregroundStyle(p.secondary)
+            }
+            Label(isDNS ? (isIPLeak ? "本机 WebView 发起查询，IPLeak 返回 DNS 观测；不代表所有 AI 应用。" : "本机 WebView 发起查询，Net.Coffee 返回权威 DNS 观测；不代表所有 AI 应用。")
                   : "仅代表当前检测 WebView，不代表 AI 应用或其他浏览器。", systemImage: "info.circle")
                 .font(.caption).foregroundStyle(p.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -114,7 +129,11 @@ private struct LeakInspectorPage: View {
     }
     private var referenceSummary: some View {
         VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing:8) { BrandLogo(brand:.cloudflare,size:18); Text("HTTP 出口参考").font(.headline) }
+            HStack(spacing:8) {
+                if isIPLeak { InspectorIcon(name:"globe",color:style.transport) }
+                else { BrandLogo(brand:.cloudflare,size:18) }
+                Text("HTTP 出口参考").font(.headline)
+            }
             if reference.isEmpty {
                 Text(result == nil ? "未检测" : "未取得")
                     .font(.system(size: 24, weight: .semibold, design: .monospaced))
@@ -162,9 +181,9 @@ private struct LeakInspectorPage: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Divider().overlay(style.border)
-            Label(store.source == .netCoffee ? "Net.Coffee 归属 · Cloudflare HTTP · 本机采样" : isDNS ? "Akamai DNS · Cloudflare HTTP" : "Google / Cloudflare STUN", systemImage: "server.rack")
+            Label(isIPLeak ? "IPLeak DNS · IPLeak HTTP · 本机采样" : store.source == .netCoffee || isDNS ? "Net.Coffee 归属 · Cloudflare HTTP · 本机采样" : "Google / Cloudflare STUN", systemImage: "server.rack")
                 .font(.caption).foregroundStyle(style.transport)
-            Text(isDNS ? (store.source == .netCoffee ? "DNS 遵循 WebView 路由；API / HTTP 经 7890。" : "DNS 按系统解析路径，HTTP 参考经 7890。") : "按当前系统路由检测，不强制 UDP 走 7890。")
+            Text(isDNS ? (isIPLeak ? "DNS 与 HTTP 参考均通过当前检测 WebView。" : "DNS 遵循 WebView 路由；API / HTTP 经 7890。") : "按当前系统路由检测，不强制 UDP 走 7890。")
                 .font(.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -241,7 +260,7 @@ private struct LeakInspectorPage: View {
                                 .foregroundStyle(p.amber).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                         }
                         if let raw = result.externalJSON {
-                            Text("Net.Coffee 原始 API 回执（含来源、时间、HTTP 状态与未裁剪 JSON）").font(.callout.weight(.medium))
+                            Text(isIPLeak ? "IPLeak 回执（DNS 地址、计数与归属摘要）" : "Net.Coffee 原始 API 回执（含来源、时间、HTTP 状态与未裁剪 JSON）").font(.callout.weight(.medium))
                             Text(raw).font(.system(.caption,design:.monospaced)).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
                         }
                         ForEach(Array(result.details.enumerated()), id: \.offset) { _, detail in

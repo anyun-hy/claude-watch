@@ -11,6 +11,7 @@ from .common import SwitcherError, atomic_json, load_config, operation_lock, rea
 
 SCHEMA = 1
 UNKNOWN_LIMIT = 2
+UNKNOWN_GRACE = 15
 RISK_EVIDENCE_TTL = 300
 AUDIT_EGRESS_TTL = 30
 GUARD_EGRESS_TTL = 10
@@ -101,7 +102,7 @@ def begin_launch_session(paths, system, audit_receipt):
         created = time.time()
         value = {"schema": SCHEMA, "state": "pending", "session_id": str(uuid.uuid4()), "created_at": created,
                  "context_id": context_id[:160], "audit_observation_id": str(audit_receipt.get("observation_id") or "")[:80],
-                 "baseline": current, "unknown_count": 0, "risk_evidence": copy.deepcopy(initial_risk), "reason": None,
+                 "baseline": current, "unknown_count": 0, "unknown_since": None, "risk_evidence": copy.deepcopy(initial_risk), "reason": None,
                  "pending_deadline": created + 15, "launcher": None}
         atomic_json(state_path(paths), value)
         return value
@@ -163,12 +164,20 @@ def record_uncertain(paths, code, detail):
         return {"state": "locked", "reason": value.get("reason"), "session": value}
     if not value or value.get("state") not in ("active", "pending"):
         return {"state": "risk", "reason": _reason("session_missing", "Claude 未绑定受控启动会话")}
+    now = time.time()
+    raw_since = value.get("unknown_since")
+    try: since = float(raw_since)
+    except (TypeError, ValueError): since = None
+    invalid_since = raw_since is not None and (since is None or not math.isfinite(since) or since <= 0 or since > now)
+    if invalid_since or since is None:
+        since = now
+        value["unknown_since"] = since
     value["unknown_count"] = int(value.get("unknown_count", 0)) + 1
     value["last_reason"] = _reason(code, detail)
     value["last_risk_state"] = "unknown"
     if not _save(paths, value, value["session_id"]):
         return {"state": "unknown", "reason": _reason("session_changed", "会话已由新的受控启动替换")}
-    if value["unknown_count"] < UNKNOWN_LIMIT:
+    if value["unknown_count"] < UNKNOWN_LIMIT or (not invalid_since and now - since < UNKNOWN_GRACE):
         return {"state": "unknown", "reason": value["last_reason"], "session": value}
     locked = lock_session(paths, code, detail, value["session_id"])
     if not locked: return {"state": "unknown", "reason": _reason("session_changed", "会话已由新的受控启动替换")}
@@ -203,16 +212,7 @@ def check_session(paths, system, config, *, risk_reader=None):
     try:
         identity_matches = system.session_desktop_matches(value.get("desktop"))
     except Exception:
-        value["unknown_count"] = int(value.get("unknown_count", 0)) + 1
-        value["last_reason"] = _reason("session_identity_unconfirmed", "Claude 主进程身份暂未能复核")
-        value["last_risk_state"] = "unknown"
-        if not _save(paths, value, value["session_id"]):
-            return {"state": "unknown", "reason": _reason("session_changed", "会话已由新的受控启动替换")}
-        if value["unknown_count"] < UNKNOWN_LIMIT:
-            return {"state": "unknown", "reason": value["last_reason"], "session": value}
-        locked = lock_session(paths, "session_identity_unconfirmed", "Claude 主进程身份连续未能复核", value["session_id"])
-        if not locked: return {"state": "unknown", "reason": _reason("session_changed", "会话已由新的受控启动替换")}
-        return {"state": "risk", "reason": locked["reason"], "session": locked}
+        return record_uncertain(paths, "session_identity_unconfirmed", "Claude 主进程身份暂未能复核")
     if not identity_matches:
         locked = lock_session(paths, "session_identity_changed", "运行中的 Claude 主进程不再匹配受控启动身份", value["session_id"])
         if not locked: return {"state": "unknown", "reason": _reason("session_changed", "会话已由新的受控启动替换")}
@@ -244,7 +244,7 @@ def check_session(paths, system, config, *, risk_reader=None):
         locked = lock_session(paths, "evidence_expired", "DNS/WebRTC 有效风险证据已超过 300 秒", value["session_id"], current=current, risk_evidence=risk)
         if not locked: return {"state": "unknown", "reason": _reason("session_changed", "会话已由新的受控启动替换")}
         return {"state": "risk", "baseline": baseline, "current": current, "reason": locked["reason"], "risk_evidence": risk, "session": locked}
-    value.update(unknown_count=0, last_check=current, last_risk_state=risk.get("state"),
+    value.update(unknown_count=0, unknown_since=None, last_check=current, last_risk_state=risk.get("state"),
                  last_reason=None if risk.get("state") == "safe" else risk.get("reason"))
     if not _save(paths, value, value["session_id"]):
         return {"state": "unknown", "reason": _reason("session_changed", "会话已由新的受控启动替换")}
