@@ -463,6 +463,8 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                 identities: BTreeMap::new(),
                 roles: json!({}),
                 unavailable: vec![],
+                diagnostic_reasons: BTreeMap::new(),
+                confirmed_exited_count: 0,
                 complete: true,
                 observed_at: native::now(),
             };

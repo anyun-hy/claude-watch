@@ -135,6 +135,10 @@ struct EventDiagnosticInput: Encodable, Sendable {
     }
 }
 
+struct ReceiptDiagnosticInput: Encodable, Sendable {
+    let kind, outcome, code, run_id: String
+}
+
 @MainActor final class DiagnosticLogStatus: ObservableObject {
     static let shared = DiagnosticLogStatus()
     @Published var error: String?

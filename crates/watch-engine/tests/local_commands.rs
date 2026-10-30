@@ -342,3 +342,26 @@ fn cli_targets_need_parent_apply_and_cannot_borrow_it_from_opaque_child_args() {
             .any(|r| r["id"] == "cli_proxy"));
     }
 }
+
+#[test]
+fn receipt_diagnostic_command_preserves_run_and_rejects_private_fields() {
+    let home = Home::new(); let run = uuid::Uuid::new_v4().to_string();
+    let input = json!({"kind":"dns","outcome":"rejected","code":"dns_context_changed","run_id":run});
+    assert_eq!(call(&home, &["receipt-diagnostic", "--apply"], Some(input.clone())).0, 0);
+    for (kind, code) in [("dns", "busy"), ("dns", "invalid_dns_receipt"), ("webrtc", "webrtc_context_unavailable")] {
+        let item = json!({"kind":kind,"outcome":"rejected","code":code,"run_id":run});
+        assert_eq!(call(&home, &["receipt-diagnostic", "--apply"], Some(item)).0, 0);
+    }
+    let accepted = json!({"kind":"dns","outcome":"accepted","code":"none","run_id":run});
+    assert_eq!(call(&home, &["receipt-diagnostic", "--apply"], Some(accepted)).0, 0);
+    let mut private = input.clone(); private["message"] = json!("private 203.0.113.9");
+    assert_ne!(call(&home, &["receipt-diagnostic", "--apply"], Some(private)).0, 0);
+    let (_, history) = call(&home, &["event-history"], Some(json!({"filter":"all","query":"","offset":0})));
+    assert_eq!(history["total"], 5);
+    assert!(history.to_string().contains("回执未接受"));
+    assert!(history.to_string().contains("不代表检测通过"));
+    assert!(history.to_string().contains("webrtc_context_unavailable"));
+    assert!(history.to_string().contains("dns_context_changed"));
+    assert!(history.to_string().contains(&run));
+    assert!(!history.to_string().contains("203.0.113.9"));
+}

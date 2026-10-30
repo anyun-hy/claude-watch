@@ -1,6 +1,6 @@
 //! Best-effort, bounded event writer. Producers never wait for filesystem I/O.
 use claude_watch_runtime::{
-    events::{EventFields, EventStore},
+    events::{EventFields, EventStore, SamplingDiagnostics},
     storage::StateStore,
 };
 use serde_json::Value;
@@ -125,6 +125,7 @@ pub struct SamplingHistory {
     exited_total: u32,
     reason_totals: BTreeMap<String, u32>,
     partial_reasons: Vec<String>,
+    last_health_diagnostics: Option<SamplingDiagnostics>,
 }
 impl SamplingHistory {
     pub fn observe(&mut self, queue: &DiagnosticQueue, snapshot: &Value, at: f64) {
@@ -136,6 +137,17 @@ impl SamplingHistory {
         );
         let round = uuid(&observation["roundID"]);
         let counts = reasons(&observation["dropped"]);
+        let process_counts: BTreeMap<String, u32> =
+            serde_json::from_value(observation["processReasonCounts"].clone()).unwrap_or_default();
+        let diagnostics: Option<SamplingDiagnostics> =
+            serde_json::from_value(snapshot["samplingDiagnostics"].clone())
+                .ok()
+                .filter(SamplingDiagnostics::valid);
+        let health_reason_changed = match (&self.last_health_diagnostics, &diagnostics) {
+            (Some(old), Some(new)) => !old.same_condition(new),
+            (None, Some(_)) | (Some(_), None) => true,
+            _ => false,
+        };
         let exited = observation["confirmedExitedCount"]
             .as_u64()
             .and_then(|v| u32::try_from(v).ok())
@@ -151,7 +163,13 @@ impl SamplingHistory {
         let reason_set: Vec<_> = counts
             .iter()
             .filter(|(_, v)| **v > 0)
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| format!("socket:{k}"))
+            .chain(
+                process_counts
+                    .iter()
+                    .filter(|(_, v)| **v > 0)
+                    .map(|(k, _)| format!("process:{k}")),
+            )
             .collect();
         let reason_changed = connection == "partial"
             && self.connection.as_ref().is_some_and(|v| v.0 == "partial")
@@ -163,7 +181,8 @@ impl SamplingHistory {
             ("connection", connection.clone(), &mut self.connection),
         ] {
             let changed = previous.as_ref().is_none_or(|(old, _)| old != &current)
-                || (operation == "connection" && reason_changed);
+                || (operation == "connection" && reason_changed)
+                || (operation == "health" && health_reason_changed);
             if changed {
                 queue.send(
                     "sampling-state",
@@ -176,6 +195,9 @@ impl SamplingHistory {
                         round_id: round.clone(),
                         confirmed_exited_count: (operation == "connection").then_some(exited),
                         reason_counts: (operation == "connection").then(|| counts.clone()),
+                        process_reason_counts: (operation == "connection")
+                            .then(|| process_counts.clone()),
+                        sampling_diagnostics: diagnostics.clone(),
                         ..Default::default()
                     },
                     at,
@@ -194,6 +216,9 @@ impl SamplingHistory {
                             .then_some(self.exited_total),
                         reason_counts: (operation == "connection")
                             .then(|| self.reason_totals.clone()),
+                        process_reason_counts: (operation == "connection")
+                            .then(|| process_counts.clone()),
+                        sampling_diagnostics: diagnostics.clone(),
                         ..Default::default()
                     },
                     at,
@@ -203,6 +228,7 @@ impl SamplingHistory {
                 *previous = Some((current, at));
             }
         }
+        self.last_health_diagnostics = diagnostics;
         self.partial_reasons = if connection == "partial" {
             reason_set
         } else {
@@ -224,13 +250,24 @@ impl GuardHistory {
     pub fn observe(&mut self, queue: &DiagnosticQueue, receipt: &Value, at: f64) {
         let session = uuid(&receipt["session_id"]);
         let guard = &receipt["session_guard"];
-        let current = state(
-            &guard["state"],
-            &[
-                "idle", "safe", "risk", "locked", "unknown", "missing", "pending",
-            ],
-        );
-        let code = match guard["reason"]["code"].as_str() {
+        let current = if guard.is_null()
+            && receipt["status"] == "disabled"
+            && receipt["action"] == "observe"
+            && receipt["code"].is_null()
+        {
+            "disabled".to_owned()
+        } else {
+            state(
+                &guard["state"],
+                &[
+                    "idle", "safe", "risk", "locked", "unknown", "missing", "pending",
+                ],
+            )
+        };
+        let reason = guard["reason"]["code"]
+            .as_str()
+            .or_else(|| receipt["code"].as_str());
+        let code = match reason {
             None => "none",
             Some(
                 code @ ("egress_ip_changed"
@@ -247,7 +284,18 @@ impl GuardHistory {
                 | "session_identity_unconfirmed"
                 | "session_pending"
                 | "risk_evidence_unavailable"
-                | "risk_evidence_missing"),
+                | "risk_evidence_missing"
+                | "invalid_config"
+                | "invalid_session"
+                | "invalid_native_observation"
+                | "native_observation_unavailable"
+                | "desktop_inventory_incomplete"
+                | "process_metadata_unavailable"
+                | "state_io_failed"
+                | "unsafe_path"
+                | "home_owner_mismatch"
+                | "clock_unavailable"
+                | "sampling_failed"),
             ) => code,
             _ => "other",
         };
@@ -719,6 +767,100 @@ mod tests {
         assert!(rows.iter().any(|e| e.time == 1600.0
             && e.fields.operation.as_deref() == Some("connection")
             && e.fields.confirmed_exited_count == Some(0)));
+        drop(queue);
+        fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn disabled_idle_and_failed_sampling_are_distinct_and_risk_wins() {
+        let (path, store) = fixture();
+        let queue = DiagnosticQueue::new(store.clone());
+        let mut history = GuardHistory::default();
+        history.observe(
+            &queue,
+            &json!({"status":"disabled","action":"observe"}),
+            1000.0,
+        );
+        history.observe(
+            &queue,
+            &json!({"status":"ok","action":"observe","session_guard":{"state":"idle"}}),
+            1001.0,
+        );
+        history.observe(&queue, &json!({"status":"unknown","action":"observe","code":"state_io_failed","message":"private token 198.51.100.1"}), 1002.0);
+        history.observe(&queue, &json!({"status":"disabled","action":"observe","session_guard":{"state":"risk","reason":{"code":"egress_ip_changed"}}}), 1003.0);
+        let events = EventStore::new(store);
+        wait_for(|| {
+            events.history().is_ok_and(|h| {
+                h.events
+                    .iter()
+                    .filter(|e| e.category == "guard-decision")
+                    .count()
+                    == 4
+            })
+        });
+        let rows = events.history().unwrap().events;
+        let at = |time: f64| {
+            rows.iter()
+                .find(|e| e.category == "guard-decision" && e.time == time)
+                .unwrap()
+        };
+        assert_eq!(at(1000.0).fields.status.as_deref(), Some("disabled"));
+        assert_eq!(
+            at(1001.0).fields.previous_state.as_deref(),
+            Some("disabled")
+        );
+        assert_eq!(at(1001.0).fields.status.as_deref(), Some("idle"));
+        assert_eq!(at(1002.0).fields.status.as_deref(), Some("unknown"));
+        assert_eq!(at(1002.0).fields.code.as_deref(), Some("state_io_failed"));
+        assert_eq!(at(1003.0).fields.status.as_deref(), Some("risk"));
+        assert!(!serde_json::to_string(&rows)
+            .unwrap()
+            .contains("198.51.100.1"));
+        drop(queue);
+        fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn unchanged_health_and_partial_state_still_record_new_bounded_causes() {
+        let (path, store) = fixture();
+        let queue = DiagnosticQueue::new(store.clone());
+        let mut history = SamplingHistory::default();
+        let round = Uuid::new_v4().to_string();
+        let snapshot = |process_code: &str, bytes: &str| json!({"health":{"state":"degraded"},"proxy":{"connectionObservation":{"roundID":round,"collectorState":"partial","confirmedExitedCount":0,"dropped":{},"processReasonCounts":{process_code:1}}},"samplingDiagnostics":{"process_complete":false,"process_reasons":{process_code:1},"process_confirmed_exited_count":0,"process_sampled_at":1000.0,"network_quality":false,"network_round_id":round,"network_sampled_at":999.0,"network_reused":true,"activity_state":"ok","bytes_state":bytes,"activity_reasons":{},"activity_sampled_at":999.0,"publisher_error_code":null}});
+        history.observe(&queue, &snapshot("identity_unavailable", "empty"), 1001.0);
+        history.observe(
+            &queue,
+            &snapshot("root_arguments_unavailable", "unavailable"),
+            1002.0,
+        );
+        let events = EventStore::new(store);
+        wait_for(|| {
+            events.history().is_ok_and(|h| {
+                h.events
+                    .iter()
+                    .filter(|e| e.category == "sampling-state" && e.time == 1002.0)
+                    .count()
+                    == 2
+            })
+        });
+        let rows = events.history().unwrap().events;
+        let changed: Vec<_> = rows
+            .iter()
+            .filter(|e| e.category == "sampling-state" && e.time == 1002.0)
+            .collect();
+        assert_eq!(changed.len(), 2);
+        assert!(changed
+            .iter()
+            .all(|e| e
+                .fields
+                .sampling_diagnostics
+                .as_ref()
+                .is_some_and(|d| d.network_reused == Some(true)
+                    && d.network_sampled_at == Some(999.0)
+                    && d.process_sampled_at == Some(1000.0))));
+        assert!(changed.iter().any(|e| e
+            .fields
+            .process_reason_counts
+            .as_ref()
+            .is_some_and(|m| m.get("root_arguments_unavailable") == Some(&1))));
         drop(queue);
         fs::remove_dir_all(path).unwrap();
     }

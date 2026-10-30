@@ -33,6 +33,43 @@ fn valid_label(value: &str, maximum: usize) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"-_.:".contains(&c))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SamplingDiagnostics {
+    pub process_complete: Option<bool>,
+    pub process_reasons: BTreeMap<String, u32>,
+    pub process_confirmed_exited_count: u32,
+    pub process_sampled_at: Option<f64>,
+    pub network_quality: Option<bool>,
+    pub network_round_id: Option<String>,
+    pub network_sampled_at: Option<f64>,
+    pub network_reused: Option<bool>,
+    pub activity_state: String,
+    pub bytes_state: String,
+    pub activity_reasons: BTreeMap<String, u32>,
+    pub activity_sampled_at: Option<f64>,
+    pub publisher_error_code: Option<String>,
+}
+impl SamplingDiagnostics {
+    pub fn valid(&self) -> bool {
+        let process = ["inventory_partial","inventory_truncated","inventory_count_mismatch","identity_unavailable","inventory_deadline","bundle_identity_unavailable","root_arguments_unavailable","other"];
+        let activity = ["identity_before_unavailable","identity_after_unavailable","identity_unverified","file_sample_unavailable","byte_sample_unavailable","service_sample_unavailable","other"];
+        self.process_reasons.len() <= process.len() && self.process_reasons.keys().all(|k| process.contains(&k.as_str()))
+            && self.activity_reasons.len() <= activity.len() && self.activity_reasons.keys().all(|k| activity.contains(&k.as_str()))
+            && self.network_round_id.as_ref().is_none_or(|v| uuid::Uuid::parse_str(v).is_ok())
+            && self.publisher_error_code.as_ref().is_none_or(|v| ["invalid_native_observation","native_observation_unavailable","network_sample_missing","command_timeout","command_unavailable","command_output_oversize","command_wait_failed","native_observer_missing","invalid_command_encoding","lease_read_failed","invalid_lease","invalid_tracked","state_io_failed","unsafe_path","home_owner_mismatch","busy","sampling_failed","other"].contains(&v.as_str()))
+            && [self.process_sampled_at, self.network_sampled_at, self.activity_sampled_at].into_iter().flatten().all(|v| v.is_finite() && v > 0.0 && v <= 1.0e12)
+            && ["ok","partial","unavailable","no_targets","unknown"].contains(&self.activity_state.as_str())
+            && ["ok","empty","unavailable","no_targets","unknown"].contains(&self.bytes_state.as_str())
+    }
+    pub fn same_condition(&self, other: &Self) -> bool {
+        let keys = |values: &BTreeMap<String, u32>| values.iter().filter(|(_, count)| **count > 0).map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        self.process_complete == other.process_complete && keys(&self.process_reasons) == keys(&other.process_reasons)
+            && self.network_quality == other.network_quality && self.activity_state == other.activity_state
+            && self.bytes_state == other.bytes_state && keys(&self.activity_reasons) == keys(&other.activity_reasons) && self.publisher_error_code == other.publisher_error_code
+    }
+}
+
 /// The log schema intentionally has no arbitrary message, argv, URL, account,
 /// credential, cookie, token, controller secret, or process-command field.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -83,6 +120,10 @@ pub struct EventFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason_counts: Option<BTreeMap<String, u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_reason_counts: Option<BTreeMap<String, u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_diagnostics: Option<SamplingDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub egress_sampled_at: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_sampled_at: Option<f64>,
@@ -126,7 +167,9 @@ impl EventFields {
             return Err(invalid("事件进程身份无效"));
         }
         if [&self.run_id, &self.session_id, &self.correlation_id, &self.round_id].into_iter().flatten().any(|v| uuid::Uuid::parse_str(v).is_err()) { return Err(invalid("运行标识无效")); }
-        if self.previous_state.as_ref().is_some_and(|v| !matches!(v.as_str(), "running" | "degraded" | "ok" | "partial" | "empty" | "no_targets" | "unknown" | "failed" | "idle" | "safe" | "risk" | "locked" | "missing" | "pending")) { return Err(invalid("前一状态无效")); }
+        if self.previous_state.as_ref().is_some_and(|v| !matches!(v.as_str(), "running" | "degraded" | "ok" | "partial" | "empty" | "no_targets" | "unknown" | "failed" | "idle" | "safe" | "risk" | "locked" | "missing" | "pending" | "disabled")) { return Err(invalid("前一状态无效")); }
+        if self.process_reason_counts.as_ref().is_some_and(|m| m.len() > 8 || m.keys().any(|k| !["inventory_partial","inventory_truncated","inventory_count_mismatch","identity_unavailable","inventory_deadline","bundle_identity_unavailable","root_arguments_unavailable","other"].contains(&k.as_str()))) { return Err(invalid("进程采样原因无效")); }
+        if self.sampling_diagnostics.as_ref().is_some_and(|v| !v.valid()) { return Err(invalid("采样诊断无效")); }
         if self.reason_counts.as_ref().is_some_and(|m| m.len() > 12 || m.keys().any(|k| !matches!(k.as_str(), "process_exited" | "identity_changed" | "missing_target_sample" | "fd_inventory_unavailable" | "socket_deadline" | "socket_info_unavailable" | "fd_closed_during_sample" | "fd_list_truncated" | "foreign_socket_pid" | "socket_sample_partial" | "other"))) { return Err(invalid("采样原因无效")); }
         if let Some(value) = &self.guard_diagnostics { value.validate()?; }
         Ok(())
@@ -219,6 +262,9 @@ pub struct DiagnosticEventInput {
     pub elapsed_seconds: Option<f64>,
     pub run_id: Option<String>,
 }
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptDiagnosticInput { pub kind: String, pub outcome: String, pub code: String, pub run_id: String }
 impl EventStore {
     pub fn new(storage: StateStore) -> Self {
         Self { storage }
@@ -336,6 +382,11 @@ impl EventStore {
             )?
             .is_some())
     }
+    pub fn record_receipt_diagnostic(&self, input: &ReceiptDiagnosticInput, at: f64) -> Result<bool> {
+        let valid_codes = ["none","dns_context_changed","dns_context_unknown","dns_stale","invalid_dns_receipt","oversize_dns_receipt","webrtc_context_changed","webrtc_context_unavailable","webrtc_stale","invalid_webrtc_receipt","oversize_webrtc_receipt","context_changed","context_unavailable","context_missing","receipt_invalid","receipt_superseded","receipt_transport_error","busy","superseded_receipt","receipt_conflict","state_io_failed","unsafe_path","invalid_config","recovery_required","other"];
+        if !["dns","webrtc"].contains(&input.kind.as_str()) || !["accepted","rejected"].contains(&input.outcome.as_str()) || !valid_codes.contains(&input.code.as_str()) || uuid::Uuid::parse_str(&input.run_id).is_err() || (input.outcome == "accepted" && input.code != "none") || (input.outcome == "rejected" && input.code == "none") { return Err(invalid("回执诊断无效")); }
+        Ok(self.append_stream("diagnostics", "receipt-diagnostic", EventFields { operation: Some(input.kind.clone()), action: Some("receipt".into()), status: Some(input.outcome.clone()), code: Some(input.code.clone()), run_id: Some(input.run_id.clone()), ..Default::default() }, at, true)?.is_some())
+    }
     pub fn record_guard_diagnostic(
         &self,
         round: &crate::guard_diagnostics::GuardRound,
@@ -380,14 +431,14 @@ impl EventStore {
         if matches!(category, "sampling-state" | "guard-decision" | "guard-stop") {
             let value = serde_json::to_value(&fields).map_err(|_| invalid("事件无法编码"))?;
             let allowed: &[&str] = match category {
-                "sampling-state" => &["operation", "status", "action", "previous_state", "elapsed_seconds", "round_id", "confirmed_exited_count", "reason_counts"],
+                "sampling-state" => &["operation", "status", "action", "previous_state", "elapsed_seconds", "round_id", "confirmed_exited_count", "reason_counts", "process_reason_counts", "sampling_diagnostics"],
                 "guard-decision" => &["session_id", "status", "previous_state", "code", "action", "egress_sampled_at", "dns_sampled_at", "webrtc_sampled_at"],
                 _ => &["session_id", "correlation_id", "action", "status", "code", "elapsed_seconds"],
             };
             if value.as_object().is_none_or(|m| m.keys().any(|k| !allowed.contains(&k.as_str()))) { return Err(invalid("诊断事件包含不允许的字段")); }
             let valid = match category {
                 "sampling-state" => matches!(fields.operation.as_deref(), Some("health" | "connection")) && matches!(fields.action.as_deref(), Some("transition" | "summary")) && matches!(fields.status.as_deref(), Some("running" | "degraded" | "ok" | "partial" | "empty" | "no_targets" | "failed" | "unknown")),
-                "guard-decision" => matches!(fields.action.as_deref(), Some("post_action")) && matches!(fields.status.as_deref(), Some("idle" | "safe" | "risk" | "locked" | "unknown" | "missing" | "pending")) && matches!(fields.code.as_deref(), Some("egress_ip_changed" | "egress_country_cn" | "session_identity_changed" | "proxy_or_tun_failed" | "egress_risk_persist_failed" | "evidence_expired" | "dns_risk" | "webrtc_risk" | "egress_unconfirmed" | "proxy_or_tun_unconfirmed" | "guard_sampling_failed" | "session_identity_unconfirmed" | "session_pending" | "risk_evidence_unavailable" | "risk_evidence_missing" | "none" | "other")),
+                "guard-decision" => matches!(fields.action.as_deref(), Some("post_action")) && matches!(fields.status.as_deref(), Some("idle" | "safe" | "risk" | "locked" | "unknown" | "missing" | "pending" | "disabled")) && matches!(fields.code.as_deref(), Some("egress_ip_changed" | "egress_country_cn" | "session_identity_changed" | "proxy_or_tun_failed" | "egress_risk_persist_failed" | "evidence_expired" | "dns_risk" | "webrtc_risk" | "egress_unconfirmed" | "proxy_or_tun_unconfirmed" | "guard_sampling_failed" | "session_identity_unconfirmed" | "session_pending" | "risk_evidence_unavailable" | "risk_evidence_missing" | "invalid_config" | "invalid_session" | "invalid_native_observation" | "native_observation_unavailable" | "desktop_inventory_incomplete" | "process_metadata_unavailable" | "state_io_failed" | "unsafe_path" | "home_owner_mismatch" | "clock_unavailable" | "sampling_failed" | "none" | "other")),
                 _ => fields.correlation_id.is_some() && match fields.action.as_deref() { Some("request_post_action" | "retry_post_action") => fields.status.is_none(), Some("result_post_action") => matches!(fields.status.as_deref(), Some("confirmed" | "failed" | "session_changed")) && fields.code.as_deref().is_none_or(|c| matches!(c, "claude_still_running" | "permission_denied" | "component_unavailable" | "identity_unconfirmed" | "other")), _ => false },
             };
             if !valid { return Err(invalid("诊断事件状态无效")); }

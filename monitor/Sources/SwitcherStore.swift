@@ -461,7 +461,8 @@ final class SwitcherStore: ObservableObject {
     var awaitFreshDNSReceipt: (() async -> Bool)?
     var onDNSReceiptRecorded: (() -> Void)?
     var onWebRTCRiskRecorded: (() -> Void)?
-    var onReceiptDiagnostic: ((LeakKind, String) -> Void)?
+    var onReceiptDiagnostic: ((LeakKind, String, UUID?, String?) -> Void)?
+    var receiptCommandFixture: ((String, Data) async throws -> Data)?
     var diagnosticContextProvider: (() -> String?)?
     private(set) var initializationDNSReceipt: (context: String, state: String, sampled: Double)?
     private(set) var initializationWebRTCReceipt: (context: String, state: String, sampled: Double)?
@@ -833,38 +834,42 @@ final class SwitcherStore: ObservableObject {
               let state = verdict["state"] as? String, ["ok", "fail", "unknown"].contains(state) else { return nil }
         return (context, state, sampled)
     }
-    func recordDNSLeak(_ probe: LeakProbeResult) async -> Bool {
+    static func safeReceiptCode(_ code: String?) -> String {
+        let allowed = ["dns_context_changed", "dns_context_unknown", "dns_stale", "invalid_dns_receipt", "oversize_dns_receipt", "webrtc_context_changed", "webrtc_context_unavailable", "webrtc_stale", "invalid_webrtc_receipt", "oversize_webrtc_receipt", "context_changed", "context_unavailable", "busy", "recovery_required", "superseded_receipt", "receipt_conflict", "state_io_failed", "unsafe_path", "invalid_config"]
+        return code.flatMap { allowed.contains($0) ? $0 : nil } ?? "other"
+    }
+    func recordDNSLeak(_ probe: LeakProbeResult, runID: UUID? = nil) async -> Bool {
         initializationDNSReceipt = nil
-        guard !isFixture else {
+        guard !isFixture || receiptCommandFixture != nil else {
             initializationDNSReceipt = ("fixture-context-0001", "ok", probe.finishedAt)
             return true
         }
         guard let expectedContext = diagnosticContextProvider?(), !expectedContext.isEmpty else {
-            onReceiptDiagnostic?(.dns, "context_missing")
+            onReceiptDiagnostic?(.dns, "context_missing", runID, "context_missing")
             dnsReceiptError = "DNS 检测时代理上下文未稳定，未记录为当前网络结果。"
             return false
         }
         var backendRejected = false
         do {
             let payload = try JSONEncoder().encode(DNSLeakRecordInput(probe: probe, expected_context: expectedContext))
-            let data = try await Task.detached {
-                try SwitcherCommandRunner.run(["dns-leak-record", "--apply"], input: payload)
-            }.value
+            let data: Data
+            if isFixture, let fixture = receiptCommandFixture { data = try await fixture("dns-leak-record", payload) }
+            else { data = try await Task.detached { try SwitcherCommandRunner.run(["dns-leak-record", "--apply"], input: payload) }.value }
             let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
             guard raw["status"] as? String != "error" else {
                 backendRejected = true
                 let code = raw["code"] as? String
-                onReceiptDiagnostic?(.dns, code == "superseded_receipt" ? "receipt_superseded" : code == "receipt_conflict" ? "receipt_conflict" : "receipt_backend_error")
+                onReceiptDiagnostic?(.dns, code == "superseded_receipt" ? "receipt_superseded" : code == "receipt_conflict" ? "receipt_conflict" : "receipt_backend_error", runID, Self.safeReceiptCode(code))
                 throw NSError(domain: "Switcher", code: 7, userInfo: [NSLocalizedDescriptionKey: raw["message"] as? String ?? "DNS 泄漏回执未保存"])
             }
             dnsReceiptError = ""
             guard diagnosticContextProvider?() == expectedContext else {
-                onReceiptDiagnostic?(.dns, "context_changed")
+                onReceiptDiagnostic?(.dns, "context_changed", runID, "context_changed")
                 dnsReceiptError = "DNS 检测完成后代理上下文已变化，未接受该回执。"
                 return false
             }
             guard let receipt = Self.initializationReceiptMetadata(raw, kind: .dns, sampledAt: probe.finishedAt) else {
-                onReceiptDiagnostic?(.dns, "receipt_invalid")
+                onReceiptDiagnostic?(.dns, "receipt_invalid", runID, "receipt_invalid")
                 dnsReceiptError = "DNS 后台回执缺少本轮上下文、时间或判定。"
                 return false
             }
@@ -874,24 +879,25 @@ final class SwitcherStore: ObservableObject {
             // previous DNS row. Keep both views atomic and request a fresh
             // complete environment receipt instead.
             onDNSReceiptRecorded?()
+            onReceiptDiagnostic?(.dns, "receipt_accepted", runID, "none")
             return true
         } catch {
-            if !backendRejected { onReceiptDiagnostic?(.dns, "receipt_transport_error") }
+            if !backendRejected { onReceiptDiagnostic?(.dns, "receipt_transport_error", runID, "receipt_transport_error") }
             dnsReceiptError = "DNS 泄漏结果未能提交给启动预检：" + error.localizedDescription
             return false
         }
     }
-    func recordWebRTCRisk(_ probe: LeakProbeResult) async -> Bool {
+    func recordWebRTCRisk(_ probe: LeakProbeResult, runID: UUID? = nil) async -> Bool {
         webRTCReceiptGeneration += 1
         let generation = webRTCReceiptGeneration
         initializationWebRTCReceipt = nil
-        if isFixture {
+        if isFixture && receiptCommandFixture == nil {
             webRTCReceiptError = ""
             initializationWebRTCReceipt = ("fixture-context-0001", "ok", probe.finishedAt)
             return true
         }
         guard let expectedContext = diagnosticContextProvider?(), !expectedContext.isEmpty else {
-            onReceiptDiagnostic?(.webrtc, "context_missing")
+            onReceiptDiagnostic?(.webrtc, "context_missing", runID, "context_missing")
             if generation == webRTCReceiptGeneration {
                 webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: nil, hasContext: false, contextStillMatches: false)
             }
@@ -899,38 +905,39 @@ final class SwitcherStore: ObservableObject {
         }
         do {
             let payload = try JSONEncoder().encode(WebRTCRiskRecordInput(probe: probe, expected_context: expectedContext))
-            let data = try await Task.detached {
-                try SwitcherCommandRunner.run(["webrtc-risk-record", "--apply"], input: payload)
-            }.value
+            let data: Data
+            if isFixture, let fixture = receiptCommandFixture { data = try await fixture("webrtc-risk-record", payload) }
+            else { data = try await Task.detached { try SwitcherCommandRunner.run(["webrtc-risk-record", "--apply"], input: payload) }.value }
             let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
             let backendMessage = raw["message"] as? String
             guard raw["status"] as? String != "error" else {
                 let code = raw["code"] as? String
-                onReceiptDiagnostic?(.webrtc, code == "superseded_receipt" ? "receipt_superseded" : code == "receipt_conflict" ? "receipt_conflict" : "receipt_backend_error")
+                onReceiptDiagnostic?(.webrtc, code == "superseded_receipt" ? "receipt_superseded" : code == "receipt_conflict" ? "receipt_conflict" : "receipt_backend_error", runID, Self.safeReceiptCode(code))
                 if generation == webRTCReceiptGeneration {
                     webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: backendMessage, hasContext: true, contextStillMatches: true)
                 }
                 return false
             }
             guard diagnosticContextProvider?() == expectedContext else {
-                onReceiptDiagnostic?(.webrtc, "context_changed")
+                onReceiptDiagnostic?(.webrtc, "context_changed", runID, "context_changed")
                 if generation == webRTCReceiptGeneration {
                     webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: nil, hasContext: true, contextStillMatches: false)
                 }
                 return false
             }
-            guard generation == webRTCReceiptGeneration else { onReceiptDiagnostic?(.webrtc, "receipt_superseded"); return false }
+            guard generation == webRTCReceiptGeneration else { onReceiptDiagnostic?(.webrtc, "receipt_superseded", runID, "receipt_superseded"); return false }
             guard let receipt = Self.initializationReceiptMetadata(raw, kind: .webrtc, sampledAt: probe.finishedAt) else {
-                onReceiptDiagnostic?(.webrtc, "receipt_invalid")
+                onReceiptDiagnostic?(.webrtc, "receipt_invalid", runID, "receipt_invalid")
                 webRTCReceiptError = "WebRTC 后台回执缺少本轮上下文、时间或判定。"
                 return false
             }
             initializationWebRTCReceipt = receipt
             webRTCReceiptError = ""
             onWebRTCRiskRecorded?()
+            onReceiptDiagnostic?(.webrtc, "receipt_accepted", runID, "none")
             return true
         } catch {
-            onReceiptDiagnostic?(.webrtc, "receipt_transport_error")
+            onReceiptDiagnostic?(.webrtc, "receipt_transport_error", runID, "receipt_transport_error")
             if generation == webRTCReceiptGeneration {
                 webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: error.localizedDescription, hasContext: true, contextStillMatches: true)
             }

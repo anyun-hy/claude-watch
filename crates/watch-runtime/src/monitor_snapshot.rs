@@ -94,6 +94,15 @@ pub fn connection_observation(raw: &Value, observed: f64) -> Value {
     }) else {
         return bad("连接丢弃计数无效");
     };
+    let process_exited = match raw.get("process_confirmed_exited_count") { None => 0, Some(value) => match value.as_u64() { Some(n) if n <= u32::MAX as u64 => n, _ => return bad("进程退出计数无效") } };
+    let process_reasons = match raw.get("process_reason_counts") {
+        None => json!({}),
+        Some(value) => {
+            let Some(map) = value.as_object() else { return bad("进程采样原因无效") };
+            if map.iter().any(|(k,v)| !["inventory_partial","inventory_truncated","inventory_count_mismatch","identity_unavailable","inventory_deadline","bundle_identity_unavailable","root_arguments_unavailable","other"].contains(&k.as_str()) || v.as_u64().is_none_or(|n| n > u32::MAX as u64)) { return bad("进程采样原因无效"); }
+            value.clone()
+        }
+    };
     let state = if ["ok", "empty", "no_targets"].contains(&state)
         && dropped.values().any(|v| v.as_u64().is_some_and(|n| n > 0))
     {
@@ -102,7 +111,7 @@ pub fn connection_observation(raw: &Value, observed: f64) -> Value {
         state
     };
     json!({"schema":1,"roundID":round,"observedAt":time,"collectorState":state,"targetCount":targets,"parsedCount":parsed,"acceptedCount":accepted,"correlatedCount":correlated,"unconfirmedCount":unknown,
-        "confirmedExitedCount":exited,"dropped":dropped,"detail":raw["detail"].as_str().unwrap_or(""),"uiFilteredCount":0,"uiDropped":{}})
+        "confirmedExitedCount":exited,"processConfirmedExitedCount":process_exited,"processReasonCounts":process_reasons,"dropped":dropped,"detail":raw["detail"].as_str().unwrap_or(""),"uiFilteredCount":0,"uiDropped":{}})
 }
 pub fn proxy(raw: &Value) -> Option<Value> {
     if raw["schema"] != 1 || !raw["entry"].is_object() || !raw["api"].is_object() {
@@ -248,12 +257,14 @@ fn present_event(e: Event) -> Value {
         "guard-diagnostic" => ("保护后台心跳检查", "info", "service"),
         "guard-decision" => ("会话保护判定", "info", "service"),
         "guard-stop" => ("会话保护退出", "info", "service"),
+        "receipt-diagnostic" => ("检测回执提交", "info", "network"),
         "sampling-state" => ("采样状态变化", "info", "network"),
         "background-evidence" => ("后台保护证据更新", "info", "service"),
         _ => ("监控记录", "info", "service"),
     };
     let fields = &e.fields;
     if e.category == "guard-decision" && matches!(fields.status.as_deref(), Some("risk" | "locked")) { severity = "warning"; }
+    if e.category == "receipt-diagnostic" && fields.status.as_deref() == Some("rejected") { severity = "warning"; }
     if e.category == "background-evidence" && fields.status.as_deref() == Some("risk") {
         severity = "error";
     }
@@ -341,6 +352,8 @@ fn present_event(e: Event) -> Value {
             "disabled" => "未启用",
             "partial" => "部分完成",
             "sent" => "已发送",
+            "accepted" if e.category == "receipt-diagnostic" => "回执已保存（不代表检测通过）",
+            "rejected" if e.category == "receipt-diagnostic" => "回执未接受",
             "confirmed" => "已确认退出",
             "risk" => "已确认风险",
             "locked" => "会话已锁定",
@@ -400,8 +413,20 @@ fn present_event(e: Event) -> Value {
         }
     }
     if let Some(previous) = &fields.previous_state {
-        let label = match previous.as_str() { "ok" => "正常", "partial" => "部分完成", "running" => "运行中", "degraded" => "采样异常", "unknown" => "未确认", "safe" => "安全", "risk" => "风险", "locked" => "锁定", "empty" => "完整空样本", "no_targets" => "无目标", "failed" => "失败", "idle" => "待命", "missing" => "无会话", "pending" => "建立中", _ => "其他" };
+        let label = match previous.as_str() { "ok" => "正常", "partial" => "部分完成", "running" => "运行中", "degraded" => "采样异常", "unknown" => "未确认", "safe" => "安全", "risk" => "风险", "locked" => "锁定", "empty" => "完整空样本", "no_targets" => "无目标", "failed" => "失败", "idle" => "待命", "disabled" => "未启用", "missing" => "无会话", "pending" => "建立中", _ => "其他" };
         summary.push(format!("先前状态：{label}"));
+    }
+    if let Some(counts) = &fields.process_reason_counts {
+        for (reason, count) in counts { if *count > 0 {
+            let label = match reason.as_str() { "identity_unavailable" => "进程身份不可读", "inventory_deadline" => "进程枚举超时", "inventory_truncated" => "进程列表截断", "inventory_count_mismatch" => "进程数量不一致", "inventory_partial" => "进程枚举不完整", "bundle_identity_unavailable" => "应用身份不可读", "root_arguments_unavailable" => "入口参数不可读", _ => "其他进程原因" };
+            summary.push(format!("{label}：{count}"));
+        }}
+    }
+    if let Some(diag) = &fields.sampling_diagnostics {
+        summary.push(format!("进程采样：{}，网络采样：{}{}，活动：{}，字节：{}", match diag.process_complete {Some(true)=>"完整",Some(false)=>"不完整",None=>"未知"}, match diag.network_quality {Some(true)=>"完整",Some(false)=>"不完整",None=>"未知"}, match diag.network_reused {Some(true)=>"（复用）",Some(false)=>"（新采样）",None=>""}, diag.activity_state, diag.bytes_state));
+        if diag.process_confirmed_exited_count > 0 { summary.push(format!("进程枚举确认退出：{}", diag.process_confirmed_exited_count)); }
+        if let Some(code) = &diag.publisher_error_code { summary.push(format!("快照采样错误：{code}")); }
+        for (reason,count) in &diag.activity_reasons { if *count > 0 { summary.push(format!("活动采样 {reason}：{count}")); } }
     }
     if let Some(count) = fields.confirmed_exited_count { summary.push(format!("确认退出目标：{count}")); }
     if let Some(counts) = &fields.reason_counts {

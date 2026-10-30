@@ -119,6 +119,12 @@ fn native_protocol_rejects_replay_foreign_identity_duplicates_and_conflicting_ro
             .unwrap()
             .complete
     );
+    let mut ended_inventory = inv.clone();
+    ended_inventory["exited"] = json!([99]); ended_inventory["requested_count"] = json!(2);
+    let ended_result = native::decode_inventory(&ended_inventory, 1000.0, 1003.0).unwrap();
+    assert!(ended_result.complete);
+    assert_eq!(ended_result.confirmed_exited_count, 1);
+    assert!(ended_result.diagnostic_reasons.is_empty());
     let mut duplicate = inv.clone();
     duplicate["processes"] = json!([p, p]);
     assert!(native::decode_inventory(&duplicate, 1000.0, 1003.0).is_err());
@@ -597,4 +603,36 @@ fn sampler_discovers_managed_codex_servers_with_bound_arguments() {
         );
     }
     fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn incomplete_process_round_keeps_causes_separate_from_complete_socket_sample() {
+    struct Incomplete;
+    impl ReadRunner for Incomplete {
+        fn run(&self, command: ReadCommand, input: &[u8], timeout: Duration, limit: usize) -> claude_watch_core::error::Result<Output> {
+            let is_inventory = matches!(command, ReadCommand::Observer(ObserverAction::Inventory));
+            let mut output = FakeRunner.run(command, input, timeout, limit)?;
+            if is_inventory {
+                let mut body: Value = serde_json::from_slice(&output.stdout).unwrap();
+                body["unavailable"] = json!([{"pid":88,"code":"identity_unavailable"}]);
+                body["requested_count"] = json!(2);
+                output.stdout = serde_json::to_vec(&body).unwrap();
+            }
+            Ok(output)
+        }
+    }
+    let home = std::env::temp_dir().join(format!("cw-partial-process-{}", Uuid::new_v4()));
+    fs::create_dir(&home).unwrap();
+    let mut sampler = Sampler::new(Incomplete, Paths::new(&home).unwrap());
+    let process = sampler.processes().unwrap();
+    assert!(!process.complete);
+    assert_eq!(process.diagnostic_reasons["identity_unavailable"], 1);
+    assert_eq!(process.diagnostic_reasons["inventory_count_mismatch"], 1);
+    let socket = sampler.sockets(&process).unwrap();
+    assert_eq!(socket.receipt["collector_state"], "partial");
+    assert_eq!(socket.receipt["dropped"], json!({}));
+    assert_eq!(socket.receipt["process_reason_counts"]["identity_unavailable"], 1);
+    let view = claude_watch_runtime::monitor_snapshot::connection_observation(&socket.receipt, socket.receipt["observed_at"].as_f64().unwrap());
+    assert_eq!(view["processReasonCounts"]["identity_unavailable"], 1);
+    fs::remove_dir_all(home).unwrap();
 }

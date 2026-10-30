@@ -173,8 +173,8 @@ final class LeakCheckStore: ObservableObject {
     var automaticContextProvider: (() -> String?)?
     /// The owner persists a complete DNS receipt through the backend.  This is
     /// deliberately a callback: the UI never writes the policy receipt itself.
-    var onDNSComplete: ((LeakProbeResult) async -> Bool)?
-    var onWebRTCComplete: ((LeakProbeResult) async -> Bool)?
+    var onDNSComplete: ((LeakProbeResult, UUID) async -> Bool)?
+    var onWebRTCComplete: ((LeakProbeResult, UUID) async -> Bool)?
     private var runs: [LeakKind: UUID] = [:]
     private var runLogSources: [LeakKind: String] = [:]
     private struct ContextSnapshot { let required: Bool; let value: String? }
@@ -446,7 +446,7 @@ final class LeakCheckStore: ObservableObject {
             dnsReceiptSubmitting = true
             let boundContext = contextProvider?()
             Task { [weak self] in
-                let stored = await onDNSComplete(completed)
+                let stored = await onDNSComplete(completed, id)
                 guard let self else { return }
                 self.trace(kind, stored ? "receipt_accepted" : "receipt_rejected", run: id)
                 if !stored {
@@ -467,7 +467,7 @@ final class LeakCheckStore: ObservableObject {
             webRTCReceiptSubmitting = true
             let boundContext = contextProvider?()
             Task { [weak self] in
-                let stored = await onWebRTCComplete(completed)
+                let stored = await onWebRTCComplete(completed, id)
                 guard let self else { return }
                 self.trace(kind, stored ? "receipt_accepted" : "receipt_rejected", run: id)
                 if !stored {

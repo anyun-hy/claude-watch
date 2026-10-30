@@ -109,6 +109,8 @@ pub struct ProcessRound {
     pub identities: BTreeMap<u32, Identity>,
     pub roles: Value,
     pub unavailable: Vec<Value>,
+    pub diagnostic_reasons: BTreeMap<String, u32>,
+    pub confirmed_exited_count: u32,
     pub complete: bool,
     pub observed_at: f64,
 }
@@ -127,6 +129,8 @@ pub struct Sampler<R: ReadRunner> {
     pub paths: Paths,
     tracked: Vec<Target>,
     trusted: TrustedCliPaths,
+    #[cfg(test)]
+    fixture_tag: bool,
 }
 impl<R: ReadRunner> Sampler<R> {
     pub fn new(runner: R, paths: Paths) -> Self {
@@ -136,8 +140,12 @@ impl<R: ReadRunner> Sampler<R> {
             paths,
             tracked: Vec::new(),
             trusted,
+            #[cfg(test)]
+            fixture_tag: false,
         }
     }
+    #[cfg(test)]
+    pub(crate) fn use_fixture_tag(&mut self) { self.fixture_tag = true; }
     pub fn processes(&mut self) -> Result<ProcessRound> {
         let observer = Observer {
             runner: &self.runner,
@@ -281,6 +289,11 @@ impl<R: ReadRunner> Sampler<R> {
                 current = parent.parent;
             }
         }
+        let mut diagnostic_reasons = inventory.diagnostic_reasons.clone();
+        for row in unavailable.iter().skip(inventory.unavailable.len()) {
+            let key = match row["code"].as_str() { Some("bundle_identity_unavailable") => "bundle_identity_unavailable", Some("root_arguments_unavailable") => "root_arguments_unavailable", _ => "other" };
+            let count = diagnostic_reasons.entry(key.into()).or_default(); *count = count.saturating_add(1);
+        }
         let complete = inventory.complete && unavailable.is_empty();
         if complete {
             self.tracked = targets.clone();
@@ -292,6 +305,8 @@ impl<R: ReadRunner> Sampler<R> {
             identities,
             roles: Value::Object(roles),
             unavailable,
+            diagnostic_reasons,
+            confirmed_exited_count: inventory.confirmed_exited_count,
             complete,
             observed_at: native::now(),
         })
@@ -300,7 +315,7 @@ impl<R: ReadRunner> Sampler<R> {
         if round.targets.is_empty() {
             return Ok(SocketRound {
                 flows: Vec::new(),
-                receipt: json!({"schema":1,"round_id":round.id,"observed_at":native::now(),"collector_state":if round.complete{"no_targets"}else{"unknown"},"target_count":0,"confirmed_exited_count":0,"parsed_count":0,"accepted_count":0,"correlated_count":0,"unconfirmed_count":0,"dropped":{},"detail":"没有已确认的受监控目标；未读取套接字"}),
+                receipt: json!({"schema":1,"round_id":round.id,"observed_at":native::now(),"collector_state":if round.complete{"no_targets"}else{"unknown"},"target_count":0,"confirmed_exited_count":0,"process_reason_counts":round.diagnostic_reasons,"process_confirmed_exited_count":round.confirmed_exited_count,"parsed_count":0,"accepted_count":0,"correlated_count":0,"unconfirmed_count":0,"dropped":{},"detail":"没有已确认的受监控目标；未读取套接字"}),
             });
         }
         let ids: Vec<_> = round.targets.iter().map(|p| p.identity.clone()).collect();
@@ -333,7 +348,7 @@ impl<R: ReadRunner> Sampler<R> {
             "ok"
         };
         let receipt = json!({"schema":1,"round_id":round.id,"observed_at":result.observed_at,"collector_state":state,"target_count":ids.len(),"parsed_count":result.parsed_count,"accepted_count":result.accepted_count,
-            "correlated_count":0,"unconfirmed_count":0,"confirmed_exited_count":result.confirmed_exited_count,"dropped":result.dropped,"detail":if complete{"已按进程启动身份读取本轮可见套接字；空样本不证明没有网络活动"}else{"本轮部分原生采样未完成；未判定为网络变化"}});
+            "correlated_count":0,"unconfirmed_count":0,"confirmed_exited_count":result.confirmed_exited_count,"process_reason_counts":round.diagnostic_reasons,"process_confirmed_exited_count":round.confirmed_exited_count,"dropped":result.dropped,"detail":if complete{"已按进程启动身份读取本轮可见套接字；空样本不证明没有网络活动"}else{"本轮部分原生采样未完成；未判定为网络变化"}});
         Ok(SocketRound { flows, receipt })
     }
     pub fn tag_report(
@@ -343,6 +358,10 @@ impl<R: ReadRunner> Sampler<R> {
         group: &str,
         pin: &str,
     ) -> Value {
+        #[cfg(test)]
+        if self.fixture_tag {
+            return json!({"schema":1,"observed_epoch":sockets.receipt["observed_at"],"entry":{},"api":{},"flows":[],"connection_observation":sockets.receipt});
+        }
         let captured = native::now();
         let mut report = json!({"schema":1,"observed_epoch":captured.floor(),"round_id":processes.id,"expected_group":group,"expected_node":pin,"pinned":!pin.is_empty(),"flows":[],"cli":{"state":"unconfirmed","detail":"连接证据来自原生套接字，不读取或修改shell代理变量"}});
         let before = self.process_table();

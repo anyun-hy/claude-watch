@@ -102,6 +102,7 @@ impl Request {
             "event-history" => (&[], &[], &[]),
             "event-diagnostic" => (&[], &["apply"], &[]),
             "guard-diagnostic" => (&[], &["apply"], &[]),
+            "receipt-diagnostic" => (&[], &["apply"], &[]),
             "diagnose-proxy" => (&[], &["stdin-config"], &["proxy", "config"]),
             "observe" => (&[], &["json"], &["home"]),
             "snapshot" => (&[], &["full"], &[]),

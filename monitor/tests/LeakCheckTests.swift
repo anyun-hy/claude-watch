@@ -104,7 +104,7 @@ struct LeakCheckTests {
         var dnsContext: String? = "A"
         var unknownSubmissions = 0
         missingDuringDNS.contextProvider = { dnsContext }
-        missingDuringDNS.onDNSComplete = { _ in unknownSubmissions += 1; return true }
+        missingDuringDNS.onDNSComplete = { _, _ in unknownSubmissions += 1; return true }
         missingDuringDNS.start(.dns); dnsContext = nil
         try await Task.sleep(nanoseconds: 450_000_000)
         expect(missingDuringDNS.dns.verdict.state == .incomplete, "missing context never passes")
@@ -172,8 +172,8 @@ struct LeakCheckTests {
         let primary = LeakCheckStore(isFixture: true)
         primary.contextProvider = { "current" }
         var dnsWrites = 0, rtcWrites = 0
-        primary.onDNSComplete = { _ in dnsWrites += 1; return true }
-        primary.onWebRTCComplete = { _ in rtcWrites += 1; return true }
+        primary.onDNSComplete = { _, _ in dnsWrites += 1; return true }
+        primary.onWebRTCComplete = { _, _ in rtcWrites += 1; return true }
         let ready = await primary.ensureFreshDNSReceipt(maximumWait: 2)
         expect(ready && dnsWrites == 1 && primary.dns.verdict.state == .matched,
                "primary DNS completes through the shared backend receipt callback")
@@ -181,6 +181,31 @@ struct LeakCheckTests {
         expect(primary.rtc.running, "cancelling DNS never cancels WebRTC")
         try await Task.sleep(nanoseconds: 450_000_000)
         expect(rtcWrites == 1 && dnsWrites == 1, "cancelled DNS cannot submit a late receipt")
+        let receiptProbe = LeakCheckStore(isFixture: true)
+        let receiptStore = SwitcherStore(isFixture: true)
+        receiptProbe.contextProvider = { "ctx" }
+        receiptStore.diagnosticContextProvider = { "ctx" }
+        var injectedCode = "dns_context_changed"
+        var submittedRun: UUID?
+        var diagnostic: (LeakKind, String, UUID?, String?)?
+        receiptStore.receiptCommandFixture = { _, _ in
+            try JSONSerialization.data(withJSONObject: ["status":"error", "code":injectedCode, "message":"private-token 203.0.113.9"])
+        }
+        receiptStore.onReceiptDiagnostic = { kind, event, id, code in diagnostic = (kind,event,id,code) }
+        receiptProbe.onDNSComplete = { result, id in submittedRun = id; return await receiptStore.recordDNSLeak(result, runID: id) }
+        receiptProbe.onWebRTCComplete = { result, id in submittedRun = id; return await receiptStore.recordWebRTCRisk(result, runID: id) }
+        for code in ["dns_context_changed", "busy", "invalid_dns_receipt"] {
+            injectedCode = code; diagnostic = nil; submittedRun = nil
+            receiptProbe.start(.dns)
+            try await Task.sleep(nanoseconds: 450_000_000)
+            expect(receiptProbe.dns.verdict.state == .matched, "a rejected receipt does not rewrite the matched detection")
+            expect(diagnostic?.2 == submittedRun && diagnostic?.3 == code && diagnostic?.1 == "receipt_backend_error", "DNS rejection retains this run and bounded backend code")
+        }
+        injectedCode = "webrtc_context_unavailable"; diagnostic = nil; submittedRun = nil
+        receiptProbe.start(.webrtc)
+        try await Task.sleep(nanoseconds: 450_000_000)
+        expect(diagnostic?.0 == .webrtc && diagnostic?.2 == submittedRun && diagnostic?.3 == "webrtc_context_unavailable", "WebRTC rejection retains its own run and code")
+        expect(SwitcherStore.safeReceiptCode("private-token-203.0.113.9") == "other", "unrecognized backend strings never enter receipt diagnostics")
         let automatic = LeakCheckStore(isFixture: true)
         automatic.refreshLeakChecksIfNeeded(interval: 0)
         expect(automatic.dns.running && automatic.rtc.running, "DNS and WebRTC automatic probes remain independent")

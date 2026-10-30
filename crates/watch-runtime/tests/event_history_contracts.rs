@@ -220,3 +220,26 @@ fn structured_lifecycle_events_reject_unknown_or_private_fields() {
     let mut private = fields; private.account = Some("private-account".into());
     assert!(events.append("sampling-state", private, 1002.0).is_err());
 }
+
+#[test]
+fn guard_disabled_and_top_level_failure_remain_distinct_in_event_view() {
+    let f = Fixture::new();
+    let events = EventStore::new(f.store.clone());
+    events.append("guard-decision", EventFields { status:Some("idle".into()), previous_state:Some("disabled".into()), code:Some("none".into()), action:Some("post_action".into()), ..Default::default() }, 1000.0).unwrap();
+    events.append("guard-decision", EventFields { status:Some("unknown".into()), previous_state:Some("idle".into()), code:Some("state_io_failed".into()), action:Some("post_action".into()), ..Default::default() }, 1001.0).unwrap();
+    let view = query(&f.store, "all", "", 0).to_string();
+    assert!(view.contains("先前状态：未启用"));
+    assert!(view.contains("state_io_failed"));
+}
+
+#[test]
+fn sampling_diagnostics_reject_unknown_or_private_nested_fields() {
+    let payload = json!({"process_complete":false,"process_reasons":{"identity_unavailable":1},"process_confirmed_exited_count":0,"process_sampled_at":1000.0,"network_quality":true,"network_round_id":uuid::Uuid::new_v4().to_string(),"network_sampled_at":999.0,"network_reused":true,"activity_state":"ok","bytes_state":"empty","activity_reasons":{},"activity_sampled_at":999.0,"publisher_error_code":null});
+    let valid: claude_watch_runtime::events::SamplingDiagnostics = serde_json::from_value(payload.clone()).unwrap();
+    assert!(valid.valid());
+    let mut private = payload.clone(); private["ip"] = json!("203.0.113.9");
+    assert!(serde_json::from_value::<claude_watch_runtime::events::SamplingDiagnostics>(private).is_err());
+    let mut reason = payload; reason["process_reasons"] = json!({"private-token":1});
+    let invalid: claude_watch_runtime::events::SamplingDiagnostics = serde_json::from_value(reason).unwrap();
+    assert!(!invalid.valid());
+}

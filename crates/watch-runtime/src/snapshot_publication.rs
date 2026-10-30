@@ -293,6 +293,26 @@ impl<R: ReadRunner> SnapshotPublisher<R> {
         );
         snapshot["processes"] = json!(monitor_snapshot::process_rows(&processes, &active));
         snapshot["activity"] = self.last_activity.clone();
+        let mut activity_reasons = std::collections::BTreeMap::<String, u32>::new();
+        for value in self.last_activity["unavailable"].as_array().into_iter().flatten() {
+            let key = match value.as_str() {
+                Some(code @ ("identity_before_unavailable" | "identity_after_unavailable" | "identity_unverified" | "file_sample_unavailable" | "byte_sample_unavailable" | "service_sample_unavailable")) => code,
+                _ => "other",
+            };
+            let count = activity_reasons.entry(key.to_owned()).or_default(); *count = count.saturating_add(1);
+        }
+        let activity_state = self.last_activity["state"].as_str().filter(|s| ["ok","partial","unavailable","no_targets"].contains(s)).unwrap_or("unknown");
+        let bytes_state = self.last_activity["bytes"]["state"].as_str().filter(|s| ["ok","empty","unavailable","no_targets"].contains(s)).unwrap_or("unknown");
+        let network_observation = &tag["connection_observation"];
+        let diagnostics = crate::events::SamplingDiagnostics {
+            process_complete: Some(processes.complete), process_reasons: processes.diagnostic_reasons.clone(), process_confirmed_exited_count: processes.confirmed_exited_count, process_sampled_at: Some(processes.observed_at),
+            network_quality: Some(*network_quality), network_round_id: network_observation["round_id"].as_str().filter(|s| uuid::Uuid::parse_str(s).is_ok()).map(str::to_owned),
+            network_sampled_at: network_observation["observed_at"].as_f64(), network_reused: Some(!refresh),
+            activity_state: activity_state.into(), bytes_state: bytes_state.into(), activity_reasons,
+            activity_sampled_at: self.last_activity["observed_at"].as_f64(), publisher_error_code: None,
+        };
+        if diagnostics.valid() { snapshot["samplingDiagnostics"] = serde_json::to_value(diagnostics).unwrap_or(Value::Null); }
+
         snapshot["health"]["alerts"] = json!(if crate::events::EventStore::new(self.store.clone())
             .notifications_enabled(native::now())
         {
@@ -558,4 +578,72 @@ mod tests {
         );
         fs::remove_dir_all(path).unwrap();
     }
+    struct PipelineFake { incomplete: AtomicBool }
+    impl ReadRunner for PipelineFake {
+        fn run(&self, command: ReadCommand, input: &[u8], _: Duration, _: usize) -> Result<Output> {
+            let now = native::now();
+            let producer = identity();
+            let mut target = identity(); target.pid = 88; target.start_stamp = "target".into(); target.executable = "/Applications/Claude.app/Contents/MacOS/Claude".into();
+            let mut body = json!({"schema":1,"status":"ok","uid":501,"started_at":now,"finished_at":now});
+            match command {
+                ReadCommand::Observer(ObserverAction::Inventory) => {
+                    let mut app = serde_json::to_value(&target).unwrap(); app["bundle_path"] = json!("/Applications/Claude.app"); app["bundle_id"] = json!("com.anthropic.claudefordesktop");
+                    body["state"] = json!("ok"); body["truncated"] = json!(false); body["processes"] = json!([producer,app]); body["exited"] = json!([]);
+                    let bad = self.incomplete.load(Ordering::Relaxed);
+                    body["unavailable"] = if bad { json!([{"pid":90,"code":"identity_unavailable"}]) } else { json!([]) };
+                    body["requested_count"] = json!(if bad {3} else {2});
+                }
+                ReadCommand::Observer(ObserverAction::Arguments) | ReadCommand::Observer(ObserverAction::Identities) | ReadCommand::Observer(ObserverAction::Sockets) => {
+                    let request: Value = serde_json::from_slice(input).unwrap(); body["round_id"] = request["round_id"].clone();
+                    let targets = request["targets"].as_array().unwrap();
+                    match command {
+                        ReadCommand::Observer(ObserverAction::Arguments) => body["argument_prefixes"] = json!(targets.iter().map(|p| json!({"pid":p["pid"],"state":"ok","identity":p,"arguments":["Claude"],"cwd":"/tmp","truncated":false})).collect::<Vec<_>>()),
+                        ReadCommand::Observer(ObserverAction::Identities) => body["identities"] = json!(targets.iter().map(|p| json!({"pid":p["pid"],"state":"ok","identity":p})).collect::<Vec<_>>()),
+                        _ => body["socket_samples"] = json!(targets.iter().map(|p| json!({"pid":p["pid"],"state":"ok","identity":p,"sockets":[],"dropped":{}})).collect::<Vec<_>>()),
+                    }
+                }
+                ReadCommand::LsofFiles {..} => return Ok(Output {status:0,stdout:vec![],stderr:vec![]}),
+                ReadCommand::NettopBytes {..} => return Ok(Output {status:0,stdout:b"name,bytes_in,bytes_out\n".to_vec(),stderr:vec![]}),
+                ReadCommand::LaunchctlList => return Ok(Output {status:0,stdout:vec![],stderr:vec![]}),
+                _ => return Err(CoreError::new("fixture_unavailable", "fixture")),
+            }
+            Ok(Output {status:0,stdout:serde_json::to_vec(&body).unwrap(),stderr:vec![]})
+        }
+    }
+    #[test]
+    fn actual_publisher_preserves_process_activity_and_reused_network_evidence() {
+        let (path, store) = temp();
+        let runner = std::sync::Arc::new(PipelineFake { incomplete: AtomicBool::new(true) });
+        let mut sampler = Sampler::new(runner.clone(), store.paths.clone()); sampler.use_fixture_tag();
+        let mut publisher = SnapshotPublisher::new(store.clone(), sampler, identity()).unwrap();
+        let first = publisher.poll("", "", true).unwrap();
+        assert_eq!(first["proxy"]["connectionObservation"]["collectorState"], "partial");
+        assert_eq!(first["proxy"]["connectionObservation"]["dropped"], json!({}));
+        assert_eq!(first["proxy"]["connectionObservation"]["processReasonCounts"]["identity_unavailable"], 1);
+        assert_eq!(first["samplingDiagnostics"]["process_complete"], false);
+        runner.incomplete.store(false, Ordering::Relaxed);
+        let next = publisher.poll("", "", true).unwrap();
+        assert_eq!(next["proxy"]["connectionObservation"]["collectorState"], "empty");
+        assert_eq!(next["samplingDiagnostics"]["bytes_state"], "empty");
+        assert_eq!(next["health"]["state"], "degraded");
+        std::thread::sleep(Duration::from_millis(10));
+        let cached = publisher.poll("", "", false).unwrap();
+        assert_eq!(cached["samplingDiagnostics"]["network_reused"], true);
+        assert_eq!(cached["samplingDiagnostics"]["network_round_id"], next["samplingDiagnostics"]["network_round_id"]);
+        assert_eq!(cached["samplingDiagnostics"]["network_sampled_at"], next["samplingDiagnostics"]["network_sampled_at"]);
+        assert!(cached["samplingDiagnostics"]["process_sampled_at"].as_f64().unwrap() > next["samplingDiagnostics"]["process_sampled_at"].as_f64().unwrap());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn publisher_failure_keeps_only_bounded_error_code_in_sampling_diagnostics() {
+        let (path, store) = temp(); let producer = identity();
+        let owner = crate::daemon::DaemonLease::acquire(store.clone(), producer.clone(), &std::collections::BTreeMap::from([(producer.pid,producer)])).unwrap();
+        let snapshot = owner.publish(Err(CoreError::new("state_io_failed", "private-token 203.0.113.9")), native::now()).unwrap();
+        assert_eq!(snapshot["samplingDiagnostics"]["publisher_error_code"], "state_io_failed");
+        assert!(snapshot["samplingDiagnostics"]["process_complete"].is_null());
+        assert!(!snapshot["samplingDiagnostics"].to_string().contains("private-token"));
+        drop(owner); fs::remove_dir_all(path).unwrap();
+    }
+
 }

@@ -52,6 +52,8 @@ pub struct Inventory {
     pub unavailable: Vec<Value>,
     pub exited: Vec<u32>,
     pub complete: bool,
+    pub diagnostic_reasons: BTreeMap<String, u32>,
+    pub confirmed_exited_count: u32,
     pub started_at: f64,
     pub finished_at: f64,
 }
@@ -149,12 +151,22 @@ pub fn decode_inventory(value: &Value, sent: f64, received: f64) -> Result<Inven
         && value["truncated"] == false
         && unavailable.is_empty()
         && requested == processes.len() as u64 + exited.len() as u64;
+    let mut diagnostic_reasons = BTreeMap::<String, u32>::new();
+    if value["state"] != "ok" { diagnostic_reasons.insert("inventory_partial".into(), 1); }
+    if value["truncated"] == true { diagnostic_reasons.insert("inventory_truncated".into(), 1); }
+    if requested != processes.len() as u64 + exited.len() as u64 { diagnostic_reasons.insert("inventory_count_mismatch".into(), 1); }
+    for row in &unavailable {
+        let key = match row["code"].as_str() { Some("identity_unavailable") => "identity_unavailable", Some("inventory_deadline") => "inventory_deadline", _ => "other" };
+        let count = diagnostic_reasons.entry(key.into()).or_default(); *count = count.saturating_add(1);
+    }
     Ok(Inventory {
         uid,
         processes,
         unavailable,
+        confirmed_exited_count: u32::try_from(exited.len()).unwrap_or(u32::MAX),
         exited,
         complete,
+        diagnostic_reasons,
         started_at: value["started_at"].as_f64().unwrap(),
         finished_at: value["finished_at"].as_f64().unwrap(),
     })

@@ -71,8 +71,8 @@ struct IPLeakBridgeTests {
                   let global = api["global_node"] as? String else { return nil }
             return [endpoint, mode, selected, global].joined(separator: "|")
         }
-        store.onDNSComplete = { _ in dnsCallbacks += 1; return false }
-        store.onWebRTCComplete = { _ in rtcCallbacks += 1; return false }
+        store.onDNSComplete = { _, _ in dnsCallbacks += 1; return false }
+        store.onWebRTCComplete = { _, _ in rtcCallbacks += 1; return false }
         store.start(.dns)
         window.contentView = store.browserViews[.dns]
         window.orderFront(nil)

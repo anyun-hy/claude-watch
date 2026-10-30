@@ -177,13 +177,13 @@ final class MonitorStore: ObservableObject {
         self.leakChecks.contextProvider = bindingContext
         self.leakChecks.automaticContextProvider = currentContext
         self.switcher.diagnosticContextProvider = bindingContext
-        self.leakChecks.onDNSComplete = { [weak self] result in
+        self.leakChecks.onDNSComplete = { [weak self] result, runID in
             guard let self else { return false }
-            return await self.switcher.recordDNSLeak(result)
+            return await self.switcher.recordDNSLeak(result, runID: runID)
         }
-        self.leakChecks.onWebRTCComplete = { [weak self] result in
+        self.leakChecks.onWebRTCComplete = { [weak self] result, runID in
             guard let self else { return false }
-            return await self.switcher.recordWebRTCRisk(result)
+            return await self.switcher.recordWebRTCRisk(result, runID: runID)
         }
         self.switcher.awaitFreshDNSReceipt = { [weak self] in
             guard let self else { return false }
@@ -196,9 +196,11 @@ final class MonitorStore: ObservableObject {
             guard let self, !self.initializing else { return }
             Task { await self.switcher.refreshBackground() }
         }
-        self.switcher.onReceiptDiagnostic = { kind, event in
-            guard case .rustCandidate? = BundledBackendVariant.current() else { return }
-            LeakDiagnosticTrace.shared.record(kind: kind.rawValue, event: event)
+        self.switcher.onReceiptDiagnostic = { kind, event, runID, code in
+            guard case .rustCandidate? = BundledBackendVariant.current(), let runID else { return }
+            if event != "receipt_accepted" { LeakDiagnosticTrace.shared.record(kind: kind.rawValue, event: event, run: runID) }
+            let input = ReceiptDiagnosticInput(kind: kind.rawValue, outcome: event == "receipt_accepted" ? "accepted" : "rejected", code: code ?? "none", run_id: runID.uuidString)
+            if let data = try? JSONEncoder().encode(input) { DiagnosticLogRunner.submit(data, command: "receipt-diagnostic") }
         }
         self.aiChecks.contextProvider = bindingContext
         self.aiChecks.onResult = { [weak self] result in

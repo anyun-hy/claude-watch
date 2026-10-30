@@ -252,13 +252,13 @@ struct InitializationTests {
         leaks.fixtureDelayNanoseconds = 1_000_000
         var context = "fixture-A"
         leaks.contextProvider = { context }; leaks.automaticContextProvider = { context }
-        leaks.onDNSComplete = { _ in true }
-        leaks.onWebRTCComplete = { _ in false }
+        leaks.onDNSComplete = { _, _ in true }
+        leaks.onWebRTCComplete = { _, _ in false }
         let dnsAccepted = await leaks.ensureInitializationReceipt(.dns, maximumWait: 1)
         expect(dnsAccepted && leaks.initializationReceiptIsCurrent(.dns), "DNS page and onboarding use the actual same recorded result")
         let unrecordedRTC = await leaks.ensureInitializationReceipt(.webrtc, maximumWait: 1)
         expect(!unrecordedRTC && leaks.rtc.verdict.state == .matched, "a locally green WebRTC probe cannot pass without an accepted backend receipt")
-        leaks.onWebRTCComplete = { _ in true }
+        leaks.onWebRTCComplete = { _, _ in true }
         let recordedRTC = await leaks.ensureInitializationReceipt(.webrtc, maximumWait: 1)
         expect(recordedRTC && leaks.initializationReceiptIsCurrent(.webrtc), "accepted WebRTC receipt completes its mandatory check")
         let dnsSampleTime = leaks.dns.result!.finishedAt
@@ -409,7 +409,7 @@ struct InitializationTests {
         recovery.beginInitialization(startSnapshotPolling: false)
         recovery.automatic = false
         recovery.leakChecks.fixtureDelayNanoseconds = 1_000_000
-        recovery.leakChecks.onDNSComplete = { _ in true }
+        recovery.leakChecks.onDNSComplete = { _, _ in true }
         let base = Date()
         recovery.acceptSnapshot(snapshot(node: "A", at: base.timeIntervalSince1970 - 9), receivedAt: base)
         let acceptedBeforeGap = await recovery.leakChecks.ensureInitializationReceipt(.dns, maximumWait: 1)

@@ -105,6 +105,11 @@ impl DaemonLease {
                 let mut value = monitor_snapshot::empty(&self.storage, now, &error.message);
                 value["health"]["pid"] = json!(self.producer.pid);
                 value["health"]["started"] = json!(self.producer.start_stamp);
+                let code = match error.code.as_str() {
+                    code @ ("invalid_native_observation" | "native_observation_unavailable" | "network_sample_missing" | "command_timeout" | "command_unavailable" | "command_output_oversize" | "command_wait_failed" | "native_observer_missing" | "invalid_command_encoding" | "lease_read_failed" | "invalid_lease" | "invalid_tracked" | "state_io_failed" | "unsafe_path" | "home_owner_mismatch" | "busy" | "sampling_failed") => code,
+                    _ => "other",
+                };
+                value["samplingDiagnostics"] = json!({"process_complete":null,"process_reasons":{},"process_confirmed_exited_count":0,"process_sampled_at":null,"network_quality":null,"network_round_id":null,"network_sampled_at":null,"network_reused":null,"activity_state":"unknown","bytes_state":"unknown","activity_reasons":{},"activity_sampled_at":null,"publisher_error_code":code});
                 value
             }
         };

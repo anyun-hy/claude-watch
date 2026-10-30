@@ -131,6 +131,12 @@ fn local_command(request: &claude_watch_core::cli::Request, paths: Paths) -> Res
                 .record_diagnostic(&input, claude_watch_runtime::native::now())?;
             Ok(Some(json!({"status":"ok","recorded":recorded})))
         }
+        ("receipt-diagnostic", _) => {
+            request.require_apply()?;
+            let input: claude_watch_runtime::events::ReceiptDiagnosticInput = serde_json::from_value(bounded_input(request.input_limit())?).map_err(|_| CoreError::new("invalid_event", "回执诊断格式无效"))?;
+            let recorded = EventStore::new(storage).record_receipt_diagnostic(&input, claude_watch_runtime::native::now())?;
+            Ok(Some(json!({"status":"ok","recorded":recorded})))
+        }
         ("guard-diagnostic", _) => {
             request.require_apply()?;
             let input: claude_watch_runtime::guard_diagnostics::GuardRound =
