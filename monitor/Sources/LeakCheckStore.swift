@@ -184,6 +184,9 @@ final class LeakCheckStore: ObservableObject {
     private var dnsReceiptSubmitting = false
     private var lastRecordedDNSAt: Date?
     private var lastRecordedDNSContext: String?
+    private var webRTCReceiptSubmitting = false
+    private var lastRecordedWebRTCAt: Date?
+    private var lastRecordedWebRTCContext: String?
     private var ipLeakRunner: IPLeakDNSRunner?
     private var ipLeakRun: UUID?
     private var ipLeakContext: ContextSnapshot?
@@ -369,6 +372,40 @@ final class LeakCheckStore: ObservableObject {
         }
         return false
     }
+    /// First-run requires both a real passing result and its accepted backend
+    /// receipt. A completed WebView alone is not enough to open the main UI.
+    func initializationReceiptIsCurrent(_ kind: LeakKind, at date: Date = Date()) -> Bool {
+        let value = state(kind)
+        guard !value.running, value.verdict.state == .matched,
+              let result = value.result, !result.contextChanged,
+              let context = automaticContext(), contexts[kind]?.value == context else { return false }
+        let submitted = kind == .dns ? lastRecordedDNSAt : lastRecordedWebRTCAt
+        let submittedContext = kind == .dns ? lastRecordedDNSContext : lastRecordedWebRTCContext
+        let submitting = kind == .dns ? dnsReceiptSubmitting : webRTCReceiptSubmitting
+        guard !submitting, let submitted, submittedContext == context,
+              submitted.timeIntervalSince1970 == result.finishedAt else { return false }
+        return (0..<300).contains(date.timeIntervalSince1970 - result.finishedAt)
+    }
+    func ensureInitializationReceipt(_ kind: LeakKind, maximumWait: TimeInterval = 85) async -> Bool {
+        now = Date()
+        if initializationReceiptIsCurrent(kind) { return true }
+        guard automaticContext()?.isEmpty == false else { return false }
+        if !state(kind).running { start(kind) }
+        let deadline = Date().addingTimeInterval(maximumWait)
+        while Date() < deadline && !Task.isCancelled {
+            let submitting = kind == .dns ? dnsReceiptSubmitting : webRTCReceiptSubmitting
+            if !state(kind).running && !submitting {
+                now = Date()
+                return initializationReceiptIsCurrent(kind)
+            }
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+        return false
+    }
+    func adoptInitializationReceipts() {
+        lastAutomaticDNSAt = lastRecordedDNSAt; lastAutomaticDNSContext = lastRecordedDNSContext
+        lastAutomaticWebRTCAt = lastRecordedWebRTCAt; lastAutomaticWebRTCContext = lastRecordedWebRTCContext
+    }
     func cancel(_ kind: LeakKind) {
         guard state(kind).running else { return }
         browserViews[kind] = nil; coffeeRunners[kind]?.cancel(); coffeeRunners[kind] = nil; progress[kind] = nil
@@ -420,7 +457,15 @@ final class LeakCheckStore: ObservableObject {
             }
         }
         if kind == .webrtc, let onWebRTCComplete {
-            Task { _ = await onWebRTCComplete(completed) }
+            webRTCReceiptSubmitting = true
+            let boundContext = contextProvider?()
+            Task { [weak self] in
+                let stored = await onWebRTCComplete(completed)
+                guard let self else { return }
+                self.webRTCReceiptSubmitting = false
+                self.lastRecordedWebRTCAt = stored ? Date(timeIntervalSince1970: completed.finishedAt) : nil
+                self.lastRecordedWebRTCContext = stored ? boundContext : nil
+            }
         }
     }
     private func reevaluate(_ kind: LeakKind) {

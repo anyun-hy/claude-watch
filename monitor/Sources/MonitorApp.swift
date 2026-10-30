@@ -421,9 +421,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct ClaudeWatchApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
-    @StateObject private var store = MonitorStore()
+    @StateObject private var store: MonitorStore
+    @StateObject private var initialization: FirstRunInitialization
+    @MainActor init() {
+        let store = MonitorStore()
+        let storage = InitializationStorage()
+        _store = StateObject(wrappedValue: store)
+        _initialization = StateObject(wrappedValue: FirstRunInitialization(checks: FirstRunChecks(store: store),
+            completed: storage.isComplete(), saveCompletion: { try storage.complete() }))
+    }
     var body: some Scene {
-        WindowGroup("Claude Watch") { MonitorView(store: store) }
+        WindowGroup("Claude Watch") { MonitorEntryView(store: store, initialization: initialization) }
             .defaultSize(width: 1240, height: 820)
             .windowStyle(.titleBar)
             .windowToolbarStyle(.unifiedCompact)
@@ -435,7 +443,7 @@ struct ClaudeWatchApp: App {
                             Button(page.rawValue) { store.page = page }
                                 .keyboardShortcut(KeyEquivalent(Character(index == 9 ? "0" : String(index + 1))), modifiers: .command)
                         } else { Button(page.rawValue) { store.page = page } }
-                    }
+                    }.disabled(!initialization.entered)
                 }
             }
     }

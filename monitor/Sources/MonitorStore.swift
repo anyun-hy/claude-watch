@@ -147,7 +147,9 @@ final class MonitorStore: ObservableObject {
     let aiChecks: AIProbeStore
     let netCoffee = NetCoffeeStore()
     let processControl = AIProcessControl()
-    let switcher = SwitcherStore()
+    let switcher: SwitcherStore
+    /// First-run owns diagnostic/mutation sequencing; the timer only reads snapshots.
+    @Published private(set) var initializing = false
     @Published var snapshot: MonitorSnapshot?
     @Published var error: String?
     @Published var refreshing = false
@@ -166,9 +168,10 @@ final class MonitorStore: ObservableObject {
     private var environmentRefreshScheduler = EnvironmentRefreshScheduler()
     private var diagnosticContext = DiagnosticContextTracker()
     private var refreshGate = MonitorRefreshGate()
-    init(leakChecks: LeakCheckStore? = nil, aiChecks: AIProbeStore? = nil) {
+    init(leakChecks: LeakCheckStore? = nil, aiChecks: AIProbeStore? = nil, switcher: SwitcherStore? = nil) {
         self.leakChecks = leakChecks ?? LeakCheckStore()
         self.aiChecks = aiChecks ?? AIProbeStore()
+        self.switcher = switcher ?? SwitcherStore()
         let bindingContext: () -> String? = { [weak self] in self?.retainedDiagnosticContext() }
         let currentContext: () -> String? = { [weak self] in self?.currentDiagnosticContext() }
         self.leakChecks.contextProvider = bindingContext
@@ -190,7 +193,8 @@ final class MonitorStore: ObservableObject {
             self?.requestEnvironmentRefreshAfterDNS()
         }
         self.switcher.onWebRTCRiskRecorded = { [weak self] in
-            Task { await self?.switcher.refreshBackground() }
+            guard let self, !self.initializing else { return }
+            Task { await self.switcher.refreshBackground() }
         }
         self.aiChecks.contextProvider = bindingContext
         self.aiChecks.onResult = { [weak self] result in
@@ -204,9 +208,8 @@ final class MonitorStore: ObservableObject {
     }
     func start() {
         guard timer == nil else { return }
-        AccessibilityPermission.checkInstalledBuild()
-        refreshBackgroundIfNeeded(at: Date())
-        referenceQueriesEnabled = true
+        if !initializing { refreshBackgroundIfNeeded(at: Date()) }
+        referenceQueriesEnabled = !initializing
         refresh(full: true)
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -223,6 +226,12 @@ final class MonitorStore: ObservableObject {
         // network/environment detection is paused.
         switcher.advanceLoginClock(date)
         guard automatic else { return }
+        if initializing {
+            // Fresh local context is needed while a DNS probe takes tens of
+            // seconds. This poll never starts diagnostics or changes settings.
+            refresh(full: date.timeIntervalSince(lastFull) >= 15)
+            return
+        }
         refreshBackgroundIfNeeded(at: date)
         // AX reading is independent and must not delay the snapshot scheduler.
         Task { @MainActor [weak switcher] in
@@ -249,19 +258,7 @@ final class MonitorStore: ObservableObject {
             aiChecks.now = completedAt
             switch result {
             case .success(let value):
-                // The backend capture timestamp is authoritative for display
-                // freshness.  Move the clock before publishing the value so a
-                // just-arrived Native result cannot look "from the future".
-                let captured = Date(timeIntervalSince1970: value.capturedAt)
-                if captured > now { now = captured; leakChecks.now = captured; aiChecks.now = captured }
-                error = nil
-                let transition = observeDiagnosticContext(from: value, at: completedAt)
-                snapshot = value
-                if automatic {
-                    if transition == .changed { switcher.invalidateCurrentEnvironmentRequest() }
-                    leakChecks.refreshWebRTCIfNeeded()
-                    refreshEnvironmentIfNeeded()
-                }
+                acceptSnapshot(value, receivedAt: completedAt)
             case .failure(let message):
                 error = message
             }
@@ -269,6 +266,20 @@ final class MonitorStore: ObservableObject {
             let repeatManual = refreshGate.complete()
             if refreshing != refreshGate.manualVisible { refreshing = refreshGate.manualVisible }
             if repeatManual { refresh(full: true, manual: true) }
+        }
+    }
+    func acceptSnapshot(_ value: MonitorSnapshot, receivedAt: Date) {
+        // A single publication path is shared by first-run and normal polling.
+        // Backend capture time remains authoritative; rereads cannot renew it.
+        now = max(receivedAt, Date(timeIntervalSince1970: value.capturedAt))
+        leakChecks.now = now; aiChecks.now = now
+        error = nil
+        let transition = observeDiagnosticContext(from: value, at: receivedAt)
+        snapshot = value
+        if automatic && transition == .changed { switcher.invalidateCurrentEnvironmentRequest() }
+        if automatic && !initializing {
+            leakChecks.refreshWebRTCIfNeeded()
+            refreshEnvironmentIfNeeded()
         }
     }
     private func refreshBackgroundIfNeeded(at date: Date, force: Bool = false) {
@@ -281,6 +292,7 @@ final class MonitorStore: ObservableObject {
         }
     }
     private func refreshEnvironmentIfNeeded() {
+        guard !initializing else { return }
         let usableContext = currentDiagnosticContext()
         guard environmentRefreshScheduler.claim(context: usableContext, now: Date(),
                                                 switcherBusy: switcher.readingEnvironment || switcher.busy) != nil else { return }
@@ -321,6 +333,19 @@ final class MonitorStore: ObservableObject {
     /// but cannot create a new green environment receipt.
     private func currentDiagnosticContext() -> String? {
         context(from: freshProxy(in: snapshot, at: now))
+    }
+    var initializationContext: String? { currentDiagnosticContext() }
+    func beginInitialization(startSnapshotPolling: Bool = true) {
+        initializing = true
+        if startSnapshotPolling { start() }
+    }
+    func finishInitialization() {
+        // Preserve the exact receipts just checked; normal polling adopts them
+        // instead of clearing or immediately recollecting all page data.
+        environmentRefreshScheduler.complete(context: currentDiagnosticContext(), accepted: true, now: Date())
+        leakChecks.adoptInitializationReceipts()
+        initializing = false
+        referenceQueriesEnabled = true
     }
     private func retainedDiagnosticContext() -> String? {
         guard !hasExplicitProxyFailure else { return nil }

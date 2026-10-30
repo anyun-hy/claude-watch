@@ -5,6 +5,14 @@ enum AccessibilityPermission {
     static let bundleID = "io.local.watchpanel"
     static let installedPath = "/Applications/Claude Watch Monitor.app"
 
+    @MainActor static var trusted: Bool {
+        #if UI_REVIEW
+        return false
+        #else
+        return AXIsProcessTrusted()
+        #endif
+    }
+
     static func shouldPrompt(trusted: Bool, build: String, previous: String?, bundle: String?, path: String) -> Bool {
         !trusted && !build.isEmpty && previous != build && bundle == bundleID && path == installedPath
     }

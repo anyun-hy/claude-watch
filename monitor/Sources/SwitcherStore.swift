@@ -875,6 +875,24 @@ final class SwitcherStore: ObservableObject {
             background = value; backgroundError = ""
         } catch { backgroundError = error.localizedDescription }
     }
+    /// First-run reads the same status consumed by the regular pages, with a
+    /// success result so an old `loaded` value cannot conceal a failed read.
+    func refreshInitializationStatus() async -> Bool {
+        guard !busy else { return false }
+        busy = true
+        defer { busy = false }
+        do {
+            let data = isFixture ? Self.fixtureStatus() : try await Task.detached {
+                try SwitcherCommandRunner.run(["status"])
+            }.value
+            try consumeStatus(data)
+            loaded = true
+            return true
+        } catch {
+            message = error.localizedDescription; failure = true
+            return false
+        }
+    }
     func previewProtection(_ key: String, enable: Bool) async {
         guard !busy, !hasUnsavedSettings else { return }
         protectionChanges = [key: enable]; planCommand = "protection"; plan = nil
@@ -944,13 +962,13 @@ final class SwitcherStore: ObservableObject {
             message = "请核对候选目标、选项与系统变更。确认后才会保存基线。"; failure = false
         } catch { message = error.localizedDescription; failure = true }
     }
-    func applyEnvironment() async {
+    func applyEnvironment(refreshDetection: Bool = true) async {
         guard setupCanConfirm, let setupPlan else { return }
         let input = try? JSONSerialization.data(withJSONObject: setupOptions)
         await perform(["setup", "apply", "--candidate-id", setupPlan.candidate_id, "--plan-id", setupPlan.id, "--apply"], input: input)
         self.setupPlan = nil; candidate = nil
         await inspectEnvironment()
-        _ = await detectCurrentEnvironment()
+        if refreshDetection { _ = await detectCurrentEnvironment() }
     }
     func diagnoseProxy() async {
         guard !busy else { return }
