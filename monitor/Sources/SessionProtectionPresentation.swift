@@ -7,6 +7,13 @@ struct SessionProtectionEvidence {
     let backendReady: Bool
     var readError: String = ""
 
+    static func fromBackground(_ receipt: BackgroundServiceReceipt, error: String = "") -> Self? {
+        guard let session = receipt.session_guard else { return nil }
+        let backendReady = (receipt.guard_backend_healthy ?? receipt.backend_healthy) &&
+            receipt.services.first(where: { $0.id == "guard" })?.healthy == true
+        return .init(session: session, observedAt: receipt.observed_at, backendReady: backendReady, readError: error)
+    }
+
     static func latest(_ candidates: [Self]) -> Self? {
         candidates.filter { $0.observedAt.isFinite && $0.observedAt > 0 }
             .max { $0.observedAt < $1.observedAt }

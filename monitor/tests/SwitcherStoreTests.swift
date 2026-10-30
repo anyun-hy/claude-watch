@@ -52,6 +52,38 @@ struct SwitcherStoreTests {
         let idle = SessionProtectionEvidence(session: service.session_guard!, observedAt: 1000, backendReady: true)
         expect(idle.presentation(at: 1005).detail.contains("后台保护待命，无需操作") && idle.presentation(at: 1005).tone == "info", "normal closed app never prompts confirmation")
         expect(idle.presentation(at: 1040).title == "正在更新保护状态", "stale idle does not claim current standby")
+        func backgroundReceipt(at time: Double, sampling: Bool, guardReady: Bool?, guardState: String = "running") -> BackgroundServiceReceipt {
+            .init(observed_at: time, backend_healthy: sampling, update_source_ready: false,
+                  guard_backend_healthy: guardReady, backend_sampling_state: sampling ? "complete" : "incomplete",
+                  services: [.init(id: "guard", title: "保护", state: guardState, detail: "", source: "fixture", desired: true, last_checked: time)],
+                  policy_issues: [], session_guard: .init(state: "idle"))
+        }
+        let partial = backgroundReceipt(at: 1000, sampling: false, guardReady: true)
+        expect(SessionProtectionEvidence.fromBackground(partial)?.presentation(at: 1005).title == SessionProtectionPresentation.idleTitle &&
+               SessionBaselinePresentation.make(partial, now: 1005).title == SessionProtectionPresentation.idleTitle &&
+               partial.backend_sampling_state == "incomplete", "incomplete monitoring sampling does not contradict a healthy guard or conceal sampling status")
+        let failedGuard = backgroundReceipt(at: 1000, sampling: true, guardReady: false)
+        let failedService = backgroundReceipt(at: 1000, sampling: true, guardReady: true, guardState: "error")
+        expect(SessionProtectionEvidence.fromBackground(failedGuard)?.presentation(at: 1005).title == "保护后台不可用" &&
+               SessionProtectionEvidence.fromBackground(failedService)?.presentation(at: 1005).title == "保护后台不可用", "actual guard or service failures remain unavailable")
+        expect(SessionProtectionEvidence.fromBackground(backgroundReceipt(at: 1000, sampling: true, guardReady: nil))?.backendReady == true &&
+               SessionProtectionEvidence.fromBackground(backgroundReceipt(at: 1000, sampling: false, guardReady: nil))?.backendReady == false,
+               "older receipts without guard-specific health use the general health fallback")
+        expect(SessionProtectionEvidence.fromBackground(partial, error: "read failed")?.presentation(at: 1005).title == "正在更新保护状态" &&
+               idle.presentation(at: 999).title == "正在更新保护状态", "read errors and future-dated evidence are not shown as current")
+        let received = SwitcherStore(isFixture: true)
+        let sampleTime = Date().timeIntervalSince1970
+        received.advanceLoginClock(Date(timeIntervalSince1970: sampleTime - 2))
+        received.publishBackgroundForFixture(backgroundReceipt(at: sampleTime, sampling: false, guardReady: true))
+        expect(received.sessionDisplay.title == SessionProtectionPresentation.idleTitle && received.loginClock.timeIntervalSince1970 >= sampleTime,
+               "receipt arrival advances display clock to actual completion time")
+        received.publishBackgroundForFixture(backgroundReceipt(at: sampleTime - 1, sampling: true, guardReady: false))
+        expect(received.background?.observed_at == sampleTime && received.sessionDisplay.title == SessionProtectionPresentation.idleTitle,
+               "late older background response cannot replace newer evidence")
+        received.publishBackgroundForFixture(backgroundReceipt(at: sampleTime + 60, sampling: true, guardReady: true))
+        expect(received.sessionDisplay.title == "正在更新保护状态", "future observation is never made current by the display clock")
+        received.publishBackgroundForFixture(backgroundReceipt(at: sampleTime, sampling: false, guardReady: true))
+        expect(received.sessionDisplay.title == SessionProtectionPresentation.idleTitle, "valid observation can recover after a future-dated receipt")
         expect(SessionProtectionPresentation.make(service.session_guard!, backendReady: false).tone == "warning", "disabled or failed backend is not mislabeled healthy idle")
         let active = SessionProtectionEvidence(session: .init(state: "safe"), observedAt: 990, backendReady: true)
         expect(SessionProtectionEvidence.latest([idle, active])?.session.state == "idle", "older active sample cannot overwrite newer closed-app observation")

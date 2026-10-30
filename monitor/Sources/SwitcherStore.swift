@@ -649,10 +649,8 @@ final class SwitcherStore: ObservableObject {
     }
     var sessionDisplayEvidence: SessionProtectionEvidence? {
         var candidates: [SessionProtectionEvidence] = []
-        if let value = background, let session = value.session_guard {
-            candidates.append(.init(session: session, observedAt: value.observed_at,
-                                    backendReady: value.backend_healthy && value.services.first(where: { $0.id == "guard" })?.healthy == true,
-                                    readError: backgroundError))
+        if let value = background, let evidence = SessionProtectionEvidence.fromBackground(value, error: backgroundError) {
+            candidates.append(evidence)
         }
         if let value = currentEnvironment, let session = value.session_guard {
             candidates.append(.init(session: session, observedAt: value.observed_at,
@@ -761,6 +759,7 @@ final class SwitcherStore: ObservableObject {
             }
             if !isFixture { GuardDiagnosticLogger.submit(from: data) }
             guard generation == environmentGeneration else { return false }
+            advanceLoginClock(Date())
             currentEnvironment = result
             // A newly received failed/unavailable observation is still current;
             // only an older receipt retained after a later context change is historical.
@@ -965,8 +964,9 @@ final class SwitcherStore: ObservableObject {
                 value = try JSONDecoder().decode(BackgroundServiceReceipt.self, from: data)
             }
             guard generation == backgroundGeneration else { return }
-            background = value; backgroundError = ""; backgroundReadFailureCode = nil
+            publishBackground(value)
         } catch {
+            guard generation == backgroundGeneration else { return }
             backgroundError = error.localizedDescription
             if case DecodingError.keyNotFound(let key, _) = error {
                 backgroundReadFailureCode = "missing_" + BackendInitializationDiagnostics.code(key.stringValue)
@@ -974,6 +974,21 @@ final class SwitcherStore: ObservableObject {
             else { backgroundReadFailureCode = "read_error_\((error as NSError).code)" }
         }
     }
+    private func publishBackground(_ value: BackgroundServiceReceipt) {
+        // Concurrent status reads must not replace a newer observation with an
+        // older one. Advance the UI clock from the real completion time, not
+        // from the receipt, so future timestamps remain invalid.
+        if let previous = background, previous.observed_at.isFinite, previous.observed_at <= Date().timeIntervalSince1970,
+           value.observed_at.isFinite, value.observed_at < previous.observed_at { return }
+        advanceLoginClock(Date())
+        background = value; backgroundError = ""; backgroundReadFailureCode = nil
+    }
+    #if UI_REVIEW
+    func publishBackgroundForFixture(_ value: BackgroundServiceReceipt) {
+        guard isFixture else { return }
+        publishBackground(value)
+    }
+    #endif
     /// First-run reads the same status consumed by the regular pages, with a
     /// success result so an old `loaded` value cannot conceal a failed read.
     func refreshInitializationStatus() async -> Bool {
@@ -1276,7 +1291,7 @@ final class SwitcherStore: ObservableObject {
         setupUpdater = settings["auto_update"] as? Bool ?? false
         setupEnablePolicy = settings["enabled"] as? Bool ?? false
         if let object = raw["service_status"] {
-            background = try JSONDecoder().decode(BackgroundServiceReceipt.self, from: JSONSerialization.data(withJSONObject: object))
+            publishBackground(try JSONDecoder().decode(BackgroundServiceReceipt.self, from: JSONSerialization.data(withJSONObject: object)))
         }
         if let object = raw["accounts"], !(object is NSNull) {
             accounts = try JSONDecoder().decode(SwitcherAccountState.self, from: JSONSerialization.data(withJSONObject: object))

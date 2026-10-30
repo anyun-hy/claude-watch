@@ -225,7 +225,7 @@ struct MonitorView: View {
     private var footer: some View {
         HStack(spacing: 7) {
             Circle().fill(statusTint).frame(width: 5, height: 5)
-            Text(store.error != nil ? "本次同步未完成" : !store.automatic ? "已暂停界面同步" : store.live ? "正在同步后台数据" : "等待有效状态")
+            Text(store.error != nil ? "本次同步未完成" : !store.automatic ? "已暂停界面同步" : store.live ? "后台数据自动同步" : "等待有效状态")
             Spacer()
             Text(pageSampleTime)
                 .monospacedDigit()

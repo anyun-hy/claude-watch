@@ -7,13 +7,11 @@ struct SessionBaselinePresentation {
     let tone: String
 
     static func make(_ receipt: BackgroundServiceReceipt?, error: String = "", now: Double) -> Self {
-        guard let receipt, let session = receipt.session_guard else {
+        guard let receipt, let evidence = SessionProtectionEvidence.fromBackground(receipt, error: error) else {
             return .init(title: "正在读取会话基准", detail: error.isEmpty ? "正在读取自动保护的会话记录。" : error,
                          symbol: "clock", tone: "info")
         }
-        return make(evidence: .init(session: session, observedAt: receipt.observed_at,
-                                   backendReady: receipt.backend_healthy && receipt.services.first(where: { $0.id == "guard" })?.healthy == true,
-                                   readError: error), now: now)
+        return make(evidence: evidence, now: now)
     }
     static func make(evidence: SessionProtectionEvidence?, now: Double) -> Self {
         guard let evidence else {
