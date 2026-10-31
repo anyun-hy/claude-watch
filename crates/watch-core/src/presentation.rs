@@ -40,10 +40,8 @@ pub fn service_response(
         return (fallback_state, fallback_detail, None);
     }
     let expected: &[&str] = if service == "claude" {
-        // The runtime's credential-free web observation is Cloudflare's trace
-        // endpoint. Keep the original homepage source readable for persisted
-        // receipts from the Python runtime, but do not downgrade the current
-        // trace receipt merely because its source is more specific.
+        // Current observations check the homepage; keep trace receipts
+        // readable for snapshots made by earlier runtime versions.
         &["https://claude.ai/", "https://claude.ai/cdn-cgi/trace"]
     } else {
         &["https://api.anthropic.com/v1/models"]

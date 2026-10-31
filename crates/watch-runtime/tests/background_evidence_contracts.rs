@@ -32,12 +32,14 @@ fn failed_worker_persists_only_validated_lifecycle_diagnostics() {
     let script = f.root.join(WORKER);
     fs::write(
         &script,
-        r##"#!/bin/sh
-printf '%s\n' '{"cw_trace":"navigation_finished","attached":true,"elapsed_ms":40}' >&2
-printf '%s\n' '{"cw_trace":"dns_retry","attached":true,"elapsed_ms":45}' >&2
-printf '%s\n' '{"cw_trace":"secret-203.0.113.9","attached":true,"elapsed_ms":50}' >&2
-printf '%s\n' 'unstructured secret-token' >&2
-printf '%s\n' '{"status":"timeout"}'
+        r##"#!/usr/bin/python3
+import json,sys
+print(json.dumps({'schema':1,'ready':True}),flush=True)
+for line in sys.stdin:
+ r=json.loads(line)
+ for event in ['navigation_finished','dns_retry','secret-203.0.113.9']:
+  print(json.dumps({'cw_trace':event,'request_id':r['id'],'attached':True,'elapsed_ms':40}),file=sys.stderr,flush=True)
+ print(json.dumps({'schema':1,'id':r['id'],'kind':r['kind'],'result':{'kind':r['kind'],'status':'timeout','errors':[]}}),flush=True)
 "##,
     )
     .unwrap();
@@ -62,7 +64,14 @@ printf '%s\n' '{"status":"timeout"}'
     assert_eq!(log.lines().count(), 2);
 
     let script = f.root.join(WORKER);
-    fs::write(&script, "#!/bin/sh\nprintf '%s\\n' '{\"cw_trace\":\"phase_dns\",\"attached\":true,\"elapsed_ms\":40}' >&2\n/bin/sleep 5\n").unwrap();
+    fs::write(&script, r#"#!/usr/bin/python3
+import json,sys,time
+print(json.dumps({'schema':1,'ready':True}),flush=True)
+for line in sys.stdin:
+ r=json.loads(line)
+ print(json.dumps({'cw_trace':'phase_dns','request_id':r['id'],'attached':True,'elapsed_ms':40}),file=sys.stderr,flush=True)
+ time.sleep(5)
+"#).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
     let timeout = ProbeExecutor::new(Arc::new(AtomicBool::new(false)))
         .with_diagnostics(f.store.clone())
@@ -95,11 +104,14 @@ fn recovered_worker_retains_only_bounded_http_retry_diagnostic() {
     let script = f.root.join(WORKER);
     fs::write(
         &script,
-        r##"#!/bin/sh
-printf '%s\n' '{"cw_trace":"navigation_finished","attached":true,"elapsed_ms":40}' >&2
-printf '%s\n' '{"cw_trace":"http_retry","attached":true,"elapsed_ms":45}' >&2
-printf '%s\n' '{"cw_trace":"secret-203.0.113.9","attached":true,"elapsed_ms":50}' >&2
-printf '%s\n' '{"status":"complete"}'
+        r##"#!/usr/bin/python3
+import json,sys
+print(json.dumps({'schema':1,'ready':True}),flush=True)
+for line in sys.stdin:
+ r=json.loads(line)
+ for event in ['navigation_finished','http_retry','secret-203.0.113.9']:
+  print(json.dumps({'cw_trace':event,'request_id':r['id'],'attached':True,'elapsed_ms':40}),file=sys.stderr,flush=True)
+ print(json.dumps({'schema':1,'id':r['id'],'kind':r['kind'],'result':{'kind':r['kind'],'status':'complete','errors':[]}}),flush=True)
 "##,
     )
     .unwrap();

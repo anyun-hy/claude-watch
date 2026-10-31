@@ -42,6 +42,7 @@ pub struct Request {
     /// Bound only the connect/proxy-negotiation/TLS phase when a caller has a
     /// historical connect-time contract in addition to its total deadline.
     pub connect_timeout: Option<Duration>,
+    /// Maximum response body bytes; zero reads only the status and headers.
     pub max_body: usize,
     /// Fixed, caller-owned protocol headers.  This is intentionally not a
     /// general user-input header surface.
@@ -113,28 +114,30 @@ impl Transport for UreqTransport {
         })?;
         let status = response.status().as_u16();
         let mut body = Vec::new();
-        response
-            .body_mut()
-            .with_config()
-            .limit(request.max_body as u64 + 1)
-            .reader()
-            .take(request.max_body as u64 + 1)
-            .read_to_end(&mut body)
-            .map_err(|e| {
-                let inner = e
-                    .get_ref()
-                    .and_then(|value| value.downcast_ref::<ureq::Error>());
-                let code = if e.kind() == std::io::ErrorKind::TimedOut
-                    || matches!(inner, Some(ureq::Error::Timeout(_)))
-                {
-                    "timeout"
-                } else if matches!(inner, Some(ureq::Error::BodyExceedsLimit(_))) {
-                    "body_too_large"
-                } else {
-                    "read_failed"
-                };
-                TransportError::new(code, &e.to_string())
-            })?;
+        if request.max_body > 0 {
+            response
+                .body_mut()
+                .with_config()
+                .limit(request.max_body as u64 + 1)
+                .reader()
+                .take(request.max_body as u64 + 1)
+                .read_to_end(&mut body)
+                .map_err(|e| {
+                    let inner = e
+                        .get_ref()
+                        .and_then(|value| value.downcast_ref::<ureq::Error>());
+                    let code = if e.kind() == std::io::ErrorKind::TimedOut
+                        || matches!(inner, Some(ureq::Error::Timeout(_)))
+                    {
+                        "timeout"
+                    } else if matches!(inner, Some(ureq::Error::BodyExceedsLimit(_))) {
+                        "body_too_large"
+                    } else {
+                        "read_failed"
+                    };
+                    TransportError::new(code, &e.to_string())
+                })?;
+        }
         if body.len() > request.max_body {
             return Err(TransportError::new("body_too_large", "响应超过上限"));
         }
@@ -521,7 +524,7 @@ impl<T: Transport> NetworkClient<T> {
                 }
             }
         };
-        if out.status == "complete" && kind != "trace" {
+        if out.status == "complete" && !matches!(kind, "trace" | "service") {
             match serde_json::from_str::<Value>(&out.raw) {
                 Ok(v) if v.is_object() => out.data = Some(v),
                 _ => {
@@ -795,6 +798,14 @@ impl<T: Transport> NetworkClient<T> {
             ),
         }
     }
+
+    /// Observe the actual homepage without credentials or downloading its body.
+    /// Egress sampling continues to use `service_metadata` and its trace URL.
+    pub fn claude_homepage(&self) -> Receipt {
+        self.clone()
+            .with_timeout(Duration::from_secs(8))
+            .request_limited("service", "", "https://claude.ai/".into(), 0)
+    }
 }
 
 /// A RIPE country is accepted only when every accepted row names this exact ASN
@@ -871,11 +882,13 @@ pub fn lookup_asn(receipt: &Receipt) -> Option<u32> {
 pub fn service_observation(service: &str, receipt: &Receipt) -> Value {
     let status = receipt.http_status;
     let reached = receipt.http_status.is_some();
-    let cloudflare_challenge = receipt.source_url == "https://claude.ai/cdn-cgi/trace"
-        && receipt
-            .response_headers
-            .get("cf-mitigated")
-            .is_some_and(|v| v.eq_ignore_ascii_case("challenge"));
+    let cloudflare_challenge = matches!(
+        receipt.source_url.as_str(),
+        "https://claude.ai/" | "https://claude.ai/cdn-cgi/trace"
+    ) && receipt
+        .response_headers
+        .get("cf-mitigated")
+        .is_some_and(|v| v.eq_ignore_ascii_case("challenge"));
     let (access, challenge) = match (service, status) {
         ("api", Some(401)) => ("authentication_required", Value::Null),
         ("claude", Some(403)) if cloudflare_challenge => (

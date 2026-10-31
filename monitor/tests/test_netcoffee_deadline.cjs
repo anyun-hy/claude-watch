@@ -179,6 +179,12 @@ async function collect(run, kind = 'dns', id = 'one', rounds = 5) {
   await Promise.resolve();
   assert.equal(run.payloads.length, 0);
 
+  run = fixture();
+  run.start('webrtc', 'current-round');
+  run.context.window.NetCoffeeProbe.cancel('previous-round');
+  await run.clock.runUntil(() => run.payloads.length > 0);
+  assert.equal(run.payloads[0].status, 'complete', 'a stale cancellation cannot stop the current WebRTC round');
+
   // A late response belonging to a cancelled run cannot populate a later run.
   run = fixture({ deferRequests: true });
   run.start('dns', 'old');

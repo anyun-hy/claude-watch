@@ -70,7 +70,9 @@ async function cancelRun() {
   vm.runInContext(code, context);
   context.window.IPLeakProbe.run({runID: 'cancel', rounds: 5});
   await new Promise(resolve => setImmediate(resolve));
-  context.window.IPLeakProbe.cancel();
+  context.window.IPLeakProbe.cancel('previous-round');
+  assert(signals.every(signal => !signal.aborted), 'an old cancellation cannot abort the current DNS round');
+  context.window.IPLeakProbe.cancel('cancel');
   await new Promise(resolve => setTimeout(resolve, 20));
   assert(signals.length >= 2 && signals.every(signal => signal.aborted));
   assert.equal(delivered, false, 'cancelled run must not publish a late receipt');

@@ -62,10 +62,25 @@ final class WebRTCProbeRunner: NSObject, WKScriptMessageHandler, WKNavigationDel
     private var documentURL: URL?
     private var watchdog: DispatchWorkItem?
     var onDiagnostic: ((String, Bool) -> Void)?
-    private func trace(_ event: String) { onDiagnostic?(event, webView?.window != nil) }
+    private var pageReady = false
+    private func trace(_ event: String) {
+        guard runID != nil else { return }
+        onDiagnostic?(event, webView?.window != nil)
+    }
 
     func start(id: UUID, completion: @escaping (LeakProbeResult) -> Void) {
+        cancel()
         self.runID = id.uuidString; self.completion = completion
+        let work = DispatchWorkItem { [weak self] in
+            guard self?.runID == id.uuidString else { return }
+            self?.trace("watchdog_timeout")
+            self?.finish(.failure(.webrtc, code: "timeout", message: "WebRTC 页面未在时限内完成；没有结果不代表无泄漏。"))
+        }
+        watchdog = work; DispatchQueue.main.asyncAfter(deadline: .now() + 22, execute: work)
+        if let webView {
+            if pageReady { trace("view_reused"); runScript(webView, runID: id.uuidString) }
+            return
+        }
         guard let file = Bundle.main.url(forResource: "webrtc_probe", withExtension: "html") else {
             finish(.failure(.webrtc, code: "component_missing", message: "WebRTC 检测页面不可用。")); return
         }
@@ -73,41 +88,43 @@ final class WebRTCProbeRunner: NSObject, WKScriptMessageHandler, WKNavigationDel
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+        configuration.preferences.inactiveSchedulingPolicy = .none
         #if LEAK_BRIDGE_TEST
         if let testBootstrap {
             configuration.userContentController.addUserScript(WKUserScript(source: testBootstrap, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         }
         #endif
-        configuration.userContentController.add(self, name: "leakProbe")
+        configuration.userContentController.add(WebRTCScriptHandler(self), name: "leakProbe")
         let view = WKWebView(frame: .zero, configuration: configuration)
         view.navigationDelegate = self; webView = view
-        let work = DispatchWorkItem { [weak self] in
-            self?.trace("watchdog_timeout")
-            self?.finish(.failure(.webrtc, code: "timeout", message: "WebRTC 页面未在时限内完成；没有结果不代表无泄漏。"))
-        }
-        watchdog = work; DispatchQueue.main.asyncAfter(deadline: .now() + 22, execute: work)
         view.loadFileURL(file, allowingReadAccessTo: file.deletingLastPathComponent())
     }
     func cancel() {
         if let runID {
             webView?.evaluateJavaScript("window.ClaudeWatchProbe && window.ClaudeWatchProbe.cancel('\(runID)')", completionHandler: nil)
         }
-        cleanup()
-    }
-    private func cleanup() {
         watchdog?.cancel(); watchdog = nil
+        completion = nil; runID = nil
+    }
+    func invalidate() {
+        cancel(); pageReady = false
         webView?.configuration.userContentController.removeScriptMessageHandler(forName: "leakProbe")
         webView?.stopLoading(); webView?.navigationDelegate = nil
         webView = nil; completion = nil; runID = nil
     }
     private func finish(_ result: LeakProbeResult) {
         let done = completion
-        cancel()
+        if result.status == "complete" && result.errors.isEmpty { cancel() }
+        else { invalidate() }
         done?(result)
     }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard webView === self.webView, let runID else { return }
+        guard webView === self.webView else { return }
+        pageReady = true
         trace("navigation_finished")
+        if let runID { runScript(webView, runID: runID) }
+    }
+    private func runScript(_ webView: WKWebView, runID: String) {
         // Return a plain scalar to WebKit; the probe sends its async receipt via
         // the native handler instead of asking evaluateJavaScript to bridge a Promise.
         let script = "if (!window.ClaudeWatchProbe) { throw new Error('probe missing'); } window.ClaudeWatchProbe.run({runID:'\(runID)', timeoutMs:8000}); true;"
@@ -119,18 +136,23 @@ final class WebRTCProbeRunner: NSObject, WKScriptMessageHandler, WKNavigationDel
         }
     }
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard webView === self.webView else { return }
         trace("navigation_failed")
         finish(.failure(.webrtc, code: "page_failed", message: "本地 WebRTC 检测页加载失败。"))
     }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard webView === self.webView else { return }
         trace("navigation_failed")
         finish(.failure(.webrtc, code: "page_failed", message: "本地 WebRTC 检测页未能打开。"))
     }
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         guard webView === self.webView else { return }
         trace("webcontent_terminated")
+        if runID != nil { finish(.failure(.webrtc, code: "page_failed", message: "WebRTC 检测进程已退出。")) }
+        else { invalidate() }
     }
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard webView === self.webView else { decisionHandler(.cancel); return }
         decisionHandler(navigationAction.request.url == documentURL ? .allow : .cancel)
     }
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -139,9 +161,21 @@ final class WebRTCProbeRunner: NSObject, WKScriptMessageHandler, WKNavigationDel
               let body = message.body as? [String: Any], body["runID"] as? String == expectedID else { trace("message_rejected"); return }
         guard let payload = body["payload"], JSONSerialization.isValidJSONObject(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload), data.count <= 65_536,
-              let result = try? JSONDecoder().decode(LeakProbeResult.self, from: data) else { trace("payload_invalid"); return }
+              let result = try? JSONDecoder().decode(LeakProbeResult.self, from: data), result.kind == LeakKind.webrtc.rawValue else {
+            trace("payload_invalid")
+            finish(.failure(.webrtc, code: "invalid_result", message: "WebRTC 返回结果无效。"))
+            return
+        }
         trace("payload_received")
         finish(result)
+    }
+}
+
+private final class WebRTCScriptHandler: NSObject, WKScriptMessageHandler {
+    weak var target: WKScriptMessageHandler?
+    init(_ target: WKScriptMessageHandler) { self.target = target }
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        target?.userContentController(controller, didReceive: message)
     }
 }
 
@@ -233,6 +267,8 @@ final class LeakCheckStore: ObservableObject {
     func changeSource(_ value: LeakProbeSource) {
         guard source != value else { return }
         cancel(.webrtc); set(LeakCheckState(), for: .webrtc)
+        _ = coffeeRunners.removeValue(forKey: .webrtc)?.invalidate()
+        rtcRunner?.invalidate(); rtcRunner = nil
         source = value
     }
     func start(_ kind: LeakKind) {
@@ -264,7 +300,7 @@ final class LeakCheckStore: ObservableObject {
                 self.complete(kind, id: id, result: Self.fixture(kind, scenario: self.fixtureScenario, at: Date()))
             }
         } else if kind == .dns {
-            let runner = IPLeakDNSRetryRunner(); ipLeakRunner = runner
+            let runner = ipLeakRunner ?? IPLeakDNSRetryRunner(); ipLeakRunner = runner
             runner.onDiagnostic = { [weak self] event, attached in self?.trace(kind, event, run: id, attached: attached) }
             runner.onViewChanged = { [weak self] browser in
                 guard self?.runs[kind] == id else { return }; self?.browserViews[kind] = browser
@@ -274,7 +310,7 @@ final class LeakCheckStore: ObservableObject {
                 guard self?.runs[kind] == id else { return }; self?.progress[kind] = text
             }) { [weak self] result in self?.complete(kind, id: id, result: result) }
         } else if source == .netCoffee {
-            let runner = NetCoffeeLeakRunner(); coffeeRunners[kind] = runner
+            let runner = coffeeRunners[kind] ?? NetCoffeeLeakRunner(); coffeeRunners[kind] = runner
             runner.onDiagnostic = { [weak self] event, attached in self?.trace(kind, event, run: id, attached: attached) }
             progress[kind] = "准备 Net.Coffee 采集"
             runner.start(kind: kind, rounds: deepDNS ? 8 : 5, id: id, progress: { [weak self] text in
@@ -284,7 +320,7 @@ final class LeakCheckStore: ObservableObject {
             trace(kind, runner.browserView?.window == nil ? "host_detached" : "host_attached", run: id,
                   attached: runner.browserView?.window != nil)
         } else {
-            let runner = WebRTCProbeRunner(); rtcRunner = runner
+            let runner = rtcRunner ?? WebRTCProbeRunner(); rtcRunner = runner
             runner.onDiagnostic = { [weak self] event, attached in self?.trace(kind, event, run: id, attached: attached) }
             runner.start(id: id) { [weak self] result in self?.complete(kind, id: id, result: result) }
         }
@@ -397,21 +433,25 @@ final class LeakCheckStore: ObservableObject {
     func cancel(_ kind: LeakKind) {
         guard state(kind).running else { return }
         trace(kind, "cancelled", run: runs[kind])
-        browserViews[kind] = nil; coffeeRunners[kind]?.cancel(); coffeeRunners[kind] = nil; progress[kind] = nil
+        browserViews[kind] = nil; coffeeRunners[kind]?.cancel(); progress[kind] = nil
         runs[kind] = nil; fixtureTasks[kind]?.cancel(); fixtureTasks[kind] = nil
         runLogSources[kind] = nil
-        if kind == .dns { dnsRunner?.cancel(); dnsRunner = nil; ipLeakRunner?.cancel(); ipLeakRunner = nil }
-        else { rtcRunner?.cancel(); rtcRunner = nil }
+        if kind == .dns { dnsRunner?.cancel(); dnsRunner = nil; ipLeakRunner?.cancel() }
+        else { rtcRunner?.cancel() }
         var cancelled = state(kind)
         cancelled.running = false; cancelled.result = nil; cancelled.verdict = .cancelled; cancelled.inputError = nil
         set(cancelled, for: kind)
     }
     func reattachDNSBrowser(_ browser: WKWebView) { ipLeakRunner?.reattachIfNeeded(browser) }
+    func reattachBrowser(_ browser: WKWebView, kind: LeakKind) {
+        if kind == .dns { reattachDNSBrowser(browser) }
+        else if source == .netCoffee { coffeeRunners[kind]?.reattachIfNeeded(browser) }
+    }
     private func complete(_ kind: LeakKind, id: UUID, result: LeakProbeResult) {
         guard runs[kind] == id else { return }
         let logSource = runLogSources.removeValue(forKey: kind)
-        browserViews[kind] = nil; runs[kind] = nil; fixtureTasks[kind] = nil; coffeeRunners[kind] = nil; progress[kind] = nil
-        if kind == .dns { dnsRunner = nil; ipLeakRunner = nil } else { rtcRunner = nil }
+        browserViews[kind] = nil; runs[kind] = nil; fixtureTasks[kind] = nil; progress[kind] = nil
+        if kind == .dns { dnsRunner = nil }
         now = Date()
         var completed = result
         if let context = contexts[kind], context.required {

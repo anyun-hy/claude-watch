@@ -2,11 +2,20 @@ import AppKit
 import Foundation
 import WebKit
 
+private final class IPLeakScriptHandler: NSObject, WKScriptMessageHandler {
+    weak var target: WKScriptMessageHandler?
+    init(_ target: WKScriptMessageHandler) { self.target = target }
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        target?.userContentController(controller, didReceive: message)
+    }
+}
+
 /// IPLeak DNS collection shared by the UI and the background evidence worker.
 @MainActor
 final class IPLeakDNSRunner: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     #if IPLEAK_BRIDGE_TEST
     var testBootstrap: String?
+    var testWatchdogInterval: TimeInterval?
     #endif
     private var view: WKWebView?
     private var hiddenHost: NSWindow?
@@ -16,11 +25,15 @@ final class IPLeakDNSRunner: NSObject, WKScriptMessageHandler, WKNavigationDeleg
     private var completion: ((LeakProbeResult) -> Void)?
     private var progress: ((String) -> Void)?
     var onDiagnostic: ((String, Bool) -> Void)?
-    private func trace(_ event: String) { onDiagnostic?(event, view?.window != nil) }
+    private func trace(_ event: String) {
+        guard id != nil else { return }
+        onDiagnostic?(event, view?.window != nil)
+    }
     private var watchdog: DispatchWorkItem?
     private var rounds = 5
     private var startedAt: Double = 0
     private let resourceDirectory: URL?
+    private var pageReady = false
 
     init(resourceDirectory: URL? = nil) {
         self.resourceDirectory = resourceDirectory
@@ -37,9 +50,26 @@ final class IPLeakDNSRunner: NSObject, WKScriptMessageHandler, WKNavigationDeleg
 
     func start(rounds: Int, id: UUID, progress: @escaping (String) -> Void = { _ in },
                completion: @escaping (LeakProbeResult) -> Void) {
+        cancel()
         self.id = id; self.completion = completion; self.progress = progress
         self.startedAt = Date().timeIntervalSince1970
         self.rounds = rounds == 8 ? 8 : 5
+        let timer = DispatchWorkItem { [weak self] in
+            guard let self, self.id == id else { return }
+            self.trace("watchdog_timeout")
+            self.finish(self.failure(code: "timeout", message: "IPLeak 检测超时；未完成不代表安全。"))
+        }
+        #if IPLEAK_BRIDGE_TEST
+        let timeout: Double = testWatchdogInterval ?? (testBootstrap == nil ? 75 : 15)
+        #else
+        let timeout: Double = 75
+        #endif
+        watchdog = timer; DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: timer)
+        if let view {
+            reattachIfNeeded(view)
+            if pageReady { trace("view_reused"); runScript(view, id: id) }
+            return
+        }
         let directory = resourceDirectory ?? Bundle.main.resourceURL
         guard let file = directory?.appendingPathComponent("ipleak_probe.html"), FileManager.default.isReadableFile(atPath: file.path) else {
             finish(failure(code: "component_missing", message: "IPLeak 检测页面不可用。")); return
@@ -49,14 +79,14 @@ final class IPLeakDNSRunner: NSObject, WKScriptMessageHandler, WKNavigationDeleg
         configuration.websiteDataStore = .nonPersistent()
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
         // The collector may be detached while its page is not selected. Keep
-        // this short-lived WebView runnable rather than suspending its timers.
+        // this retained WebView runnable rather than suspending its timers.
         configuration.preferences.inactiveSchedulingPolicy = .none
         #if IPLEAK_BRIDGE_TEST
         if let testBootstrap {
             configuration.userContentController.addUserScript(.init(source: testBootstrap, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         }
         #endif
-        configuration.userContentController.add(self, name: "ipLeakProbe")
+        configuration.userContentController.add(IPLeakScriptHandler(self), name: "ipLeakProbe")
         let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 640, height: 100), configuration: configuration)
         webView.navigationDelegate = self; view = webView
         // Automatic DNS checks must keep a WebKit view attached even when the
@@ -66,28 +96,24 @@ final class IPLeakDNSRunner: NSObject, WKScriptMessageHandler, WKNavigationDeleg
         host.isReleasedWhenClosed = false
         host.contentView = webView; hiddenHost = host; host.orderFront(nil)
         trace("host_attached")
-        let timer = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.trace("watchdog_timeout")
-            self.finish(self.failure(code: "timeout", message: "IPLeak 检测超时；未完成不代表安全。"))
-        }
-        #if IPLEAK_BRIDGE_TEST
-        let timeout: Double = testBootstrap == nil ? 75 : 15
-        #else
-        let timeout: Double = 75
-        #endif
-        watchdog = timer; DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: timer)
         guard let document else { finish(failure(code: "component_missing", message: "IPLeak 检测页面不可用。")); return }
         webView.loadFileURL(document, allowingReadAccessTo: document.deletingLastPathComponent())
     }
 
     func cancel() {
+        let oldID = id
         id = nil; watchdog?.cancel(); watchdog = nil
-        view?.evaluateJavaScript("window.IPLeakProbe && window.IPLeakProbe.cancel()", completionHandler: nil)
+        if let oldID {
+            view?.evaluateJavaScript("window.IPLeakProbe && window.IPLeakProbe.cancel('\(oldID.uuidString)')", completionHandler: nil)
+        }
+        completion = nil; progress = nil
+    }
+    func invalidate() {
+        cancel()
+        pageReady = false
         view?.configuration.userContentController.removeScriptMessageHandler(forName: "ipLeakProbe")
         view?.stopLoading(); view?.navigationDelegate = nil; view = nil
         hiddenHost?.close(); hiddenHost = nil
-        completion = nil; progress = nil
     }
     func reattachIfNeeded(_ browser: WKWebView) {
         DispatchQueue.main.async { [weak self, weak browser] in
@@ -100,11 +126,17 @@ final class IPLeakDNSRunner: NSObject, WKScriptMessageHandler, WKNavigationDeleg
     }
     private func finish(_ result: LeakProbeResult) {
         let done = completion
-        cancel(); done?(result)
+        if result.status == "complete" && result.errors.isEmpty { cancel() }
+        else { invalidate() }
+        done?(result)
     }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard webView === view, let id else { return }
+        guard webView === view else { return }
+        pageReady = true
         trace("navigation_finished")
+        if let id { runScript(webView, id: id) }
+    }
+    private func runScript(_ webView: WKWebView, id: UUID) {
         #if IPLEAK_BRIDGE_TEST || BACKGROUND_LEAK_WORKER_TEST
         FileHandle.standardError.write(Data("IPLeak bridge: didFinish\n".utf8))
         #endif
@@ -121,9 +153,11 @@ final class IPLeakDNSRunner: NSObject, WKScriptMessageHandler, WKNavigationDeleg
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         guard webView === view else { return }
         trace("webcontent_terminated")
-        finish(failure(code: "page_failed", message: "IPLeak 检测页面进程已退出。"))
+        if id != nil { finish(failure(code: "page_failed", message: "IPLeak 检测页面进程已退出。")) }
+        else { invalidate() }
     }
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard webView === view else { return }
         trace("navigation_failed")
         #if IPLEAK_BRIDGE_TEST || BACKGROUND_LEAK_WORKER_TEST
         FileHandle.standardError.write(Data("IPLeak bridge: navigation failed\n".utf8))
@@ -131,6 +165,7 @@ final class IPLeakDNSRunner: NSObject, WKScriptMessageHandler, WKNavigationDeleg
         finish(failure(code: "page_failed", message: "IPLeak 检测页面加载失败。"))
     }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard webView === view else { return }
         trace("navigation_failed")
         #if IPLEAK_BRIDGE_TEST || BACKGROUND_LEAK_WORKER_TEST
         FileHandle.standardError.write(Data("IPLeak bridge: provisional navigation failed\n".utf8))
@@ -139,6 +174,7 @@ final class IPLeakDNSRunner: NSObject, WKScriptMessageHandler, WKNavigationDeleg
     }
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard webView === view else { decisionHandler(.cancel); return }
         let requested = navigationAction.request.url?.resolvingSymlinksInPath().standardizedFileURL
         let allowed = requested == document
         #if IPLEAK_BRIDGE_TEST || BACKGROUND_LEAK_WORKER_TEST
@@ -168,7 +204,11 @@ final class IPLeakDNSRunner: NSObject, WKScriptMessageHandler, WKNavigationDeleg
         guard body["payload"] != nil else { return }
         guard let payload = body["payload"], JSONSerialization.isValidJSONObject(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload), data.count <= 1_048_576,
-              let result = try? JSONDecoder().decode(LeakProbeResult.self, from: data), result.kind == LeakKind.dns.rawValue else { trace("payload_invalid"); return }
+              let result = try? JSONDecoder().decode(LeakProbeResult.self, from: data), result.kind == LeakKind.dns.rawValue else {
+            trace("payload_invalid")
+            finish(failure(code: "invalid_result", message: "IPLeak 返回结果无效。"))
+            return
+        }
         trace("payload_received")
         finish(result)
     }

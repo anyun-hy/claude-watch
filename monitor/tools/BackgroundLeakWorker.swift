@@ -3,10 +3,10 @@ import CryptoKit
 import Darwin
 import Foundation
 
-/// Windowless WebKit collection for an active protected session. The helper
-/// reads only the fixed runtime files beside itself and emits one bounded
-/// `LeakProbeResult` JSON document on stdout. It owns no policy, state file,
-/// network configuration, or process-control capability.
+/// WebKit collection for an active protected session. The resident mode keeps
+/// loaded views and answers bounded, ID-bound requests over private pipes.
+/// The helper reads only its fixed runtime files and owns no policy, state
+/// file, network configuration, or process-control capability.
 enum BackgroundLeakWorker {
     static let maximumOutputBytes = 1_048_576
 
@@ -78,93 +78,131 @@ enum BackgroundLeakWorker {
 }
 
 #if BACKGROUND_LEAK_WORKER
+private struct WorkerRequest: Decodable {
+    let schema: Int
+    let id: String
+    let kind: String
+}
+
+@MainActor
+private final class BackgroundLeakService {
+    private let serving: Bool
+    private let runner: NetCoffeeLeakRunner
+    private let dnsRunner: IPLeakDNSRetryRunner
+    private var requestID: String?
+    private var kind: LeakKind = .dns
+    private var started = ProcessInfo.processInfo.systemUptime
+
+    init(directory: URL, serving: Bool) {
+        self.serving = serving
+        runner = NetCoffeeLeakRunner(resourceDirectory: directory, backendVariant: .rustCandidate)
+        dnsRunner = IPLeakDNSRetryRunner(resourceDirectory: directory)
+        let diagnostic: (String, Bool) -> Void = { [weak self] event, attached in
+            guard let self, let id = self.requestID else { return }
+            self.write(["cw_trace": event, "request_id": id, "attached": attached,
+                        "elapsed_ms": Int((ProcessInfo.processInfo.systemUptime - self.started) * 1000)], stderr: true)
+        }
+        runner.onDiagnostic = diagnostic
+        dnsRunner.onDiagnostic = diagnostic
+    }
+    private func write(_ value: [String: Any], stderr: Bool = false) {
+        guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+              data.count <= BackgroundLeakWorker.maximumOutputBytes else { return }
+        let output = stderr ? FileHandle.standardError : FileHandle.standardOutput
+        output.write(data); output.write(Data([10]))
+    }
+    func receive(_ request: WorkerRequest) {
+        guard requestID == nil, request.schema == 1, let id = UUID(uuidString: request.id),
+              ["dns", "webrtc"].contains(request.kind), request.id.count == 36 else { invalid(); return }
+        requestID = request.id
+        kind = request.kind == "dns" ? .dns : .webrtc
+        started = ProcessInfo.processInfo.systemUptime
+        if kind == .dns {
+            dnsRunner.start(rounds: 5, id: id) { [weak self] result in self?.finish(result) }
+        } else {
+            runner.start(kind: kind, id: id) { [weak self] result in self?.finish(result) }
+        }
+    }
+    private func finish(_ value: LeakProbeResult) {
+        guard let id = requestID else { return }
+        var result = value
+        if value.kind != kind.rawValue || (try? JSONEncoder().encode(value).count).map({ $0 > 900_000 }) != false {
+            result = .failure(kind, code: "invalid_result", message: "后台检测返回结果无效或超限。")
+            _ = runner.invalidate(); dnsRunner.invalidate()
+        }
+        requestID = nil
+        if serving, let data = try? JSONEncoder().encode(result),
+           let object = try? JSONSerialization.jsonObject(with: data) {
+            write(["schema": 1, "id": id, "kind": kind.rawValue, "result": object])
+        } else {
+            BackgroundLeakWorker.write(result)
+            shutdown()
+        }
+    }
+    func ready() { write(["schema": 1, "ready": true]) }
+    func invalid() {
+        write(["schema": 1, "error": "invalid_request"])
+        shutdown()
+    }
+    func shutdown() {
+        requestID = nil
+        _ = runner.invalidate(); dnsRunner.invalidate()
+        NSApp.terminate(nil)
+    }
+}
+
 @main
 struct BackgroundLeakWorkerMain {
     @MainActor static func main() {
-        guard let kind = BackgroundLeakWorker.kind(arguments: CommandLine.arguments) else {
-            BackgroundLeakWorker.write(.failure(.dns, code: "invalid_arguments", message: "后台检测仅接受 --dns 或 --webrtc。"))
+        let arguments = CommandLine.arguments
+        let serving = arguments.count == 2 && arguments[1] == "--serve"
+        let oneShotKind = BackgroundLeakWorker.kind(arguments: arguments)
+        guard serving || oneShotKind != nil else {
+            BackgroundLeakWorker.write(.failure(.dns, code: "invalid_arguments", message: "后台检测仅接受固定采集入口。"))
             exit(2)
         }
-        let executable = URL(fileURLWithPath: CommandLine.arguments.first ?? "").standardizedFileURL
+        let executable = URL(fileURLWithPath: arguments.first ?? "").standardizedFileURL
         guard let directory = BackgroundLeakWorker.verifiedResources(executable: executable) else {
-            BackgroundLeakWorker.write(.failure(kind, code: "component_missing", message: "后台检测组件或固定资源不可用。"))
+            BackgroundLeakWorker.write(.failure(oneShotKind ?? .dns, code: "component_missing", message: "后台检测组件或固定资源不可用。"))
             return
         }
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
-        let workerStarted = ProcessInfo.processInfo.systemUptime
-        let runner = NetCoffeeLeakRunner(resourceDirectory: directory, backendVariant: .rustCandidate)
-        let dnsRunner = IPLeakDNSRetryRunner(resourceDirectory: directory)
-        // Fixed labels only; the supervisor validates and persists them for
-        // incomplete runs and retains HTTP-retry evidence after recovery.
-        // Never include probe data or arbitrary WebKit errors.
-        let diagnostic: (String, Bool) -> Void = { event, attached in
-            let record: [String: Any] = ["cw_trace": event, "attached": attached,
-                                         "elapsed_ms": Int((ProcessInfo.processInfo.systemUptime - workerStarted) * 1000)]
-            if let bytes = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) {
-                FileHandle.standardError.write(bytes); FileHandle.standardError.write(Data([0x0a]))
-            }
-        }
-        runner.onDiagnostic = diagnostic
-        dnsRunner.onDiagnostic = diagnostic
-        #if BACKGROUND_LEAK_WORKER_TEST
-        runner.onPhase = { phase, elapsed in
-            let record: [String: Any] = ["phase": phase, "elapsed_ms": elapsed]
-            if let bytes = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) {
-                FileHandle.standardError.write(bytes)
-                FileHandle.standardError.write(Data([0x0a]))
-            }
-        }
-        #endif
-        // WebKit needs an attached view to advance navigation callbacks. This
-        // host is never ordered front or activated; it only owns the hidden
-        // view for the lifetime of this one bounded collection.
-        let host = NSWindow(contentRect: NSRect(x: -10_000, y: -10_000, width: 1, height: 1),
-                            styleMask: .borderless, backing: .buffered, defer: false)
-        host.isReleasedWhenClosed = false
-        var completed = false
-        var termination: DispatchSourceSignal?
-        func finish(_ result: LeakProbeResult) {
-            guard !completed else { return }
-            completed = true
-            termination?.cancel()
-            BackgroundLeakWorker.write(result)
-            NSApp.terminate(nil)
-        }
+        let service = BackgroundLeakService(directory: directory, serving: serving)
         signal(SIGTERM, SIG_IGN)
-        let signalSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-        signalSource.setEventHandler {
-            _ = runner.cancel()
-            dnsRunner.cancel()
-            finish(.failure(kind, code: "cancelled", message: "保护后台已取消本轮检测。"))
-        }
-        termination = signalSource; signalSource.resume()
-        DispatchQueue.main.async {
-            if kind == .dns {
-                dnsRunner.start(rounds: 5, id: UUID(), progress: { label in
-                    #if BACKGROUND_LEAK_WORKER_TEST
-                    let phase = label.contains("归属") ? "geoip" : label.contains("HTTP") ? "http" : "dns"
-                    let event = label.contains("失败") ? "failure" : label.contains("完成") ? "complete" : "start"
-                    let record: [String: Any] = ["phase": phase, "event": event, "elapsed_ms": Int((ProcessInfo.processInfo.systemUptime - workerStarted) * 1000)]
-                    if let bytes = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) {
-                        FileHandle.standardError.write(bytes); FileHandle.standardError.write(Data([0x0a]))
+        let termination = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        termination.setEventHandler { service.shutdown() }
+        termination.resume()
+        if serving {
+            service.ready()
+            // One bounded line per request. No caller-provided paths, scripts,
+            // endpoints, settings or process-control commands are accepted.
+            DispatchQueue.global(qos: .utility).async {
+                var pending = Data()
+                var bytes = [UInt8](repeating: 0, count: 512)
+                while true {
+                    let count = Darwin.read(STDIN_FILENO, &bytes, bytes.count)
+                    if count < 0 && errno == EINTR { continue }
+                    if count <= 0 { break }
+                    pending.append(contentsOf: bytes.prefix(count))
+                    if pending.count > 2048 { DispatchQueue.main.async { service.invalid() }; return }
+                    while let end = pending.firstIndex(of: 10) {
+                        let line = Data(pending[..<end]); pending.removeSubrange(...end)
+                        guard line.count <= 1024,
+                              let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any], object.count == 3,
+                              let request = try? JSONDecoder().decode(WorkerRequest.self, from: line) else {
+                            DispatchQueue.main.async { service.invalid() }; return
+                        }
+                        DispatchQueue.main.async { service.receive(request) }
                     }
-                    #endif
-                }) { result in finish(result) }
-            } else {
-                runner.start(kind: kind, id: UUID(), progress: { label in
-                #if BACKGROUND_LEAK_WORKER_TEST
-                let stage = label.contains("trace") ? "trace" : label.contains("geoip") ? "geoip" : label.contains("DNS") ? "dns" : "other"
-                FileHandle.standardError.write(Data("background fixture stage: \(stage)\n".utf8))
-                #endif
-                }) { result in finish(result) }
-                host.contentView = runner.browserView
-                host.orderFront(nil)
-                diagnostic(runner.browserView?.window == nil ? "host_detached" : "host_attached", runner.browserView?.window != nil)
+                }
+                DispatchQueue.main.async { service.shutdown() }
             }
+        } else if let kind = oneShotKind {
+            DispatchQueue.main.async { service.receive(WorkerRequest(schema: 1, id: UUID().uuidString, kind: kind.rawValue)) }
         }
         app.run()
-        _ = (runner, dnsRunner)
+        _ = (service, termination)
     }
 }
 #endif

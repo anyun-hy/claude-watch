@@ -71,7 +71,7 @@ private struct LeakInspectorPage: View {
             }
             if state.running, let progress = currentProgress { Label(progress,systemImage:"arrow.triangle.2.circlepath").font(.callout).foregroundStyle(style.network) }
             if let browser = currentBrowser {
-                CoffeeCollectorView(browser: browser, onDetach: isDNS ? { store.reattachDNSBrowser($0) } : nil)
+                CoffeeCollectorView(browser: browser, onDetach: { store.reattachBrowser($0, kind: kind) })
                     .frame(height:72).clipShape(RoundedRectangle(cornerRadius:10))
             }
             InspectorStatus(verdict: state.verdict, running: state.running, finishedAt: latestResult?.finishedAt, p: p)

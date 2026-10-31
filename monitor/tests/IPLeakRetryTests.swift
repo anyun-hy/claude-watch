@@ -33,6 +33,11 @@ struct IPLeakRetryTests {
         attempts[0].callback?(result)
         expect(received.count == 1, "a stale callback cannot replace completed evidence")
 
+        wrapper.start(rounds: 5, id: UUID()) { received.append($0) }
+        expect(attempts.count == 2, "a successful collector is retained for the next round")
+        attempts[1].callback?(result)
+        expect(received.count == 2, "reused collector publishes the new round")
+        wrapper.invalidate()
         attempts.removeAll(); received.removeAll()
         wrapper.start(rounds: 5, id: UUID()) { received.append($0) }
         for _ in 0..<100 where received.isEmpty { try? await Task.sleep(nanoseconds: 10_000_000) }
@@ -41,6 +46,7 @@ struct IPLeakRetryTests {
         expect(received[0].errors.first?.code == "timeout", "timeout remains identifiable in diagnostics")
         expect(diagnostics.contains("watchdog_timeout"), "an exhausted retry emits a timeout diagnostic")
 
+        wrapper.invalidate()
         attempts.removeAll(); received.removeAll()
         wrapper.start(rounds: 5, id: UUID()) { received.append($0) }
         wrapper.cancel(); attempts[0].callback?(result)

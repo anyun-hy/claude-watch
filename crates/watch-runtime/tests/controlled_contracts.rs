@@ -597,6 +597,75 @@ fn controlled_launch_builds_immutable_baseline_and_legacy_lease_only_after_full_
     assert_eq!(locked.state, Phase::Locked);
     assert_eq!(locked.baseline.ip, "1.1.1.1");
 }
+
+#[test]
+fn a_stalled_resident_webview_does_not_delay_confirmed_ip_change_protection() {
+    use claude_watch_runtime::{
+        background_evidence::{ProbeExecutor, WORKER},
+        release_native::{FixedCommand, FixedCommandExecutor},
+    };
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Instant,
+    };
+    let fixture = Fixture::new();
+    let script = fixture.home.join(WORKER);
+    let ready = fixture.home.join("probe-waiting");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/usr/bin/python3
+import json,sys,time
+from pathlib import Path
+print(json.dumps({{'schema':1,'ready':True}}),flush=True)
+for line in sys.stdin:
+ Path({:?}).write_text('waiting')
+ time.sleep(30)
+"#,
+            ready.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let cancel = stop.clone();
+    let probe = std::thread::spawn(move || {
+        ProbeExecutor::new(stop).run(FixedCommand {
+            program: script,
+            args: vec!["--dns".into()],
+            timeout: Duration::from_secs(30),
+        })
+    });
+    let wait = Instant::now();
+    while !ready.exists() && wait.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.launch(&mut system).unwrap();
+    system.now += 1.0;
+    system.ip = "8.8.8.8";
+    let started = Instant::now();
+    let protected = controller.guard_tick(&mut system).unwrap();
+    let elapsed = started.elapsed();
+    cancel.store(true, Ordering::Release);
+    assert!(probe.join().unwrap().is_err());
+    assert!(
+        ready.exists(),
+        "the isolated helper must be stalled during the guard check"
+    );
+    assert_eq!(protected["action"], "close-desktop");
+    assert_eq!(system.closes, 1);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "confirmed IP change must not wait for the WebView"
+    );
+}
+
 #[test]
 fn failed_audit_or_incomplete_risk_never_opens_and_never_weakens_launch_gate() {
     let fixture = Fixture::new();

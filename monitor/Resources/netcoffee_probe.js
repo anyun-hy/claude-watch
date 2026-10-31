@@ -143,5 +143,5 @@
     if(own.stopped||active!==own)return;
     publish(own);cleanup(own);
   }
-  window.NetCoffeeProbe={run:run,receive:receive,cancel:function(){cleanup(active);}};
+  window.NetCoffeeProbe={run:run,receive:receive,cancel:function(id){if(!id||(active&&active.id===id))cleanup(active);}};
 }());

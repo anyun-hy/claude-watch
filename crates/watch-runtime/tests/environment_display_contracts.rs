@@ -79,6 +79,50 @@ fn receipt_keeps_same_round_display_window_without_mutating_launch_audit() {
 }
 
 #[test]
+fn homepage_403_is_visible_on_the_card_without_mislabeling_old_trace_results() {
+    let (home, store) = store();
+    let mut observed = audit();
+    observed["rows"].as_array_mut().unwrap().push(json!({
+        "id":"reachability", "state":"ok", "required":true,
+        "service_responses":{"claude":{
+            "source":"https://claude.ai/", "status":"ok", "transport_reached":true,
+            "http_status":403, "access":"challenge",
+            "challenge":{"provider":"cloudflare","mitigated":"challenge"}
+        }}
+    }));
+    let current = |value: &Value| {
+        value["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "reachability")
+            .unwrap()["current"]
+            .clone()
+    };
+    let challenged = receipt(&store, observed.clone(), session(), false).unwrap();
+    assert_eq!(current(&challenged), "首页 HTTP 403 · 需要浏览器验证");
+
+    let row = observed["rows"].as_array_mut().unwrap().last_mut().unwrap();
+    row["state"] = json!("warn");
+    row["service_responses"]["claude"]["access"] = json!("unknown");
+    row["service_responses"]["claude"]["challenge"] = Value::Null;
+    let denied = receipt(&store, observed.clone(), session(), false).unwrap();
+    assert_eq!(current(&denied), "首页 HTTP 403 · 访问被拒绝");
+
+    let row = observed["rows"].as_array_mut().unwrap().last_mut().unwrap();
+    row["state"] = json!("unknown");
+    let unavailable = receipt(&store, observed.clone(), session(), false).unwrap();
+    assert_eq!(current(&unavailable), "网页/API 网络响应");
+
+    let row = observed["rows"].as_array_mut().unwrap().last_mut().unwrap();
+    row["state"] = json!("warn");
+    row["service_responses"]["claude"]["source"] = json!("https://claude.ai/cdn-cgi/trace");
+    let old_trace = receipt(&store, observed, session(), false).unwrap();
+    assert_eq!(current(&old_trace), "网页/API 网络响应");
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn initialization_receipt_evidence_uses_current_backend_receipts_not_display_cache() {
     let (home, store) = store();
     let mut observed = audit();

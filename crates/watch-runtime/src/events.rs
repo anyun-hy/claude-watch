@@ -308,7 +308,7 @@ impl EventStore {
     pub fn record_worker_trace(&self, kind: &str, run: &str, event: &str, attached: bool, elapsed: f64, at: f64) -> Result<()> {
         let allowed = ["host_attached", "host_detached", "navigation_finished", "navigation_failed",
             "webcontent_terminated", "script_started", "script_failed", "message_rejected", "payload_invalid",
-            "payload_received", "watchdog_timeout", "dns_retry", "http_retry", "phase_http", "phase_dns", "phase_dns_images",
+            "payload_received", "watchdog_timeout", "dns_retry", "http_retry", "view_reused", "phase_http", "phase_dns", "phase_dns_images",
             "phase_dns_records", "phase_geoip", "phase_ice", "phase_collector",
             "dns_request_timeout", "dns_request_network", "dns_request_http_status", "dns_request_invalid_response",
             "http_request_timeout", "http_request_network", "http_request_http_status", "http_request_invalid_response",

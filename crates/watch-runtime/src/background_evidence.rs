@@ -16,14 +16,16 @@ use claude_watch_core::{
 use serde_json::{json, Value};
 use std::{
     fs,
+    io::{Read, Write},
     os::unix::fs::MetadataExt,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
-use subprocess::{Exec, ExecExt, Job, JobExt, Redirection};
+use subprocess::{Communicator, Exec, ExecExt, Job, JobExt, Redirection};
 
 pub const WORKER: &str = "watch-leak-worker";
 pub const ASSETS: [&str; 3] = [
@@ -285,29 +287,195 @@ pub fn refresh_active_session<S: EvidenceSystem>(
     )
 }
 
-/// One owned process group, cancellable without waiting for a long probe.
-/// Signals only the group created here, before reaping its leader (PID reuse
-/// cannot retarget an unrelated group). The worker's CoffeeRequest children
-/// inherit this group and cannot outlive a timeout or daemon shutdown.
+/// One resident helper, owned only by the evidence thread. Requests remain
+/// bounded and correlated; a timeout or damaged channel discards the helper.
 pub struct ProbeExecutor {
     stop: Arc<AtomicBool>,
     diagnostics: Option<StateStore>,
+    resident: Option<ResidentProbe>,
 }
-impl ProbeExecutor {
-    pub fn new(stop: Arc<AtomicBool>) -> Self {
-        Self { stop, diagnostics: None }
+#[derive(PartialEq, Eq)]
+struct WorkerStamp {
+    path: PathBuf,
+    binary: (u64, u64, u64, i64, i64),
+    manifest: Option<String>,
+}
+impl WorkerStamp {
+    fn read(path: &std::path::Path) -> Result<Self> {
+        let stamp = |m: fs::Metadata| (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec());
+        let binary = fs::symlink_metadata(path)
+            .map_err(|_| err("evidence_worker_unavailable", "后台检测组件不可读取"))?;
+        if !binary.is_file() || binary.file_type().is_symlink() {
+            return Err(err("evidence_runtime_invalid", "后台检测组件不是普通文件"));
+        }
+        let manifest = match fs::File::open(path.with_file_name("BuildInfo.plist")) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take(256 * 1024 + 1).read_to_end(&mut bytes)
+                    .map_err(|_| err("evidence_runtime_invalid", "后台检测清单不可读取"))?;
+                if bytes.len() > 256 * 1024 {
+                    return Err(err("evidence_runtime_invalid", "后台检测清单超限"));
+                }
+                Some(sha256(&bytes))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(err("evidence_runtime_invalid", "后台检测清单不可读取")),
+        };
+        Ok(Self {
+            path: path.into(),
+            binary: stamp(binary),
+            manifest,
+        })
     }
-    pub fn with_diagnostics(mut self, store: StateStore) -> Self {
-        self.diagnostics = Some(store);
-        self
-    }
+}
+struct ResidentProbe {
+    job: Option<Job>,
+    input: fs::File,
+    io: Option<Communicator>,
+    stamp: WorkerStamp,
 }
 fn stop_group(job: &Job) {
+    // Signal before reaping: the still-owned leader reserves the group ID.
     let _ = job.send_signal_group(signal_hook::consts::SIGTERM);
     std::thread::sleep(Duration::from_millis(200));
     let _ = job.send_signal_group(signal_hook::consts::SIGKILL);
     if !matches!(job.wait_timeout(Duration::from_millis(500)), Ok(Some(_))) {
         job.detach();
+    }
+}
+impl Drop for ResidentProbe {
+    fn drop(&mut self) {
+        if let Some(job) = self.job.take() {
+            stop_group(&job);
+        }
+    }
+}
+impl ResidentProbe {
+    fn spawn(stamp: WorkerStamp) -> Result<Self> {
+        let mut job = Exec::cmd(&stamp.path)
+            .args(["--serve"])
+            .setpgid()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .stdin(Redirection::Pipe)
+            .stdout(Redirection::Pipe)
+            .stderr(Redirection::Pipe)
+            .start()
+            .map_err(|_| err("evidence_worker_unavailable", "后台检测组件无法启动"))?;
+        let input = job.stdin.take();
+        let io = job.communicate();
+        match (input, io) {
+            (Some(input), Ok(io)) => Ok(Self {
+                job: Some(job),
+                input,
+                io: Some(io),
+                stamp,
+            }),
+            _ => {
+                stop_group(&job);
+                Err(err("evidence_probe_failed", "后台检测通道不可用"))
+            }
+        }
+    }
+    fn frame(
+        &mut self,
+        stop: &AtomicBool,
+        deadline: Instant,
+        errors: &mut Vec<u8>,
+    ) -> Result<Value> {
+        let mut io = self
+            .io
+            .take()
+            .ok_or_else(|| err("evidence_probe_failed", "后台检测通道已关闭"))?
+            .limit_time(Duration::from_millis(100));
+        let mut out = Vec::new();
+        let result = loop {
+            if stop.load(Ordering::Acquire) {
+                break Err(err("evidence_cancelled", "后台检测已停止"));
+            }
+            if Instant::now() >= deadline {
+                break Err(err("evidence_probe_timeout", "后台检测超过时限"));
+            }
+            io = io.limit_size(1_048_577usize.saturating_sub(out.len() + errors.len()));
+            let read = io.read_to(&mut out, &mut *errors);
+            if out.len() + errors.len() > 1_048_576 {
+                break Err(err("evidence_probe_oversize", "后台检测输出超限"));
+            }
+            if let Some(end) = out.iter().position(|b| *b == b'\n') {
+                if out[end + 1..].iter().any(|b| !b.is_ascii_whitespace()) {
+                    break Err(err("evidence_probe_invalid", "后台检测返回了多余消息"));
+                }
+                break strict_json(&out[..end])
+                    .map_err(|_| err("evidence_probe_invalid", "后台检测消息无效"));
+            }
+            match read {
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                _ => {
+                    break Err(err(
+                        "evidence_probe_failed",
+                        "后台检测组件提前退出或通道失败",
+                    ))
+                }
+            }
+        };
+        self.io = Some(io);
+        result
+    }
+}
+impl ProbeExecutor {
+    pub fn new(stop: Arc<AtomicBool>) -> Self {
+        Self {
+            stop,
+            diagnostics: None,
+            resident: None,
+        }
+    }
+    pub fn with_diagnostics(mut self, store: StateStore) -> Self {
+        self.diagnostics = Some(store);
+        self
+    }
+    fn record_trace(&self, kind: &str, run: &str, started: f64, raw: &[u8], incomplete: bool) {
+        let Some(store) = &self.diagnostics else {
+            return;
+        };
+        let events = crate::events::EventStore::new(store.clone());
+        let mut recorded = 0;
+        for line in raw.split(|b| *b == b'\n').take(4096) {
+            if recorded >= 64 {
+                break;
+            }
+            let Ok(v) = serde_json::from_slice::<Value>(line) else {
+                continue;
+            };
+            if v["request_id"] != run {
+                continue;
+            }
+            let (Some(event), Some(attached), Some(ms)) = (
+                v["cw_trace"].as_str(),
+                v["attached"].as_bool(),
+                v["elapsed_ms"].as_f64(),
+            ) else {
+                continue;
+            };
+            if !incomplete && !matches!(event, "http_retry" | "view_reused") {
+                continue;
+            }
+            if !(0.0..=120_000.0).contains(&ms) {
+                continue;
+            }
+            if events
+                .record_worker_trace(
+                    kind,
+                    run,
+                    event,
+                    attached,
+                    ms / 1000.0,
+                    started + ms / 1000.0,
+                )
+                .is_ok()
+            {
+                recorded += 1;
+            }
+        }
     }
 }
 impl FixedCommandExecutor for ProbeExecutor {
@@ -320,92 +488,69 @@ impl FixedCommandExecutor for ProbeExecutor {
         {
             return Err(err("evidence_command_invalid", "后台检测命令不是固定入口"));
         }
-        if self.stop.load(Ordering::Acquire) {
-            return Err(err("evidence_cancelled", "后台检测已停止"));
-        }
-        let mut job = Exec::cmd(&command.program)
-            .args(&command.args)
-            .setpgid()
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .stdout(Redirection::Pipe)
-            .stderr(Redirection::Pipe)
-            .start()
-            .map_err(|_| err("evidence_worker_unavailable", "后台检测组件无法启动"))?;
-        let started_at = crate::native::now();
-        let mut error_output = Vec::new();
-        let result = (|| -> Result<FixedOutput> {
-            let mut io = job
-                .communicate()
-                .map_err(|_| err("evidence_probe_failed", "后台检测通道不可用"))?
-                .limit_time(Duration::from_millis(100));
-            let deadline = Instant::now() + command.timeout;
-            let mut out = Vec::new();
-            loop {
-                if self.stop.load(Ordering::Acquire) {
-                    return Err(err("evidence_cancelled", "后台检测已停止"));
-                }
-                if Instant::now() >= deadline {
-                    return Err(err("evidence_probe_timeout", "后台检测超过时限"));
-                }
-                let remaining = 1_048_577usize.saturating_sub(out.len() + error_output.len());
-                io = io.limit_size(remaining);
-                let read = io.read_to(&mut out, &mut error_output);
-                if out.len() + error_output.len() > 1_048_576 {
-                    return Err(err("evidence_probe_oversize", "后台检测输出超限"));
-                }
-                match read {
-                    Ok(()) => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
-                    Err(_) => return Err(err("evidence_probe_failed", "后台检测通道失败")),
-                }
+        let kind = if command.args == ["--dns"] {
+            "dns"
+        } else {
+            "webrtc"
+        };
+        let run = uuid::Uuid::new_v4().to_string();
+        let mut started = crate::native::now();
+        let mut errors = Vec::new();
+        let deadline = Instant::now() + command.timeout;
+        let result = (|| {
+            if self.stop.load(Ordering::Acquire) {
+                return Err(err("evidence_cancelled", "后台检测已停止"));
             }
-            // EOF is the protocol end. Clean up any descendant before reaping
-            // the group leader, including a worker that crashed unexpectedly.
-            let _ = job.send_signal_group(signal_hook::consts::SIGTERM);
-            std::thread::sleep(Duration::from_millis(100));
-            let _ = job.send_signal_group(signal_hook::consts::SIGKILL);
-            let status = job
-                .wait_timeout(Duration::from_millis(500))
-                .ok()
-                .flatten()
-                .ok_or_else(|| err("evidence_probe_failed", "后台检测组件未退出"))?;
+            let stamp = WorkerStamp::read(&command.program)?;
+            if !self.resident.as_ref().is_some_and(|r| r.stamp == stamp) {
+                self.resident = None;
+                self.resident = Some(ResidentProbe::spawn(stamp)?);
+                let ready =
+                    self.resident
+                        .as_mut()
+                        .unwrap()
+                        .frame(&self.stop, deadline, &mut errors)?;
+                if ready != json!({"schema":1,"ready":true}) {
+                    return Err(err("evidence_probe_invalid", "后台检测组件不支持常驻协议"));
+                }
+                errors.clear();
+            }
+            started = crate::native::now();
+            let worker = self.resident.as_mut().unwrap();
+            let request = format!("{}\n", json!({"schema":1,"id":run,"kind":kind}));
+            worker
+                .input
+                .write_all(request.as_bytes())
+                .and_then(|_| worker.input.flush())
+                .map_err(|_| err("evidence_probe_failed", "后台检测请求无法发送"))?;
+            let response = worker.frame(&self.stop, deadline, &mut errors)?;
+            if response["schema"] != 1
+                || response["id"] != run
+                || response["kind"] != kind
+                || !response["result"].is_object()
+                || response["result"]["kind"] != kind
+                || response.as_object().is_none_or(|v| v.len() != 4)
+            {
+                return Err(err("evidence_probe_invalid", "后台检测结果轮次或类型不符"));
+            }
             Ok(FixedOutput {
-                status: status.code().map(|v| v as i32).unwrap_or(-1),
-                stdout: String::from_utf8(out)
-                    .map_err(|_| err("evidence_probe_invalid", "后台检测结果编码无效"))?,
+                status: 0,
+                stdout: response["result"].to_string(),
                 stderr: String::new(),
             })
         })();
-        if result.is_err() {
-            stop_group(&job);
-        }
-        // Keep detailed worker phases for an unsuccessful collection, and
-        // retain the single bounded HTTP-retry event even after recovery.
-        // stderr can contain system output: accept only the fixed JSON fields
-        // and event vocabulary, never persist arbitrary stderr text.
-        let incomplete = result.as_ref().map_or(true, |output| {
-            output.status != 0 || serde_json::from_str::<Value>(&output.stdout).ok()
-                .and_then(|value| value["status"].as_str().map(str::to_owned))
-                .as_deref() != Some("complete")
+        let incomplete = result.as_ref().map_or(true, |out| {
+            serde_json::from_str::<Value>(&out.stdout)
+                .ok()
+                .is_none_or(|v| {
+                    v["status"] != "complete"
+                        || v["errors"].as_array().is_none_or(|e| !e.is_empty())
+                })
         });
-        if incomplete || !error_output.is_empty() {
-            if let Some(store) = &self.diagnostics {
-                let events = crate::events::EventStore::new(store.clone());
-                let run = uuid::Uuid::new_v4().to_string();
-                let kind = if command.args == ["--dns"] { "dns" } else { "webrtc" };
-                let mut recorded = 0;
-                for line in error_output.split(|b| *b == b'\n').take(4096) {
-                    if recorded >= 64 { break; }
-                    let Ok(value) = serde_json::from_slice::<Value>(line) else { continue };
-                    let (Some(event), Some(attached), Some(ms)) = (value["cw_trace"].as_str(), value["attached"].as_bool(), value["elapsed_ms"].as_f64()) else { continue };
-                    if !incomplete && event != "http_retry" { continue; }
-                    if !(0.0..=120_000.0).contains(&ms) { continue; }
-                    if events.record_worker_trace(kind, &run, event, attached, ms / 1000.0, started_at + ms / 1000.0).is_ok() {
-                        recorded += 1;
-                    }
-                }
-            }
+        if incomplete {
+            self.resident = None;
         }
+        self.record_trace(kind, &run, started, &errors, incomplete);
         result
     }
 }

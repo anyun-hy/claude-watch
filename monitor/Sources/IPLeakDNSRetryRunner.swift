@@ -7,7 +7,9 @@ protocol IPLeakDNSRunning: AnyObject {
     func start(rounds: Int, id: UUID, progress: @escaping (String) -> Void,
                completion: @escaping (LeakProbeResult) -> Void)
     func cancel()
+    func invalidate()
 }
+extension IPLeakDNSRunning { func invalidate() { cancel() } }
 extension IPLeakDNSRunner: IPLeakDNSRunning {}
 
 /// A native progress deadline protects against a suspended WebKit timer. A
@@ -50,7 +52,7 @@ final class IPLeakDNSRetryRunner {
         guard runID == id else { return }
         attempts += 1
         let attempt = UUID(); attemptID = attempt
-        let runner = makeRunner(); active = runner
+        let runner = active ?? makeRunner(); active = runner
         runner.onDiagnostic = { [weak self] event, attached in
             guard let self, self.runID == id, self.attemptID == attempt else { return }
             self.onDiagnostic?(event, attached)
@@ -72,7 +74,7 @@ final class IPLeakDNSRetryRunner {
             if self.attempts < 2 {
                 self.onDiagnostic?("dns_retry", self.browserView?.window != nil)
                 self.attemptID = nil
-                self.active?.cancel(); self.active = nil
+                self.active?.invalidate(); self.active = nil
                 self.progress?("IPLeak 请求无进展，正在重新检测。")
                 self.beginAttempt(id)
             } else { self.timedOut(id) }
@@ -82,6 +84,7 @@ final class IPLeakDNSRetryRunner {
     private func timedOut(_ id: UUID) {
         guard runID == id else { return }
         onDiagnostic?("watchdog_timeout", browserView?.window != nil)
+        active?.invalidate(); active = nil
         finish(.init(kind: "dns", status: "timeout", startedAt: startedAt,
                      finishedAt: Date().timeIntervalSince1970, scope: "IPLeak.net · 本机 WebView DNS 检测",
                      observations: [], errors: [.init(stage: "dns", code: "timeout", message: "IPLeak 检测在时限内没有完成。")],
@@ -89,11 +92,18 @@ final class IPLeakDNSRetryRunner {
     }
     private func finish(_ result: LeakProbeResult) {
         let callback = completion
+        if result.status != "complete" || !result.errors.isEmpty {
+            active?.invalidate(); active = nil
+        }
         cancel(); callback?(result)
     }
     func cancel() {
         runID = nil; attemptID = nil
         stall?.cancel(); stall = nil; total?.cancel(); total = nil
-        active?.cancel(); active = nil; onViewChanged?(nil); completion = nil; progress = nil
+        active?.cancel(); onViewChanged?(nil); completion = nil; progress = nil
+    }
+    func invalidate() {
+        cancel()
+        active?.invalidate(); active = nil
     }
 }

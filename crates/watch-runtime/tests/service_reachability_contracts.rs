@@ -71,3 +71,28 @@ fn an_unreachable_receipt_still_reports_unknown() {
     let (state, detail, _, _) = presentation::services(&online);
     assert_eq!(state, "unknown", "detail={detail}");
 }
+
+#[test]
+fn homepage_403_distinguishes_verified_challenge_from_plain_denial() {
+    let api = receipt(
+        "https://api.anthropic.com/v1/models",
+        401,
+        "authentication_required",
+    );
+    let mut homepage = receipt("https://claude.ai/", 403, "challenge");
+    homepage["challenge"] = json!({"provider":"cloudflare","mitigated":"challenge"});
+    let online = json!({"service_responses":{"claude":homepage,"api":api}});
+    let (state, detail, _, _) = presentation::services(&online);
+    assert_eq!(
+        state, "ok",
+        "a verified challenge establishes network reachability"
+    );
+    assert!(detail.contains("HTTP 403") && detail.contains("需要浏览器验证"));
+
+    let mut denied = online;
+    denied["service_responses"]["claude"]["access"] = json!("unknown");
+    denied["service_responses"]["claude"]["challenge"] = serde_json::Value::Null;
+    let (state, detail, _, _) = presentation::services(&denied);
+    assert_eq!(state, "warn");
+    assert!(detail.contains("HTTP 403") && detail.contains("访问被拒绝"));
+}

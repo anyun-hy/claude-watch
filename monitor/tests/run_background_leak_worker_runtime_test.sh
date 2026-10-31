@@ -110,8 +110,10 @@ for argument in ('--dns', '--webrtc'):
     for expected in ('host_attached', 'navigation_finished', 'payload_received'):
         if not any(row.get('cw_trace') == expected for row in traces):
             raise SystemExit(f'{argument}: missing worker diagnostic {expected}')
-    if any(set(row) != {'cw_trace', 'attached', 'elapsed_ms'} or not isinstance(row['attached'], bool) for row in traces):
+    if any(set(row) != {'cw_trace', 'request_id', 'attached', 'elapsed_ms'} or not isinstance(row['attached'], bool) for row in traces):
         raise SystemExit(f'{argument}: worker trace contains unexpected fields')
+    if len({row['request_id'] for row in traces}) != 1:
+        raise SystemExit(f'{argument}: worker trace changed request identity')
     if '8.8.4.4' in stderr:
         raise SystemExit(f'{argument}: worker trace leaked an observation')
 print('BackgroundLeakWorker runtime DNS/WebRTC fixture: passed')

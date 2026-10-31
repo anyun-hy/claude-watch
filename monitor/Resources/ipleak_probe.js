@@ -148,8 +148,8 @@
     }
     return observations;
   }
-  function cancel() {
-    if (!active) return;
+  function cancel(id) {
+    if (!active || (id && active.id !== id)) return;
     active.stopped = true;
     active.controllers.forEach(function (controller) { controller.abort(); });
     active.controllers.clear();

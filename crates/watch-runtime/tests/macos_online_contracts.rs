@@ -285,3 +285,16 @@ fn observed_target_reuses_exit_metadata_without_claude_service_requests() {
         assert!(observed.get("service_responses").is_none());
     }
 }
+
+#[test]
+fn environment_observes_homepage_challenge_instead_of_trace_status() {
+    let (out, _) = online(Lookup::CamelCase);
+    let homepage = &out["service_responses"]["claude"];
+    assert_eq!(homepage["source"], "https://claude.ai/");
+    assert_eq!(homepage["http_status"], 403);
+    assert_eq!(homepage["access"], "challenge");
+    let (_, detail, _, _) = claude_watch_core::presentation::services(&out);
+    assert!(detail.contains("HTTP 403"), "{detail}");
+    assert!(detail.contains("需要浏览器验证"), "{detail}");
+    assert!(detail.contains("API HTTP 401"), "{detail}");
+}

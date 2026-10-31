@@ -12,7 +12,7 @@ final class LeakDiagnosticTrace {
         "schedule_wait_interval", "schedule_deferred", "schedule_busy", "schedule_disabled", "schedule_initializing", "snapshot_failed",
         "start", "source_ipleak", "source_netcoffee", "source_local", "cancelled", "host_attached", "host_detached", "navigation_finished", "navigation_failed",
         "webcontent_terminated", "script_started", "script_failed", "message_rejected", "payload_invalid",
-        "payload_received", "watchdog_timeout", "dns_retry", "http_retry", "phase_http", "phase_dns", "phase_dns_images",
+        "payload_received", "watchdog_timeout", "dns_retry", "http_retry", "view_reused", "phase_http", "phase_dns", "phase_dns_images",
         "phase_dns_records", "phase_geoip", "phase_ice", "phase_collector", "result_matched",
         "result_difference", "result_incomplete", "result_other", "receipt_submitting",
         "receipt_accepted", "receipt_rejected", "context_missing", "context_changed", "trace_limit_reached",

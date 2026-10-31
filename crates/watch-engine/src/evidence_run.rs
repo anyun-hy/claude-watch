@@ -28,6 +28,7 @@ struct NativeEvidence {
     host: super::runtime::Host,
     desktop: NativeDesktop<Arc<claude_watch_runtime::commands::SystemRunner>>,
     stop: Arc<AtomicBool>,
+    executor: background_evidence::ProbeExecutor,
 }
 fn next_interval(failures: &mut u32, incomplete: bool) -> Duration {
     if incomplete {
@@ -56,7 +57,7 @@ impl EvidenceSystem for NativeEvidence {
         background_evidence::collect_native(
             &self.host.storage,
             &self.host.runner,
-            &mut background_evidence::ProbeExecutor::new(self.stop.clone()).with_diagnostics(self.host.storage.clone()),
+            &mut self.executor,
             kind,
         )
     }
@@ -75,10 +76,13 @@ pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<thread::JoinHandle<(
     thread::Builder::new()
         .name("claude-background-evidence".into())
         .spawn(move || {
+            let executor = background_evidence::ProbeExecutor::new(stop.clone())
+                .with_diagnostics(host.storage.clone());
             let mut system = NativeEvidence {
                 host,
                 desktop,
                 stop: stop.clone(),
+                executor,
             };
             let events = EventStore::new(store.clone());
             let mut last_report = String::new();

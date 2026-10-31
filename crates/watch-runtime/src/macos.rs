@@ -731,7 +731,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         }
         let services = include_claude.then(|| {
             (
-                self.network.service_metadata("claude"),
+                self.network.claude_homepage(),
                 self.network.service_metadata("api"),
             )
         });

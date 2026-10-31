@@ -142,6 +142,89 @@ fn known_401_and_cloudflare_403_are_metadata_not_successful_login() {
 }
 
 #[test]
+fn homepage_reachability_is_separate_from_the_egress_trace() {
+    struct Endpoints(std::sync::Mutex<Vec<Request>>);
+    impl Transport for Endpoints {
+        fn get(&self, request: &Request) -> Result<Response, TransportError> {
+            self.0.lock().unwrap().push(request.clone());
+            match request.url.as_str() {
+                "https://claude.ai/" => Ok(Response {
+                    status: 403,
+                    headers: HashMap::from([("cf-mitigated".into(), "challenge".into())]),
+                    body: b"page body must not be retained".to_vec(),
+                }),
+                "https://claude.ai/cdn-cgi/trace" => Ok(Response {
+                    status: 200,
+                    headers: HashMap::new(),
+                    body: b"ip=1.1.1.1\n".to_vec(),
+                }),
+                _ => panic!("unexpected endpoint"),
+            }
+        }
+    }
+    let transport = Arc::new(Endpoints(Default::default()));
+    let client = NetworkClient::new(transport.clone(), Some(DEFAULT_PROXY.into())).unwrap();
+    let homepage = client.claude_homepage();
+    let observed = service_observation("claude", &homepage);
+    assert_eq!(homepage.source_url, "https://claude.ai/");
+    assert_eq!(homepage.http_status, Some(403));
+    assert!(homepage.raw.is_empty());
+    assert_eq!(observed["access"], "challenge");
+    assert_eq!(observed["challenge"]["provider"], "cloudflare");
+    let egress = client.service_metadata("claude");
+    assert_eq!(egress.source_url, "https://claude.ai/cdn-cgi/trace");
+    assert_eq!(trace_ip(&egress).as_deref(), Some("1.1.1.1"));
+    let requests = transport.0.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].max_body, 0);
+    assert!(requests[0].safe_headers.is_empty());
+    assert_eq!(requests[0].proxy.as_deref(), Some(DEFAULT_PROXY));
+    assert!(requests[1].max_body > 0);
+}
+
+#[test]
+fn homepage_200_needs_no_json_page_body() {
+    let transport = Arc::new(Fixture {
+        calls: AtomicUsize::new(0),
+        status: 200,
+        body: "<html>fixture</html>".into(),
+    });
+    let result = client(transport).claude_homepage();
+    assert_eq!(result.status, "complete");
+    assert_eq!(result.http_status, Some(200));
+    assert!(result.raw.is_empty());
+    assert_eq!(
+        service_observation("claude", &result)["transport_reached"],
+        true
+    );
+}
+
+#[test]
+fn homepage_timeout_stays_unknown() {
+    struct Timeout;
+    impl Transport for Timeout {
+        fn get(&self, _: &Request) -> Result<Response, TransportError> {
+            Err(TransportError::new("timeout", "fixture timeout"))
+        }
+    }
+    let client = NetworkClient::new(Arc::new(Timeout), None).unwrap();
+    let result = client.claude_homepage();
+    let observed = service_observation("claude", &result);
+    assert_eq!(result.status, "timeout");
+    assert_eq!(observed["transport_reached"], false);
+    assert_eq!(observed["status"], "unknown");
+    assert_eq!(
+        claude_watch_core::presentation::service_response(
+            "claude",
+            &observed,
+            &serde_json::Value::Null
+        )
+        .0,
+        "unknown"
+    );
+}
+
+#[test]
 fn metadata_context_requires_a_current_explicit_egress_measurement() {
     let fixture = Arc::new(Fixture {
         calls: AtomicUsize::new(0),
@@ -235,6 +318,37 @@ fn production_transport_can_read_a_bounded_local_http_response() {
     server.join().unwrap();
     assert_eq!(receipt.status, 200);
     assert_eq!(receipt.body, b"ok");
+}
+
+#[test]
+fn status_only_transport_preserves_403_headers_without_waiting_for_page_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (release, wait) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = [0; 512];
+        let _ = socket.read(&mut request).unwrap();
+        socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 1000000\r\nCF-Mitigated: challenge\r\nConnection: close\r\n\r\n").unwrap();
+        let _ = wait.recv_timeout(Duration::from_secs(2));
+    });
+    let result = UreqTransport.get(&Request {
+        url: format!("http://{address}/fixture"),
+        proxy: None,
+        timeout: Duration::from_secs(1),
+        connect_timeout: None,
+        max_body: 0,
+        safe_headers: vec![],
+    });
+    let _ = release.send(());
+    server.join().unwrap();
+    let response = result.unwrap();
+    assert_eq!(response.status, 403);
+    assert_eq!(
+        response.headers.get("cf-mitigated").map(String::as_str),
+        Some("challenge")
+    );
+    assert!(response.body.is_empty());
 }
 
 #[test]

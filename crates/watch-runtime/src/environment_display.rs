@@ -229,11 +229,28 @@ fn present_rows(audit: &Value) -> Vec<Value> {
                 "ASN 注册国家与本轮出口国家".into(),
                 "Net.Coffee lookup / RIPEstat RIR".into(),
             ),
-            "reachability" => (
-                "网页/API 网络响应".into(),
-                "不证明登录或账号可用".into(),
-                "本轮无账号凭据的 HTTPS 请求".into(),
-            ),
+            "reachability" => {
+                let homepage = &value["service_responses"]["claude"];
+                let (state, _, _) =
+                    presentation::service_response("claude", homepage, &Value::Null);
+                let current = if homepage["source"] == "https://claude.ai/"
+                    && homepage["http_status"] == 403
+                    && matches!(value["state"].as_str(), Some("ok" | "warn"))
+                {
+                    match state {
+                        "ok" => "首页 HTTP 403 · 需要浏览器验证",
+                        "warn" => "首页 HTTP 403 · 访问被拒绝",
+                        _ => "网页/API 网络响应",
+                    }
+                } else {
+                    "网页/API 网络响应"
+                };
+                (
+                    current.into(),
+                    "不证明登录或账号可用".into(),
+                    "本轮无账号凭据的 HTTPS 请求".into(),
+                )
+            }
             _ => (String::new(), String::new(), String::new()),
         };
         value["current"] = json!(current);

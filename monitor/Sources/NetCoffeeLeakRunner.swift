@@ -1,10 +1,19 @@
 import Foundation
 import WebKit
 
+private final class CoffeeScriptHandler: NSObject, WKScriptMessageHandler {
+    weak var target: WKScriptMessageHandler?
+    init(_ target: WKScriptMessageHandler) { self.target = target }
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        target?.userContentController(controller, didReceive: message)
+    }
+}
+
 @MainActor
 final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     #if COFFEE_BRIDGE_TEST
     var testBootstrap: String?
+    var testWatchdogInterval: TimeInterval?
     #endif
     private var view: WKWebView?
     var browserView: WKWebView? { view }
@@ -18,10 +27,15 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
     private var deadline: TimeInterval = 0
     private var startedAt: Double = 0
     private var phase = "collector"
+    private var pageReady = false
+    private var hiddenHost: NSWindow?
     /// Only fixed phase names and relative timings; never addresses or tokens.
     var onPhase: ((String, Double) -> Void)?
     var onDiagnostic: ((String, Bool) -> Void)?
-    private func trace(_ event: String) { onDiagnostic?(event, view?.window != nil) }
+    private func trace(_ event: String) {
+        guard id != nil else { return }
+        onDiagnostic?(event, view?.window != nil)
+    }
     private var requests: [String: CoffeeRequest] = [:]
     private var usedIDs = Set<String>()
     private let resourceDirectory: URL?
@@ -34,17 +48,11 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
     }
 
     func start(kind: LeakKind, rounds: Int = 5, id: UUID, progress: @escaping (String) -> Void = { _ in }, completion: @escaping (LeakProbeResult) -> Void) {
+        _ = cancel()
         self.kind = kind; self.rounds = rounds == 8 ? 8 : 5; self.id = id; self.completion = completion; self.progress = progress
         startedAt = Date().timeIntervalSince1970
         deadline = ProcessInfo.processInfo.systemUptime + 70
         phase = "collector"
-        let directory = resourceDirectory ?? Bundle.main.resourceURL
-        let file = directory?.appendingPathComponent("netcoffee_probe.html", isDirectory: false)
-        guard let file, FileManager.default.isReadableFile(atPath: file.path) else { finish(.failure(kind, code: "component_missing", message: "Net.Coffee 采集页面不可用")); return }
-        document = file.resolvingSymlinksInPath().standardizedFileURL
-        let c = WKWebViewConfiguration(); c.websiteDataStore = .nonPersistent(); c.preferences.javaScriptCanOpenWindowsAutomatically = false
-        c.userContentController.add(self, name: "coffeeProbe")
-        let w = WKWebView(frame: NSRect(x:0,y:0,width:640,height:100), configuration: c); view = w; w.navigationDelegate = self
         let timer = DispatchWorkItem { [weak self] in
             guard let self, self.id == id else { return }
             self.trace("watchdog_timeout")
@@ -53,15 +61,38 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
                               observations: [], errors: [.init(stage: self.phase, code: "timeout", message: "本轮检测超过总时限；未完成不代表安全")],
                               contextChanged: false, details: []))
         }
-        watchdog = timer; DispatchQueue.main.asyncAfter(deadline: .now()+75, execute: timer)
+        #if COFFEE_BRIDGE_TEST
+        let watchdogInterval = testWatchdogInterval ?? 75
+        #else
+        let watchdogInterval: TimeInterval = 75
+        #endif
+        watchdog = timer; DispatchQueue.main.asyncAfter(deadline: .now()+watchdogInterval, execute: timer)
+        if let view {
+            reattachIfNeeded(view)
+            if pageReady { trace("view_reused"); runScript(view, id: id) }
+            return
+        }
+        let directory = resourceDirectory ?? Bundle.main.resourceURL
+        let file = directory?.appendingPathComponent("netcoffee_probe.html", isDirectory: false)
+        guard let file, FileManager.default.isReadableFile(atPath: file.path) else { finish(.failure(kind, code: "component_missing", message: "Net.Coffee 采集页面不可用")); return }
+        document = file.resolvingSymlinksInPath().standardizedFileURL
+        let c = WKWebViewConfiguration(); c.websiteDataStore = .nonPersistent(); c.preferences.javaScriptCanOpenWindowsAutomatically = false
+        c.preferences.inactiveSchedulingPolicy = .none
+        c.userContentController.add(CoffeeScriptHandler(self), name: "coffeeProbe")
+        let w = WKWebView(frame: NSRect(x:0,y:0,width:640,height:100), configuration: c); view = w; w.navigationDelegate = self
+        let host = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 1, height: 1),
+                            styleMask: .borderless, backing: .buffered, defer: false)
+        host.isReleasedWhenClosed = false; host.contentView = w; hiddenHost = host; host.orderFront(nil)
+        trace("host_attached")
         w.loadFileURL(document!, allowingReadAccessTo: document!.deletingLastPathComponent())
     }
     @discardableResult
     func cancel() -> Bool {
+        let oldID = id
         id = nil; watchdog?.cancel(); watchdog = nil
-        view?.evaluateJavaScript("window.NetCoffeeProbe && window.NetCoffeeProbe.cancel()", completionHandler: nil)
-        view?.configuration.userContentController.removeScriptMessageHandler(forName: "coffeeProbe")
-        view?.stopLoading(); view?.navigationDelegate = nil; view = nil
+        if let oldID {
+            view?.evaluateJavaScript("window.NetCoffeeProbe && window.NetCoffeeProbe.cancel('\(oldID.uuidString)')", completionHandler: nil)
+        }
         let deadline = DispatchTime.now() + .seconds(3)
         var requestsExited = true
         for request in requests.values {
@@ -70,6 +101,22 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
         requests.removeAll(); usedIDs.removeAll(); completion = nil; progress = nil
         return requestsExited
     }
+    @discardableResult
+    func invalidate() -> Bool {
+        let stopped = cancel()
+        pageReady = false
+        view?.configuration.userContentController.removeScriptMessageHandler(forName: "coffeeProbe")
+        view?.stopLoading(); view?.navigationDelegate = nil; view = nil
+        hiddenHost?.close(); hiddenHost = nil
+        return stopped
+    }
+    func reattachIfNeeded(_ browser: WKWebView) {
+        DispatchQueue.main.async { [weak self, weak browser] in
+            guard let self, let browser, self.view === browser, browser.window == nil,
+                  let host = self.hiddenHost else { return }
+            host.contentView = browser; host.orderFront(nil); self.trace("host_attached")
+        }
+    }
     private func finish(_ result: LeakProbeResult) {
         let done = completion
         var receipt = result
@@ -77,11 +124,17 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
             receipt = .init(kind:result.kind,status:result.status,startedAt:result.startedAt,finishedAt:result.finishedAt,
                 scope:kind == .dns ? "Net.Coffee · 本机 WebView DNS 查询" : "Net.Coffee · 当前检测 WebView ICE",observations:result.observations,errors:result.errors,contextChanged:result.contextChanged,details:result.details,externalJSON:result.externalJSON)
         }
-        _ = cancel(); done?(receipt)
+        if receipt.status == "complete" && receipt.errors.isEmpty { _ = cancel() }
+        else { _ = invalidate() }
+        done?(receipt)
     }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard webView === view, let id else { return }
+        guard webView === view else { return }
+        pageReady = true
         trace("navigation_finished")
+        if let id { runScript(webView, id: id) }
+    }
+    private func runScript(_ webView: WKWebView, id: UUID) {
         #if COFFEE_BRIDGE_TEST
         let bootstrap = testBootstrap ?? ""
         #else
@@ -99,6 +152,7 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
         }
     }
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard webView === view else { decisionHandler(.cancel); return }
         let requested = navigationAction.request.url?.resolvingSymlinksInPath().standardizedFileURL
         let allowed = requested == document
         #if COFFEE_BRIDGE_TEST
@@ -107,6 +161,7 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
         decisionHandler(allowed ? .allow : .cancel)
     }
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard webView === view else { return }
         trace("navigation_failed")
         #if COFFEE_BRIDGE_TEST
         print("NetCoffee bridge navigation failed: \(error.localizedDescription)")
@@ -116,8 +171,11 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         guard webView === view else { return }
         trace("webcontent_terminated")
+        if id != nil { finish(.failure(kind, code: "page_failed", message: "WebRTC 检测页面进程已退出。")) }
+        else { _ = invalidate() }
     }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard webView === view else { return }
         trace("navigation_failed")
         #if COFFEE_BRIDGE_TEST
         print("NetCoffee bridge provisional failure: \(error.localizedDescription)")
@@ -140,7 +198,11 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
         }
         if let payload = body["payload"] {
             guard JSONSerialization.isValidJSONObject(payload), let data = try? JSONSerialization.data(withJSONObject: payload), data.count < 1_048_576,
-                  let r = try? JSONDecoder().decode(LeakProbeResult.self, from: data), r.kind == kind.rawValue else { trace("payload_invalid"); return }
+                  let r = try? JSONDecoder().decode(LeakProbeResult.self, from: data), r.kind == kind.rawValue else {
+                trace("payload_invalid")
+                finish(.failure(kind, code: "invalid_result", message: "WebRTC 返回结果无效。"))
+                return
+            }
             trace("payload_received"); finish(r); return
         }
         if let text = body["progress"] as? String, text.utf8.count < 256 { progress?(text) }

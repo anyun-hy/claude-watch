@@ -41,9 +41,18 @@ CW_MACOS_MINIMUM=$(/bin/cat "$REPOSITORY_ROOT/monitor/macos-minimum.txt")
 CW_CARGO_BIN=${CW_CARGO_BIN:-cargo}
 command -v "$CW_CARGO_BIN" >/dev/null 2>&1 || { echo 'Cargo is required to build the Rust candidate components.' >&2; exit 1; }
 
+# Select both from the active developer toolchain. An inherited CLT SDK can
+# contain newer TBD architectures that the selected Xcode linker cannot read.
+CW_APPLE_CLANG=$(/usr/bin/xcrun --sdk macosx --find clang)
+CW_APPLE_SDK=$(/usr/bin/xcrun --sdk macosx --show-sdk-path)
+[[ -x "$CW_APPLE_CLANG" && -d "$CW_APPLE_SDK" ]] || { echo 'The selected Apple compiler or macOS SDK is unavailable.' >&2; exit 1; }
+printf 'Rust compiler driver: %s\nmacOS SDK: %s\n' "$CW_APPLE_CLANG" "$CW_APPLE_SDK"
+
 # Cargo's package/bin name is verified in crates/watch-engine/Cargo.toml. The
 # native component locations are queried from the built engine, never guessed.
-MACOSX_DEPLOYMENT_TARGET="$CW_MACOS_MINIMUM" "$CW_CARGO_BIN" build --manifest-path "$REPOSITORY_ROOT/Cargo.toml" --locked --release --target aarch64-apple-darwin \
+SDKROOT="$CW_APPLE_SDK" CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="$CW_APPLE_CLANG" \
+CC_aarch64_apple_darwin="$CW_APPLE_CLANG" MACOSX_DEPLOYMENT_TARGET="$CW_MACOS_MINIMUM" \
+"$CW_CARGO_BIN" build --manifest-path "$REPOSITORY_ROOT/Cargo.toml" --locked --release --target aarch64-apple-darwin \
   --package claude-watch-engine --bin claude-watch-engine
 
 ENGINE="$REPOSITORY_ROOT/target/aarch64-apple-darwin/release/claude-watch-engine"
