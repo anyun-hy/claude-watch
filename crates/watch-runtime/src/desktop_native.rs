@@ -30,7 +30,7 @@ use std::{
 use subprocess::unix::JobExt;
 use subprocess::{Exec, Job, Redirection};
 
-fn execute(program: &Path, args: &[&str], timeout: Duration) -> Result<()> {
+fn execute_output(program: &Path, args: &[&str], timeout: Duration) -> Result<Vec<u8>> {
     let started = Instant::now();
     let mut job = Exec::cmd(program)
         .args(args)
@@ -43,33 +43,46 @@ fn execute(program: &Path, args: &[&str], timeout: Duration) -> Result<()> {
     let result = job
         .communicate()
         .and_then(|c| c.limit_time(timeout).limit_size(65537).read());
-    let failure = match result {
+    let mut reaped = false;
+    let outcome = match result {
         Ok((out, error)) if out.len() + error.len() <= 65536 => {
             match job.wait_timeout(timeout.saturating_sub(started.elapsed())) {
-                Ok(Some(s)) if s.success() => None,
-                _ => Some(CoreError::new(
+                Ok(Some(s)) if s.success() => {
+                    reaped = true;
+                    Ok(out)
+                }
+                Ok(Some(_)) => {
+                    reaped = true;
+                    Err(CoreError::new(
+                        "desktop_operation_failed",
+                        "原生应用操作未完成",
+                    ))
+                }
+                _ => Err(CoreError::new(
                     "desktop_operation_failed",
                     "原生应用操作未完成",
                 )),
             }
         }
-        Ok(_) => Some(CoreError::new(
+        Ok(_) => Err(CoreError::new(
             "desktop_output_oversize",
             "应用执行组件输出过大",
         )),
-        Err(_) => Some(CoreError::new(
+        Err(_) => Err(CoreError::new(
             "desktop_operation_timeout",
             "应用执行组件通信失败或超时",
         )),
     };
-    if let Some(error) = failure {
+    if outcome.is_err() && !reaped {
         let _ = job.kill();
         if !matches!(job.wait_timeout(Duration::from_millis(500)), Ok(Some(_))) {
             job.detach();
         }
-        return Err(error);
     }
-    Ok(())
+    outcome
+}
+fn execute(program: &Path, args: &[&str], timeout: Duration) -> Result<()> {
+    execute_output(program, args, timeout).map(|_| ())
 }
 pub struct NativeDesktop<R: ReadRunner> {
     pub runner: R,
@@ -614,6 +627,46 @@ impl<R: ReadRunner> NativeDesktop<R> {
         }
         Ok(result)
     }
+
+    pub fn desktop_alive(&self, expected: &Desktop) -> Result<bool> {
+        let inventory = Observer {
+            runner: &self.runner,
+        }
+        .inventory()?;
+        if !inventory.complete {
+            return Err(CoreError::new(
+                "desktop_inventory_incomplete",
+                "进程清单不完整，无法确认旧进程是否退出",
+            ));
+        }
+        Ok(inventory
+            .processes
+            .get(&expected.pid)
+            .is_some_and(|record| {
+                record.identity.start_seconds == expected.start_seconds
+                    && record.identity.start_microseconds == expected.start_microseconds
+            }))
+    }
+
+    pub fn desktop_tree_running(&self) -> Result<bool> {
+        let inventory = Observer {
+            runner: &self.runner,
+        }
+        .inventory()?;
+        if !inventory.complete {
+            return Err(CoreError::new(
+                "desktop_inventory_incomplete",
+                "进程清单不完整，无法确认 Claude 是否完全退出",
+            ));
+        }
+        Ok(inventory.processes.values().any(|record| {
+            record.bundle_id.as_deref() == Some("com.anthropic.claudefordesktop")
+                || record
+                    .identity
+                    .executable
+                    .starts_with("/Applications/Claude.app/Contents/")
+        }))
+    }
     pub fn launcher(&self) -> Result<Launcher> {
         let inventory = Observer {
             runner: &self.runner,
@@ -686,7 +739,7 @@ impl<R: ReadRunner> NativeDesktop<R> {
             Duration::from_secs(15),
         )
     }
-    pub fn quit(&self) -> Result<()> {
+    fn require_quit_authority(&self) -> Result<()> {
         if !self.target.protected() {
             return Err(CoreError::new(
                 "protected_scope_mismatch",
@@ -699,8 +752,37 @@ impl<R: ReadRunner> NativeDesktop<R> {
                 "只读运行入口不关闭应用",
             ));
         }
-        execute(&self.helper, &["close-desktop"], Duration::from_secs(20))?;
-        if !self.desktops()?.is_empty() {
+        Ok(())
+    }
+    pub fn quit(&self) -> Result<()> {
+        self.require_quit_authority()?;
+        let request = execute(&self.helper, &["close-desktop"], Duration::from_secs(20));
+        if !self.desktop_tree_running()? {
+            return Ok(());
+        }
+        request?;
+        Err(CoreError::new("claude_still_running", "Claude尚未完全退出"))
+    }
+    /// Only the confirmed IP-risk path requests the bounded force fallback.
+    /// The actual process tree decides success even if another guard closed it.
+    pub fn quit_for_confirmed_ip_risk(&self, forced: &mut Option<u32>) -> Result<()> {
+        *forced = None;
+        self.require_quit_authority()?;
+        let request = execute_output(
+            &self.helper,
+            &["guard-close-desktop"],
+            Duration::from_secs(20),
+        );
+        *forced = request
+            .as_ref()
+            .ok()
+            .and_then(|bytes| crate::storage::strict_json(bytes).ok())
+            .filter(|value| matches!(value["status"].as_str(), Some("ok" | "error")))
+            .and_then(|value| value.get("force_requested").and_then(Value::as_u64))
+            .and_then(|count| u32::try_from(count).ok())
+            .filter(|count| *count <= 4096);
+        if self.desktop_tree_running()? {
+            request?;
             return Err(CoreError::new("claude_still_running", "Claude尚未完全退出"));
         }
         Ok(())
@@ -801,6 +883,12 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
     fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
         self.desktop.desktops()
     }
+    fn desktop_alive(&mut self, desktop: &Desktop) -> Result<bool> {
+        self.desktop.desktop_alive(desktop)
+    }
+    fn desktop_tree_running(&mut self) -> Result<bool> {
+        self.desktop.desktop_tree_running()
+    }
     fn launcher(&mut self) -> Result<Launcher> {
         self.desktop.launcher()
     }
@@ -857,6 +945,9 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
     }
     fn quit_desktop(&mut self) -> Result<()> {
         self.desktop.quit()
+    }
+    fn quit_for_confirmed_ip_risk(&mut self, forced: &mut Option<u32>) -> Result<()> {
+        self.desktop.quit_for_confirmed_ip_risk(forced)
     }
 }
 

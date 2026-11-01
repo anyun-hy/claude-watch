@@ -1,7 +1,7 @@
 use claude_watch_core::{
     config::Config,
     error::{CoreError, Result},
-    session::{Desktop, Identity},
+    session::{Desktop, Identity, Phase},
 };
 use claude_watch_runtime::{
     background_evidence::{self, EvidenceSystem, ProbeKind},
@@ -251,6 +251,9 @@ impl EvidenceSystem for Fake {
     fn desktop_matches(&mut self, _: &Desktop) -> Result<bool> {
         Ok(self.running)
     }
+    fn desktop_unique_stamp(&mut self, _: &Desktop) -> Result<Option<String>> {
+        Ok(self.running.then(|| "fixture".to_owned()))
+    }
     fn collect(&mut self, kind: ProbeKind) -> Result<Value> {
         self.calls += 1;
         self.now += 1.;
@@ -268,6 +271,462 @@ impl EvidenceSystem for Fake {
             Ok(probe(kind, self.now, self.country))
         }
     }
+}
+
+struct RecheckFake {
+    store: StateStore,
+    now: f64,
+    collections: usize,
+    audit_ready: bool,
+    unique: bool,
+    ip: &'static str,
+    started: Option<std::sync::mpsc::Sender<()>>,
+    resume: Option<std::sync::mpsc::Receiver<()>>,
+}
+impl EvidenceSystem for RecheckFake {
+    fn now(&self) -> f64 {
+        self.now
+    }
+    fn local(&mut self, _: &Config) -> Result<Value> {
+        Ok(local("ctx"))
+    }
+    fn desktop_matches(&mut self, _: &Desktop) -> Result<bool> {
+        Ok(true)
+    }
+    fn desktop_unique_stamp(&mut self, _: &Desktop) -> Result<Option<String>> {
+        Ok(self.unique.then(|| "fixture".to_owned()))
+    }
+    fn collect(&mut self, kind: ProbeKind) -> Result<Value> {
+        self.collections += 1;
+        self.now += 1.;
+        let mut value = probe(kind, self.now, "JP");
+        value["observations"][0]["address"] = json!(self.ip);
+        if kind == ProbeKind::WebRtc {
+            value["observations"][1]["address"] = json!(self.ip);
+        } else {
+            let mut external: Value =
+                serde_json::from_str(value["externalJSON"].as_str().unwrap()).unwrap();
+            external["http"]["address"] = json!(self.ip);
+            value["externalJSON"] = json!(serde_json::to_string(&external).unwrap());
+        }
+        Ok(value)
+    }
+    fn revalidate(&mut self) -> Result<(Value, Value)> {
+        if let Some(started) = self.started.take() {
+            started.send(()).unwrap();
+        }
+        if let Some(resume) = self.resume.take() {
+            resume
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+        }
+        self.now += 1.;
+        let config = claude_watch_runtime::config_store::ConfigStore {
+            storage: self.store.clone(),
+        }
+        .load()?;
+        let policy = claude_watch_runtime::config_store::policy_digest(&config.value()?)?;
+        let audit = json!({"ready":self.audit_ready,"policy":policy,"observed_at":self.now,"expires_at":self.now+30.,"context_id":"ctx","observation_id":"recheck-round","context_transition":{"state":"stable"},"egress_reference":{"ip":self.ip,"country":"JP","checked_at":self.now,"context":"ctx","source":"fixture"}});
+        Ok((
+            audit,
+            json!({"ip":self.ip,"country":"JP","observed_at":self.now,"source":"fixture"}),
+        ))
+    }
+}
+
+fn replacement(f: &Fixture) -> (String, Desktop) {
+    let sessions = SessionStore::new(f.store.clone());
+    let old = sessions.load(1001.).unwrap().unwrap();
+    assert!(sessions
+        .end_desktop(&old.session_id, old.desktop.as_ref().unwrap(), 1001., false)
+        .unwrap());
+    let desktop = Desktop {
+        pid: 88,
+        start_seconds: 101,
+        start_microseconds: 1,
+    };
+    let value = sessions
+        .begin_recheck(&old.session_id, desktop.clone(), 1002.)
+        .unwrap()
+        .unwrap();
+    let receipts = ReceiptStore {
+        storage: f.store.clone(),
+    };
+    let pending = sessions
+        .check_verified(
+            &receipts,
+            Some(&value.session_id),
+            1002.5,
+            false,
+            Identity::Matches,
+            egress(1002.5),
+        )
+        .unwrap();
+    assert_eq!(pending.state, "pending");
+    (value.session_id, desktop)
+}
+
+#[test]
+fn replacement_is_promoted_only_after_independent_full_recheck() {
+    let f = Fixture::new();
+    f.active(1000.);
+    let (id, desktop) = replacement(&f);
+    let mut system = RecheckFake {
+        store: f.store.clone(),
+        now: 1003.,
+        collections: 0,
+        audit_ready: true,
+        unique: true,
+        ip: "1.1.1.1",
+        started: None,
+        resume: None,
+    };
+    assert_eq!(
+        SessionStore::new(f.store.clone())
+            .load(system.now)
+            .unwrap()
+            .unwrap()
+            .state,
+        Phase::Rechecking
+    );
+    background_evidence::refresh_active_session(&f.store, &mut system).unwrap();
+    let active = SessionStore::new(f.store.clone())
+        .load(system.now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.state, Phase::Active);
+    assert_eq!(active.session_id, id);
+    assert_eq!(active.desktop, Some(desktop));
+    assert_eq!(active.audit_observation_id, "recheck-round");
+    assert_eq!(
+        system.collections, 2,
+        "the replacement must not inherit old DNS/WebRTC samples"
+    );
+    let lease = f.store.paths.watch().join("state/sessions/rust-88.session");
+    assert!(fs::read_to_string(lease)
+        .unwrap()
+        .starts_with("desktop|claude|88|fixture|"));
+}
+
+#[test]
+fn fresh_new_session_can_complete_recheck_with_an_exit_changed_while_closed() {
+    let f = Fixture::new();
+    f.active(1000.);
+    let sessions = SessionStore::new(f.store.clone());
+    let old = sessions.load(1001.).unwrap().unwrap();
+    assert!(sessions
+        .end_desktop(&old.session_id, old.desktop.as_ref().unwrap(), 1001., false)
+        .unwrap());
+    let desktop = Desktop {
+        pid: 88,
+        start_seconds: 101,
+        start_microseconds: 1,
+    };
+    let pending = sessions
+        .begin_recheck(&old.session_id, desktop, 1002.)
+        .unwrap()
+        .unwrap();
+    let receipts = ReceiptStore {
+        storage: f.store.clone(),
+    };
+    let current = json!({"ip":"8.8.8.8","country":"JP","observed_at":1002.5});
+    assert_eq!(
+        sessions
+            .check_verified(
+                &receipts,
+                Some(&pending.session_id),
+                1002.5,
+                false,
+                Identity::Matches,
+                current
+            )
+            .unwrap()
+            .state,
+        "pending"
+    );
+    let mut system = RecheckFake {
+        store: f.store.clone(),
+        now: 1003.,
+        collections: 0,
+        audit_ready: true,
+        unique: true,
+        ip: "8.8.8.8",
+        started: None,
+        resume: None,
+    };
+    background_evidence::refresh_active_session(&f.store, &mut system).unwrap();
+    let active = sessions.load(system.now).unwrap().unwrap();
+    assert_eq!(active.state, Phase::Active);
+    assert_eq!(active.baseline.ip, "8.8.8.8");
+    assert_eq!(system.collections, 2);
+}
+
+#[test]
+fn a_failed_full_recheck_never_promotes_the_new_process() {
+    let f = Fixture::new();
+    f.active(1000.);
+    let (id, _) = replacement(&f);
+    let mut system = RecheckFake {
+        store: f.store.clone(),
+        now: 1003.,
+        collections: 0,
+        audit_ready: false,
+        unique: true,
+        ip: "1.1.1.1",
+        started: None,
+        resume: None,
+    };
+    let error = background_evidence::refresh_active_session(&f.store, &mut system).unwrap_err();
+    assert_eq!(error.code, "preflight_blocked");
+    let value = SessionStore::new(f.store.clone())
+        .load(system.now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(value.session_id, id);
+    assert_eq!(value.state, Phase::Rechecking);
+}
+
+#[test]
+fn ambiguous_main_process_never_passes_recheck() {
+    let f = Fixture::new();
+    f.active(1000.);
+    let (id, _) = replacement(&f);
+    let mut system = RecheckFake {
+        store: f.store.clone(),
+        now: 1003.,
+        collections: 0,
+        audit_ready: true,
+        unique: false,
+        ip: "1.1.1.1",
+        started: None,
+        resume: None,
+    };
+    let error = background_evidence::refresh_active_session(&f.store, &mut system).unwrap_err();
+    assert_eq!(error.code, "evidence_session_changed");
+    let value = SessionStore::new(f.store.clone())
+        .load(system.now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(value.session_id, id);
+    assert_eq!(value.state, Phase::Rechecking);
+}
+
+#[test]
+fn full_audit_cannot_promote_before_the_fast_guard_establishes_a_baseline() {
+    let f = Fixture::new();
+    f.active(1000.);
+    let sessions = SessionStore::new(f.store.clone());
+    let old = sessions.load(1001.).unwrap().unwrap();
+    assert!(sessions
+        .end_desktop(&old.session_id, old.desktop.as_ref().unwrap(), 1001., false)
+        .unwrap());
+    let candidate = Desktop {
+        pid: 88,
+        start_seconds: 101,
+        start_microseconds: 1,
+    };
+    let value = sessions
+        .begin_recheck(&old.session_id, candidate, 1002.)
+        .unwrap()
+        .unwrap();
+    let mut system = RecheckFake {
+        store: f.store.clone(),
+        now: 1003.,
+        collections: 0,
+        audit_ready: true,
+        unique: true,
+        ip: "1.1.1.1",
+        started: None,
+        resume: None,
+    };
+    let error = background_evidence::refresh_active_session(&f.store, &mut system).unwrap_err();
+    assert_eq!(error.code, "egress_unconfirmed");
+    let pending = sessions.load(system.now).unwrap().unwrap();
+    assert_eq!(pending.session_id, value.session_id);
+    assert_eq!(pending.state, Phase::Rechecking);
+}
+
+#[test]
+fn old_exit_sample_cannot_become_the_replacement_baseline() {
+    let f = Fixture::new();
+    f.active(1000.);
+    let sessions = SessionStore::new(f.store.clone());
+    let old = sessions.load(1001.).unwrap().unwrap();
+    assert!(sessions
+        .end_desktop(&old.session_id, old.desktop.as_ref().unwrap(), 1001., false)
+        .unwrap());
+    let desktop = Desktop {
+        pid: 88,
+        start_seconds: 101,
+        start_microseconds: 1,
+    };
+    let pending = sessions
+        .begin_recheck(&old.session_id, desktop, 1002.)
+        .unwrap()
+        .unwrap();
+    let receipts = ReceiptStore {
+        storage: f.store.clone(),
+    };
+    let result = sessions
+        .check_verified(
+            &receipts,
+            Some(&pending.session_id),
+            1003.,
+            false,
+            Identity::Matches,
+            egress(1001.9),
+        )
+        .unwrap();
+    assert_eq!(result.state, "unknown");
+    let stored = sessions.load(1003.).unwrap().unwrap();
+    assert_eq!(
+        stored.extra.get("recheck_baseline_pending"),
+        Some(&json!(true))
+    );
+    assert!(claude_watch_core::session::status(&stored, 1003., Some(true))["baseline"].is_null());
+}
+
+#[test]
+fn old_launch_audit_cannot_authorize_the_replacement() {
+    let f = Fixture::new();
+    f.active(1000.);
+    let (id, desktop) = replacement(&f);
+    let config = claude_watch_runtime::config_store::ConfigStore {
+        storage: f.store.clone(),
+    }
+    .load()
+    .unwrap();
+    let policy =
+        claude_watch_runtime::config_store::policy_digest(&config.value().unwrap()).unwrap();
+    let audit = json!({"ready":true,"policy":policy,"observed_at":1001.,"expires_at":1030.,"context_id":"ctx","context_transition":{"state":"stable"},"egress_reference":{"ip":"1.1.1.1","country":"JP","checked_at":1001.,"context":"ctx"}});
+    let sessions = SessionStore::new(f.store.clone());
+    let error = sessions
+        .complete_recheck(&id, &desktop, "fixture", &audit, &egress(1003.), 1003.)
+        .unwrap_err();
+    assert_eq!(error.code, "egress_unconfirmed");
+    assert_eq!(
+        sessions.load(1003.).unwrap().unwrap().state,
+        Phase::Rechecking
+    );
+}
+
+#[test]
+fn old_dns_and_webrtc_receipts_cannot_authorize_the_replacement() {
+    let f = Fixture::new();
+    f.active(1000.);
+    let (id, desktop) = replacement(&f);
+    let config = claude_watch_runtime::config_store::ConfigStore {
+        storage: f.store.clone(),
+    }
+    .load()
+    .unwrap();
+    let policy =
+        claude_watch_runtime::config_store::policy_digest(&config.value().unwrap()).unwrap();
+    let audit = json!({"ready":true,"policy":policy,"observed_at":1003.,"expires_at":1030.,"context_id":"ctx","context_transition":{"state":"stable"},"egress_reference":{"ip":"1.1.1.1","country":"JP","checked_at":1003.,"context":"ctx"}});
+    let sessions = SessionStore::new(f.store.clone());
+    let error = sessions
+        .complete_recheck(&id, &desktop, "fixture", &audit, &egress(1003.), 1003.)
+        .unwrap_err();
+    assert_eq!(error.code, "risk_evidence_unavailable");
+    assert_eq!(
+        sessions.load(1003.).unwrap().unwrap().state,
+        Phase::Rechecking
+    );
+}
+
+#[test]
+fn slow_recheck_cannot_block_or_overwrite_confirmed_ip_risk() {
+    use claude_watch_core::session::Identity;
+    use std::time::{Duration, Instant};
+    let f = Fixture::new();
+    f.active(1000.);
+    let (id, _) = replacement(&f);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let store = f.store.clone();
+    let worker = std::thread::spawn(move || {
+        let mut system = RecheckFake {
+            store: store.clone(),
+            now: 1003.,
+            collections: 0,
+            audit_ready: true,
+            unique: true,
+            ip: "1.1.1.1",
+            started: Some(started_tx),
+            resume: Some(resume_rx),
+        };
+        background_evidence::refresh_active_session(&store, &mut system)
+    });
+    started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let sessions = SessionStore::new(f.store.clone());
+    let receipts = ReceiptStore {
+        storage: f.store.clone(),
+    };
+    let start = Instant::now();
+    let changed = json!({"ip":"8.8.8.8","country":"JP","observed_at":1004.});
+    let guarded = sessions
+        .check_verified(
+            &receipts,
+            Some(&id),
+            1004.,
+            false,
+            Identity::Matches,
+            changed,
+        )
+        .unwrap();
+    assert_eq!(guarded.state, "risk");
+    assert_eq!(guarded.reason.unwrap().code, "egress_ip_changed");
+    assert!(start.elapsed() < Duration::from_secs(2));
+    resume_tx.send(()).unwrap();
+    assert!(
+        worker.join().unwrap().is_err(),
+        "late full audit cannot reactivate a locked session"
+    );
+    assert_eq!(sessions.load(1005.).unwrap().unwrap().state, Phase::Locked);
+}
+
+#[test]
+fn late_recheck_cannot_authorize_a_later_replacement() {
+    use std::time::Duration;
+    let f = Fixture::new();
+    f.active(1000.);
+    let (old_id, old_desktop) = replacement(&f);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let store = f.store.clone();
+    let worker = std::thread::spawn(move || {
+        let mut system = RecheckFake {
+            store: store.clone(),
+            now: 1003.,
+            collections: 0,
+            audit_ready: true,
+            unique: true,
+            ip: "1.1.1.1",
+            started: Some(started_tx),
+            resume: Some(resume_rx),
+        };
+        background_evidence::refresh_active_session(&store, &mut system)
+    });
+    started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let sessions = SessionStore::new(f.store.clone());
+    assert!(sessions
+        .end_desktop(&old_id, &old_desktop, 1007., false)
+        .unwrap());
+    let new_desktop = Desktop {
+        pid: 99,
+        start_seconds: 102,
+        start_microseconds: 1,
+    };
+    let new = sessions
+        .begin_recheck(&old_id, new_desktop.clone(), 1008.)
+        .unwrap()
+        .unwrap();
+    resume_tx.send(()).unwrap();
+    assert!(worker.join().unwrap().is_err());
+    let current = sessions.load(1009.).unwrap().unwrap();
+    assert_eq!(current.session_id, new.session_id);
+    assert_eq!(current.desktop, Some(new_desktop));
+    assert_eq!(current.state, Phase::Rechecking);
 }
 
 #[test]

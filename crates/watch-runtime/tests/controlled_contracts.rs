@@ -57,6 +57,7 @@ struct Fake {
     running: bool,
     opens: u32,
     closes: u32,
+    ip_force_calls: u32,
     ready: bool,
     fail_open: bool,
     fail_quit: bool,
@@ -70,6 +71,12 @@ struct Fake {
     root_kind: Option<claude_watch_core::processes::Kind>,
     root_uid: u32,
     no_main: bool,
+    desktop_pid: u32,
+    hide_main: bool,
+    alive_override: Option<bool>,
+    tree_running_override: Option<bool>,
+    native_liveness: bool,
+    native_start: Option<(u64, u32)>,
     reuse_root: bool,
     root_reads: u32,
     audits: u32,
@@ -90,6 +97,7 @@ impl Default for Fake {
             running: false,
             opens: 0,
             closes: 0,
+            ip_force_calls: 0,
             ready: true,
             fail_open: false,
             fail_quit: false,
@@ -103,6 +111,12 @@ impl Default for Fake {
             root_kind: None,
             root_uid: 501,
             no_main: false,
+            desktop_pid: 77,
+            hide_main: false,
+            alive_override: None,
+            tree_running_override: None,
+            native_liveness: false,
+            native_start: None,
             reuse_root: false,
             root_reads: 0,
             audits: 0,
@@ -119,6 +133,19 @@ impl Default for Fake {
     }
 }
 struct TestChild(std::process::Child);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_test_start(pid: u32) -> Result<(u64, u32)> {
+    let runner = claude_watch_runtime::commands::SystemRunner::development()?;
+    let inventory = claude_watch_runtime::native::Observer { runner: &runner }.inventory()?;
+    let record = inventory
+        .processes
+        .get(&pid)
+        .ok_or_else(|| CoreError::new("fixture_process_missing", "测试进程未被原生采样识别"))?;
+    Ok((
+        record.identity.start_seconds,
+        record.identity.start_microseconds,
+    ))
+}
 impl std::ops::Deref for TestChild {
     type Target = std::process::Child;
     fn deref(&self) -> &Self::Target {
@@ -248,16 +275,39 @@ impl DesktopSystem for Fake {
                         .test_child
                         .as_ref()
                         .map(|child| child.id())
-                        .unwrap_or(77),
-                    start_seconds: 900,
-                    start_microseconds: 1,
+                        .unwrap_or(self.desktop_pid),
+                    start_seconds: self.native_start.map_or(900, |v| v.0),
+                    start_microseconds: self.native_start.map_or(1, |v| v.1),
                 },
-                true,
+                !self.hide_main,
                 "Tue Nov 14 22:12:50 2023".into(),
             )]
         } else {
             vec![]
         })
+    }
+    fn desktop_alive(&mut self, expected: &Desktop) -> Result<bool> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if self.native_liveness {
+            let runner = claude_watch_runtime::commands::SystemRunner::development()?;
+            let helper = claude_watch_runtime::native::built_process_control_path().unwrap();
+            let desktop = claude_watch_runtime::desktop_native::NativeDesktop::new(
+                runner,
+                helper.into(),
+                claude_watch_runtime::macos::Authority::ReadOnly,
+            )?;
+            return desktop.desktop_alive(expected);
+        }
+        if let Some(value) = self.alive_override {
+            return Ok(value);
+        }
+        Ok(self
+            .desktops()?
+            .iter()
+            .any(|(desktop, main, _)| *main && desktop == expected))
+    }
+    fn desktop_tree_running(&mut self) -> Result<bool> {
+        Ok(self.tree_running_override.unwrap_or(self.running))
     }
     fn launcher(&mut self) -> Result<Launcher> {
         Ok(Launcher {
@@ -323,6 +373,11 @@ impl DesktopSystem for Fake {
                         CoreError::new("test_child_failed", "isolated test child failed to start")
                     })?,
             ));
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if self.native_liveness {
+                self.native_start =
+                    Some(native_test_start(self.test_child.as_ref().unwrap().id())?);
+            }
         }
         self.running = true;
         Ok(())
@@ -348,6 +403,12 @@ impl DesktopSystem for Fake {
         }
         self.running = false;
         Ok(())
+    }
+    fn quit_for_confirmed_ip_risk(&mut self, forced: &mut Option<u32>) -> Result<()> {
+        self.ip_force_calls += 1;
+        let had_child = self.test_child.is_some();
+        *forced = Some(u32::from(had_child));
+        self.quit_desktop()
     }
 }
 
@@ -532,6 +593,498 @@ fn isolated_process_protection_handles_retry_recovery_and_confirmed_ip_change() 
             .unwrap()
             .state,
         Phase::Active
+    );
+}
+
+#[test]
+fn externally_exited_process_ends_session_and_replacement_keeps_fast_ip_guard() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake {
+        spawn_test_process: true,
+        ..Fake::default()
+    };
+    controller.launch(&mut system).unwrap();
+    let old = SessionStore::new(fixture.storage.clone())
+        .load(system.now)
+        .unwrap()
+        .unwrap();
+    let mut child = system.test_child.take().unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    system.running = false;
+    system.now += 1.0;
+    let ended = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(ended["session_guard"]["state"], "idle");
+    assert_eq!(ended["ended_session_id"], old.session_id);
+    assert_eq!(
+        system.closes, 0,
+        "an already-exited process needs no duplicate stop"
+    );
+    assert_eq!(
+        SessionStore::new(fixture.storage.clone())
+            .load(system.now)
+            .unwrap()
+            .unwrap()
+            .state,
+        Phase::Ended
+    );
+
+    system.test_child = Some(TestChild(
+        std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .spawn()
+            .unwrap(),
+    ));
+    system.running = true;
+    system.now += 1.0;
+    let pending = controller.guard_tick(&mut system).unwrap();
+    let replacement = SessionStore::new(fixture.storage.clone())
+        .load(system.now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replacement.state, Phase::Rechecking);
+    assert_ne!(replacement.session_id, old.session_id);
+    assert_eq!(pending["session_guard"]["state"], "pending");
+    assert_eq!(
+        system.closes, 0,
+        "a new process is rechecked, not closed merely for a new PID"
+    );
+
+    system.ip = "8.8.8.8";
+    system.now += 1.0;
+    let risk = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(risk["action"], "close-desktop");
+    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_ip_changed");
+    assert_eq!(system.ip_force_calls, 1);
+    assert_eq!(risk["stop_force_requested"], 1);
+    assert!(
+        system.test_child.is_none(),
+        "confirmed IP change stops the owned test process"
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn native_identity_and_owned_process_drive_the_guard_lifecycle() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake {
+        spawn_test_process: true,
+        native_liveness: true,
+        ..Fake::default()
+    };
+    controller.launch(&mut system).unwrap();
+    let mut old = system.test_child.take().unwrap();
+    old.kill().unwrap();
+    old.wait().unwrap();
+    system.running = false;
+    for _ in 0..5 {
+        system.now += 1.0;
+        controller.guard_tick(&mut system).unwrap();
+        if SessionStore::new(fixture.storage.clone())
+            .load(system.now)
+            .unwrap()
+            .unwrap()
+            .state
+            == Phase::Ended
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        SessionStore::new(fixture.storage.clone())
+            .load(system.now)
+            .unwrap()
+            .unwrap()
+            .state,
+        Phase::Ended
+    );
+    assert_eq!(system.closes, 0);
+    system.test_child = Some(TestChild(
+        std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .spawn()
+            .unwrap(),
+    ));
+    system.native_start =
+        Some(native_test_start(system.test_child.as_ref().unwrap().id()).unwrap());
+    system.running = true;
+    system.now += 1.0;
+    assert_eq!(
+        controller.guard_tick(&mut system).unwrap()["session_guard"]["state"],
+        "pending"
+    );
+    system.ip = "8.8.8.8";
+    system.now += 1.0;
+    let risk = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(risk["action"], "close-desktop");
+    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_ip_changed");
+    assert!(system.test_child.is_none());
+}
+
+#[test]
+fn missing_main_metadata_does_not_end_or_stop_a_still_live_process() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.launch(&mut system).unwrap();
+    system.now += 1.0;
+    system.hide_main = true;
+    system.alive_override = Some(true);
+    let result = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(result["session_guard"]["state"], "unknown");
+    assert_eq!(system.closes, 0);
+    assert_eq!(
+        SessionStore::new(fixture.storage.clone())
+            .load(system.now)
+            .unwrap()
+            .unwrap()
+            .state,
+        Phase::Active
+    );
+}
+
+#[test]
+fn exited_main_with_lingering_helper_does_not_look_like_a_new_main() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.launch(&mut system).unwrap();
+    system.now += 1.0;
+    system.hide_main = true;
+    system.alive_override = Some(false);
+    let partial = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(partial["session_guard"]["state"], "unknown");
+    assert_eq!(system.closes, 0);
+    let ended = SessionStore::new(fixture.storage.clone())
+        .load(system.now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended.state, Phase::Ended);
+    assert_eq!(
+        claude_watch_core::session::status(&ended, system.now, Some(true))["state"],
+        "unknown"
+    );
+    assert_eq!(
+        claude_watch_core::session::status(&ended, system.now, Some(false))["state"],
+        "idle"
+    );
+    system.now += 1.0;
+    system.hide_main = false;
+    system.desktop_pid = 78;
+    let recheck = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(recheck["session_guard"]["state"], "pending");
+    assert_eq!(system.closes, 0);
+}
+
+#[test]
+fn lingering_helpers_are_still_stopped_if_ip_changes_after_main_exit() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.launch(&mut system).unwrap();
+    system.now += 1.0;
+    system.hide_main = true;
+    system.alive_override = Some(false);
+    system.tree_running_override = Some(true);
+    let waiting = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(waiting["session_guard"]["state"], "unknown");
+    assert_eq!(system.closes, 0);
+    system.ip = "8.8.8.8";
+    system.now += 1.0;
+    let risk = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(risk["action"], "close-desktop");
+    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_ip_changed");
+    assert_eq!(system.closes, 1);
+}
+
+#[test]
+fn native_tree_only_helpers_remain_guarded_after_the_main_is_gone() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.launch(&mut system).unwrap();
+    system.running = false;
+    system.alive_override = Some(false);
+    system.tree_running_override = Some(true);
+    system.now += 1.0;
+    let waiting = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(waiting["session_guard"]["state"], "unknown");
+    assert_eq!(system.closes, 0);
+    system.ip = "8.8.8.8";
+    system.now += 1.0;
+    let risk = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(risk["action"], "close-desktop");
+    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_ip_changed");
+    assert_eq!(system.closes, 1);
+}
+
+#[test]
+fn confirmed_proxy_failure_still_stops_lingering_helpers() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.launch(&mut system).unwrap();
+    system.running = false;
+    system.alive_override = Some(false);
+    system.tree_running_override = Some(true);
+    system.proxy = "fail";
+    system.now += 1.0;
+    let risk = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(risk["action"], "close-desktop");
+    assert_eq!(
+        risk["session_guard"]["reason"]["code"],
+        "proxy_or_tun_failed"
+    );
+    assert_eq!(
+        system.ip_force_calls, 0,
+        "non-IP failures use the existing normal-exit path"
+    );
+}
+
+#[test]
+fn replacement_uses_its_own_exit_baseline_after_old_session_ended() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.launch(&mut system).unwrap();
+    system.running = false;
+    system.now += 1.0;
+    controller.guard_tick(&mut system).unwrap();
+    system.running = true;
+    system.desktop_pid = 78;
+    system.ip = "8.8.8.8"; // Changed while the previous session was already closed.
+    system.now += 1.0;
+    let pending = controller.guard_tick(&mut system).unwrap();
+    let value = SessionStore::new(fixture.storage.clone())
+        .load(system.now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending["session_guard"]["state"], "pending");
+    assert_eq!(value.baseline.ip, "8.8.8.8");
+    assert_eq!(
+        system.closes, 0,
+        "an old session baseline must not stop a new session"
+    );
+    system.ip = "9.9.9.9";
+    system.now += 1.0;
+    let risk = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(risk["action"], "close-desktop");
+    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_ip_changed");
+}
+
+#[test]
+fn replacement_seen_in_same_round_as_old_exit_is_rechecked_not_closed() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.launch(&mut system).unwrap();
+    let old = SessionStore::new(fixture.storage.clone())
+        .load(system.now)
+        .unwrap()
+        .unwrap();
+    system.desktop_pid = 78;
+    system.now += 1.0;
+    let result = controller.guard_tick(&mut system).unwrap();
+    let new = SessionStore::new(fixture.storage.clone())
+        .load(system.now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result["session_guard"]["state"], "pending");
+    assert_eq!(new.state, Phase::Rechecking);
+    assert_ne!(new.session_id, old.session_id);
+    assert_eq!(system.closes, 0);
+}
+
+#[test]
+fn replacement_cannot_absorb_a_changed_ip_without_a_confirmed_empty_tree() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.launch(&mut system).unwrap();
+    system.desktop_pid = 78;
+    system.ip = "8.8.8.8";
+    system.now += 1.0;
+    let risk = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_ip_changed");
+    assert_eq!(risk["action"], "close-desktop");
+    assert_eq!(system.ip_force_calls, 1);
+}
+
+#[test]
+fn unknown_sample_cannot_discard_previous_baseline_during_immediate_replacement() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.launch(&mut system).unwrap();
+    system.desktop_pid = 78;
+    system.ip = "";
+    system.now += 1.0;
+    let unknown = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(unknown["session_guard"]["state"], "unknown");
+    assert_eq!(system.closes, 0);
+    system.ip = "8.8.8.8";
+    system.now += 1.0;
+    let risk = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_ip_changed");
+    assert_eq!(risk["action"], "close-desktop");
+    assert_eq!(system.ip_force_calls, 1);
+}
+
+#[test]
+fn replacement_with_confirmed_cn_exit_is_closed_before_recheck() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.launch(&mut system).unwrap();
+    system.running = false;
+    system.now += 1.0;
+    controller.guard_tick(&mut system).unwrap();
+    system.running = true;
+    system.desktop_pid = 78;
+    system.country = "CN";
+    system.now += 1.0;
+    let risk = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(risk["action"], "close-desktop");
+    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_country_cn");
+    assert_eq!(system.ip_force_calls, 1);
+}
+
+#[test]
+fn confirmed_risk_stays_latched_until_remaining_desktop_tree_has_exited() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.launch(&mut system).unwrap();
+    system.ip = "8.8.8.8";
+    system.fail_quit = true;
+    system.now += 1.0;
+    let risk = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(risk["session_guard"]["state"], "risk");
+    assert_eq!(risk["stop_state"], "failed");
+    assert_eq!(system.closes, 1);
+
+    // Another protector has stopped the old main, but helpers still exist.
+    system.running = false;
+    system.alive_override = Some(false);
+    system.tree_running_override = Some(true);
+    system.now += 1.0;
+    let pending = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(pending["stop_state"], "failed");
+    assert_eq!(
+        system.closes, 2,
+        "confirmed risk keeps requesting full exit"
+    );
+    assert_eq!(
+        SessionStore::new(fixture.storage.clone())
+            .load(system.now)
+            .unwrap()
+            .unwrap()
+            .state,
+        Phase::Locked
+    );
+
+    // Once the tree is gone, whoever closed it, no duplicate stop is sent.
+    system.tree_running_override = Some(false);
+    system.now += 1.0;
+    let ended = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(ended["session_guard"]["state"], "idle");
+    assert_eq!(system.closes, 2);
+    assert_eq!(
+        SessionStore::new(fixture.storage.clone())
+            .load(system.now)
+            .unwrap()
+            .unwrap()
+            .state,
+        Phase::Ended
+    );
+}
+
+#[test]
+fn slow_new_process_audit_does_not_delay_stopping_owned_child_on_ip_change() {
+    use claude_watch_core::config::Config;
+    use claude_watch_runtime::background_evidence::{self, EvidenceSystem, ProbeKind};
+    use std::time::Instant;
+    struct BlockedAudit {
+        now: f64,
+        started: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+    impl EvidenceSystem for BlockedAudit {
+        fn now(&self) -> f64 {
+            self.now
+        }
+        fn local(&mut self, _: &Config) -> Result<Value> {
+            Ok(json!({"context_id":"ctx","proxy":"ok","tun":"ok","observation_unavailable":[]}))
+        }
+        fn desktop_matches(&mut self, _: &Desktop) -> Result<bool> {
+            Ok(true)
+        }
+        fn desktop_unique_stamp(&mut self, _: &Desktop) -> Result<Option<String>> {
+            Ok(Some("fixture".into()))
+        }
+        fn collect(&mut self, _: ProbeKind) -> Result<Value> {
+            panic!("fresh fixture receipts should be reused")
+        }
+        fn revalidate(&mut self) -> Result<(Value, Value)> {
+            self.started.send(()).unwrap();
+            self.resume.recv_timeout(Duration::from_secs(3)).unwrap();
+            Ok((json!({}), json!({})))
+        }
+    }
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake {
+        spawn_test_process: true,
+        ..Fake::default()
+    };
+    controller.launch(&mut system).unwrap();
+    let mut old = system.test_child.take().unwrap();
+    old.kill().unwrap();
+    old.wait().unwrap();
+    system.running = false;
+    system.now += 1.0;
+    controller.guard_tick(&mut system).unwrap();
+    system.test_child = Some(TestChild(
+        std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .spawn()
+            .unwrap(),
+    ));
+    system.running = true;
+    system.now += 1.0;
+    controller.guard_tick(&mut system).unwrap();
+    fixture.receipts(system.now);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let store = fixture.storage.clone();
+    let at = system.now + 0.1;
+    let worker = std::thread::spawn(move || {
+        let mut adapter = BlockedAudit {
+            now: at,
+            started: started_tx,
+            resume: resume_rx,
+        };
+        background_evidence::refresh_active_session(&store, &mut adapter)
+    });
+    started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    system.ip = "8.8.8.8";
+    system.now += 1.0;
+    let start = Instant::now();
+    let result = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(result["action"], "close-desktop");
+    assert_eq!(
+        result["session_guard"]["reason"]["code"],
+        "egress_ip_changed"
+    );
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(system.test_child.is_none());
+    resume_tx.send(()).unwrap();
+    assert!(
+        worker.join().unwrap().is_err(),
+        "late audit cannot revive the stopped session"
     );
 }
 
@@ -738,6 +1291,10 @@ fn sampling_failure_retries_then_closes_without_claiming_ip_changed_and_normal_c
     let third = controller.guard_tick(&mut system).unwrap();
     assert_eq!(third["action"], "close-desktop");
     assert_eq!(
+        system.ip_force_calls, 0,
+        "unconfirmed sampling does not use forced exit"
+    );
+    assert_eq!(
         third["session_guard"]["reason"]["code"],
         "proxy_or_tun_unconfirmed"
     );
@@ -768,6 +1325,10 @@ fn corrupt_session_fails_closed_without_overwriting_the_damaged_evidence() {
         "session_state_invalid"
     );
     assert_eq!(system.closes, 1);
+    assert_eq!(
+        system.ip_force_calls, 0,
+        "session corruption is not a confirmed IP risk"
+    );
     assert_eq!(
         fs::read(fixture.storage.paths.session()).unwrap(),
         b"{corrupt-session"
@@ -1161,6 +1722,10 @@ fn confirmed_exit_stops_even_when_session_write_fails() {
     assert_eq!(receipt["persistence_error"], "state_io_failed");
     assert_eq!(receipt["stop_state"], "confirmed");
     assert_eq!(receipt["action"], "close-desktop");
+    assert_eq!(
+        system.ip_force_calls, 1,
+        "confirmed IP risk still uses force fallback if state persistence fails"
+    );
     assert!(!system.running);
 }
 

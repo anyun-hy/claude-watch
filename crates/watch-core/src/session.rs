@@ -78,6 +78,10 @@ impl Egress {
 pub enum Phase {
     Pending,
     Active,
+    /// The old process has exited; a replacement is being fully rechecked.
+    Rechecking,
+    /// The bound process has been confirmed absent or replaced.
+    Ended,
     Locked,
 }
 
@@ -157,6 +161,27 @@ impl Session {
         .ok_or_else(|| CoreError::new("invalid_session", "会话基准不是有效公网出口"))?;
         if self.desktop.as_ref().is_some_and(|v| !v.valid()) {
             return Err(CoreError::new("invalid_session", "会话进程身份无效"));
+        }
+        if self.state == Phase::Rechecking
+            && (self.desktop.is_none()
+                || !self.created_at.is_finite()
+                || self.created_at <= 0.0
+                || !self.pending_deadline.is_finite()
+                || self.pending_deadline <= self.created_at
+                || self
+                    .extra
+                    .get("recheck_baseline_pending")
+                    .is_some_and(|v| v != &json!(true)))
+        {
+            return Err(CoreError::new("invalid_session", "新进程复核状态无效"));
+        }
+        if self.state == Phase::Ended
+            && self
+                .extra
+                .get("exit_tree_pending")
+                .is_some_and(|v| !v.is_boolean())
+        {
+            return Err(CoreError::new("invalid_session", "旧会话退出状态无效"));
         }
         Ok(())
     }
@@ -458,6 +483,9 @@ fn uncertain_with_terminal(
 pub fn check(session: &Session, input: &CheckInput) -> Outcome {
     let mut session = session.clone();
     let now = input.now;
+    if session.state == Phase::Ended {
+        return Outcome::session("idle", session, None);
+    }
     if session.state == Phase::Locked {
         return Outcome::session("locked", session.clone(), session.reason.clone());
     }
@@ -483,12 +511,16 @@ pub fn check(session: &Session, input: &CheckInput) -> Outcome {
         );
         return Outcome::session("risk", value.clone(), value.reason.clone());
     }
-    let current = Egress::fresh(&input.egress, now, GUARD_EGRESS_TTL);
+    let current = Egress::fresh(&input.egress, now, GUARD_EGRESS_TTL).filter(|exit| {
+        session.state != Phase::Rechecking || exit.observed_at >= session.created_at
+    });
     let evidence = risk(&input.risk, now);
     if let Some(exit) = current.as_ref() {
+        let baseline_pending = session.state == Phase::Rechecking
+            && session.extra.get("recheck_baseline_pending") == Some(&json!(true));
         let cause = if exit.country == "CN" {
             Some(("egress_country_cn", "运行中实测 HTTP 出口为 CN"))
-        } else if exit.ip != session.baseline.ip {
+        } else if !baseline_pending && exit.ip != session.baseline.ip {
             Some(("egress_ip_changed", "运行中实测 HTTP 出口 IP 已变化"))
         } else {
             None
@@ -500,6 +532,10 @@ pub fn check(session: &Session, input: &CheckInput) -> Outcome {
             out.baseline = Some(baseline);
             out.current = Some(exit.clone());
             return out;
+        }
+        if baseline_pending {
+            session.baseline = exit.clone();
+            session.extra.remove("recheck_baseline_pending");
         }
     }
     if input.identity == Identity::Changed {
@@ -560,6 +596,33 @@ pub fn check(session: &Session, input: &CheckInput) -> Outcome {
             now,
         );
     };
+    if session.state == Phase::Rechecking {
+        if !session.pending_deadline.is_finite() || now > session.pending_deadline {
+            let value = lock(
+                session,
+                "revalidation_timeout",
+                "新进程的完整保护校验未在时限内完成",
+                now,
+                Some(current),
+                None,
+            );
+            return Outcome::session("risk", value.clone(), value.reason.clone());
+        }
+        session.unknown_count = 0;
+        session.unknown_since = None;
+        session.last_check = Some(current.clone());
+        let mut out = Outcome::session(
+            "pending",
+            session,
+            Some(Reason::new(
+                "session_rechecking",
+                "正在重新核验 Claude 进程和环境",
+                now,
+            )),
+        );
+        out.current = Some(current);
+        return out;
+    }
     if evidence.get("state").and_then(Value::as_str) == Some("safe") {
         session.risk_evidence = evidence.clone();
     }
@@ -606,15 +669,23 @@ pub fn status(session: &Session, now: f64, running: Option<bool>) -> Value {
     let phase = match session.state {
         Phase::Pending => "pending",
         Phase::Active => "active",
+        Phase::Rechecking => "rechecking",
+        Phase::Ended => "ended",
         Phase::Locked => "locked",
     };
     let fresh = session
         .last_check
         .as_ref()
         .is_some_and(|v| (0.0..=10.0).contains(&(now - v.observed_at)));
-    let state = if session.state == Phase::Locked {
+    let state = if session.state == Phase::Ended {
+        if running == Some(false) {
+            "idle"
+        } else {
+            "unknown"
+        }
+    } else if session.state == Phase::Locked {
         "locked"
-    } else if session.state == Phase::Pending {
+    } else if matches!(session.state, Phase::Pending | Phase::Rechecking) {
         "pending"
     } else if running == Some(false) {
         "idle"
@@ -623,6 +694,13 @@ pub fn status(session: &Session, now: f64, running: Option<bool>) -> Value {
     } else {
         "unknown"
     };
-    json!({"state":state,"phase":phase,"baseline":session.baseline,"current":session.last_check,
+    let baseline = if session.state == Phase::Rechecking
+        && session.extra.get("recheck_baseline_pending") == Some(&json!(true))
+    {
+        Value::Null
+    } else {
+        json!(session.baseline)
+    };
+    json!({"state":state,"phase":phase,"baseline":baseline,"current":session.last_check,
         "reason":session.reason.as_ref().or(session.last_reason.as_ref()),"risk_evidence":session.risk_evidence,"locked_at":session.locked_at,"sampled_at":session.extra.get("guard_checked_at"),"valid_until":session.last_check.as_ref().map(|v| v.observed_at + GUARD_EGRESS_TTL)})
 }

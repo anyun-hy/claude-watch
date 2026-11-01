@@ -58,6 +58,9 @@ struct SessionProtectionPresentation {
             }
             return .init(title: "保护运行中", detail: "会话基准与当前出口已核对。", symbol: "checkmark.shield", tone: "success")
         case "pending":
+            if session.phase == "rechecking" {
+                return .init(title: "正在复核新进程", detail: "旧会话已结束，正在重新核验 Claude 身份和网络；出口保护继续运行。", symbol: "clock", tone: "info")
+            }
             return .init(title: "正在建立受控会话", detail: "正在绑定 Claude 启动进程，完成后自动更新。", symbol: "clock", tone: "info")
         case "missing":
             return .init(title: "等待受控启动", detail: "使用“检查并启动 Claude”时自动建立会话，无需手动配置。", symbol: "shield", tone: "info")

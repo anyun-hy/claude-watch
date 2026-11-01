@@ -2,10 +2,10 @@ import AppKit
 import SwiftUI
 
 private enum GraphNodeID: String {
-    case code, desktop, gateway, tag, node, service
+    case code, desktop, managed, gateway, tag, node, service
 }
 
-/// The illustration is a native, read-only projection of one existing sample.
+/// The illustration is a native projection of one existing sample.
 struct ConnectionGraphView: View {
     @ObservedObject var store: MonitorStore
     let p: Palette
@@ -36,8 +36,11 @@ struct ConnectionGraphView: View {
     private var graph: ConnectionGraphProjection { display.projection }
     private var codeGraph: ConnectionGraphProjection? { display.sourceProjection(.cli) }
     private var desktopGraph: ConnectionGraphProjection? { display.sourceProjection(.desktop) }
+    private var managedGraph: ConnectionGraphProjection? { display.sourceProjection(.managed) }
     private var codeSelected: Bool { codeGraph != nil }
     private var desktopSelected: Bool { desktopGraph != nil }
+    private var managedProcess: WatchedProcess? { processes.first(where: { $0.sourceRole == .managed }) }
+    private var hasManaged: Bool { selectedProduct == .openAI && managedProcess != nil }
     private var codeProcess: WatchedProcess? {
         processes.first(where: { $0.sourceRole == .cli })
     }
@@ -84,21 +87,13 @@ struct ConnectionGraphView: View {
         VStack(spacing: 0) {
             VStack(spacing: 8) {
                 HStack(alignment: .center, spacing: 12) {
-                VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 9) {
                         Image(systemName: "point.3.connected.trianglepath.dotted")
                             .font(.system(size: 17)).foregroundStyle(p.mint)
                         Text("连接全景").font(WatchTypography.section)
                     }
-                }
-                Spacer()
-                AIProcessCloseButton(product: selectedProduct, store: store, control: store.processControl, p: p)
-                    .id(selectedProduct)
-                VStack(alignment: .trailing, spacing: 6) {
+                    Spacer()
                     Badge(text: display.title, color: statusColor)
-                    Text(sampleText)
-                        .font(WatchTypography.caption).foregroundStyle(p.secondary).lineLimit(1)
-                }.frame(width: 220, alignment: .trailing)
                 }
                 HStack(spacing: 12) {
                     Picker("应用", selection: $store.networkSelection.product) {
@@ -106,6 +101,7 @@ struct ConnectionGraphView: View {
                     }.labelsHidden().pickerStyle(.segmented).frame(width: 252)
                         .onChange(of: selectedProduct) {
                             store.synchronizeNetworkSelection(); expandedNode = nil
+                            if selectedNode == .managed && selectedProduct != .openAI { selectedNode = .gateway }
                         }
                     let platform = serviceGroups.filter { $0.purpose == .platform }
                     if display.countsAvailable, !platform.isEmpty {
@@ -118,7 +114,13 @@ struct ConnectionGraphView: View {
                         }.menuStyle(.borderlessButton).frame(maxWidth: 148)
                     }
                     Spacer(minLength: 0)
-                    Text(countText).font(WatchTypography.caption).foregroundStyle(p.secondary)
+                    HStack(spacing: 8) {
+                        GraphLaunchButton(product: selectedProduct, monitor: store, switcher: store.switcher,
+                                          processControl: store.processControl, p: p)
+                        AIProcessCloseButton(product: selectedProduct, store: store, control: store.processControl,
+                                             switcher: store.switcher, p: p)
+                            .id(selectedProduct)
+                    }
                 }
                 HStack(spacing: 10) {
                     Text(display.detail)
@@ -128,6 +130,10 @@ struct ConnectionGraphView: View {
                     if !backendCoversSelectedProduct && backendCoverageKnown {
                         Text("采集器暂未覆盖此应用").foregroundStyle(p.amber)
                     }
+                    VStack(alignment: .trailing, spacing: 3) {
+                        Text(sampleText).lineLimit(1)
+                        Text(countText).lineLimit(1)
+                    }.foregroundStyle(p.secondary)
                 }.font(WatchTypography.small).frame(height: 34)
             }.padding(.horizontal, 23).padding(.top, 17).padding(.bottom, 7)
 
@@ -227,22 +233,29 @@ struct ConnectionGraphView: View {
             let gatewayX = width * 0.35
             let tagX = width * 0.56
             let exitX = width * 0.84
-            graphCanvas(width: width, height: 278, localWidth: width * 0.68)
+            let sceneHeight: CGFloat = hasManaged ? 382 : 278
+            let desktopY: CGFloat = hasManaged ? 303 : 210
+            graphCanvas(width: width, height: sceneHeight, localWidth: width * 0.68)
             if graph.flow != nil {
-                sourceRibbons(sourceX: sourceX, gatewayX: gatewayX, sourceWidth: 178, gatewayWidth: 174, sourceTop: 91, sourceBottom: 210, gatewayY: 150)
+                sourceRibbons(sourceX: sourceX, gatewayX: gatewayX, sourceWidth: 178, gatewayWidth: 174, sourceTop: 91, sourceBottom: desktopY, gatewayY: 150)
                 pathRibbons(gatewayX: gatewayX, tagX: tagX, exitX: exitX, gatewayWidth: 174, tagWidth: 164, exitWidth: 220, gatewayY: 150, tagY: 150, exitTop: 91, exitBottom: 210, unresolvedY: 239)
             } else {
-                referenceRibbons(sourceX: sourceX, gatewayX: gatewayX, tagX: tagX, exitX: exitX, sourceWidth: 178, gatewayWidth: 174, tagWidth: 164, exitWidth: 220, sourceTop: 91, sourceBottom: 210, gatewayY: 150, tagY: 150, exitTop: 91, exitBottom: 210)
+                referenceRibbons(sourceX: sourceX, gatewayX: gatewayX, tagX: tagX, exitX: exitX, sourceWidth: 178, gatewayWidth: 174, tagWidth: 164, exitWidth: 220, sourceTop: 91, sourceBottom: desktopY, gatewayY: 150, tagY: 150, exitTop: 91, exitBottom: 210)
+            }
+            if hasManaged {
+                managedRibbon(sourceX: sourceX, gatewayX: gatewayX, sourceWidth: 178, gatewayWidth: 174, sourceY: 197, gatewayY: 150)
+                sourceNode(.managed, title: "Codex 托管后台", symbol: "server", process: managedProcess, active: managedGraph != nil, width: 178)
+                    .position(x: sourceX, y: 197)
             }
             sourceNode(.code, title: codeTitle, symbol: "square-terminal", process: codeProcess, active: codeSelected, width: 178)
                 .position(x: sourceX, y: 91)
             sourceNode(.desktop, title: selectedProduct.graphDesktopTitle, symbol: "monitor", process: desktopProcess, active: desktopSelected, width: 178)
-                .position(x: sourceX, y: 210)
+                .position(x: sourceX, y: desktopY)
             gateway(width: 174).position(x: gatewayX, y: 150)
             tagHub(width: 164).position(x: tagX, y: 150)
             exitNode(width: 220).position(x: exitX, y: 91)
             targetNode(width: 220).position(x: exitX, y: 210)
-        }.frame(height: 278)
+        }.frame(height: hasManaged ? 382 : 278)
     }
 
     private var compactScene: some View {
@@ -251,22 +264,29 @@ struct ConnectionGraphView: View {
             let sourceX: CGFloat = 103
             let middleX = width * 0.49
             let exitX = width * 0.82
-            graphCanvas(width: width, height: 356, localWidth: width * 0.65)
+            let sceneHeight: CGFloat = hasManaged ? 400 : 356
+            let desktopY: CGFloat = hasManaged ? 302 : 246
+            graphCanvas(width: width, height: sceneHeight, localWidth: width * 0.65)
             if graph.flow != nil {
-                sourceRibbons(sourceX: sourceX, gatewayX: middleX, sourceWidth: 170, gatewayWidth: 160, sourceTop: 92, sourceBottom: 246, gatewayY: 92)
+                sourceRibbons(sourceX: sourceX, gatewayX: middleX, sourceWidth: 170, gatewayWidth: 160, sourceTop: 92, sourceBottom: desktopY, gatewayY: 92)
                 compactPathRibbons(middleX: middleX, exitX: exitX, gatewayWidth: 160, tagWidth: 160, exitWidth: 176, gatewayY: 92, tagY: 246, exitTop: 92, exitBottom: 246, unresolvedY: 330)
             } else {
-                compactReferenceRibbons(sourceX: sourceX, middleX: middleX, exitX: exitX, sourceWidth: 170, gatewayWidth: 160, tagWidth: 160, exitWidth: 176, sourceTop: 92, sourceBottom: 246, gatewayY: 92, tagY: 246, exitTop: 92, exitBottom: 246)
+                compactReferenceRibbons(sourceX: sourceX, middleX: middleX, exitX: exitX, sourceWidth: 170, gatewayWidth: 160, tagWidth: 160, exitWidth: 176, sourceTop: 92, sourceBottom: desktopY, gatewayY: 92, tagY: 246, exitTop: 92, exitBottom: 246)
+            }
+            if hasManaged {
+                managedRibbon(sourceX: sourceX, gatewayX: middleX, sourceWidth: 170, gatewayWidth: 160, sourceY: 197, gatewayY: 92)
+                sourceNode(.managed, title: "Codex 托管后台", symbol: "server", process: managedProcess, active: managedGraph != nil, width: 170)
+                    .position(x: sourceX, y: 197)
             }
             sourceNode(.code, title: codeTitle, symbol: "square-terminal", process: codeProcess, active: codeSelected, width: 170)
                 .position(x: sourceX, y: 92)
             sourceNode(.desktop, title: selectedProduct.graphDesktopTitle, symbol: "monitor", process: desktopProcess, active: desktopSelected, width: 170)
-                .position(x: sourceX, y: 246)
+                .position(x: sourceX, y: desktopY)
             gateway(width: 160).position(x: middleX, y: 92)
             tagHub(width: 160).position(x: middleX, y: 246)
             exitNode(width: 176).position(x: exitX, y: 92)
             targetNode(width: 176).position(x: exitX, y: 246)
-        }.frame(height: 356)
+        }.frame(height: hasManaged ? 400 : 356)
     }
 
     @ViewBuilder private func graphCanvas(width: CGFloat, height: CGFloat, localWidth: CGFloat) -> some View {
@@ -294,6 +314,15 @@ struct ConnectionGraphView: View {
         let gatewayLeft = gatewayX - gatewayWidth / 2
         ribbon(from: CGPoint(x: sourceRight, y: sourceTop), to: CGPoint(x: gatewayLeft, y: gatewayY), c1: CGPoint(x: sourceRight + 28, y: sourceTop), c2: CGPoint(x: gatewayLeft - 28, y: gatewayY), state: codeGraph?.sourceEdgeState ?? .pending, animated: codeGraph != nil && shouldAnimate, showsArrow: codeGraph != nil)
         ribbon(from: CGPoint(x: sourceRight, y: sourceBottom), to: CGPoint(x: gatewayLeft, y: gatewayY), c1: CGPoint(x: sourceRight + 28, y: sourceBottom), c2: CGPoint(x: gatewayLeft - 28, y: gatewayY), state: desktopGraph?.sourceEdgeState ?? .pending, animated: desktopGraph != nil && shouldAnimate, showsArrow: desktopGraph != nil)
+    }
+
+    private func managedRibbon(sourceX: CGFloat, gatewayX: CGFloat, sourceWidth: CGFloat, gatewayWidth: CGFloat, sourceY: CGFloat, gatewayY: CGFloat) -> some View {
+        let start = sourceX + sourceWidth / 2
+        let end = gatewayX - gatewayWidth / 2
+        return ribbon(from: CGPoint(x: start, y: sourceY), to: CGPoint(x: end, y: gatewayY),
+                      c1: CGPoint(x: start + 28, y: sourceY), c2: CGPoint(x: end - 28, y: gatewayY),
+                      state: managedGraph?.sourceEdgeState ?? .pending, animated: managedGraph != nil && shouldAnimate,
+                      showsArrow: managedGraph != nil)
     }
 
     @ViewBuilder private func pathRibbons(gatewayX: CGFloat, tagX: CGFloat, exitX: CGFloat, gatewayWidth: CGFloat, tagWidth: CGFloat, exitWidth: CGFloat, gatewayY: CGFloat, tagY: CGFloat, exitTop: CGFloat, exitBottom: CGFloat, unresolvedY: CGFloat) -> some View {
@@ -354,10 +383,10 @@ struct ConnectionGraphView: View {
 
     private func sourceNode(_ id: GraphNodeID, title: String, symbol: String,
                             process: WatchedProcess?, active: Bool, width: CGFloat) -> some View {
-        let sourceGraph = id == .code ? codeGraph : desktopGraph
+        let sourceGraph = id == .code ? codeGraph : id == .managed ? managedGraph : desktopGraph
         let state: GraphEvidence = sourceGraph?.sourceEdgeState ?? .pending
         let idleText = store.snapshot == nil ? (store.error == nil ? "读取中…" : "读取失败") : "未检测到进程"
-        let role: ProcessSourceRole = id == .code ? .cli : .desktop
+        let role: ProcessSourceRole = id == .code ? .cli : id == .managed ? .managed : .desktop
         let connectionCount = flows.filter { flow in processes.contains { $0.pid == flow.pid && $0.sourceRole == role } }.count
         let sourceStatus: String
         if display.isHistorical { sourceStatus = active ? "上次观测来源" : "此路径未经过此来源" }
@@ -535,6 +564,7 @@ struct ConnectionGraphView: View {
         switch selectedNode {
         case .code: title = codeTitle
         case .desktop: title = selectedProduct == .openAI ? "ChatGPT / Codex 桌面应用" : selectedProduct.graphDesktopTitle
+        case .managed: title = "Codex 托管后台"
         case .gateway: title = graph.gatewayTitle
         case .tag: title = "TAG · " + graph.groupTitle
         case .node: title = "代理节点 · " + graph.nodeTitle
@@ -545,15 +575,15 @@ struct ConnectionGraphView: View {
     private var detailText: String {
         let text: String
         switch selectedNode {
-        case .code, .desktop:
-            let sourceGraph = selectedNode == .code ? codeGraph : desktopGraph
+        case .code, .desktop, .managed:
+            let sourceGraph = selectedNode == .code ? codeGraph : selectedNode == .managed ? managedGraph : desktopGraph
             let sourceDetail = selectedProduct == .openAI
-                ? (selectedNode == .desktop ? "按桌面应用名称跟踪；Chromium 组件与 MCP 工具独立分组。\n" : "仅展示后台识别为独立 Codex CLI 的进程；桌面内置服务不重复计入。\n")
+                ? (selectedNode == .desktop ? "按桌面应用名称跟踪；Chromium 组件与 MCP 工具独立分组。\n" : selectedNode == .managed ? "按托管服务身份显示；客户端归属待确认。\n" : "仅展示后台识别为独立 Codex CLI 的进程；桌面内置服务不重复计入。\n")
                 : ""
             if let sourceGraph, let flow = sourceGraph.flow {
                 text = sourceDetail + "PID \(flow.pid) · \(flow.transport) · 本地端点 \(flow.local)\n" + sourceGraph.summary
             } else {
-                let role: ProcessSourceRole = selectedNode == .code ? .cli : .desktop
+                let role: ProcessSourceRole = selectedNode == .code ? .cli : selectedNode == .managed ? .managed : .desktop
                 let hasOtherPath = flows.contains { flow in processes.contains { $0.pid == flow.pid && $0.sourceRole == role } }
                 text = sourceDetail + (hasOtherPath ? "存在平台连接，但未归入当前显示的路径；可在连接列表中选择查看。" : "尚无与此进程关联的连接样本。出现连接后，图中才会显示对应路径。")
             }

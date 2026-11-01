@@ -188,6 +188,137 @@ impl AuditSystem for Fake {
         )
     }
 }
+
+#[test]
+fn environment_previews_both_desktop_targets_from_one_observation() {
+    use claude_watch_core::processes::LaunchTarget;
+    struct IndependentGuard {
+        online_calls: usize,
+        local_calls: std::cell::Cell<usize>,
+        backend_flips: bool,
+    }
+    impl AuditSystem for IndependentGuard {
+        fn now(&self) -> f64 {
+            1_700_000_000.0
+        }
+        fn network(&self) -> Result<Value> {
+            Fake { now: self.now() }.network()
+        }
+        fn local(&self, config: &Config) -> Result<Value> {
+            let mut local = Fake { now: self.now() }.local(config)?;
+            let calls = self.local_calls.get();
+            self.local_calls.set(calls + 1);
+            local["guard"] = json!(false);
+            local["guard_state"] = json!("disabled");
+            if self.backend_flips && calls > 0 {
+                local["backend_healthy"] = json!(false);
+            }
+            Ok(local)
+        }
+        fn online(&mut self, config: &Config, local: &Value) -> Result<Value> {
+            self.online_calls += 1;
+            Fake { now: self.now() }.online(config, local)
+        }
+    }
+    let root = std::env::temp_dir().join(format!("audit-two-desktops-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let storage = StateStore::new(Paths::new(&root).unwrap());
+    let mut system = IndependentGuard {
+        online_calls: 0,
+        local_calls: std::cell::Cell::new(0),
+        backend_flips: false,
+    };
+    let (audit, _) = AuditStore::new(storage.clone())
+        .collect_environment(
+            &mut system,
+            &ZoneCatalog::new(),
+            LaunchTarget::ClaudeDesktop,
+            AuditOptions {
+                online: true,
+                persist: false,
+                launch: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        system.online_calls, 1,
+        "the second policy reuses the existing sample"
+    );
+    assert_eq!(
+        audit["display_facts"]["chatgpt_preview"]["grants_launch_permission"], false,
+        "even the internal display preview cannot authorize a launch"
+    );
+    assert_eq!(
+        claude_watch_core::session::verify_launch(
+            &audit["display_facts"]["chatgpt_preview"],
+            &json!({}),
+            &json!({}),
+            1_700_000_000.0,
+            LaunchTarget::ChatgptDesktop,
+        )
+        .unwrap_err()
+        .code,
+        "display_receipt_not_authority"
+    );
+    let output = claude_watch_runtime::environment_display::receipt(
+        &storage,
+        audit,
+        json!({"state":"locked"}),
+        false,
+    )
+    .unwrap();
+    let claude = &output["policy_evaluation"];
+    let chatgpt = &output["chatgpt_policy_evaluation"];
+    let guard = |value: &Value| {
+        value["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "guard")
+            .unwrap()["state"]
+            .clone()
+    };
+    assert_ne!(guard(claude), json!("ok"));
+    assert_eq!(
+        guard(chatgpt),
+        "ok",
+        "Claude guard does not become a ChatGPT requirement"
+    );
+    assert_eq!(chatgpt["launch_target"], "chatgpt-desktop");
+    assert_eq!(chatgpt["grants_launch_permission"], false);
+    for key in ["observed_at", "expires_at", "context_id", "observation_id"] {
+        assert_eq!(
+            chatgpt[key], output[key],
+            "{key} must belong to the same round"
+        );
+    }
+    assert!(chatgpt.get("session_guard").is_none());
+    let mut flapping = IndependentGuard {
+        online_calls: 0,
+        local_calls: std::cell::Cell::new(0),
+        backend_flips: true,
+    };
+    let (changing, _) = AuditStore::new(storage.clone())
+        .collect_environment(
+            &mut flapping,
+            &ZoneCatalog::new(),
+            LaunchTarget::ClaudeDesktop,
+            AuditOptions {
+                online: true,
+                persist: false,
+                launch: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        guard(&changing["display_facts"]["chatgpt_preview"]),
+        "unknown",
+        "a backend that becomes unhealthy during the round cannot produce a green ChatGPT preview"
+    );
+    assert_eq!(flapping.online_calls, 1);
+    assert!(!root.join("Library").exists());
+    fs::remove_dir_all(root).unwrap();
+}
 #[test]
 fn environment_guard_diagnostics_do_not_change_audit_or_write_on_readonly_rounds() {
     use claude_watch_core::processes::LaunchTarget;
@@ -233,6 +364,10 @@ fn environment_guard_diagnostics_do_not_change_audit_or_write_on_readonly_rounds
     assert!(observed.get("guard_diagnostics").is_none());
     original.as_object_mut().unwrap().remove("observation_id");
     observed.as_object_mut().unwrap().remove("observation_id");
+    observed["display_facts"]
+        .as_object_mut()
+        .unwrap()
+        .remove("chatgpt_preview");
     assert_eq!(
         original, observed,
         "diagnostic capture must not alter the audit result"
@@ -335,6 +470,10 @@ fn guard_round_records_both_decisions_without_changing_a_fluctuating_audit() {
     );
     original.as_object_mut().unwrap().remove("observation_id");
     observed.as_object_mut().unwrap().remove("observation_id");
+    observed["display_facts"]
+        .as_object_mut()
+        .unwrap()
+        .remove("chatgpt_preview");
     assert_eq!(original, observed);
     assert!(!serde_json::to_string(&trace).unwrap().contains("127.0.0.1"));
     fs::remove_dir_all(root).unwrap();
@@ -383,6 +522,10 @@ fn unreadable_diagnostic_heartbeat_never_changes_environment_audit() {
     assert_eq!(trace.unwrap().before.guard_heartbeat_status, "unreadable");
     original.as_object_mut().unwrap().remove("observation_id");
     observed.as_object_mut().unwrap().remove("observation_id");
+    observed["display_facts"]
+        .as_object_mut()
+        .unwrap()
+        .remove("chatgpt_preview");
     assert_eq!(original, observed);
     fs::remove_dir_all(root).unwrap();
 }
@@ -421,6 +564,110 @@ fn persisted_audit_has_context_and_observation_identity() {
         )
         .unwrap_or_else(|error| panic!("{error:?}: {out}"));
     assert_eq!(session.context_id, "ctx");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replacement_promotion_uses_the_real_launch_audit_pipeline() {
+    use claude_watch_core::{
+        processes::LaunchTarget,
+        session::{Desktop, Identity, Phase},
+    };
+    let root = std::env::temp_dir().join(format!("audit-recheck-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let storage = StateStore::new(Paths::new(&root).unwrap());
+    let mut config = Config::default();
+    config.guard_enabled = true;
+    storage
+        .atomic_json(&storage.paths.config(), &config.value().unwrap())
+        .unwrap();
+    let at = 1_700_000_000.0;
+    let save_receipts = |time: f64| {
+        storage.atomic_json(&storage.paths.base().join("dns-leak-receipt.json"),&json!({"schema":1,"provider":"ipleak","status":"complete","finished_at":time,"recorded_at":time,"launch_expires_at":time+30.,"display_expires_at":time+300.,"context":"ctx","comparison":{"state":"ok"},"errors":[],"dns":{"egress_ips":["1.1.1.1"],"countries":["JP"]},"http":{"egress_ips":["1.1.1.1"],"countries":["JP"]}})).unwrap();
+        storage.atomic_json(&storage.paths.base().join("webrtc-risk-receipt.json"),&json!({"schema":1,"status":"complete","sampled_at":time,"recorded_at":time,"context_id":"ctx","risk":{"state":"ok","detail":"same"},"observations":[{"kind":"http","address":"1.1.1.1","country":"JP"},{"kind":"srflx","address":"1.1.1.1","country":"JP"}]})).unwrap();
+    };
+    save_receipts(at);
+    let zones = serde_json::from_value::<ZoneCatalog>(json!({"JP":["Asia/Tokyo"]})).unwrap();
+    let audit_store = AuditStore::new(storage.clone());
+    let original = audit_store
+        .collect_target(
+            &mut Fake { now: at },
+            &zones,
+            LaunchTarget::ClaudeDesktop,
+            AuditOptions {
+                online: true,
+                persist: true,
+                launch: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(original["ready"], true, "{original}");
+    let sessions = SessionStore::new(storage.clone());
+    let receipts = ReceiptStore {
+        storage: storage.clone(),
+    };
+    let current = |t| json!({"ip":"1.1.1.1","country":"JP","observed_at":t});
+    let old = sessions
+        .begin_verified(&receipts, &original, &current(at), at)
+        .unwrap();
+    let old_desktop = Desktop {
+        pid: 77,
+        start_seconds: 1000,
+        start_microseconds: 1,
+    };
+    sessions
+        .bind_desktop(&old.session_id, old_desktop.clone(), at + 0.1)
+        .unwrap();
+    assert!(sessions
+        .end_desktop(&old.session_id, &old_desktop, at + 0.2, false)
+        .unwrap());
+    let new_desktop = Desktop {
+        pid: 88,
+        start_seconds: 1001,
+        start_microseconds: 1,
+    };
+    let pending = sessions
+        .begin_recheck(&old.session_id, new_desktop.clone(), at + 0.3)
+        .unwrap()
+        .unwrap();
+    let probe = sessions
+        .check_verified(
+            &receipts,
+            Some(&pending.session_id),
+            at + 0.4,
+            false,
+            Identity::Matches,
+            current(at + 0.4),
+        )
+        .unwrap();
+    assert_eq!(probe.state, "pending");
+    save_receipts(at + 0.5);
+    let latest = audit_store
+        .collect_target(
+            &mut Fake { now: at + 0.6 },
+            &zones,
+            LaunchTarget::ClaudeDesktop,
+            AuditOptions {
+                online: true,
+                persist: true,
+                launch: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(latest["ready"], true, "{latest}");
+    let verified = sessions
+        .complete_recheck(
+            &pending.session_id,
+            &new_desktop,
+            "fixture",
+            &latest,
+            &current(at + 0.6),
+            at + 0.6,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(verified.state, Phase::Active);
+    assert_eq!(verified.desktop, Some(new_desktop));
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -107,6 +107,254 @@ impl SessionStore {
         self.save(&value)?;
         Ok(value)
     }
+
+    /// End only the session whose exact bound process was independently
+    /// confirmed gone. A stale observation must not end a replacement session.
+    pub fn end_desktop(
+        &self,
+        id: &str,
+        desktop: &Desktop,
+        now: f64,
+        tree_pending: bool,
+    ) -> Result<bool> {
+        let _lock = self.storage.lock("session-guard", None)?;
+        let Some(mut value) = self.load(now)? else {
+            return Ok(false);
+        };
+        if value.session_id != id
+            || value.desktop.as_ref() != Some(desktop)
+            || !matches!(
+                value.state,
+                Phase::Active | Phase::Rechecking | Phase::Locked
+            )
+            || value
+                .extra
+                .get("guard_checked_at")
+                .and_then(Value::as_f64)
+                .is_some_and(|at| at > now)
+        {
+            return Ok(false);
+        }
+        value.state = Phase::Ended;
+        value.extra.insert("ended_at".into(), json!(now));
+        value
+            .extra
+            .insert("exit_tree_pending".into(), json!(tree_pending));
+        self.save(&value)?;
+        Ok(true)
+    }
+
+    pub fn clear_ended_tree(&self, id: &str, now: f64) -> Result<bool> {
+        let _lock = self.storage.lock("session-guard", None)?;
+        let Some(mut value) = self.load(now)? else {
+            return Ok(false);
+        };
+        if value.session_id != id || value.state != Phase::Ended {
+            return Ok(false);
+        }
+        if value.extra.remove("exit_tree_pending").is_some() {
+            self.save(&value)?;
+        }
+        Ok(true)
+    }
+
+    /// Bind the unique replacement provisionally. If the previous desktop
+    /// tree was never observed empty, keep its known exit as the fast guard's
+    /// baseline; otherwise a fresh sample establishes the new baseline.
+    pub fn begin_recheck(&self, id: &str, desktop: Desktop, now: f64) -> Result<Option<Session>> {
+        if !desktop.valid() {
+            return Err(CoreError::new(
+                "desktop_identity_unavailable",
+                "新进程身份不完整",
+            ));
+        }
+        let _lock = self.storage.lock("session-guard", None)?;
+        let Some(mut value) = self.load(now)? else {
+            return Ok(None);
+        };
+        if value.session_id != id
+            || value.state != Phase::Ended
+            || value.desktop.as_ref() == Some(&desktop)
+        {
+            return Ok(None);
+        }
+        let keep_previous_baseline = value.extra.get("exit_tree_pending") == Some(&json!(true))
+            && value.extra.get("recheck_baseline_pending") != Some(&json!(true));
+        value.session_id = Uuid::new_v4().to_string();
+        value.state = Phase::Rechecking;
+        value.desktop = Some(desktop);
+        value.created_at = now;
+        value.bound_at = Some(now);
+        value.pending_deadline = now + session::RISK_EVIDENCE_TTL;
+        value.launcher = None;
+        value.unknown_count = 0;
+        value.unknown_since = None;
+        value.reason = None;
+        value.last_reason = None;
+        value.last_check = None;
+        value.last_risk_state = None;
+        value.locked_at = None;
+        value.extra.remove("guard_checked_at");
+        value.extra.remove("ended_at");
+        value.extra.remove("exit_tree_pending");
+        if keep_previous_baseline {
+            value.extra.remove("recheck_baseline_pending");
+        } else {
+            value
+                .extra
+                .insert("recheck_baseline_pending".into(), json!(true));
+        }
+        self.save(&value)?;
+        Ok(Some(value))
+    }
+
+    /// Update only the provisional evidence context; this never authorizes or
+    /// changes the exit baseline and cannot modify a locked/newer session.
+    pub fn recheck_context(
+        &self,
+        id: &str,
+        desktop: &Desktop,
+        context: &str,
+        now: f64,
+    ) -> Result<bool> {
+        if context.is_empty() || context.len() > 160 {
+            return Err(CoreError::new(
+                "evidence_context_unconfirmed",
+                "新进程网络上下文无效",
+            ));
+        }
+        let _lock = self.storage.lock("session-guard", None)?;
+        let Some(mut current) = self.load(now)? else {
+            return Ok(false);
+        };
+        if current.session_id != id
+            || current.state != Phase::Rechecking
+            || current.desktop.as_ref() != Some(desktop)
+        {
+            return Ok(false);
+        }
+        if current.context_id != context {
+            current.context_id = context.to_owned();
+            self.save(&current)?;
+        }
+        Ok(true)
+    }
+
+    /// Upgrade a still-current provisional process only after the same full
+    /// audit and private receipt checks used by the normal launch path.
+    pub fn complete_recheck(
+        &self,
+        id: &str,
+        desktop: &Desktop,
+        stamp: &str,
+        audit: &Value,
+        egress: &Value,
+        now: f64,
+    ) -> Result<Option<Session>> {
+        // Policy writes use this lock. Keep it short and outside network work;
+        // the fast guard does not acquire it.
+        let _operation = self.storage.lock("operation", None)?;
+        let _lock = self.storage.lock("session-guard", None)?;
+        let Some(current) = self.load(now)? else {
+            return Ok(None);
+        };
+        if current.session_id != id
+            || current.state != Phase::Rechecking
+            || current.desktop.as_ref() != Some(desktop)
+        {
+            return Ok(None);
+        }
+        if !current.pending_deadline.is_finite() || now > current.pending_deadline {
+            return Err(CoreError::new(
+                "revalidation_timeout",
+                "新进程完整校验已超时",
+            ));
+        }
+        if current.extra.get("recheck_baseline_pending") == Some(&json!(true)) {
+            return Err(CoreError::new(
+                "egress_unconfirmed",
+                "新进程出口基准尚未确认",
+            ));
+        }
+        let config = crate::config_store::ConfigStore {
+            storage: self.storage.clone(),
+        }
+        .load()?;
+        let policy = crate::config_store::policy_digest(&config.value()?)?;
+        if !config.enabled
+            || !config.guard_enabled
+            || !crate::audit_store::audit_matches_policy(audit, &policy)
+        {
+            return Err(CoreError::new(
+                "revalidation_context_changed",
+                "重新校验期间保护设置已变化",
+            ));
+        }
+        let measured = session::Egress::fresh(egress, now, session::GUARD_EGRESS_TTL)
+            .ok_or_else(|| CoreError::new("egress_unconfirmed", "新进程出口未确认"))?;
+        if measured.observed_at < current.created_at
+            || audit["observed_at"]
+                .as_f64()
+                .is_none_or(|at| at < current.created_at)
+            || audit["egress_reference"]["checked_at"]
+                .as_f64()
+                .is_none_or(|at| at < current.created_at)
+        {
+            return Err(CoreError::new(
+                "egress_unconfirmed",
+                "新进程需要本次启动之后的完整采样",
+            ));
+        }
+        if measured.ip != current.baseline.ip {
+            return Err(CoreError::new(
+                "egress_changed",
+                "新进程出口与原会话基准不一致",
+            ));
+        }
+        let context = audit["context_id"].as_str().unwrap_or("");
+        let risk = crate::receipt_store::ReceiptStore {
+            storage: self.storage.clone(),
+        }
+        .session_risk(context, Some(&measured.ip), now);
+        if ["dns", "webrtc"].iter().any(|kind| {
+            risk["sources"][*kind]["observed_at"]
+                .as_f64()
+                .is_none_or(|at| !at.is_finite() || at < current.created_at)
+        }) {
+            return Err(CoreError::new(
+                "risk_evidence_unavailable",
+                "新进程需要重新采集 DNS 和 WebRTC 证据",
+            ));
+        }
+        let mut verified = session::begin(audit, egress, &risk, id, now)?;
+        verified.state = Phase::Active;
+        verified.desktop = Some(desktop.clone());
+        verified.bound_at = Some(now);
+        let lease_path = self
+            .storage
+            .paths
+            .watch()
+            .join(format!("state/sessions/rust-{}.session", desktop.pid));
+        let old_lease = self.storage.read_bytes(&lease_path, 16 * 1024)?;
+        crate::controlled::Controller::new(self.storage.clone()).lease(desktop, stamp, now)?;
+        if let Err(error) = self.save(&verified) {
+            let rollback = match old_lease {
+                Some(bytes) => self.storage.atomic_bytes(&lease_path, &bytes, 0o600),
+                None => {
+                    self.storage.guarded(&lease_path)?;
+                    std::fs::remove_file(&lease_path).map_err(|_| {
+                        CoreError::new(
+                            "revalidation_lease_rollback_failed",
+                            "未能撤销重新校验观察记录",
+                        )
+                    })
+                }
+            };
+            rollback?;
+            return Err(error);
+        }
+        Ok(Some(verified))
+    }
     /// A stale probe may never overwrite or close a newer controlled session.
     #[cfg(test)]
     fn apply_check(&self, id: Option<&str>, input: &CheckInput) -> Result<Outcome> {
@@ -195,8 +443,14 @@ impl SessionStore {
             .filter(|v| Some(v.session_id.as_str()) == id);
         let immediate = current.as_ref().is_some_and(|s| {
             s.state == Phase::Locked
-                || session::Egress::fresh(&egress, now, session::GUARD_EGRESS_TTL)
-                    .is_some_and(|e| e.country == "CN" || e.ip != s.baseline.ip)
+                || session::Egress::fresh(&egress, now, session::GUARD_EGRESS_TTL).is_some_and(
+                    |e| {
+                        (s.state != Phase::Rechecking || e.observed_at >= s.created_at)
+                            && (e.country == "CN"
+                                || (s.extra.get("recheck_baseline_pending") != Some(&json!(true))
+                                    && e.ip != s.baseline.ip))
+                    },
+                )
         }) || identity == claude_watch_core::session::Identity::Changed;
         let risk = if immediate {
             json!({"state":"unknown"})

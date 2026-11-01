@@ -265,6 +265,21 @@ impl GuardHistory {
                 ],
             )
         };
+        if let Some(ended) = uuid(&receipt["ended_session_id"]) {
+            if session.as_deref() != Some(ended.as_str()) || current != "idle" {
+                queue.send(
+                    "guard-decision",
+                    EventFields {
+                        session_id: Some(ended),
+                        status: Some("idle".into()),
+                        code: Some("session_ended".into()),
+                        action: Some("post_action".into()),
+                        ..Default::default()
+                    },
+                    at,
+                );
+            }
+        }
         let reason = guard["reason"]["code"]
             .as_str()
             .or_else(|| receipt["code"].as_str());
@@ -279,11 +294,15 @@ impl GuardHistory {
                 | "evidence_expired"
                 | "dns_risk"
                 | "webrtc_risk"
+                | "network_leak_risk"
                 | "egress_unconfirmed"
                 | "proxy_or_tun_unconfirmed"
                 | "guard_sampling_failed"
                 | "session_identity_unconfirmed"
                 | "session_pending"
+                | "session_rechecking"
+                | "session_ended"
+                | "revalidation_timeout"
                 | "risk_evidence_unavailable"
                 | "risk_evidence_missing"
                 | "invalid_config"
@@ -351,6 +370,9 @@ impl GuardHistory {
                 .as_f64()
                 .filter(|v| v.is_finite() && *v >= start && *v <= at)
                 .unwrap_or(at);
+            let forced = receipt["stop_force_requested"]
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok());
             let stop_code = if receipt["stop_state"] == "failed" {
                 Some(
                     match receipt["stop_error"].as_str() {
@@ -368,6 +390,10 @@ impl GuardHistory {
                     }
                     .to_owned(),
                 )
+            } else if forced.is_some_and(|count| count > 0) {
+                Some("force_requested".to_owned())
+            } else if receipt["stop_force_reported"] == false {
+                Some("force_report_unavailable".to_owned())
             } else {
                 None
             };
@@ -397,6 +423,7 @@ impl GuardHistory {
                     action: Some("result_post_action".into()),
                     status: receipt["stop_state"].as_str().map(str::to_owned),
                     code: stop_code,
+                    count: forced.filter(|count| *count > 0),
                     elapsed_seconds: duration,
                     ..Default::default()
                 },
@@ -502,6 +529,64 @@ mod tests {
         drop(queue);
         fs::remove_dir_all(path).unwrap();
     }
+
+    #[test]
+    fn externally_finished_session_and_new_recheck_are_not_reported_as_our_stop() {
+        let (path, store) = fixture();
+        let queue = DiagnosticQueue::new(store.clone());
+        let mut guard = GuardHistory::default();
+        let old = Uuid::new_v4().to_string();
+        let new = Uuid::new_v4().to_string();
+        guard.observe(&queue, &json!({"session_id":old,"session_guard":{"state":"locked","reason":{"code":"egress_ip_changed"}}}), 1000.0);
+        guard.observe(&queue, &json!({"session_id":new,"ended_session_id":old,"session_guard":{"state":"pending","reason":{"code":"session_rechecking"}}}), 1002.0);
+        let events = EventStore::new(store);
+        wait_for(|| {
+            events.history().is_ok_and(|h| {
+                h.events
+                    .iter()
+                    .filter(|e| e.category == "guard-decision")
+                    .count()
+                    == 3
+            })
+        });
+        let rows = events.history().unwrap().events;
+        assert!(rows
+            .iter()
+            .any(|e| e.category == "guard-decision"
+                && e.fields.code.as_deref() == Some("session_ended")));
+        assert!(rows.iter().any(|e| e.category == "guard-decision"
+            && e.fields.code.as_deref() == Some("session_rechecking")));
+        assert!(!rows.iter().any(|e| e.category == "guard-stop"));
+        drop(queue);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn confirmed_force_and_unavailable_force_report_are_distinguishable() {
+        let (path, store) = fixture();
+        let queue = DiagnosticQueue::new(store.clone());
+        let mut guard = GuardHistory::default();
+        let session = Uuid::new_v4().to_string();
+        let receipt = |force: Value, reported: bool| json!({
+            "session_id":session, "session_guard":{"state":"locked","reason":{"code":"egress_ip_changed"}},
+            "stop_state":"confirmed","stop_started_at":1000.0,"stop_completed_at":1001.0,"stop_elapsed_seconds":1.0,
+            "stop_force_requested":force,"stop_force_reported":reported
+        });
+        guard.observe(&queue, &receipt(json!(2), true), 1002.0);
+        guard.observe(&queue, &receipt(Value::Null, false), 1003.0);
+        let mut failed = receipt(json!(1), true);
+        failed["stop_state"] = json!("failed");
+        failed["stop_error"] = json!("claude_still_running");
+        guard.observe(&queue, &failed, 1004.0);
+        let events = EventStore::new(store);
+        wait_for(|| events.history().is_ok_and(|h| h.events.iter().filter(|e| e.category == "guard-stop" && e.fields.action.as_deref() == Some("result_post_action")).count() == 3));
+        let rows = events.history().unwrap().events;
+        assert!(rows.iter().any(|e| e.fields.code.as_deref() == Some("force_requested") && e.fields.count == Some(2)));
+        assert!(rows.iter().any(|e| e.fields.code.as_deref() == Some("force_report_unavailable") && e.fields.count.is_none()));
+        assert!(rows.iter().any(|e| e.fields.code.as_deref() == Some("claude_still_running") && e.fields.count == Some(1)));
+        drop(queue);
+        fs::remove_dir_all(path).unwrap();
+    }
     #[test]
     fn full_queue_and_write_failure_are_visible_without_blocking_producer() {
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -569,6 +654,12 @@ mod tests {
                     vec![]
                 })
             }
+            fn desktop_alive(&mut self, _: &Desktop) -> Result<bool> {
+                Ok(self.running)
+            }
+            fn desktop_tree_running(&mut self) -> Result<bool> {
+                Ok(self.running)
+            }
             fn launcher(&mut self) -> Result<Launcher> {
                 unreachable!()
             }
@@ -593,6 +684,10 @@ mod tests {
             fn quit_desktop(&mut self) -> Result<()> {
                 self.running = false;
                 Ok(())
+            }
+            fn quit_for_confirmed_ip_risk(&mut self, forced: &mut Option<u32>) -> Result<()> {
+                *forced = Some(0);
+                self.quit_desktop()
             }
         }
         let (path, store) = fixture();
@@ -715,7 +810,11 @@ mod tests {
         let rows = events.history().unwrap().events;
         assert!(rows.iter().any(|e| e.category == "sampling-state"
             && e.time == 1004.0
-            && e.fields.reason_counts.as_ref().and_then(|m| m.get("identity_unavailable")) == Some(&1)));
+            && e.fields
+                .reason_counts
+                .as_ref()
+                .and_then(|m| m.get("identity_unavailable"))
+                == Some(&1)));
         let guards: Vec<_> = rows
             .iter()
             .filter(|e| e.category == "guard-decision")

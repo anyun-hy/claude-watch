@@ -400,6 +400,8 @@ fn present_event(e: Event) -> Value {
             "permission_denied" => Some("退出权限未确认"),
             "component_unavailable" => Some("退出组件不可用"),
             "identity_unconfirmed" => Some("进程身份未确认"),
+            "force_requested" => Some("已向身份核验通过的进程发送强制退出请求"),
+            "force_report_unavailable" => Some("进程已退出，强制步骤记录不可确认"),
             _ => None,
         };
         if let Some(reason) = reason {
@@ -446,7 +448,11 @@ fn present_event(e: Event) -> Value {
         summary.push(format!("PID {pid}"));
     }
     if let Some(count) = fields.count {
-        summary.push(format!("数量 {count}"));
+        if e.category == "guard-stop" {
+            summary.push(format!("强制退出请求 {count} 项"));
+        } else {
+            summary.push(format!("数量 {count}"));
+        }
     }
     if let Some(bytes) = fields.bytes_in {
         summary.push(format!("接收 {bytes} B"));

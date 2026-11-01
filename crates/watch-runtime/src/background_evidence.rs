@@ -92,7 +92,12 @@ pub trait EvidenceSystem {
     fn now(&self) -> f64;
     fn local(&mut self, config: &Config) -> Result<Value>;
     fn desktop_matches(&mut self, desktop: &Desktop) -> Result<bool>;
+    fn desktop_unique_stamp(&mut self, desktop: &Desktop) -> Result<Option<String>>;
     fn collect(&mut self, kind: ProbeKind) -> Result<Value>;
+    /// The full launch-grade audit runs here, never on the fast guard thread.
+    fn revalidate(&mut self) -> Result<(Value, Value)> {
+        Err(err("revalidation_unavailable", "新进程的完整校验不可用"))
+    }
     fn cancelled(&self) -> bool {
         false
     }
@@ -115,7 +120,7 @@ fn context(local: &Value) -> Option<&str> {
         .as_str()
         .filter(|s| !s.is_empty())
 }
-fn fresh(store: &StateStore, kind: ProbeKind, ctx: &str, now: f64) -> bool {
+fn fresh(store: &StateStore, kind: ProbeKind, ctx: &str, now: f64, since: Option<f64>) -> bool {
     let (name, stamp, ctx_key) = match kind {
         ProbeKind::Dns => ("dns-leak-receipt.json", "finished_at", "context"),
         ProbeKind::WebRtc => ("webrtc-risk-receipt.json", "sampled_at", "context_id"),
@@ -134,9 +139,9 @@ fn fresh(store: &StateStore, kind: ProbeKind, ctx: &str, now: f64) -> bool {
             matches!(verified["state"].as_str(), Some("ok" | "fail"))
                 && v["status"] == "complete"
                 && v[ctx_key] == ctx
-                && v[stamp]
-                    .as_f64()
-                    .is_some_and(|t| (0.0..kind.refresh_age()).contains(&(now - t)))
+                && v[stamp].as_f64().is_some_and(|t| {
+                    (0.0..kind.refresh_age()).contains(&(now - t)) && since.is_none_or(|s| t >= s)
+                })
         })
 }
 
@@ -156,16 +161,17 @@ pub fn refresh_active_session<S: EvidenceSystem>(
     let sessions = SessionStore::new(store.clone());
     let Some(session) = sessions
         .load(system.now())?
-        .filter(|s| s.state == Phase::Active)
+        .filter(|s| matches!(s.state, Phase::Active | Phase::Rechecking))
     else {
         return Ok(json!({"status":"idle","count":0}));
     };
     let Some(desktop) = session.desktop.as_ref() else {
         return Err(err("evidence_identity_unknown", "受控会话缺少主进程身份"));
     };
-    if [ProbeKind::Dns, ProbeKind::WebRtc]
-        .iter()
-        .all(|kind| fresh(store, *kind, &session.context_id, system.now()))
+    if session.state == Phase::Active
+        && [ProbeKind::Dns, ProbeKind::WebRtc]
+            .iter()
+            .all(|kind| fresh(store, *kind, &session.context_id, system.now(), None))
     {
         return Ok(json!({"status":"ok","count":0,"failed_probes":[]}));
     }
@@ -173,6 +179,23 @@ pub fn refresh_active_session<S: EvidenceSystem>(
         return Ok(json!({"status":"idle","count":0}));
     }
     let policy = guard_policy_digest(&config)?;
+    let evidence_context = if session.state == Phase::Rechecking {
+        let local = system.local(&config)?;
+        let current_context = context(&local)
+            .ok_or_else(|| err("evidence_context_unconfirmed", "新进程网络上下文未确认"))?
+            .to_owned();
+        if !sessions.recheck_context(
+            &session.session_id,
+            desktop,
+            &current_context,
+            system.now(),
+        )? {
+            return Err(err("evidence_session_changed", "新进程会话已变化"));
+        }
+        current_context
+    } else {
+        session.context_id.clone()
+    };
     let mut count = 0u32;
     let mut errors = Vec::new();
     let mut risks = Vec::new();
@@ -180,11 +203,12 @@ pub fn refresh_active_session<S: EvidenceSystem>(
         if system.cancelled() {
             break;
         }
-        if fresh(store, kind, &session.context_id, system.now()) {
+        let since = (session.state == Phase::Rechecking).then_some(session.created_at);
+        if fresh(store, kind, &evidence_context, system.now(), since) {
             continue;
         }
         let before = system.local(&config)?;
-        if context(&before) != Some(session.context_id.as_str()) {
+        if context(&before) != Some(evidence_context.as_str()) {
             return Err(err(
                 "evidence_context_unconfirmed",
                 "当前网络未能与受控会话核对，未更新保护证据",
@@ -207,7 +231,7 @@ pub fn refresh_active_session<S: EvidenceSystem>(
         }
         let active = sessions.load(system.now())?;
         if !active.as_ref().is_some_and(|s| {
-            s.state == Phase::Active
+            matches!(s.state, Phase::Active | Phase::Rechecking)
                 && s.session_id == session.session_id
                 && s.desktop.as_ref() == Some(desktop)
         }) || !system.desktop_matches(desktop)?
@@ -229,7 +253,7 @@ pub fn refresh_active_session<S: EvidenceSystem>(
             // session. The network observations above remain outside this lock.
             let _session_lock = store.lock("session-guard", None)?;
             if !sessions.load(system.now())?.as_ref().is_some_and(|s| {
-                s.state == Phase::Active
+                matches!(s.state, Phase::Active | Phase::Rechecking)
                     && s.session_id == session.session_id
                     && s.desktop.as_ref() == Some(desktop)
             }) {
@@ -252,7 +276,7 @@ pub fn refresh_active_session<S: EvidenceSystem>(
                 // collection; no UI token or cached context is trusted here.
                 ProbeKind::Dns => receipts.record_dns(&probe, &after, None, system.now()),
                 ProbeKind::WebRtc => {
-                    receipts.record_webrtc(&probe, &after, Some(&session.context_id), system.now())
+                    receipts.record_webrtc(&probe, &after, Some(&evidence_context), system.now())
                 }
             }
         });
@@ -280,6 +304,32 @@ pub fn refresh_active_session<S: EvidenceSystem>(
                 return Err(e)
             }
             Err(_) => errors.push(kind.label()),
+        }
+    }
+    if session.state == Phase::Rechecking
+        && errors.is_empty()
+        && risks.is_empty()
+        && !system.cancelled()
+    {
+        let (audit, egress) = system.revalidate()?;
+        let Some(stamp) = system.desktop_unique_stamp(desktop)? else {
+            return Err(err("evidence_session_changed", "重新校验期间进程已变化"));
+        };
+        if system.cancelled() {
+            return Err(err("evidence_session_changed", "重新校验期间进程已变化"));
+        }
+        if sessions
+            .complete_recheck(
+                &session.session_id,
+                desktop,
+                &stamp,
+                &audit,
+                &egress,
+                system.now(),
+            )?
+            .is_none()
+        {
+            return Err(err("evidence_session_changed", "重新校验结果已过期"));
         }
     }
     Ok(
@@ -311,7 +361,8 @@ impl WorkerStamp {
         let manifest = match fs::File::open(path.with_file_name("BuildInfo.plist")) {
             Ok(file) => {
                 let mut bytes = Vec::new();
-                file.take(256 * 1024 + 1).read_to_end(&mut bytes)
+                file.take(256 * 1024 + 1)
+                    .read_to_end(&mut bytes)
                     .map_err(|_| err("evidence_runtime_invalid", "后台检测清单不可读取"))?;
                 if bytes.len() > 256 * 1024 {
                     return Err(err("evidence_runtime_invalid", "后台检测清单超限"));

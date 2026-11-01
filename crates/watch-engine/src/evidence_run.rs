@@ -8,7 +8,8 @@ use claude_watch_core::{
 use claude_watch_runtime::{
     audit_store::AuditSystem,
     background_evidence::{self, EvidenceSystem, ProbeKind},
-    desktop_native::NativeDesktop,
+    controlled::DesktopSystem,
+    desktop_native::{DesktopRuntime, NativeDesktop},
     events::{EventFields, EventStore},
     macos::Authority,
     native,
@@ -53,6 +54,14 @@ impl EvidenceSystem for NativeEvidence {
             .iter()
             .any(|(actual, main, _)| *main && actual == expected))
     }
+    fn desktop_unique_stamp(&mut self, expected: &Desktop) -> Result<Option<String>> {
+        let processes = self.desktop.desktops()?;
+        let mut mains = processes.iter().filter(|(_, main, _)| *main);
+        let first = mains.next();
+        Ok(first
+            .filter(|(actual, _, _)| actual == expected && mains.next().is_none())
+            .map(|(_, _, stamp)| stamp.clone()))
+    }
     fn collect(&mut self, kind: ProbeKind) -> Result<Value> {
         background_evidence::collect_native(
             &self.host.storage,
@@ -60,6 +69,21 @@ impl EvidenceSystem for NativeEvidence {
             &mut self.executor,
             kind,
         )
+    }
+    fn revalidate(&mut self) -> Result<(Value, Value)> {
+        let network = self.host.network.clone();
+        let storage = self.host.storage.clone();
+        let mut runtime = DesktopRuntime {
+            desktop: &self.desktop,
+            system: &mut self.host,
+            network,
+            storage,
+            started: Instant::now(),
+            cli: None,
+        };
+        let audit = runtime.full_audit()?;
+        let egress = runtime.egress();
+        Ok((audit, egress))
     }
     fn cancelled(&self) -> bool {
         self.stop.load(Ordering::Acquire)
@@ -106,6 +130,13 @@ pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<thread::JoinHandle<(
                             | "evidence_context_unconfirmed"
                             | "evidence_session_changed"
                             | "evidence_policy_changed"
+                            | "revalidation_timeout"
+                            | "revalidation_context_changed"
+                            | "revalidation_lease_rollback_failed"
+                            | "revalidation_unavailable"
+                            | "preflight_blocked"
+                            | "egress_changed"
+                            | "risk_evidence_unavailable"
                             | "desktop_inventory_incomplete" => e.code.as_str(),
                             _ => "evidence_refresh_failed",
                         }),

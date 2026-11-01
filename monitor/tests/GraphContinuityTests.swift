@@ -165,7 +165,8 @@ struct GraphContinuityTests {
         expect(selectedCLI.projection.sourceKind == "code" && selectedCLI.sourceProjection(.desktop)?.sourcePID == 72,
                "desktop keeps its own confirmed edge when CLI is selected")
         let frontend = WatchedProcess(id: "frontend", pid: 79345, started: "front-start", kind: "codex-cli", authorized: true)
-        let managed = WatchedProcess(id: "managed-server", pid: 38392, started: "server-start", kind: "codex-cli", authorized: true)
+        let managed = WatchedProcess(id: "managed-server", pid: 38392, started: "server-start", kind: "codex-cli", authorized: true,
+                                     runtimeRole: "codex_managed", serviceName: "Codex 托管后台", roleEvidence: "managed_app_server")
         let managedFlow = flow(.openAI, pid: 38392, id: "managed-flow", host: "ab.chatgpt.com")
         let managedSnapshot = snapshot(.openAI, time: 2050, flows: [desktopFlow, managedFlow], processes: [frontend, managed, desktop])
         var managedSelection = NetworkGraphSelection()
@@ -174,8 +175,19 @@ struct GraphContinuityTests {
         var managedTimeline = GraphContinuityStore()
         managedTimeline.observe(snapshot: managedSnapshot, selection: managedSelection, now: 2050, error: nil, automatic: true)
         let managedDisplay = managedTimeline.display(product: .openAI, snapshot: managedSnapshot, selection: managedSelection, now: 2050, error: nil, automatic: true)
-        expect(managedDisplay.sourceProjection(.cli)?.sourcePID == 38392 && managedDisplay.sourceProjection(.cli)?.sourceEdgeState == .confirmed && managedDisplay.sourceProjection(.desktop)?.sourcePID == 72,
-               "independent managed server's own flow can join desktop on the same observed route")
+        expect(managedDisplay.sourceProjection(.managed)?.sourcePID == 38392 && managedDisplay.sourceProjection(.managed)?.sourceEdgeState == .confirmed && managedDisplay.sourceProjection(.desktop)?.sourcePID == 72,
+               "managed server has its own confirmed path alongside desktop")
+        expect(managedDisplay.sourceProjection(.cli) == nil, "managed server is not shown as independent CLI")
+        let frontendFlow = flow(.openAI, pid: 79345, id: "frontend-flow", host: "chatgpt.com")
+        let threeSnapshot = snapshot(.openAI, time: 2060, flows: [desktopFlow, managedFlow, frontendFlow], processes: [frontend, managed, desktop])
+        var threeSelection = NetworkGraphSelection()
+        threeSelection.select(flowID: "managed-flow", product: .openAI)
+        threeSelection.reconcile(proxy: threeSnapshot.proxy, processes: threeSnapshot.processes, fresh: true)
+        var threeTimeline = GraphContinuityStore()
+        threeTimeline.observe(snapshot: threeSnapshot, selection: threeSelection, now: 2060, error: nil, automatic: true)
+        let three = threeTimeline.display(product: .openAI, snapshot: threeSnapshot, selection: threeSelection, now: 2060, error: nil, automatic: true)
+        expect(three.sourceProjection(.cli)?.sourcePID == 79345 && three.sourceProjection(.managed)?.sourcePID == 38392 && three.sourceProjection(.desktop)?.sourcePID == 72,
+               "CLI, managed backend and desktop each retain their own observed flow")
         let desktopOnly = dualDisplay(flow(.openAI, pid: 71, id: "cli-flow", association: "unconfirmed"))
         expect(desktopOnly.sourceProjection(.desktop)?.sourcePID == 72 && desktopOnly.sourceProjection(.cli) == nil,
                "missing CLI evidence leaves desktop evidence intact and CLI as a reference")

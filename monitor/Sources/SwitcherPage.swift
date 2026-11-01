@@ -163,7 +163,11 @@ struct SwitcherPage: View {
                             HStack {
                                 Label("采样于 " + timeLabel(result.observed_at), systemImage: "clock")
                                 Spacer()
-                                if historical { Label(expired ? "历史样本 · 请重新检测" : "上下文已变化 · 上次样本仅供参考", systemImage: "clock.badge.exclamationmark").foregroundStyle(p.amber) }
+                                if historical {
+                                    Label(expired ? "历史样本 · 请重新检测" :
+                                          store.detectionError.isEmpty ? "上下文已变化 · 上次样本仅供参考" : "本轮检测未完成 · 上次样本仅供参考",
+                                          systemImage: "clock.badge.exclamationmark").foregroundStyle(p.amber)
+                                }
                             }.font(WatchTypography.small).foregroundStyle(p.secondary)
                             LazyVGrid(columns: [GridItem(.adaptive(minimum: 310), spacing: 10, alignment: .top)], spacing: 10) {
                                 ForEach(result.rows) { row in EnvironmentCheckTile(row: row, p: p, stale: historical) }

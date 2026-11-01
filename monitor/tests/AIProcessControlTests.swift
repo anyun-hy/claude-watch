@@ -4,6 +4,33 @@ import Darwin
 @main
 struct AIProcessControlTests {
     @MainActor static func main() async throws {
+        if CommandLine.arguments.contains("--owned-force-child") {
+            let child = Process()
+            child.executableURL = URL(fileURLWithPath: "/bin/sh")
+            child.arguments = ["-c", "trap '' TERM; exec /bin/sleep 30"]
+            try child.run()
+            let pid = child.processIdentifier
+            defer { if child.isRunning { _ = Darwin.kill(pid, SIGKILL); child.waitUntilExit() } }
+            var identity: AIProcessIdentity?
+            for _ in 0..<50 {
+                if let current = AIProcessInventory.identity(pid), current.executable == "/bin/sleep" {
+                    identity = current; break
+                }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            guard let identity, identity.uid == getuid() else { fatalError("owned child identity unavailable") }
+            let plan = AIProcessClosePlan(product: .claude, uid: getuid(), targets: [identity], protected: [getpid()])
+            guard Darwin.kill(pid, SIGTERM) == 0 else { fatalError("normal exit request failed") }
+            try await Task.sleep(nanoseconds: 200_000_000)
+            guard child.isRunning else { fatalError("fixture did not ignore normal exit") }
+            let forced = AIProcessClosePolicy.forceRemaining(plan, lookup: AIProcessInventory.identity,
+                force: { target in target == pid && Darwin.kill(target, SIGKILL) == 0 })
+            guard forced.requested == 1 else { fatalError("verified child was not force-signalled") }
+            child.waitUntilExit()
+            guard !child.isRunning else { fatalError("owned child still running") }
+            print("Owned-child force fallback passed: only the verified test child was force-stopped")
+            return
+        }
         if CommandLine.arguments.contains("--owned-child") {
             let child = Process()
             child.executableURL = URL(fileURLWithPath: "/bin/sleep"); child.arguments = ["30"]
@@ -70,6 +97,26 @@ struct AIProcessControlTests {
         let failed = AIProcessClosePolicy.execute(plan, lookup: { pid in rows.first { $0.pid == pid } },
             quitApplication: { _ in false }, terminate: { _ in false })
         expect(failed.failed == 3 && failed.requested == 0, "failed requests are not reported as accepted")
+        var forced: [Int32] = []
+        let onlySame = AIProcessClosePolicy.forceRemaining(plan, lookup: { pid in
+            if pid == 10 { return row(10, product: .claude, seconds: 101, main: true) }
+            if pid == 11 { return rows.first { $0.pid == pid } }
+            return nil
+        }, force: { forced.append($0); return true })
+        expect(forced == [11] && onlySame.requested == 1 && onlySame.skipped == 2,
+               "force fallback skips recycled or exited identities")
+        for changed in [row(10, product: .claude, seconds: 101), row(10, product: .claude, micros: 2),
+                        row(10, product: .claude, path: "/unrelated/app"), row(10, product: .claude, uid: 502)] {
+            let one = AIProcessClosePlan(product: .claude, uid: 501, targets: [rows[0]], protected: [])
+            var called = false
+            let result = AIProcessClosePolicy.forceRemaining(one, lookup: { _ in changed }, force: { _ in called = true; return true })
+            expect(!called && result.skipped == 1, "force fallback rechecks PID start, path and owner")
+        }
+        let otherPlan = AIProcessClosePlan(product: .openAI, uid: 501, targets: [rows[3]], protected: [])
+        let other = AIProcessClosePolicy.forceRemaining(otherPlan, lookup: { _ in fatalError() }, force: { _ in fatalError() })
+        expect(other.requested == 0 && other.skipped == 1, "force fallback cannot target other products")
+        let forceFailed = AIProcessClosePolicy.forceRemaining(plan, lookup: { pid in rows.first { $0.pid == pid } }, force: { _ in false })
+        expect(forceFailed.requested == 0 && forceFailed.failed == 3, "failed force requests are never reported as successful")
         expect(AIProcessInventory.nodeEntry("/usr/bin/node /x/node_modules/@anthropic-ai/claude-code/cli.js")?.hasSuffix("cli.js") == true, "executed node script recognized")
         expect(AIProcessInventory.nodeEntry("/usr/bin/node -e /x/node_modules/@anthropic-ai/claude-code/cli.js") == nil, "inline code cannot impersonate script entry")
         expect(AIProcessInventory.nodeEntry("/usr/bin/node /unrelated.js /x/node_modules/@anthropic-ai/claude-code/cli.js") == "/unrelated.js", "later data argument is not an entry")

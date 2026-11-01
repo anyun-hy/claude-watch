@@ -271,6 +271,14 @@ fn native_check_commands_ignore_old_baselines_and_return_non_authorizing_audits(
         assert!(value["context_transition"].is_object());
         assert_eq!(fs::read(&old).unwrap(), b"invalid old baseline\nformat=1\n");
     }
+    let (code, environment) = call(&home, &["environment"], None);
+    assert_eq!(code, 0, "{environment}");
+    let preview = &environment["chatgpt_policy_evaluation"];
+    assert_eq!(preview["launch_target"], "chatgpt-desktop");
+    assert_eq!(preview["grants_launch_permission"], false);
+    for key in ["observation_id", "context_id", "observed_at", "expires_at"] {
+        assert_eq!(preview[key], environment[key], "{key}");
+    }
     for (command, count) in [("proxy-check", 3), ("dns-check", 1)] {
         let (code, value) = call(&home, &[command], None);
         assert!([0, 3, 4].contains(&code), "{command}: {value}");

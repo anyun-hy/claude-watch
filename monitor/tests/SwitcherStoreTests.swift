@@ -91,6 +91,8 @@ struct SwitcherStoreTests {
         expect(SessionProtectionEvidence.fromBackground(closed)!.presentation(at: 1015).title == SessionProtectionPresentation.idleTitle, "fresh process observation keeps idle current despite old session sample")
         let locked = SessionGuardStatus(state: "locked", phase: "locked", reason: .init(code: "dns_risk", detail: "DNS 风险"))
         expect(SessionProtectionPresentation.make(locked, stale: true, backendReady: false).tone == "danger", "latched real risk wins over stale or missing backend state")
+        let rechecking = SessionProtectionPresentation.make(.init(state: "pending", phase: "rechecking"))
+        expect(rechecking.title == "正在复核新进程" && rechecking.tone == "info", "a replacement awaiting the full audit is never shown as protected")
         expect(SessionProtectionPresentation.make(.init(state: "risk"), stale: true, backendReady: false).tone == "danger", "explicit risk keeps danger priority")
         expect(SessionProtectionPresentation.make(.init(state: "unknown")).tone == "info", "unknown protection evidence uses neutral presentation")
         expect(SessionProtectionPresentation.make(.init(state: "safe", reason: .init(code: "egress_unconfirmed", detail: "unknown"))).tone == "info", "unconfirmed exit is not shown as a positive or error result")
@@ -156,6 +158,88 @@ struct SwitcherStoreTests {
         expect(review.currentPolicyEvaluation?.ready == true &&
                review.auditOperationMessage.contains("手动"),
                "recovery scenario remains manual-start only")
+        let claudeLaunch = GraphLaunchTarget(product: .claude)
+        let chatgptLaunch = GraphLaunchTarget(product: .openAI)
+        var wireEnvironment = try JSONSerialization.jsonObject(with: SwitcherStore.fixtureCurrentEnvironment()) as! [String: Any]
+        var wireChatGPT = wireEnvironment["policy_evaluation"] as! [String: Any]
+        wireChatGPT["launch_target"] = "chatgpt-desktop"
+        wireEnvironment["chatgpt_policy_evaluation"] = wireChatGPT
+        let decodedEnvironment = try JSONDecoder().decode(CurrentEnvironmentReceipt.self,
+            from: JSONSerialization.data(withJSONObject: wireEnvironment))
+        expect(decodedEnvironment.chatgpt_policy_evaluation?.launch_target == "chatgpt-desktop" &&
+               decodedEnvironment.chatgpt_policy_evaluation?.observation_id == decodedEnvironment.observation_id,
+               "the shared environment receipt decodes the target-specific preview from the same round")
+        expect(claudeLaunch.arguments == ["launch", "--apply"] &&
+               chatgptLaunch.arguments == ["launch", "--target", "chatgpt-desktop", "--apply"],
+               "graph starts the selected desktop using its own full launch entry")
+        let cliOnly = [WatchedProcess(id: "cli", pid: 1, started: "fixture", kind: "codex-cli", authorized: nil)]
+        let chatgptMain = [WatchedProcess(id: "desktop", pid: 2, started: "fixture", kind: "chatgpt-desktop-main", authorized: nil)]
+        expect(!chatgptLaunch.hasRunningDesktop(in: cliOnly) && chatgptLaunch.hasRunningDesktop(in: chatgptMain) &&
+               !claudeLaunch.hasRunningDesktop(in: chatgptMain),
+               "a running desktop blocks only its own launch, not another product or a CLI")
+        review.publishBackgroundForFixture(backgroundReceipt(at: Date().timeIntervalSince1970, sampling: true, guardReady: true))
+        expect(claudeLaunch.blockReason(store: review, at: Date()) == nil &&
+               chatgptLaunch.blockReason(store: review, at: Date()) == nil,
+               "both buttons use the matching current ready environment preview")
+        var independentEnvironment = review.currentEnvironment!
+        let basePreview = review.currentPolicyEvaluation!
+        independentEnvironment.policy_evaluation = EnvironmentPolicyEvaluation(
+            purpose: basePreview.purpose, grants_launch_permission: false,
+            observed_at: basePreview.observed_at, expires_at: basePreview.expires_at,
+            observation_id: basePreview.observation_id, context_id: basePreview.context_id,
+            policy: basePreview.policy, rows: basePreview.rows, blocked: ["guard"],
+            ready: false, message: "Claude guard unavailable")
+        review.loadReviewReceipts(independentEnvironment, background: backgroundReceipt(
+            at: Date().timeIntervalSince1970, sampling: true, guardReady: false))
+        expect(claudeLaunch.blockReason(store: review, at: Date()) != nil &&
+               chatgptLaunch.blockReason(store: review, at: Date()) == nil,
+               "a blocked Claude-only preview does not block the same-round ChatGPT preview")
+        independentEnvironment.chatgpt_policy_evaluation?.launch_target = "codex-desktop"
+        review.loadReviewReceipts(independentEnvironment, background: backgroundReceipt(
+            at: Date().timeIntervalSince1970, sampling: true, guardReady: true))
+        expect(chatgptLaunch.blockReason(store: review, at: Date()) != nil,
+               "a preview for a different target cannot enable ChatGPT")
+        review.loadReviewScenario(.recovered)
+        review.publishBackgroundForFixture(backgroundReceipt(at: Date().timeIntervalSince1970, sampling: true, guardReady: false))
+        expect(claudeLaunch.blockReason(store: review, at: Date()) != nil &&
+               chatgptLaunch.blockReason(store: review, at: Date()) == nil,
+               "unconfirmed Claude protection blocks Claude without pretending it protects ChatGPT")
+        review.publishBackgroundForFixture(backgroundReceipt(at: Date().timeIntervalSince1970 - 40, sampling: true, guardReady: true))
+        expect(claudeLaunch.blockReason(store: review, at: Date()) != nil &&
+               chatgptLaunch.blockReason(store: review, at: Date()) == nil,
+               "stale Claude protection cannot leave its launch button green")
+        var lockedBackground = backgroundReceipt(at: Date().timeIntervalSince1970, sampling: true, guardReady: true)
+        lockedBackground.session_guard = .init(state: "locked", phase: "locked")
+        review.publishBackgroundForFixture(lockedBackground)
+        expect(claudeLaunch.blockReason(store: review, at: Date()) != nil,
+               "a latched Claude session risk cannot enable launch")
+        review.publishBackgroundForFixture(backgroundReceipt(at: Date().timeIntervalSince1970, sampling: true, guardReady: true))
+        let expiry = review.currentPolicyEvaluation!.expires_at
+        expect(claudeLaunch.blockReason(store: review, at: Date(timeIntervalSince1970: expiry)) != nil,
+               "an expired environment preview never enables launch")
+        let beforeSample = review.currentPolicyEvaluation!.observed_at - 1
+        expect(claudeLaunch.blockReason(store: review, at: Date(timeIntervalSince1970: beforeSample)) != nil,
+               "a future-dated environment preview never enables launch")
+        review.loadReviewScenario(.ipChanged)
+        expect(claudeLaunch.blockReason(store: review, at: Date()) != nil &&
+               chatgptLaunch.blockReason(store: review, at: Date()) != nil,
+               "a blocked environment preview never enables either button")
+        review.loadReviewScenario(.normal)
+        review.text("country").wrappedValue = "GB"
+        expect(claudeLaunch.blockReason(store: review, at: Date()) != nil,
+               "unsaved settings disable graph launch")
+        review.loadReviewScenario(.normal)
+        review.recordDetectionFailure("fixture unavailable")
+        expect(claudeLaunch.blockReason(store: review, at: Date()) != nil,
+               "a failed refresh cannot keep the previous green launch state")
+        review.loadReviewScenario(.normal)
+        review.awaitFreshDNSReceipt = { false }
+        await review.perform(chatgptLaunch.arguments)
+        expect(review.failure && review.message.contains("ChatGPT") && !review.message.contains("启动 Claude"),
+               "a failed DNS prerequisite reports the correct selected target without launching it")
+        expect(review.currentPolicyEvaluation == nil && review.currentEnvironmentIsHistorical && review.detectionError.contains("DNS") &&
+               chatgptLaunch.blockReason(store: review, at: Date()) != nil,
+               "a failed launch DNS refresh invalidates the prior green environment preview")
         expect(SwitcherStore.webRTCSubmissionError(backendMessage: nil, hasContext: false, contextStillMatches: false).contains("上下文未稳定") &&
                SwitcherStore.webRTCSubmissionError(backendMessage: "后端拒绝", hasContext: true, contextStillMatches: true).contains("后端拒绝") &&
                SwitcherStore.webRTCSubmissionError(backendMessage: nil, hasContext: true, contextStillMatches: false).contains("上下文已变化"),

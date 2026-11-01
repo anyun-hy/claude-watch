@@ -26,6 +26,8 @@ struct WatchedProcess: Decodable, Identifiable, Sendable {
     }
 
     var sourceRole: ProcessSourceRole {
+        if runtimeRole == "codex_managed" && roleEvidence == "managed_app_server" { return .managed }
+        if runtimeRole == "codex_managed_unconfirmed" && roleEvidence == "managed_path_only" { return .child }
         if kind == "code" || kind == "codex-cli" { return .cli }
         if kind.contains("desktop-") { return .desktop }
         // These providers have no standalone CLI kind. The backend has already
@@ -41,11 +43,14 @@ struct WatchedProcess: Decodable, Identifiable, Sendable {
         switch sourceRole {
         case .cli: return product == .openAI ? "独立 CLI" : "Claude Code"
         case .desktop: return "桌面应用"
+        case .managed: return "Codex 托管后台"
         case .child: return "来源待确认"
         }
     }
 
     var name: String {
+        if sourceRole == .managed { return "Codex 托管后台" }
+        if runtimeRole == "codex_managed_unconfirmed" && roleEvidence == "managed_path_only" { return "Codex 后台（身份待确认）" }
         switch kind {
         case "desktop-main": return "Claude Desktop"
         case "desktop-helper": return "Desktop 辅助进程"
@@ -67,7 +72,7 @@ struct WatchedProcess: Decodable, Identifiable, Sendable {
 }
 
 enum ProcessSourceRole: Sendable, Equatable {
-    case cli, desktop, child
+    case cli, desktop, managed, child
 }
 
 enum MonitoredProduct: String, CaseIterable, Identifiable, Sendable, Hashable {

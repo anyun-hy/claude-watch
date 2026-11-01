@@ -129,7 +129,8 @@ fn project_session_heartbeat(
 ) {
     let matching = heartbeat["session_id"].as_str() == Some(session_id);
     let applicable = matching && heartbeat["stop_state"] != "session_changed";
-    if applicable
+    if status["phase"] != "ended"
+        && applicable
         && heartbeat["persistence_error"] == "state_io_failed"
         && heartbeat["session_guard"]["reason"]["code"] == "egress_risk_persist_failed"
     {
@@ -151,14 +152,25 @@ fn project_session_heartbeat(
 
 pub fn session_view(host: &Host) -> Value {
     let session = SessionStore::new(host.storage.clone()).load(native::now());
+    let ended_session = session
+        .as_ref()
+        .ok()
+        .and_then(|v| v.as_ref())
+        .is_some_and(|s| s.state == claude_watch_core::session::Phase::Ended);
     let running = NativeDesktop::new(
         host.runner.clone(),
         process_component().unwrap_or_default(),
         Authority::ReadOnly,
     )
     .ok()
-    .and_then(|d| d.desktops().ok())
-    .map(|v| !v.is_empty());
+    .and_then(|d| {
+        let processes = d.desktops().ok()?;
+        if processes.is_empty() && ended_session {
+            d.desktop_tree_running().ok()
+        } else {
+            Some(!processes.is_empty())
+        }
+    });
     match session {
         Ok(Some(s)) => {
             let mut status = claude_watch_core::session::status(&s, native::now(), running);
@@ -617,5 +629,16 @@ mod session_heartbeat_projection_tests {
             &heartbeat("same", "confirmed"),
         );
         assert_eq!(stopped["stop_state"], "confirmed");
+        let mut ended = json!({"state":"idle","phase":"ended"});
+        project_session_heartbeat(
+            &mut ended,
+            "same",
+            Some(false),
+            &heartbeat("same", "failed"),
+        );
+        assert_eq!(
+            ended["state"], "idle",
+            "a stale failure cannot resurrect an ended session"
+        );
     }
 }

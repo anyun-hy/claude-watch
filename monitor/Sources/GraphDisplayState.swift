@@ -51,7 +51,7 @@ struct GraphDisplayState: Sendable {
     /// additional source may join it only when the evidenced route is the same.
     func sourceProjection(_ role: ProcessSourceRole) -> ConnectionGraphProjection? {
         let selected = projection
-        let expectedKind = role == .cli ? "code" : role == .desktop ? "desktop" : "other"
+        let expectedKind = role == .cli ? "code" : role == .desktop ? "desktop" : role == .managed ? "managed" : "other"
         if selected.sourceKind == expectedKind, selected.flow != nil { return selected }
         guard role != .child, phase == .live, !isHistorical, !safetyBlocked,
               let sample, let proxy = currentProxy,

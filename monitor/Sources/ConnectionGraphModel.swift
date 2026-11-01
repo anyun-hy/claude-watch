@@ -100,6 +100,7 @@ struct NetworkGraphSelection: Equatable {
         switch role {
         case .cli?: roleText = "cli"
         case .desktop?: roleText = "desktop"
+        case .managed?: roleText = "managed"
         case .child?: roleText = "child"
         case nil: roleText = "unknown"
         }
@@ -151,6 +152,7 @@ struct ConnectionGraphProjection: Sendable {
         switch process?.sourceRole {
         case .cli: sourceKind = "code"
         case .desktop: sourceKind = "desktop"
+        case .managed: sourceKind = "managed"
         case .child: sourceKind = "other"
         case .none: sourceKind = selected == nil ? "none" : "other"
         }

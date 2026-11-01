@@ -525,8 +525,10 @@ fn managed_codex_app_server_requires_exact_path_and_entry() {
 
 #[test]
 fn sampler_discovers_managed_codex_servers_with_bound_arguments() {
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
     struct ManagedRunner {
         home: PathBuf,
+        missing_arguments: Arc<AtomicBool>,
     }
     impl ReadRunner for ManagedRunner {
         fn run(
@@ -569,6 +571,10 @@ fn sampler_discovers_managed_codex_servers_with_bound_arguments() {
                         {"pid":72,"state":"ok","identity":daemon,"arguments":["codex","app-server","daemon"],"cwd":"/fixture","truncated":false},
                         {"pid":73,"state":"ok","identity":server,"arguments":["codex","app-server","--listen","unix:///tmp/socket"],"cwd":"/fixture","truncated":false}
                     ]);
+                    if self.missing_arguments.load(Ordering::Relaxed) {
+                        body["argument_prefixes"][1] = json!({"pid":72,"state":"unknown"});
+                        body["argument_prefixes"][2] = json!({"pid":73,"state":"unknown"});
+                    }
                 }
                 _ => panic!("unexpected command"),
             }
@@ -584,14 +590,21 @@ fn sampler_discovers_managed_codex_servers_with_bound_arguments() {
     fs::create_dir(&temp).unwrap();
     // Process classification only reads managed home paths; fixture binaries need not exist.
     let paths = Paths::new(&temp).unwrap();
+    let missing_arguments = Arc::new(AtomicBool::new(false));
     let mut sampler = Sampler::new(
         ManagedRunner {
             home: paths.home.clone(),
+            missing_arguments: missing_arguments.clone(),
         },
         paths,
     );
     let round = sampler.processes().unwrap();
     assert!(round.complete);
+    assert_eq!(round.roles["72"]["runtimeRole"], "codex_managed");
+    assert_eq!(round.roles["73"]["roleEvidence"], "managed_app_server");
+    assert!(round.roles.get("71").is_none(), "independent CLI is not a managed server");
+    let rows = claude_watch_runtime::monitor_snapshot::process_rows(&round, &[]);
+    assert_eq!(rows.iter().find(|row| row["pid"] == 73).unwrap()["runtimeRole"], "codex_managed");
     for pid in [71, 72, 73] {
         assert_eq!(
             round
@@ -603,6 +616,12 @@ fn sampler_discovers_managed_codex_servers_with_bound_arguments() {
             Kind::CodexCli
         );
     }
+    missing_arguments.store(true, Ordering::Relaxed);
+    let incomplete = sampler.processes().unwrap();
+    assert!(!incomplete.complete);
+    assert_eq!(incomplete.roles["72"]["runtimeRole"], "codex_managed_unconfirmed");
+    assert_eq!(incomplete.roles["73"]["roleEvidence"], "managed_path_only");
+    assert!(incomplete.roles.get("71").is_none());
     fs::remove_dir_all(temp).unwrap();
 }
 

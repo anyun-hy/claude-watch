@@ -2,7 +2,7 @@ import AppKit
 import Darwin
 import Foundation
 
-// Same identity and close policy source as the GUI; no root or SIGKILL path.
+// The guard's explicitly selected IP-risk path may force only verified identities.
 enum MonitoredProduct: Equatable, Sendable { case claude, openAI }
 
 @main
@@ -70,22 +70,49 @@ struct WatchProcessHelper {
                 result = ["status": "ok", "processes": try AIProcessInventory.read().map(encode)]
             case "desktop-status":
                 result = ["status": "ok", "processes": plan(try desktopInventory()).targets.map(encode)]
-            case "close-desktop":
+            case "close-desktop", "guard-close-desktop":
+                let allowForce = args[0] == "guard-close-desktop"
                 let selected = plan(try desktopInventory())
                 let outcome = AIProcessClosePolicy.execute(selected, lookup: AIProcessInventory.identity,
                     quitApplication: { NSRunningApplication(processIdentifier: $0)?.terminate() ?? false },
                     terminate: { Darwin.kill($0, SIGTERM) == 0 })
                 var remaining = selected.targets
-                let until = Date().addingTimeInterval(15)
-                repeat {
+                var forced = (requested: 0, skipped: 0, failed: 0)
+                if allowForce {
+                    func originalStillRunning() -> Bool {
+                        selected.targets.contains { target in
+                            guard let live = AIProcessInventory.identity(target.pid) else { return false }
+                            return target.sameProcess(as: live)
+                        }
+                    }
+                    let graceDeadline = ProcessInfo.processInfo.systemUptime + 2
+                    while originalStillRunning() && ProcessInfo.processInfo.systemUptime < graceDeadline {
+                        Thread.sleep(forTimeInterval: 0.1)
+                    }
+                    if originalStillRunning() {
+                        forced = AIProcessClosePolicy.forceRemaining(selected, lookup: AIProcessInventory.identity,
+                            force: { Darwin.kill($0, SIGKILL) == 0 })
+                    }
+                    let forceDeadline = ProcessInfo.processInfo.systemUptime + 5
+                    while originalStillRunning() && ProcessInfo.processInfo.systemUptime < forceDeadline {
+                        Thread.sleep(forTimeInterval: 0.1)
+                    }
+                    // Re-scan the full tree for processes started during exit;
+                    // only the original verified plan was eligible for force.
                     remaining = plan(try desktopInventory()).targets
-                    if remaining.isEmpty { break }
-                    Thread.sleep(forTimeInterval: 0.2)
-                } while Date() < until
+                } else {
+                    let until = ProcessInfo.processInfo.systemUptime + 15
+                    repeat {
+                        remaining = plan(try desktopInventory()).targets
+                        if remaining.isEmpty { break }
+                        Thread.sleep(forTimeInterval: 0.2)
+                    } while ProcessInfo.processInfo.systemUptime < until
+                }
                 result = ["status": remaining.isEmpty ? "ok" : "error",
                           "code": remaining.isEmpty ? "" : "claude_still_running",
                           "message": remaining.isEmpty ? "Claude Desktop 已退出" : "Claude 未完全退出，禁止替换数据",
-                          "requested": outcome.requested, "remaining": remaining.count]
+                          "requested": outcome.requested, "remaining": remaining.count,
+                          "force_requested": forced.requested, "force_skipped": forced.skipped, "force_failed": forced.failed]
             default: throw NSError(domain: "invalid_action", code: 1)
             }
             let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])

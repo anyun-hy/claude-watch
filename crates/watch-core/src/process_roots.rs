@@ -128,7 +128,7 @@ pub fn cli_kind(path: &str, home: &Path, trusted: &TrustedCliPaths) -> Option<Ki
     None
 }
 
-fn managed_codex_app_server(path: &str, home: &Path) -> bool {
+pub fn managed_codex_app_server(path: &str, home: &Path) -> bool {
     let Some(path) = lexical_path(path, None) else {
         return false;
     };

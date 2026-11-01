@@ -460,6 +460,15 @@ pub fn receipt(store: &StateStore, audit: Value, session: Value, persist: bool) 
         preview["message"] = json!(message);
     }
     preview.as_object_mut().map(|v| v.remove("display_facts"));
+    let chatgpt_preview = audit["display_facts"]["chatgpt_preview"]
+        .as_object()
+        .map(|_| {
+            let mut value = audit["display_facts"]["chatgpt_preview"].clone();
+            value["purpose"] = json!("launch_requirements_preview");
+            value["grants_launch_permission"] = json!(false);
+            value["expires_at"] = json!(display_expires);
+            value
+        });
     let mut output = audit;
     output["status"] = json!("ok");
     output["purpose"] = json!("environment_detection");
@@ -481,6 +490,9 @@ pub fn receipt(store: &StateStore, audit: Value, session: Value, persist: bool) 
     output["source_notices"] = presentation::source_notices(&output["display_facts"]["online"]);
     output["message"] = json!("本轮实测结果；未知项保留未知。受控启动仍需独立预检。");
     output["policy_evaluation"] = preview;
+    if let Some(preview) = chatgpt_preview {
+        output["chatgpt_policy_evaluation"] = preview;
+    }
     output.as_object_mut().map(|v| v.remove("display_facts"));
     Ok(output)
 }

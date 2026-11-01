@@ -4,6 +4,7 @@ struct AIProcessCloseButton: View {
     let product: MonitoredProduct
     @ObservedObject var store: MonitorStore
     @ObservedObject var control: AIProcessControl
+    @ObservedObject var switcher: SwitcherStore
     let p: Palette
     @State private var pending: AIProcessClosePlan?
     @State private var confirming = false
@@ -22,9 +23,10 @@ struct AIProcessCloseButton: View {
             }
         } label: {
             Label(control.busy ? "正在核对" : "退出 \(product.title)", systemImage: "power")
-                .font(.body.weight(.medium)).padding(.horizontal, 2).frame(minHeight: 28)
+                .font(WatchTypography.caption.weight(.medium)).padding(.horizontal, 12).frame(height: 32)
+                .foregroundStyle(p.red).background(p.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
         }
-        .buttonStyle(.bordered).controlSize(.large).tint(p.red).disabled(control.busy)
+        .buttonStyle(.plain).disabled(control.busy || switcher.busy).opacity(control.busy || switcher.busy ? 0.55 : 1)
         .help("核对身份后关闭 \(product.title) 桌面应用、CLI 与关联子进程")
         .accessibilityLabel("退出 \(product.title)")
         .confirmationDialog("退出 \(product.title)？", isPresented: $confirming, titleVisibility: .visible) {

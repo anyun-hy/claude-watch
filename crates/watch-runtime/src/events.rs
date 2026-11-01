@@ -433,15 +433,22 @@ impl EventStore {
             let allowed: &[&str] = match category {
                 "sampling-state" => &["operation", "status", "action", "previous_state", "elapsed_seconds", "round_id", "confirmed_exited_count", "reason_counts", "process_reason_counts", "sampling_diagnostics"],
                 "guard-decision" => &["session_id", "status", "previous_state", "code", "action", "egress_sampled_at", "dns_sampled_at", "webrtc_sampled_at"],
-                _ => &["session_id", "correlation_id", "action", "status", "code", "elapsed_seconds"],
+                _ => &["session_id", "correlation_id", "action", "status", "code", "count", "elapsed_seconds"],
             };
             if value.as_object().is_none_or(|m| m.keys().any(|k| !allowed.contains(&k.as_str()))) { return Err(invalid("诊断事件包含不允许的字段")); }
             let valid = match category {
                 "sampling-state" => matches!(fields.operation.as_deref(), Some("health" | "connection")) && matches!(fields.action.as_deref(), Some("transition" | "summary")) && matches!(fields.status.as_deref(), Some("running" | "degraded" | "ok" | "partial" | "empty" | "no_targets" | "failed" | "unknown")),
-                "guard-decision" => matches!(fields.action.as_deref(), Some("post_action")) && matches!(fields.status.as_deref(), Some("idle" | "safe" | "risk" | "locked" | "unknown" | "missing" | "pending" | "disabled")) && matches!(fields.code.as_deref(), Some("egress_ip_changed" | "egress_country_cn" | "session_identity_changed" | "proxy_or_tun_failed" | "egress_risk_persist_failed" | "evidence_expired" | "dns_risk" | "webrtc_risk" | "egress_unconfirmed" | "proxy_or_tun_unconfirmed" | "guard_sampling_failed" | "session_identity_unconfirmed" | "session_pending" | "risk_evidence_unavailable" | "risk_evidence_missing" | "invalid_config" | "invalid_session" | "invalid_native_observation" | "native_observation_unavailable" | "desktop_inventory_incomplete" | "process_metadata_unavailable" | "state_io_failed" | "unsafe_path" | "home_owner_mismatch" | "clock_unavailable" | "sampling_failed" | "none" | "other")),
-                _ => fields.correlation_id.is_some() && match fields.action.as_deref() { Some("request_post_action" | "retry_post_action") => fields.status.is_none(), Some("result_post_action") => matches!(fields.status.as_deref(), Some("confirmed" | "failed" | "session_changed")) && fields.code.as_deref().is_none_or(|c| matches!(c, "claude_still_running" | "permission_denied" | "component_unavailable" | "identity_unconfirmed" | "other")), _ => false },
+                "guard-decision" => matches!(fields.action.as_deref(), Some("post_action")) && matches!(fields.status.as_deref(), Some("idle" | "safe" | "risk" | "locked" | "unknown" | "missing" | "pending" | "disabled")) && matches!(fields.code.as_deref(), Some("egress_ip_changed" | "egress_country_cn" | "session_identity_changed" | "proxy_or_tun_failed" | "egress_risk_persist_failed" | "evidence_expired" | "dns_risk" | "webrtc_risk" | "network_leak_risk" | "egress_unconfirmed" | "proxy_or_tun_unconfirmed" | "guard_sampling_failed" | "session_identity_unconfirmed" | "session_pending" | "session_rechecking" | "session_ended" | "revalidation_timeout" | "risk_evidence_unavailable" | "risk_evidence_missing" | "invalid_config" | "invalid_session" | "invalid_native_observation" | "native_observation_unavailable" | "desktop_inventory_incomplete" | "process_metadata_unavailable" | "state_io_failed" | "unsafe_path" | "home_owner_mismatch" | "clock_unavailable" | "sampling_failed" | "none" | "other")),
+                _ => fields.correlation_id.is_some() && match fields.action.as_deref() { Some("request_post_action" | "retry_post_action") => fields.status.is_none() && fields.count.is_none(), Some("result_post_action") => matches!(fields.status.as_deref(), Some("confirmed" | "failed" | "session_changed")) && fields.code.as_deref().is_none_or(|c| matches!(c, "claude_still_running" | "permission_denied" | "component_unavailable" | "identity_unconfirmed" | "force_requested" | "force_report_unavailable" | "other")), _ => false },
             };
             if !valid { return Err(invalid("诊断事件状态无效")); }
+            if category == "guard-stop" {
+                match fields.code.as_deref() {
+                    Some("force_requested") if fields.status.as_deref() != Some("confirmed") || fields.count.is_none_or(|n| n == 0) => return Err(invalid("强制退出诊断不一致")),
+                    Some("force_report_unavailable") if fields.status.as_deref() != Some("confirmed") || fields.count.is_some() => return Err(invalid("退出诊断不一致")),
+                    _ => {}
+                }
+            }
         }
         let lock_name = match stream {
             "traffic" => "traffic-events",

@@ -44,6 +44,13 @@ struct GraphModelTests {
         expect(confirmed.routePresentation == "proxy", "explicit local proxy presentation")
         expect(confirmed.supportsPathAnimation, "a fully evidenced proxy path can animate")
         expect(codexProcess.product == .openAI && codexProcess.sourceRole == .cli, "codex cli belongs to unified page with CLI source")
+        let managedProcess = WatchedProcess(id: "managed", pid: 52, started: "now", kind: "codex-cli", authorized: nil,
+                                            runtimeRole: "codex_managed", serviceName: "Codex 托管后台", roleEvidence: "managed_app_server")
+        expect(managedProcess.sourceRole == .managed && managedProcess.name == "Codex 托管后台", "verified managed backend is distinct from independent CLI")
+        var unverifiedManaged = managedProcess; unverifiedManaged.roleEvidence = "unknown"
+        expect(unverifiedManaged.sourceRole == .cli, "an unverified hint does not change the existing process classification")
+        var missingArguments = managedProcess; missingArguments.runtimeRole = "codex_managed_unconfirmed"; missingArguments.roleEvidence = "managed_path_only"
+        expect(missingArguments.sourceRole == .child && missingArguments.name.contains("待确认"), "a retained managed-path target without arguments is not displayed as CLI")
         expect(chatGPTProcess.product == .openAI && chatGPTProcess.sourceRole == .desktop, "chatgpt desktop belongs to unified page")
         expect(sharedProcess.product == .openAI && sharedProcess.sourceRole == .desktop, "unified shell is a desktop source")
         let desktopHelper = WatchedProcess(id: "helper", pid: 46, started: "now", kind: "desktop-helper", authorized: nil)

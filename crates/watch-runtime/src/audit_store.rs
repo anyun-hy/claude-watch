@@ -190,6 +190,7 @@ impl AuditStore {
         mut options: AuditOptions,
         mut guard_capture: Option<&mut crate::guard_diagnostics::GuardCapture>,
     ) -> Result<Value> {
+        let capture_chatgpt_preview = guard_capture.is_some() && target.protected();
         if !target.protected() {
             options.persist = false;
         }
@@ -345,6 +346,34 @@ impl AuditStore {
             |v| format!("{v:.0}"),
         )?;
         let id = Uuid::new_v4().to_string();
+        let chatgpt_preview = if capture_chatgpt_preview {
+            // Re-evaluate the same observations for the other desktop target.
+            // No additional probes or launch permission are produced here.
+            let mut local = before.clone();
+            for key in ["backend_healthy", "backend_native"] {
+                local[key] = json!(before[key] == true && after[key] == true);
+            }
+            let mut preview = audit::evaluate_target(
+                AuditInput {
+                    config: &after_config,
+                    local: &local,
+                    online: &online,
+                    history: &history,
+                    zones,
+                    policy: &policy,
+                    now,
+                },
+                claude_watch_core::processes::LaunchTarget::ChatgptDesktop,
+                |v| format!("{v:.0}"),
+            )?;
+            preview["context_id"] = json!(context);
+            preview["observation_id"] = json!(id);
+            preview["purpose"] = json!("launch_requirements_preview");
+            preview["grants_launch_permission"] = json!(false);
+            Some(preview)
+        } else {
+            None
+        };
         output["context_id"] = json!(context);
         output["observation_id"] = json!(id);
         output["network_identity"] = after_network;
@@ -367,6 +396,9 @@ impl AuditStore {
             "online": online,
             "network": before_network,
         });
+        if let Some(preview) = chatgpt_preview {
+            output["display_facts"]["chatgpt_preview"] = preview;
+        }
         if !options.persist {
             return Ok(output);
         }

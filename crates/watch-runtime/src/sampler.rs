@@ -254,6 +254,14 @@ impl<R: ReadRunner> Sampler<R> {
             if !target_ids.contains(pid) {
                 continue;
             }
+            // Presentation hint only: keep the existing process/lease kind and
+            // connection sampling unchanged. Never infer a client from the daemon.
+            if process_roots::managed_codex_app_server(&args.identity.executable, &self.paths.home)
+                && matches!(evidence(*pid, Some(args)), Classification::Root(processes::Kind::CodexCli))
+            {
+                roles.insert(pid.to_string(), json!({"runtimeRole":"codex_managed", "serviceName":"Codex 托管后台", "roleEvidence":"managed_app_server", "started":args.identity.start_stamp}));
+                continue;
+            }
             if let Some(role) =
                 processes::classify_role(&args.tokens, &args.identity.executable, &specs, |s| {
                     command_path(s, Some(&args.cwd))
@@ -263,6 +271,16 @@ impl<R: ReadRunner> Sampler<R> {
                     .map_err(|_| CoreError::new("role_encoding_failed", "组件角色无法编码"))?;
                 value["started"] = json!(args.identity.start_stamp);
                 roles.insert(pid.to_string(), value);
+            }
+        }
+        // A retained target whose managed-path arguments could not be read is
+        // not evidence of an independent CLI, even during an incomplete round.
+        for target in &targets {
+            let pid = target.identity.pid;
+            if !arguments.contains_key(&pid)
+                && process_roots::managed_codex_app_server(&target.identity.executable, &self.paths.home)
+            {
+                roles.insert(pid.to_string(), json!({"runtimeRole":"codex_managed_unconfirmed", "serviceName":"Codex 后台（身份待确认）", "roleEvidence":"managed_path_only", "started":target.identity.start_stamp}));
             }
         }
         for target in &targets {

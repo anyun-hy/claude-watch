@@ -45,6 +45,19 @@ enum AIProcessClosePolicy {
         }
         return (requested, skipped, failed)
     }
+    /// Only the exact identities from the original, verified plan are eligible.
+    /// A recycled PID or a process started after that plan is never signalled.
+    static func forceRemaining(_ plan: AIProcessClosePlan, lookup: (Int32) -> AIProcessIdentity?,
+                               force: (Int32) -> Bool) -> (requested: Int, skipped: Int, failed: Int) {
+        guard plan.product == .claude else { return (0, plan.targets.count, 0) }
+        var requested = 0, skipped = 0, failed = 0
+        for target in plan.targets {
+            guard target.uid == plan.uid, !plan.protected.contains(target.pid), target.pid > 1,
+                  let live = lookup(target.pid), target.sameProcess(as: live) else { skipped += 1; continue }
+            if force(target.pid) { requested += 1 } else { failed += 1 }
+        }
+        return (requested, skipped, failed)
+    }
 }
 
 enum AIProcessInventory {

@@ -122,6 +122,7 @@ struct CurrentEnvironmentReceipt: Decodable {
     var context_id: String?
     var context_transition: EnvironmentContextTransition?
     var policy_evaluation: EnvironmentPolicyEvaluation?
+    var chatgpt_policy_evaluation: EnvironmentPolicyEvaluation? = nil
     var egress_reference: EgressReference?
     var facts: ProtectionFacts?
     var session_guard: SessionGuardStatus?
@@ -206,6 +207,7 @@ struct EnvironmentPolicyEvaluation: Decodable {
     var egress_reference: EgressReference?
     var facts: ProtectionFacts?
     var session_guard: SessionGuardStatus?
+    var launch_target: String? = nil
 }
 struct SwitcherRepairAction: Decodable, Identifiable {
     let id, title, scope: String
@@ -573,12 +575,15 @@ final class SwitcherStore: ObservableObject {
         environment.rows = rows
         environment.context_transition = transition
         environment.facts = facts
-        currentEnvironment = environment
         currentEnvironmentIsHistorical = scenario == .evidenceExpired
         let preview = EnvironmentPolicyEvaluation(purpose: "launch_requirements_preview", grants_launch_permission: false,
             observed_at: environment.observed_at, expires_at: environment.expires_at, observation_id: environment.observation_id,
             context_id: environment.context_id, policy: "fixture", rows: rows, blocked: blocked, ready: previewReady,
             message: "隔离同轮启动要求预览。", egress_reference: jp, facts: facts)
+        var chatgptPreview = preview
+        chatgptPreview.launch_target = "chatgpt-desktop"
+        environment.chatgpt_policy_evaluation = chatgptPreview
+        currentEnvironment = environment
         currentPolicyEvaluation = Self.acceptsDisplayPolicy(preview, for: environment, hasUnsavedSettings: false) ? preview : nil
         let base = try! JSONDecoder().decode(BackgroundServiceReceipt.self, from: Self.fixtureBackground(settings: settings))
         background = .init(observed_at: now, backend_healthy: true, update_source_ready: base.update_source_ready,
@@ -817,6 +822,31 @@ final class SwitcherStore: ObservableObject {
             preview.expires_at == environment.expires_at &&
             !hasUnsavedSettings &&
             (environment.context_transition?.state == "stable" || !preview.ready)
+    }
+    /// The graph uses the same current display preview as the environment page.
+    /// This is only a UI gate; the launch command performs a fresh full audit.
+    func graphLaunchBlockReason(for product: MonitoredProduct, at now: Date) -> String? {
+        if busy { return "正在执行其他操作。" }
+        if hasUnsavedSettings { return "请先保存或撤销未保存的设置。" }
+        if setupRecoveryRequired { return "请先完成未结束的环境恢复。" }
+        guard let environment = currentEnvironment, !currentEnvironmentIsHistorical else {
+            return "请先在环境状态取得有效的同轮检查结果。"
+        }
+        let evaluation = product == .claude ? currentPolicyEvaluation : environment.chatgpt_policy_evaluation
+        guard let preview = evaluation,
+              (product == .claude || preview.launch_target == "chatgpt-desktop"),
+              Self.acceptsDisplayPolicy(preview, for: environment, hasUnsavedSettings: hasUnsavedSettings) else {
+            return "当前应用的同轮环境检查尚未完成，请重新检测。"
+        }
+        let time = now.timeIntervalSince1970
+        guard time.isFinite, preview.observed_at.isFinite, preview.expires_at.isFinite,
+              preview.observed_at <= time, preview.expires_at > time else {
+            return "环境检查结果已过期或时间无效，请重新检测。"
+        }
+        guard preview.ready, preview.blocked.isEmpty, environment.context_transition?.state == "stable" else {
+            return "环境检查尚未通过，请在环境状态查看原因。"
+        }
+        return nil
     }
     func invalidateCurrentEnvironmentRequest() {
         environmentGeneration += 1
@@ -1172,7 +1202,11 @@ final class SwitcherStore: ObservableObject {
             let ready = await awaitFreshDNSReceipt()
             guard ready else {
                 failure = true
-                let failureText = "DNS 泄漏检测未在当前网络上下文内完成，未执行启动预检或启动 Claude。"
+                invalidateCurrentEnvironmentRequest()
+                detectionError = "启动前 DNS 泄漏复核未完成；此前环境结果仅供参考。"
+                let failureText = args.first == "checkdetail"
+                    ? "DNS 泄漏检测未在当前网络上下文内完成，未执行启动预检。"
+                    : "DNS 泄漏检测未在当前网络上下文内完成，未执行启动预检或启动 \(Self.launchDisplayName(args))。"
                 if args.first == "checkdetail" { auditOperationMessage = failureText; message = "" }
                 else { message = failureText }
                 return
@@ -1243,7 +1277,7 @@ final class SwitcherStore: ObservableObject {
                     message = raw["message"] as? String ?? (failure ? "操作部分完成，请查看变更记录。" :
                         status == "available" ? "发现新版本；完整应用更新应在退出界面后执行。" : "操作已完成。")
                     if args.first == "launch", status == "ok" {
-                        message = "上次操作：启动检查通过并打开 Claude。当前运行状态以上方会话状态为准。"
+                        message = "上次操作：启动检查通过并打开 \(Self.launchDisplayName(args))。当前运行状态以实际进程为准。"
                     }
                     if args == ["account", "import"] {
                         let found = (raw["accounts"] as? [String] ?? []).joined(separator: "、")
@@ -1278,6 +1312,14 @@ final class SwitcherStore: ObservableObject {
                 message = error.localizedDescription
             }
             failure = true
+        }
+    }
+    private static func launchDisplayName(_ args: [String]) -> String {
+        guard let index = args.firstIndex(of: "--target"), args.indices.contains(index + 1) else { return "Claude" }
+        switch args[index + 1] {
+        case "chatgpt-desktop": return "ChatGPT"
+        case "codex-desktop", "codex-cli": return "Codex"
+        default: return "Claude"
         }
     }
     private func consumeStatus(_ data: Data) throws {

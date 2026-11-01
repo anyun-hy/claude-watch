@@ -48,6 +48,11 @@ pub trait DesktopSystem {
     fn wait(&mut self, duration: Duration);
     /// Each returned identity is native-verified as this user's Claude desktop tree.
     fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>>;
+    /// A false result requires a complete native inventory showing that this
+    /// exact PID and start identity is no longer present.
+    fn desktop_alive(&mut self, desktop: &Desktop) -> Result<bool>;
+    /// Includes verified Claude desktop helpers, not just the main process.
+    fn desktop_tree_running(&mut self) -> Result<bool>;
     fn launcher(&mut self) -> Result<Launcher>;
     fn full_audit(&mut self) -> Result<Value>;
     fn egress(&mut self) -> Value;
@@ -59,6 +64,9 @@ pub trait DesktopSystem {
     fn launcher_matches(&mut self, launcher: &Launcher) -> Result<bool>;
     fn open_desktop(&mut self) -> Result<()>;
     fn quit_desktop(&mut self) -> Result<()>;
+    /// Writes the verified force-request count when the helper can report it,
+    /// including when some processes still remain.
+    fn quit_for_confirmed_ip_risk(&mut self, forced: &mut Option<u32>) -> Result<()>;
 }
 pub trait CliProcess {
     fn wait(&mut self) -> Result<i32>;
@@ -105,7 +113,7 @@ impl Controller {
         }
         Ok(())
     }
-    fn lease(&self, desktop: &Desktop, stamp: &str, now: f64) -> Result<()> {
+    pub(crate) fn lease(&self, desktop: &Desktop, stamp: &str, now: f64) -> Result<()> {
         if stamp.contains(['|', '\n', '\r']) || stamp.is_empty() {
             return Err(CoreError::new(
                 "desktop_identity_unavailable",
@@ -382,7 +390,19 @@ impl Controller {
     fn timed_guard_quit<S: DesktopSystem>(system: &mut S, receipt: &mut Value) -> Result<()> {
         let started = std::time::Instant::now();
         receipt["stop_started_at"] = json!(system.now());
-        let result = system.quit_desktop();
+        let confirmed_ip = matches!(
+            receipt["session_guard"]["reason"]["code"].as_str(),
+            Some("egress_ip_changed" | "egress_country_cn" | "egress_risk_persist_failed")
+        );
+        let result = if confirmed_ip {
+            let mut forced = None;
+            let result = system.quit_for_confirmed_ip_risk(&mut forced);
+            receipt["stop_force_requested"] = json!(forced);
+            receipt["stop_force_reported"] = json!(forced.is_some());
+            result
+        } else {
+            system.quit_desktop()
+        };
         receipt["stop_completed_at"] = json!(system.now());
         receipt["stop_elapsed_seconds"] = json!(started.elapsed().as_secs_f64());
         result
@@ -421,8 +441,223 @@ impl Controller {
         let now = system.now();
         let mut receipt = json!({"status":"unknown","action":"observe","time":now,"policy":crate::config_store::policy_digest(&config.value()?)?,"guard_policy_v1":crate::config_store::guard_policy_digest(&config)?});
         let result: Result<()> = (|| {
-            let desktops = system.desktops()?;
-            let current = sessions.load(system.now())?;
+            let mut desktops = system.desktops()?;
+            let mut current = sessions.load(system.now())?;
+            let mut identity_unconfirmed = false;
+            let mut exit_pending = false;
+            if let Some(previous) = current.as_ref().filter(|s| {
+                matches!(
+                    s.state,
+                    session::Phase::Active | session::Phase::Rechecking | session::Phase::Locked
+                )
+            }) {
+                if let Some(expected) = previous.desktop.as_ref() {
+                    if !desktops
+                        .iter()
+                        .any(|(actual, main, _)| *main && actual == expected)
+                    {
+                        if system.desktop_alive(expected)? {
+                            // The PID still exists, but this inventory did not
+                            // establish it as the main app. Never call it replaced.
+                            identity_unconfirmed = true;
+                        } else {
+                            let tree_running = system.desktop_tree_running()?;
+                            let risk_latched = previous.state == session::Phase::Locked
+                                && previous
+                                    .reason
+                                    .as_ref()
+                                    .is_none_or(|reason| reason.code != "session_identity_changed")
+                                || self
+                                    .failed_persistence_session
+                                    .lock()
+                                    .map_err(|_| {
+                                        CoreError::new(
+                                            "guard_memory_unavailable",
+                                            "保护内存状态不可用",
+                                        )
+                                    })?
+                                    .as_ref()
+                                    == Some(&previous.session_id);
+                            if risk_latched && tree_running {
+                                // A confirmed risk stays latched until the
+                                // entire desktop tree is gone.
+                                exit_pending = true;
+                            } else if sessions.end_desktop(
+                                &previous.session_id,
+                                expected,
+                                system.now(),
+                                tree_running,
+                            )? {
+                                receipt["ended_session_id"] = json!(previous.session_id);
+                                current = sessions.load(system.now())?;
+                                if tree_running {
+                                    // A replacement may have appeared while
+                                    // confirming the old process exit.
+                                    desktops = system.desktops()?;
+                                }
+                            } else {
+                                receipt["session_guard"] = json!({"state":"unknown","reason":{"code":"session_changed","detail":"会话已变化，等待下一轮核对"}});
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(ended) = current
+                .as_ref()
+                .filter(|s| s.state == session::Phase::Ended)
+            {
+                receipt["session_id"] = json!(ended.session_id);
+                let mains: Vec<_> = desktops.iter().filter(|(_, main, _)| *main).collect();
+                if mains.len() == 1 {
+                    let candidate = mains[0].0.clone();
+                    current = sessions.begin_recheck(&ended.session_id, candidate, system.now())?;
+                    if current.is_none() {
+                        receipt["session_guard"] = json!({"state":"unknown","reason":{"code":"session_changed","detail":"会话已变化，等待下一轮核对"}});
+                        return Ok(());
+                    }
+                } else if mains.is_empty() {
+                    let tree_pending = ended.extra.get("exit_tree_pending") == Some(&json!(true));
+                    let remaining =
+                        !desktops.is_empty() || (tree_pending && system.desktop_tree_running()?);
+                    if !remaining {
+                        if !sessions.clear_ended_tree(&ended.session_id, system.now())? {
+                            receipt["session_guard"] = json!({"state":"unknown","reason":{"code":"session_changed","detail":"会话已变化，等待下一轮核对"}});
+                            return Ok(());
+                        }
+                        receipt["status"] = json!("ok");
+                        receipt["session_guard"] = json!({"state":"idle","phase":"ended","reason":{"code":"session_ended","detail":"已确认旧会话进程退出"}});
+                        return Ok(());
+                    }
+                    // While verified helpers remain, keep the fast exit check
+                    // active; a confirmed risk still requires full shutdown.
+                    let egress = system.egress();
+                    let checked_at = system.now();
+                    let mut code =
+                        session::Egress::fresh(&egress, checked_at, session::GUARD_EGRESS_TTL)
+                            .and_then(|v| {
+                                if v.country == "CN" {
+                                    Some("egress_country_cn")
+                                } else if ended.extra.get("recheck_baseline_pending")
+                                    != Some(&json!(true))
+                                    && v.ip != ended.baseline.ip
+                                {
+                                    Some("egress_ip_changed")
+                                } else {
+                                    None
+                                }
+                            });
+                    if code.is_none() {
+                        let local = system.local_guard()?;
+                        if local["proxy"] == "fail" || local["tun"] == "fail" {
+                            code = Some("proxy_or_tun_failed");
+                        } else if let Some(current) =
+                            session::Egress::fresh(&egress, checked_at, session::GUARD_EGRESS_TTL)
+                        {
+                            let risk = receipts.session_risk(
+                                &ended.context_id,
+                                Some(&current.ip),
+                                checked_at,
+                            );
+                            if risk["state"] == "risk" {
+                                code = Some(match risk["reason"]["source"].as_str() {
+                                    Some("dns") => "dns_risk",
+                                    Some("webrtc") => "webrtc_risk",
+                                    _ => "network_leak_risk",
+                                });
+                            }
+                        }
+                    }
+                    if let Some(code) = code {
+                        let outcome = sessions.mark_failure(
+                            Some(&ended.session_id),
+                            checked_at,
+                            code,
+                            "Claude 关联进程尚未退出且保护风险已确认",
+                            true,
+                        )?;
+                        receipt["session_id"] = json!(ended.session_id);
+                        receipt["session_guard"] =
+                            serde_json::to_value(&outcome).map_err(|_| {
+                                CoreError::new("guard_encoding_failed", "保护状态无法编码")
+                            })?;
+                        if matches!(outcome.state.as_str(), "risk" | "locked") {
+                            match sessions.close_if_current(
+                                Some(&ended.session_id),
+                                system.now(),
+                                || Self::timed_guard_quit(system, &mut receipt),
+                            ) {
+                                Ok(Some(())) => {
+                                    receipt["action"] = json!("close-desktop");
+                                    receipt["stop_state"] = json!("confirmed");
+                                    self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"), &json!({"stopped_at":system.now(),"session_id":ended.session_id,"reason":outcome.reason,"force_requested":receipt["stop_force_requested"],"force_reported":receipt["stop_force_reported"]}))?;
+                                }
+                                Ok(None) => receipt["stop_state"] = json!("session_changed"),
+                                Err(error) => {
+                                    receipt["stop_state"] = json!("failed");
+                                    receipt["stop_error"] = json!(error.code);
+                                }
+                            }
+                        }
+                    } else {
+                        receipt["status"] = json!("unknown");
+                        receipt["session_guard"] = json!({"state":"unknown","phase":"ended","reason":{"code":"session_identity_unconfirmed","detail":"旧主进程已退出，仍有 Claude 关联进程待退出"}});
+                    }
+                    return Ok(());
+                } else {
+                    // Multiple mains cannot be adopted, but must not suspend
+                    // the independent fast IP check while they are running.
+                    let egress = system.egress();
+                    let checked_at = system.now();
+                    let measured =
+                        session::Egress::fresh(&egress, checked_at, session::GUARD_EGRESS_TTL);
+                    let code = measured.as_ref().and_then(|v| {
+                        if v.country == "CN" {
+                            Some("egress_country_cn")
+                        } else if ended.extra.get("recheck_baseline_pending") != Some(&json!(true))
+                            && v.ip != ended.baseline.ip
+                        {
+                            Some("egress_ip_changed")
+                        } else {
+                            None
+                        }
+                    });
+                    let outcome = sessions.mark_failure(
+                        Some(&ended.session_id),
+                        checked_at,
+                        code.unwrap_or("session_identity_unconfirmed"),
+                        if code.is_some() {
+                            "新进程出口风险已确认"
+                        } else {
+                            "存在多个 Claude 主进程，无法完成身份复核"
+                        },
+                        code.is_some(),
+                    )?;
+                    receipt["session_id"] = json!(ended.session_id);
+                    receipt["session_guard"] = serde_json::to_value(&outcome)
+                        .map_err(|_| CoreError::new("guard_encoding_failed", "保护状态无法编码"))?;
+                    if matches!(outcome.state.as_str(), "risk" | "locked") {
+                        match sessions.close_if_current(
+                            Some(&ended.session_id),
+                            system.now(),
+                            || Self::timed_guard_quit(system, &mut receipt),
+                        ) {
+                            Ok(Some(())) => {
+                                receipt["action"] = json!("close-desktop");
+                                receipt["stop_state"] = json!("confirmed");
+                                self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"), &json!({"stopped_at":system.now(),"session_id":ended.session_id,"reason":outcome.reason,"force_requested":receipt["stop_force_requested"],"force_reported":receipt["stop_force_reported"]}))?;
+                            }
+                            Ok(None) => receipt["stop_state"] = json!("session_changed"),
+                            Err(error) => {
+                                receipt["stop_state"] = json!("failed");
+                                receipt["stop_error"] = json!(error.code);
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+            let now = system.now();
             let id = current.as_ref().map(|s| s.session_id.clone());
             let latched = {
                 let mut remembered = self.failed_persistence_session.lock().map_err(|_| {
@@ -438,12 +673,12 @@ impl Controller {
                 receipt["status"] = json!("protection_triggered");
                 receipt["session_id"] = json!(id);
                 receipt["session_guard"] = json!({"state":"locked", "phase":"locked", "reason":{"code":"egress_risk_persist_failed", "detail":"出口风险已确认，会话记录写入失败"}});
-                if desktops.is_empty() {
+                if desktops.is_empty() && !identity_unconfirmed && !exit_pending {
                     receipt["stop_state"] = json!("confirmed");
                 } else {
-                    match sessions
-                        .close_if_current(id.as_deref(), system.now(), || Self::timed_guard_quit(system, &mut receipt))
-                    {
+                    match sessions.close_if_current(id.as_deref(), system.now(), || {
+                        Self::timed_guard_quit(system, &mut receipt)
+                    }) {
                         Ok(Some(())) => {
                             receipt["action"] = json!("close-desktop");
                             receipt["stop_state"] = json!("confirmed");
@@ -457,7 +692,7 @@ impl Controller {
                 }
                 return Ok(());
             }
-            if !desktops.is_empty()
+            if (!desktops.is_empty() || identity_unconfirmed || exit_pending)
                 && current
                     .as_ref()
                     .is_some_and(|s| s.state == session::Phase::Locked)
@@ -466,12 +701,13 @@ impl Controller {
                 receipt["session_id"] = json!(id);
                 receipt["session_guard"] =
                     session::status(current.as_ref().unwrap(), system.now(), Some(true));
-                match sessions
-                    .close_if_current(id.as_deref(), system.now(), || Self::timed_guard_quit(system, &mut receipt))
-                {
+                match sessions.close_if_current(id.as_deref(), system.now(), || {
+                    Self::timed_guard_quit(system, &mut receipt)
+                }) {
                     Ok(Some(())) => {
                         receipt["action"] = json!("close-desktop");
                         receipt["stop_state"] = json!("confirmed");
+                        self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"), &json!({"stopped_at":system.now(),"session_id":id,"reason":current.as_ref().and_then(|value| value.reason.as_ref()),"force_requested":receipt["stop_force_requested"],"force_reported":receipt["stop_force_reported"]}))?;
                     }
                     Ok(None) => receipt["stop_state"] = json!("session_changed"),
                     Err(error) => {
@@ -488,7 +724,7 @@ impl Controller {
             };
             let healthy = local["proxy"] == "ok" && local["tun"] == "ok" && guard_backend;
             receipt["status"] = json!(if healthy { "ok" } else { "degraded" });
-            if desktops.is_empty() {
+            if desktops.is_empty() && !identity_unconfirmed {
                 receipt["session_guard"] = current
                     .as_ref()
                     .map(|s| session::status(s, now, Some(false)))
@@ -515,7 +751,7 @@ impl Controller {
                         if desktops.iter().any(|(d, main, _)| *main && d == expected) {
                             Identity::Matches
                         } else {
-                            Identity::Changed
+                            Identity::Unavailable
                         }
                     } else {
                         Identity::Matches
@@ -525,8 +761,16 @@ impl Controller {
                 let confirmed_exit = current
                     .as_ref()
                     .and_then(|s| {
-                        session::Egress::fresh(&egress, checked_at, session::GUARD_EGRESS_TTL)
-                            .map(|e| e.country == "CN" || e.ip != s.baseline.ip)
+                        session::Egress::fresh(&egress, checked_at, session::GUARD_EGRESS_TTL).map(
+                            |e| {
+                                (s.state != session::Phase::Rechecking
+                                    || e.observed_at >= s.created_at)
+                                    && (e.country == "CN"
+                                        || (s.extra.get("recheck_baseline_pending")
+                                            != Some(&json!(true))
+                                            && e.ip != s.baseline.ip))
+                            },
+                        )
                     })
                     .unwrap_or(false);
                 let local_unknown = local["proxy"] != "ok" || local["tun"] != "ok";
@@ -577,13 +821,22 @@ impl Controller {
             receipt["session_id"] = json!(id);
             receipt["session_guard"] = serde_json::to_value(&outcome)
                 .map_err(|_| CoreError::new("guard_encoding_failed", "保护状态无法编码"))?;
+            if current
+                .as_ref()
+                .is_some_and(|s| s.state == session::Phase::Rechecking)
+                && outcome.state == "pending"
+            {
+                receipt["session_guard"]["phase"] = json!("rechecking");
+            }
             if matches!(outcome.state.as_str(), "risk" | "locked") {
                 let expected = outcome.session.as_ref().map(|s| s.session_id.as_str());
-                match sessions.close_if_current(expected, system.now(), || Self::timed_guard_quit(system, &mut receipt)) {
+                match sessions.close_if_current(expected, system.now(), || {
+                    Self::timed_guard_quit(system, &mut receipt)
+                }) {
                     Ok(Some(())) => {
                         receipt["action"] = json!("close-desktop");
                         receipt["stop_state"] = json!("confirmed");
-                        self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"), &json!({"stopped_at":system.now(),"session_id":expected,"reason":outcome.reason}))?;
+                        self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"), &json!({"stopped_at":system.now(),"session_id":expected,"reason":outcome.reason,"force_requested":receipt["stop_force_requested"],"force_reported":receipt["stop_force_reported"]}))?;
                     }
                     Ok(None) => receipt["stop_state"] = json!("session_changed"),
                     Err(error) => {
@@ -620,7 +873,9 @@ impl Controller {
             Ok(value) => value,
             Err(_) => {
                 receipt["session_guard"] = json!({"state":"risk","reason":{"code":"session_state_invalid","detail":"会话记录无法验证，未允许无保护运行"}});
-                match sessions.close_if_unreadable(system.now(), || Self::timed_guard_quit(system, receipt)) {
+                match sessions
+                    .close_if_unreadable(system.now(), || Self::timed_guard_quit(system, receipt))
+                {
                     Ok(Some(_)) => {
                         receipt["action"] = json!("close-desktop");
                         receipt["stop_state"] = json!("confirmed");
@@ -646,7 +901,9 @@ impl Controller {
             receipt["status"] = json!("protection_triggered");
             receipt["persistence_error"] = json!("state_io_failed");
             receipt["session_guard"] = json!({"state":"locked", "phase":"locked", "reason":{"code":"egress_risk_persist_failed", "detail":"出口风险已确认，会话记录写入失败"}});
-            match sessions.close_if_current(id.as_deref(), system.now(), || Self::timed_guard_quit(system, receipt)) {
+            match sessions.close_if_current(id.as_deref(), system.now(), || {
+                Self::timed_guard_quit(system, receipt)
+            }) {
                 Ok(Some(())) => {
                     receipt["action"] = json!("close-desktop");
                     receipt["stop_state"] = json!("confirmed");
@@ -665,7 +922,9 @@ impl Controller {
         {
             receipt["status"] = json!("protection_triggered");
             receipt["session_guard"] = session::status(value, system.now(), Some(true));
-            match sessions.close_if_current(id.as_deref(), system.now(), || Self::timed_guard_quit(system, receipt)) {
+            match sessions.close_if_current(id.as_deref(), system.now(), || {
+                Self::timed_guard_quit(system, receipt)
+            }) {
                 Ok(Some(())) => {
                     receipt["action"] = json!("close-desktop");
                     receipt["stop_state"] = json!("confirmed");
@@ -689,9 +948,9 @@ impl Controller {
                 receipt["session_guard"] = serde_json::to_value(&outcome)
                     .map_err(|_| CoreError::new("guard_encoding_failed", "保护状态无法编码"))?;
                 if matches!(outcome.state.as_str(), "risk" | "locked") {
-                    match sessions
-                        .close_if_current(id.as_deref(), system.now(), || Self::timed_guard_quit(system, receipt))
-                    {
+                    match sessions.close_if_current(id.as_deref(), system.now(), || {
+                        Self::timed_guard_quit(system, receipt)
+                    }) {
                         Ok(Some(_)) => {
                             receipt["action"] = json!("close-desktop");
                             receipt["stop_state"] = json!("confirmed");
