@@ -298,9 +298,18 @@ fn production_transport_can_read_a_bounded_local_http_response() {
         let (mut socket, _) = listener.accept().unwrap();
         let mut request = [0; 512];
         let used = socket.read(&mut request).unwrap();
-        assert!(std::str::from_utf8(&request[..used])
-            .unwrap()
-            .contains("accept: application/dns-json\r\n"));
+        let received = std::str::from_utf8(&request[..used]).unwrap();
+        let accepts: Vec<_> = received
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("accept"))
+            .map(|(_, value)| value.trim())
+            .collect();
+        assert_eq!(
+            accepts,
+            ["application/dns-json"],
+            "the real HTTP request must not include a second default Accept header"
+        );
         socket
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
             .unwrap();
@@ -328,7 +337,19 @@ fn status_only_transport_preserves_403_headers_without_waiting_for_page_body() {
     let server = thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
         let mut request = [0; 512];
-        let _ = socket.read(&mut request).unwrap();
+        let used = socket.read(&mut request).unwrap();
+        let received = std::str::from_utf8(&request[..used]).unwrap();
+        let accepts: Vec<_> = received
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("accept"))
+            .map(|(_, value)| value.trim())
+            .collect();
+        assert_eq!(
+            accepts,
+            ["application/json, text/plain;q=0.9"],
+            "ordinary diagnostic requests retain their default Accept header"
+        );
         socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 1000000\r\nCF-Mitigated: challenge\r\nConnection: close\r\n\r\n").unwrap();
         let _ = wait.recv_timeout(Duration::from_secs(2));
     });

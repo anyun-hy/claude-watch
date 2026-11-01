@@ -59,7 +59,7 @@ pub struct ServerReference {
     pub geo_source: String,
 }
 
-fn empty(host: &str, now: i64, message: &str) -> ServerReference {
+fn empty(host: &str, now: i64, message: &str, dns_attempted: bool) -> ServerReference {
     ServerReference {
         host: host.into(),
         basis: "dns_reference".into(),
@@ -73,8 +73,8 @@ fn empty(host: &str, now: i64, message: &str) -> ServerReference {
         message: message.into(),
         queried_at: now,
         expires_at: now + FAILURE_TTL_SECONDS,
-        dns_source: "Cloudflare DoH".into(),
-        geo_source: "IPinfo".into(),
+        dns_source: if dns_attempted { "Cloudflare DoH" } else { "" }.into(),
+        geo_source: String::new(),
     }
 }
 
@@ -125,12 +125,23 @@ pub fn normalize_host(input: &str) -> Option<String> {
 fn valid_ip(value: &str) -> Option<String> {
     public_destination(value).filter(|ip| !ip.starts_with("198.18.") && !ip.starts_with("198.19."))
 }
-fn json(response: Result<Response, crate::network_client::TransportError>) -> Option<Value> {
-    let response = response.ok()?;
-    (response.status == 200 && response.body.len() <= MAX_RESPONSE_BYTES).then_some(())?;
-    serde_json::from_slice(&response.body).ok()
+fn json(
+    response: Result<Response, crate::network_client::TransportError>,
+) -> Result<Value, String> {
+    let response = response.map_err(|error| match error.code.as_str() {
+        "timeout" => "请求超时".to_owned(),
+        "body_too_large" => "响应过大".to_owned(),
+        _ => "连接未完成".to_owned(),
+    })?;
+    if response.status != 200 {
+        return Err(format!("HTTP {}", response.status));
+    }
+    if response.body.len() > MAX_RESPONSE_BYTES {
+        return Err("响应过大".into());
+    }
+    serde_json::from_slice(&response.body).map_err(|_| "返回数据格式无效".into())
 }
-fn get<T: Transport>(transport: &T, url: String) -> Option<Value> {
+fn get<T: Transport>(transport: &T, url: String) -> Result<Value, String> {
     let is_dns = url.starts_with(DNS_URL);
     json(transport.get(&Request {
         url,
@@ -145,16 +156,22 @@ fn get<T: Transport>(transport: &T, url: String) -> Option<Value> {
         },
     }))
 }
-fn dns<T: Transport>(transport: &T, host: &str) -> Vec<String> {
+fn dns<T: Transport>(transport: &T, host: &str) -> Result<Vec<String>, String> {
+    let mut failure = None;
     for (name, kind) in [("A", 1u64), ("AAAA", 28u64)] {
-        let Some(payload) = get(transport, format!("{DNS_URL}?name={host}&type={name}")) else {
-            continue;
+        let payload = match get(transport, format!("{DNS_URL}?name={host}&type={name}")) {
+            Ok(payload) => payload,
+            Err(error) => {
+                failure = Some(error);
+                continue;
+            }
         };
-        if payload
+        if let Some(status) = payload
             .get("Status")
             .and_then(Value::as_i64)
-            .is_some_and(|status| status != 0)
+            .filter(|status| *status != 0)
         {
+            failure = Some(format!("DNS 状态码 {status}"));
             continue;
         }
         let mut addresses: Vec<String> = payload
@@ -173,22 +190,25 @@ fn dns<T: Transport>(transport: &T, host: &str) -> Vec<String> {
         addresses.sort();
         addresses.dedup();
         if !addresses.is_empty() {
-            return addresses;
+            return Ok(addresses);
         }
     }
-    vec![]
+    Err(failure.unwrap_or_else(|| "未返回可用公网地址".into()))
 }
-fn geo<T: Transport>(transport: &T, address: &str) -> Option<(String, String, String)> {
+fn geo<T: Transport>(transport: &T, address: &str) -> Result<(String, String, String), String> {
     let payload = get(transport, format!("{GEO_URL_PREFIX}{address}/json"))?;
     if payload.get("error").is_some() || payload.get("ip").and_then(Value::as_str) != Some(address)
     {
-        return None;
+        return Err("回执中的 IP 不匹配或服务返回错误".into());
     }
-    let country = payload.get("country").and_then(Value::as_str)?;
+    let country = payload
+        .get("country")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "未返回国家信息".to_owned())?;
     if country.len() != 2 || !country.bytes().all(|v| v.is_ascii_alphabetic()) {
-        return None;
+        return Err("国家信息格式无效".into());
     }
-    Some((
+    Ok((
         country.to_ascii_uppercase(),
         payload
             .get("region")
@@ -216,12 +236,12 @@ impl<T: Transport> ServerReferenceClient<T> {
     }
     pub fn lookup_at(&self, request: LookupRequest, now: i64) -> ServerReference {
         let Some(host) = normalize_host(&request.host) else {
-            return empty("", now, "仅支持指定 AI 服务的域名或子域名。");
+            return empty("", now, "仅支持指定 AI 服务的域名或子域名。", false);
         };
         let observed = match request.observed_ip {
             Some(value) => match valid_ip(value.trim()) {
                 Some(ip) => Some(ip),
-                None => return empty(&host, now, "目标 IP 不是可查询的公网地址。"),
+                None => return empty(&host, now, "目标 IP 不是可查询的公网地址。", false),
             },
             None => None,
         };
@@ -238,16 +258,21 @@ impl<T: Transport> ServerReferenceClient<T> {
         let (basis, addresses, dns_source) = if let Some(ip) = observed {
             ("observed_ip", vec![ip], "")
         } else {
-            let addresses = dns(&*self.transport, &host);
-            if addresses.is_empty() {
-                return empty(&host, now, "DNS 参考查询未返回可用公网地址。");
-            }
+            let addresses = match dns(&*self.transport, &host) {
+                Ok(addresses) => addresses,
+                Err(error) => {
+                    return empty(&host, now, &format!("DNS 参考查询未完成：{error}。"), true)
+                }
+            };
             ("dns_reference", addresses, "Cloudflare DoH")
         };
         let address = addresses[0].clone();
         let geo_value = geo(&*self.transport, &address);
-        let complete = geo_value.is_some();
-        let (country_code, region, city) = geo_value.unwrap_or_default();
+        let complete = geo_value.is_ok();
+        let (country_code, region, city, geo_error) = match geo_value {
+            Ok((country, region, city)) => (country, region, city, String::new()),
+            Err(error) => (String::new(), String::new(), String::new(), error),
+        };
         let value = ServerReference {
             host,
             basis: basis.into(),
@@ -265,17 +290,16 @@ impl<T: Transport> ServerReferenceClient<T> {
             .into(),
             message: if complete {
                 if basis == "dns_reference" {
-                    "DNS 解析与 IP 归属仅作参考，非这条连接的实测目标 IP。"
+                    "DNS 解析与 IP 归属仅作参考，非这条连接的实测目标 IP。".into()
                 } else {
-                    "基于已观测目标 IP 的归属参考。"
+                    "基于已观测目标 IP 的归属参考。".into()
                 }
             } else {
-                "IP 归属参考查询未完成。"
-            }
-            .into(),
+                format!("IP 归属参考查询未完成：{geo_error}。")
+            },
             queried_at: now,
             expires_at: now
-                + if complete || basis == "dns_reference" {
+                + if complete {
                     REFERENCE_TTL_SECONDS
                 } else {
                     FAILURE_TTL_SECONDS
@@ -399,5 +423,144 @@ mod tests {
             vec![("Accept".into(), "application/dns-json".into())]
         );
         assert!(requests[1].safe_headers.is_empty());
+    }
+
+    #[test]
+    fn claude_and_chatgpt_each_use_one_dns_and_one_geo_request() {
+        for host in ["claude.ai", "ab.chatgpt.com"] {
+            let fake = Arc::new(Fake {
+                replies: Mutex::new(vec![
+                    response(r#"{"Status":0,"Answer":[{"type":1,"data":"1.1.1.1"}]}"#),
+                    response(
+                        r#"{"ip":"1.1.1.1","country":"AU","region":"Queensland","city":"Brisbane"}"#,
+                    ),
+                ]),
+                calls: AtomicUsize::new(0),
+                requests: Mutex::new(vec![]),
+            });
+            let value = ServerReferenceClient::new(fake.clone()).lookup_at(
+                LookupRequest {
+                    host: host.into(),
+                    observed_ip: None,
+                },
+                100,
+            );
+            assert_eq!(value.status, "ready");
+            assert_eq!(value.basis, "dns_reference");
+            assert_eq!(value.country_code, "AU");
+            assert_eq!(value.city, "Brisbane");
+            assert_eq!(
+                fake.calls.load(Ordering::SeqCst),
+                2,
+                "one DNS and one geo request are sufficient"
+            );
+            let requests = fake.requests.lock().unwrap();
+            assert!(requests[0].url.contains(&format!("name={host}&type=A")));
+            assert_eq!(
+                requests[0].proxy.as_deref(),
+                Some(crate::network_client::DEFAULT_PROXY)
+            );
+            assert_eq!(
+                requests[1].proxy.as_deref(),
+                Some(crate::network_client::DEFAULT_PROXY)
+            );
+        }
+    }
+
+    #[test]
+    fn failures_report_the_actual_stage_and_keep_dns_reference_when_geo_fails() {
+        let dns_error = Arc::new(Fake {
+            replies: Mutex::new(vec![
+                Response {
+                    status: 400,
+                    headers: HashMap::new(),
+                    body: vec![]
+                };
+                2
+            ]),
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(vec![]),
+        });
+        let unavailable = ServerReferenceClient::new(dns_error.clone()).lookup_at(
+            LookupRequest {
+                host: "claude.ai".into(),
+                observed_ip: None,
+            },
+            100,
+        );
+        assert_eq!(unavailable.status, "unavailable");
+        assert!(unavailable.message.contains("DNS") && unavailable.message.contains("HTTP 400"));
+        assert!(unavailable.address.is_empty());
+        assert_eq!(unavailable.dns_source, "Cloudflare DoH");
+        assert!(
+            unavailable.geo_source.is_empty(),
+            "an uncalled IPinfo service is not shown as a source"
+        );
+        assert_eq!(dns_error.calls.load(Ordering::SeqCst), 2);
+
+        let geo_error = Arc::new(Fake {
+            replies: Mutex::new(vec![
+                response(r#"{"Status":0,"Answer":[{"type":1,"data":"1.1.1.1"}]}"#),
+                Response {
+                    status: 429,
+                    headers: HashMap::new(),
+                    body: vec![],
+                },
+            ]),
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(vec![]),
+        });
+        let partial = ServerReferenceClient::new(geo_error).lookup_at(
+            LookupRequest {
+                host: "chatgpt.com".into(),
+                observed_ip: None,
+            },
+            100,
+        );
+        assert_eq!(partial.basis, "dns_reference");
+        assert_eq!(partial.address, "1.1.1.1");
+        assert!(partial.country_code.is_empty());
+        assert!(partial.message.contains("归属") && partial.message.contains("HTTP 429"));
+        assert_eq!(partial.geo_source, "IPinfo");
+        assert_eq!(partial.expires_at, 100 + FAILURE_TTL_SECONDS);
+    }
+
+    #[test]
+    fn dns_falls_back_to_ipv6_and_reports_timeouts() {
+        let fake = Arc::new(Fake {
+            replies: Mutex::new(vec![
+                response(r#"{"Status":0,"Answer":[]}"#),
+                response(r#"{"Status":0,"Answer":[{"type":28,"data":"2606:4700:4700::1111"}]}"#),
+                response(r#"{"ip":"2606:4700:4700::1111","country":"US"}"#),
+            ]),
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(vec![]),
+        });
+        let value = ServerReferenceClient::new(fake.clone()).lookup_at(
+            LookupRequest {
+                host: "claude.ai".into(),
+                observed_ip: None,
+            },
+            100,
+        );
+        assert_eq!(value.address, "2606:4700:4700::1111");
+        assert_eq!(value.country_code, "US");
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 3);
+
+        struct Timeout;
+        impl Transport for Timeout {
+            fn get(&self, _: &Request) -> Result<Response, TransportError> {
+                Err(TransportError::new("timeout", "fixture"))
+            }
+        }
+        let unavailable = ServerReferenceClient::new(Arc::new(Timeout)).lookup_at(
+            LookupRequest {
+                host: "chatgpt.com".into(),
+                observed_ip: None,
+            },
+            100,
+        );
+        assert_eq!(unavailable.status, "unavailable");
+        assert!(unavailable.message.contains("DNS") && unavailable.message.contains("超时"));
     }
 }

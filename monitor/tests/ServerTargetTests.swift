@@ -13,9 +13,9 @@ struct ServerTargetTests {
                  transport: "TCP", association: association, policy: "match", reason: "fixture",
                  chains: ["海外AI", "日本11"], routePath: "local_proxy", interfaceName: nil)
         }
-        func reference(_ request: ServerReferenceRequest, basis: String = "dns_reference", address: String = "104.18.32.7") -> ServerReference {
+        func reference(_ request: ServerReferenceRequest, basis: String = "dns_reference", address: String = "104.18.32.7", city: String = "") -> ServerReference {
             ServerReference(host: request.host, basis: basis, address: address, addresses: [address],
-                            countryCode: "US", country: "United States", region: "California", city: "",
+                            countryCode: "US", country: "United States", region: "California", city: city,
                             status: "ready", message: "fixture", queriedAt: 100, expiresAt: 700,
                             dnsSource: basis == "dns_reference" ? "Cloudflare DoH" : "", geoSource: "IPinfo")
         }
@@ -36,6 +36,13 @@ struct ServerTargetTests {
         expect(card.addressLine == "DNS 参考：104.18.32.7", "DNS address remains explicitly reference")
         expect(card.regionLine.contains("美国"), "country is localized")
         expect(card.detail.contains("未证实") && card.detail.contains("CDN/Anycast"), "reference and geography boundaries remain visible in detail")
+        let claude = flow(host: "claude.ai")
+        let claudeRequest = ServerReferenceRequest(flow: claude)!
+        let claudeCard = ServerTargetPresentation(product: .claude, flow: claude,
+            reference: reference(claudeRequest, city: "San Francisco"), now: 101)
+        expect(claudeCard.title == "Claude 服务器" && claudeCard.regionLine.contains("美国") &&
+               claudeCard.detail.contains("城市参考：San Francisco"),
+               "Claude uses the same reference lookup and displays an available city in the detail")
         expect(dns.applies(to: request, now: 699) && !dns.applies(to: request, now: 700), "expired cache cannot display as current")
         expect(!dns.applies(to: ServerReferenceRequest(flow: flow(host: "claude.ai"))!, now: 101), "no cache reuse for a different host")
 
@@ -64,6 +71,8 @@ struct ServerTargetTests {
         store.acceptServerReference(nil, for: request, at: store.now)
         let failure = store.reference(for: sample)
         expect(failure?.status == "unavailable", "runner failure is negative-cached")
+        expect(failure?.dnsSource.isEmpty == true && failure?.geoSource.isEmpty == true,
+               "a missing runner result does not pretend either external service was queried")
         expect(ServerTargetPresentation(product: .openAI, flow: sample, reference: failure, now: 101).addressLine == "目标 IP 暂不可用", "failure does not stay in loading state")
         store.now = Date(timeIntervalSince1970: 402)
         expect(store.reference(for: sample) == nil, "failure cache expires for retry")

@@ -55,7 +55,7 @@ struct ServerReference: Decodable, Sendable {
                         address: request.observedIP ?? "", addresses: request.observedIP.map { [$0] } ?? [],
                         countryCode: "", country: "", region: "", city: "", status: "unavailable",
                         message: "参考查询暂不可用，稍后重试。", queriedAt: now, expiresAt: now + 300,
-                        dnsSource: request.observedIP == nil ? "Cloudflare DoH" : "", geoSource: "IPinfo")
+                        dnsSource: "", geoSource: "")
     }
 
     func applies(to request: ServerReferenceRequest, now: Double) -> Bool {
@@ -111,6 +111,7 @@ struct ServerTargetPresentation {
         }
         if let validReference {
             if !validReference.addresses.isEmpty { details.append("查询地址：" + validReference.addresses.joined(separator: "、")) }
+            if !validReference.city.isEmpty { details.append("城市参考：" + validReference.city) }
             if !validReference.dnsSource.isEmpty { details.append("DNS 来源：" + validReference.dnsSource) }
             if !validReference.geoSource.isEmpty { details.append("IP 归属来源：" + validReference.geoSource) }
             let formatter = DateFormatter(); formatter.dateFormat = "MM-dd HH:mm:ss"

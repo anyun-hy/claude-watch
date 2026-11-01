@@ -95,10 +95,18 @@ impl Transport for UreqTransport {
         let agent: ureq::Agent = config.build().into();
         let mut call = agent
             .get(&request.url)
-            .header("Accept", "application/json, text/plain;q=0.9")
             .header("Accept-Encoding", "identity")
             .header("User-Agent", "ClaudeWatch-Diagnostics/1.0")
             .header("Connection", "close");
+        // ureq appends headers instead of replacing them. An explicit Accept
+        // must replace the default so DNS JSON requests send exactly one.
+        if !request
+            .safe_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("Accept"))
+        {
+            call = call.header("Accept", "application/json, text/plain;q=0.9");
+        }
         for (name, value) in &request.safe_headers {
             call = call.header(name, value);
         }
