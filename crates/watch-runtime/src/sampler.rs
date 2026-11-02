@@ -132,6 +132,49 @@ pub struct Sampler<R: ReadRunner> {
     #[cfg(test)]
     fixture_tag: bool,
 }
+/// The session pin comes from the confirmed environment baseline — the same
+/// source the legacy flow reads (`tag_node` in `state/baseline.conf`).
+/// A missing file, missing keys, unreadable text, or a baseline whose
+/// `tag_group` does not match the requested policy group all mean "no pin":
+/// the caller then reports an unpinned observation, and never treats an
+/// unresolvable selection as a confirmed drift.
+pub fn pinned_node(paths: &Paths, group: &str) -> String {
+    let path = paths.watch().join("state/baseline.conf");
+    let bytes = match StateStore::new(paths.clone()).read_bytes(&path, 2_000_000) {
+        Ok(Some(bytes)) => bytes,
+        _ => return String::new(),
+    };
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => return String::new(),
+    };
+    let mut node = String::new();
+    let mut group_ok = false;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("tag_group=") {
+            // An empty requested group resolves to GLOBAL inside tag_report;
+            // the baseline pin applies to that same effective group.
+            group_ok = group == value || (group.is_empty() && value == "GLOBAL");
+        } else if let Some(value) = line.strip_prefix("tag_node=") {
+            node = value.to_string();
+        }
+    }
+    if group_ok && !node.is_empty() {
+        node
+    } else {
+        String::new()
+    }
+}
+
+/// Drift is only confirmable when the pinned expectation and the observed
+/// selection both name a real node. A `null` selection has several causes
+/// (missing group, DIRECT, REJECT, COMPATIBLE) and none of them is evidence
+/// that the node changed — an unresolved observation must never become a
+/// confirmed drift (and must never trigger the proxy-fail protection path).
+pub fn selection_drift(pin: &str, observed: &str) -> bool {
+    !pin.is_empty() && !observed.is_empty() && observed != pin
+}
+
 impl<R: ReadRunner> Sampler<R> {
     pub fn new(runner: R, paths: Paths) -> Self {
         let trusted = cli_paths(&paths);
@@ -446,13 +489,11 @@ impl<R: ReadRunner> Sampler<R> {
             group
         };
         report["expected_group"] = json!(effective_group);
-        let node = if pin.is_empty() {
-            api["selected_node"].as_str().unwrap_or("")
-        } else {
-            pin
-        };
+        let observed = api["selected_node"].as_str().unwrap_or("");
+        let node = if pin.is_empty() { observed } else { pin };
         report["expected_node"] = json!(node);
-        report["selection_changed"] = json!(!pin.is_empty() && api["selected_node"] != pin);
+        report["selection_observed"] = json!(!observed.is_empty());
+        report["selection_changed"] = json!(selection_drift(pin, observed));
         let mut native_processes = after.unwrap_or_default();
         for (pid, identity) in &processes.identities {
             native_processes.entry(*pid).and_modify(|p| {

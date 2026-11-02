@@ -12,7 +12,7 @@ use claude_watch_runtime::{
     macos::Authority,
     native::{self, Observer},
     native_notifications::{AlertDispatcher, NativeNotifier},
-    sampler::Sampler,
+    sampler::{pinned_node, Sampler},
     snapshot_publication::SnapshotPublisher,
     storage::{Paths, StateStore},
 };
@@ -254,7 +254,8 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                     "系统采样通道已结束；后台停止发布，等待已注册任务重新启动",
                 ));
             }
-            let sample = publisher.poll(&config.proxy_group, "", false);
+            let pin = pinned_node(&storage.paths, &config.proxy_group);
+            let sample = publisher.poll(&config.proxy_group, &pin, false);
             let mut log_error = diagnostic_queue.health_message();
             if let Some(count) = alerts.as_ref().map(|a| a.record_failures()).filter(|n| *n > 0) {
                 let note = format!("本次后台运行的通知事件记录或冷却写入失败 {count} 次。");

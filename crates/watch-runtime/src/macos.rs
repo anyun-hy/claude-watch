@@ -8,7 +8,7 @@ use crate::{
     network_client::{NetworkClient, Transport},
     onboarding::OnboardingSystem,
     repair::RepairSystem,
-    sampler::{ProcessRound, Sampler, SocketRound},
+    sampler::{pinned_node, ProcessRound, Sampler, SocketRound},
     services::ServiceSystem,
     storage::{sha256, StateStore},
 };
@@ -472,7 +472,8 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                 flows: vec![],
                 receipt: json!({}),
             };
-            tag = sampler.tag_report(&round, &sockets, &c.proxy_group, "");
+            let pin = pinned_node(&sampler.paths, &c.proxy_group);
+            tag = sampler.tag_report(&round, &sockets, &c.proxy_group, &pin);
             if tag["entry"]["state"] != "verified"
                 || tag["api"]["state"] != "available"
                 || tag["api"]["covers_7890"] != true
@@ -480,10 +481,9 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                 proxy = "unknown";
                 detail = "TAG 7890 监听者、控制接口或该入口覆盖范围未确认".into();
                 unavailable.push("tag_snapshot");
-            } else if tag["selection_changed"] == true {
-                proxy = "fail";
-                detail = "TAG 分组或节点偏离已确认的预期".into();
             }
+            // 节点漂移仅提醒：selectionChanged 经 monitor_snapshot 进入公开快照，
+            // 控制面板可见；断开只由 egress_ip_changed（出口 IP 确认变化）触发。
         }
         if proxy == "unknown" && unavailable.is_empty() {
             unavailable.push("proxy_sampling");

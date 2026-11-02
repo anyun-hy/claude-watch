@@ -12,7 +12,11 @@ mod runtime;
 mod setup_dispatch;
 mod update_dispatch;
 use claude_watch_core::error::{CoreError, Result};
-use claude_watch_runtime::{commands::SystemRunner, sampler::Sampler, storage::Paths};
+use claude_watch_runtime::{
+    commands::SystemRunner,
+    sampler::{pinned_node, Sampler},
+    storage::Paths,
+};
 use serde_json::{json, Value};
 use std::{
     fs::OpenOptions,
@@ -365,7 +369,8 @@ fn run() -> Result<EngineOutput> {
     let mut sampler = Sampler::new(runner, paths);
     let processes = sampler.processes()?;
     let sockets = sampler.sockets(&processes)?;
-    let tag = sampler.tag_report(&processes, &sockets, "", "");
+    let pin = pinned_node(&sampler.paths, "");
+    let tag = sampler.tag_report(&processes, &sockets, "", &pin);
     Ok(EngineOutput::json(
         json!({"schema":1,"status":"ok","mode":"read_only","grants_launch_permission":false,"engine":"rust","processes":processes.public_value(),"tag":tag}),
         0,
