@@ -212,7 +212,19 @@ struct SwitcherPage: View {
     }
     private var environmentAdjustment: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("代理客户端、出口地区、时区和日期格式均按实测自动识别。这里只在确有系统修复时展示具体变更与回滚范围。")
+            Text("出口地区、时区和日期格式按实测自动识别；代理客户端可自动识别或手动指定。这里只在确有系统修复时展示具体变更与回滚范围。")
+                .font(WatchTypography.caption).foregroundStyle(p.secondary)
+            Picker("代理客户端", selection: $store.detectMode) {
+                Text("自动识别").tag("auto")
+                Text("TAG / mihomo").tag("tag")
+                Text("Clash Verge").tag("clash-verge")
+                Text("Shadowrocket").tag("shadowrocket")
+                Text("sing-box").tag("sing-box")
+                Text("ClashX").tag("clashx")
+                Text("Surge").tag("surge")
+            }
+            .pickerStyle(.menu).disabled(store.busy)
+            Text("节点钉死基线仅对带控制接口的 TAG/mihomo 类客户端生效；其余客户端按出口 IP 基线保护。")
                 .font(WatchTypography.caption).foregroundStyle(p.secondary)
             HStack {
                 Button { Task { await store.detectEnvironment() } } label: { Label("自动检测并生成调整建议", systemImage: "wand.and.stars") }

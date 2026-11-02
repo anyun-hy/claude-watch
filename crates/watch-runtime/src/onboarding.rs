@@ -474,7 +474,10 @@ fn apply_inner<S: OnboardingSystem>(
     {
         return Err(err("baseline_incomplete", "基线与最终本机时区未能核对"));
     }
-    if text(&c, "mode") == "tag" {
+    // Pin the observed TAG node, not the requested CLI mode: auto detection
+    // must still record the baseline photo when the machine really runs a
+    // TAG-transport client (values.proxy_mode is the observed transport).
+    if text(&c["values"], "proxy_mode") == "tag" {
         let group = c["values"]["proxy_group"].as_str().unwrap_or("");
         let node = c["values"]["node"].as_str().unwrap_or("");
         if [group, node]

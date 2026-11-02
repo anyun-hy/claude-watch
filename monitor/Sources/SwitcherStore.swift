@@ -475,6 +475,9 @@ final class SwitcherStore: ObservableObject {
     @Published var setupGuard = false { didSet { setupPlan = nil } }
     @Published var setupWatchdog = false { didSet { setupPlan = nil } }
     @Published var setupUpdater = false { didSet { setupPlan = nil } }
+    /// 代理客户端检测模式；换档即作废旧候选，避免跨模式误用。
+    @Published var detectMode = "auto" { didSet { candidate = nil; setupPlan = nil } }
+    static let detectModes = ["auto", "tag", "clash-verge", "shadowrocket", "sing-box", "clashx", "surge"]
     @Published var diagnosticProxy = "http://127.0.0.1:7890"
     @Published private(set) var diagnostic: ProxyDiagnosticReceipt?
     @Published private(set) var diagnosticError = ""
@@ -1091,9 +1094,10 @@ final class SwitcherStore: ObservableObject {
         guard !busy, !hasUnsavedSettings else { return }
         busy = true; candidate = nil; setupPlan = nil
         defer { busy = false }
+        let mode = Self.detectModes.contains(detectMode) ? detectMode : "auto"
         do {
             let data = isFixture ? Self.fixtureCandidate(settings: savedSettings) : try await Task.detached {
-                try SwitcherCommandRunner.run(["setup", "detect", "--online", "--mode", "auto"])
+                try SwitcherCommandRunner.run(["setup", "detect", "--online", "--mode", mode])
             }.value
             try checkedSetupResult(data)
             candidate = try JSONDecoder().decode(EnvironmentCandidate.self, from: data)

@@ -368,6 +368,58 @@ fn candidate_plan_is_expiring_and_context_bound_without_system_commands() {
 }
 
 #[test]
+fn auto_detection_still_pins_node_when_observed_proxy_is_tag() {
+    // Requested CLI mode "auto" must not silence node pinning: the pin is
+    // bound to the observed TAG transport (values.proxy_mode), so auto
+    // detection records the baseline photo exactly like explicit "tag".
+    let (home, store) = store();
+    let zones: ZoneCatalog = serde_json::from_value(json!({"JP":["Asia/Tokyo"]})).unwrap();
+    let mut f = fake();
+    let c = onboarding::detect(&store, &f, "auto", true, &zones).unwrap();
+    let options = json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false});
+    let p = onboarding::preview(&store, &f, c["id"].as_str().unwrap(), &options, None).unwrap();
+    onboarding::apply(
+        &store,
+        &mut f,
+        c["id"].as_str().unwrap(),
+        &options,
+        p["id"].as_str().unwrap(),
+        None,
+    )
+    .unwrap();
+    let baseline = fs::read_to_string(store.paths.watch().join("state/baseline.conf")).unwrap();
+    assert!(baseline.contains("tag_group=\ntag_node=\n"));
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn non_tag_transport_never_writes_node_pin() {
+    // A non-TAG client exposes no control API: without observed tag transport
+    // the pin lines must stay absent regardless of the requested CLI mode.
+    let (home, store) = store();
+    let zones: ZoneCatalog = serde_json::from_value(json!({"JP":["Asia/Tokyo"]})).unwrap();
+    let mut f = fake();
+    f.local["mode"] = json!("clashx");
+    f.local["tag"] = json!(null);
+    let c = onboarding::detect(&store, &f, "clashx", true, &zones).unwrap();
+    let options = json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false});
+    let p = onboarding::preview(&store, &f, c["id"].as_str().unwrap(), &options, None).unwrap();
+    onboarding::apply(
+        &store,
+        &mut f,
+        c["id"].as_str().unwrap(),
+        &options,
+        p["id"].as_str().unwrap(),
+        None,
+    )
+    .unwrap();
+    let baseline = fs::read_to_string(store.paths.watch().join("state/baseline.conf")).unwrap();
+    assert!(!baseline.contains("tag_group="));
+    assert!(!baseline.contains("tag_node="));
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn tag_apply_commits_all_three_files_and_only_tag_baseline_fields() {
     let (home, store) = store();
     let zones: ZoneCatalog = serde_json::from_value(json!({"JP":["Asia/Tokyo"]})).unwrap();
