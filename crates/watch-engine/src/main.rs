@@ -8,6 +8,7 @@ mod dns_dispatch;
 mod install_dispatch;
 mod maintenance_dispatch;
 mod reference_dispatch;
+mod reinstall_dispatch;
 mod runtime;
 mod setup_dispatch;
 mod update_dispatch;
@@ -255,6 +256,10 @@ fn run() -> Result<EngineOutput> {
         }
         uid.unwrap()
     };
+    if request.command == "reinstall" {
+        let value = reinstall_dispatch::dispatch(&request, uid)?;
+        return Ok(EngineOutput::json(value.unwrap_or(serde_json::Value::Null), 0));
+    }
     runtime::require_apply(&request)?;
     let paths = Paths::new(
         home.ok_or_else(|| CoreError::new("home_unavailable", "当前用户目录不可读取"))?,

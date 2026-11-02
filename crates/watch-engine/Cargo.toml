@@ -9,6 +9,7 @@ description = "Native Rust command interface for the full Claude Watch migration
 [dependencies]
 claude-watch-core = { path = "../watch-core" }
 claude-watch-runtime = { path = "../watch-runtime" }
+claude-watch-installer = { path = "../watch-installer" }
 serde_json.workspace = true
 uuid = { version = "1", features = ["v4"] }
 

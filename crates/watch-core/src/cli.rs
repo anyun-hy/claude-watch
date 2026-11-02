@@ -82,6 +82,7 @@ impl Request {
             ),
             "update" => (&[], &["apply", "auto", "recover"], &[]),
             "app-install" => (&[], &["apply"], &["source"]),
+            "reinstall" => (&[], &["dry-run"], &["version", "build", "project"]),
             "app-uninstall" => (&[], &["apply"], &[]),
             "install" => (&[], &["apply"], &["source"]),
             "preflight" | "audit" => (&[], &["online", "require-ready", "no-report"], &["target"]),
@@ -360,5 +361,31 @@ mod cli_target_contracts {
         assert!(!request.flag("apply"));
         assert_eq!(request.child_args.len(), 2);
         assert!(!format!("{request:?}").contains("SYNTHETIC_SECRET"));
+    }
+    #[test]
+    fn reinstall_requires_the_caller_to_name_version_and_build() {
+        let request = Request::parse(
+            &[
+                "reinstall",
+                "--version",
+                "3.0.0",
+                "--build",
+                "367",
+                "--project",
+                "/Users/test/project",
+                "--dry-run",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(request.value("version").as_deref(), Some("3.0.0"));
+        assert_eq!(request.value("build").as_deref(), Some("367"));
+        assert!(request.flag("dry-run"));
+        assert!(!request.flag("apply"));
+        assert!(Request::parse(&["reinstall".to_string()]).is_ok());
+        assert!(Request::parse(
+            &["reinstall", "--version", "3.0.0", "--apply"].map(str::to_owned)
+        )
+        .is_err());
     }
 }

@@ -80,8 +80,20 @@ name = "claude-watch-engine"
 version = "0.1.0"
 dependencies = [
  "claude-watch-core",
+ "claude-watch-installer",
  "claude-watch-runtime",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "claude-watch-installer"
+version = "0.1.0"
+dependencies = [
+ "claude-watch-core",
+ "libc",
+ "serde_json",
+ "sha2 0.11.1",
  "uuid",
 ]
 

@@ -1,6 +1,6 @@
 # Claude Watch 完整重置、打包与安装流程
 
-本流程记录项目当前的协作方式：协作者核对范围，用户自行执行统一脚本完成 Claude Watch 的卸载、完整重置、打包和安装，之后再核验实际运行情况。脚本适用于此项目当前的 macOS 26 或更新系统、Apple Silicon `arm64`、Rust 候选后台；最低支持版本统一取自 `monitor/macos-minimum.txt`。每次使用前核对脚本和用户指定的目标版本。
+本流程记录项目当前的协作方式：协作者核对范围，用户自行执行统一入口 `monitor/reinstall.sh`（内部是 Rust 引擎的 `reinstall` 子命令）完成 Claude Watch 的卸载、完整重置、打包和安装，之后再核验实际运行情况。脚本适用于此项目当前的 macOS 26 或更新系统、Apple Silicon `arm64`、Rust 候选后台；最低支持版本统一取自 `monitor/macos-minimum.txt`。每次使用前核对脚本和用户指定的目标版本。
 
 流程是操作方法，不是将来操作的授权。每次按用户当次明确授权确定是否卸载、删除 Watch 数据和安装；一句明确要求“完整重置并卸载”的指令可以覆盖其中所述的清理范围，无需再逐项重复确认。提交、推送、发布以及修改 TAG 配置不包含在本流程中。
 
@@ -38,16 +38,16 @@ sudo '/Library/Application Support/ClaudeWatch/claude-watch-admin.sh' uninstall
 先正常退出 Claude。将下例的版本号和 build 号改为用户当次明确指定的值；`3.0.0 314` 仅是示例，不会自动递增。只查看计划而不修改系统时运行：
 
 ```bash
-/usr/bin/python3 /Users/anyun/Desktop/bash/monitor/reinstall_clean.py 3.0.0 314 --dry-run
+bash /Users/anyun/Desktop/bash/monitor/reinstall.sh 3.0.0 314 --dry-run
 ```
 
 确认范围后，去掉 `--dry-run` 执行完整流程：
 
 ```bash
-/usr/bin/python3 /Users/anyun/Desktop/bash/monitor/reinstall_clean.py 3.0.0 314
+bash /Users/anyun/Desktop/bash/monitor/reinstall.sh 3.0.0 314
 ```
 
-脚本会先展示现有版本与目标，要求输入 `重置并安装`，然后依次卸载、清理和核验、打包、校验、安装并打开新版。系统辅助组件存在时可能需要用户输入管理员密码。相同路径的旧构建产物不会被覆盖，编译仍可复用项目的缓存。
+脚本会先展示现有版本与目标，要求输入 `y` 确认，然后依次卸载、清理和核验、打包、校验、安装并打开新版。系统辅助组件存在时可能需要用户输入管理员密码。相同路径的旧构建产物不会被覆盖，编译仍可复用项目的缓存。
 
 脚本只支持已核对的 Rust 候选版；发现未完成事务、正在运行的更新或其他打包任务、未知辅助组件，或应用缺失但 Watch 仍有残留时会停止。流程先卸载再打包，如果打包失败旧应用已经卸载。遇到失败先保留输出并核对当前状态，不盲目重试。
 

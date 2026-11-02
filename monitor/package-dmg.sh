@@ -3,8 +3,10 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd -P)
-APP_VERSION="${APP_VERSION:-2.9.5}"
-BUILD_NUMBER="${BUILD_NUMBER:-297}"
+# Version and build number always come from the caller (the engine's reinstall
+# command or an explicit command line); no built-in default may go stale.
+: "${APP_VERSION:?Set APP_VERSION (for example 3.0.0)}"
+: "${BUILD_NUMBER:?Set BUILD_NUMBER (for example 367)}"
 APP_NAME='Claude Watch Monitor.app'
 APP="${CW_APP_OUTPUT:-$ROOT/build/Claude Watch Monitor.app}"
 DIST="$ROOT/dist"

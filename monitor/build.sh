@@ -4,8 +4,6 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd -P)
 CW_MACOS_MINIMUM=$(/bin/cat "$ROOT/macos-minimum.txt")
 REPOSITORY_ROOT=$(cd "$ROOT/.." && pwd -P)
-APP_VERSION="${APP_VERSION:-2.9.5}"
-BUILD_NUMBER="${BUILD_NUMBER:-297}"
 CW_BUILD_ARCH="${CW_BUILD_ARCH:-arm64}"
 CW_BACKEND_VARIANT="${CW_BACKEND_VARIANT:-rust-candidate}"
 BACKGROUND_EVIDENCE_SCHEMA=0
@@ -29,6 +27,10 @@ case "$APP" in
   /Applications/*) echo 'Refusing to build into an installed application path.' >&2; exit 1;;
 esac
 
+# Version and build number always come from the caller (the engine's reinstall
+# command or an explicit command line); no built-in default may go stale.
+: "${APP_VERSION:?Set APP_VERSION (for example 3.0.0)}"
+: "${BUILD_NUMBER:?Set BUILD_NUMBER (for example 367)}"
 if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   printf 'APP_VERSION must be semantic version (for example 2.2.0): %s\n' "$APP_VERSION" >&2
   exit 1
