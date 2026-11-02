@@ -20,11 +20,11 @@ struct PolicyCriterion: Identifiable {
 /// Disposition policy for one AI service.
 ///
 /// The services are deliberately not the same shape. Claude's session is
-/// supervised end to end, so it can be asked to exit; ChatGPT / Codex has no
-/// automatic exit path, so the only action it can be configured to take is a
-/// notice. That difference lives here as data: what the UI offers, what it
-/// writes and what the backend accepts all read the same declaration, so no
-/// caller can offer an action the service cannot perform.
+/// supervised end to end, so it can be forced to exit; ChatGPT / Codex is only
+/// ever asked to quit normally, so it offers close and warn but never force.
+/// That difference lives here as data: what the UI offers, what it writes and
+/// what the backend accepts all read the same declaration, so no caller can
+/// offer an action the service cannot perform.
 ///
 /// Adding a criterion or widening a service's capability is one edit in this
 /// catalog plus the matching backend family — never a second copy of the rows.
@@ -77,8 +77,8 @@ enum AIPolicyCatalog {
             .init(id: "dns", title: "DNS 递归出口偏离"),
             .init(id: "webrtc", title: "WebRTC 公网候选偏离"),
         ],
-        actions: [.warn],
-        defaultAction: "warn",
-        note: "该服务当前没有自动退出通路，因此只提供提示：检测到偏离时记录并提示，不会结束 ChatGPT / Codex 的进程。等退出动作接入后，在这里补上动作即可，Claude 的配置不受影响。"
+        actions: [.close, .warn],
+        defaultAction: "close",
+        note: "该服务支持正常关闭：桌面应用被请求退出、独立 CLI 收到 SIGTERM，默认动作即正常关闭。不提供强制结束——强制结束只用于端到端受管的 Claude 会话。"
     )
 }

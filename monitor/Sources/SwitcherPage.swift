@@ -504,6 +504,9 @@ struct SwitcherPage: View {
     /// catalog instead of one shape copied per service.
     private var protectionPolicyPanel: some View {
         VStack(alignment: .leading, spacing: 14) {
+            Text("以下两张表决定运行中的会话被怎么处置：会话建立时记录基线，任一项偏离即按所选动作处理。它不决定启动是否放行——启动门槛在页面底部的「启动要求与高级维护」。")
+                .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             ForEach(AIPolicyCatalog.services) { policy in policyCard(policy) }
         }
     }
@@ -650,6 +653,8 @@ struct SwitcherPage: View {
     }
     private var settingsPanel: some View {
         VStack(alignment: .leading, spacing: 14) {
+            Text("这一节只决定启动前哪些检查会阻止受控启动；运行中会话的处置由上面的「会话处置策略」决定，两处互不替代。")
+                .font(WatchTypography.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
             Text("代理客户端、地区、时区和网络服务使用自动识别与已确认的参考，不提供手工软件选择。以下要求继续参与启动预检。")
                 .font(WatchTypography.caption).foregroundStyle(p.secondary)
             Text("受控启动按当前实测环境独立检查；无需填写国家、时区、DNS 或出口 IP。")
