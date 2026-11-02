@@ -704,6 +704,11 @@ final class SwitcherStore: ObservableObject {
     func flag(_ key: String) -> Binding<Bool> {
         Binding(get: { self.settings[key] as? Bool ?? false }, set: { self.settings[key] = $0; self.markDraft() })
     }
+    /// Three-state action selector for the protection policy keys; the
+    /// backend defaults to "force" when the key is absent.
+    func choice(_ key: String) -> Binding<String> {
+        Binding(get: { self.settings[key] as? String ?? "force" }, set: { self.settings[key] = $0; self.markDraft() })
+    }
     func addresses(_ key: String) -> Binding<String> {
         Binding(get: { (self.settings[key] as? [String] ?? []).joined(separator: ", ") }, set: {
             self.settings[key] = $0.components(separatedBy: CharacterSet(charactersIn: ",，;； \n"))

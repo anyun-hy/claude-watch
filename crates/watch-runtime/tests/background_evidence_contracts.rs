@@ -995,8 +995,13 @@ fn collector_failure_never_refreshes_old_safe_time_and_real_dns_risk_still_block
             egress(1301.),
         )
         .unwrap();
-    assert_eq!(expired.state, "risk");
-    assert_eq!(expired.reason.unwrap().code, "evidence_expired");
+    // Stale evidence is an unknown gap, not a lock: the probes measure their
+    // own path and the egress baseline keeps guarding on its own TTL.
+    assert_eq!(expired.state, "unknown");
+    assert_eq!(
+        expired.risk_evidence.as_ref().unwrap()["reason"]["code"],
+        "risk_evidence_unavailable"
+    );
 
     let f = Fixture::new();
     f.active(1000.);

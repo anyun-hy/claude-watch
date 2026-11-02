@@ -66,6 +66,7 @@ struct Fake {
     proxy: &'static str,
     ip: &'static str,
     country: &'static str,
+    egress_age: f64,
     replace_on_open: Option<StateStore>,
     target: claude_watch_core::processes::LaunchTarget,
     root_kind: Option<claude_watch_core::processes::Kind>,
@@ -106,6 +107,7 @@ impl Default for Fake {
             proxy: "ok",
             ip: "1.1.1.1",
             country: "JP",
+            egress_age: 0.0,
             replace_on_open: None,
             target: Default::default(),
             root_kind: None,
@@ -338,7 +340,7 @@ impl DesktopSystem for Fake {
                 .unwrap()
                 .success());
         }
-        json!({"ip":self.ip,"country":self.country,"observed_at":self.now,"source":"fixture HTTP exit"})
+        json!({"ip":self.ip,"country":self.country,"observed_at":self.now - self.egress_age,"source":"fixture HTTP exit"})
     }
     fn local_guard(&mut self) -> Result<Value> {
         Ok(json!({"proxy":self.proxy,"tun":"ok"}))
@@ -1239,11 +1241,12 @@ fn failed_audit_or_incomplete_risk_never_opens_and_never_weakens_launch_gate() {
         .join("webrtc-risk-receipt.json");
     fs::remove_file(path).unwrap();
     system.ready = true;
-    assert_eq!(
-        controller.launch(&mut system).unwrap_err().code,
-        "risk_evidence_unavailable"
-    );
-    assert_eq!(system.opens, 0);
+    // Missing probe evidence no longer vetoes a launch: the probes measure
+    // their own path, the launch gate is the audit plus the egress agreement,
+    // and running drift detection handles the rest.
+    let launched = controller.launch(&mut system).unwrap();
+    assert_eq!(system.opens, 1);
+    assert_eq!(launched["status"], "ok");
 }
 #[test]
 fn launch_failure_locks_its_session_and_late_failure_cannot_close_a_new_session() {
@@ -1778,4 +1781,117 @@ fn failed_write_and_failed_stop_latch_same_session_until_retry() {
     assert_eq!(new_session["action"], "observe");
     assert_ne!(new_session["session_guard"]["state"], "locked");
     assert!(system.running);
+}
+
+#[test]
+fn a_manually_started_claude_is_adopted_into_supervision() {
+    let fixture = Fixture::new();
+    let mut system = Fake {
+        running: true,
+        ..Default::default()
+    };
+    let receipt = Controller::new(fixture.storage.clone())
+        .guard_tick(&mut system)
+        .unwrap();
+    assert_eq!(receipt["action"], "observe");
+    assert_eq!(
+        receipt["session_guard"]["reason"]["code"],
+        "session_adopted"
+    );
+    // Adoption is supervision, not a stop: the running app is left alone.
+    assert_eq!(system.closes, 0);
+    assert!(system.running);
+    let session = SessionStore::new(fixture.storage.clone())
+        .load(system.now)
+        .unwrap()
+        .expect("adopted session");
+    assert_eq!(session.state, Phase::Active);
+    assert_eq!(session.extra["adopted_from"], json!("running_desktop"));
+    assert_eq!(session.baseline.ip, "1.1.1.1");
+}
+
+#[test]
+fn adoption_refuses_an_unverified_preflight() {
+    let fixture = Fixture::new();
+    let mut system = Fake {
+        running: true,
+        ready: false,
+        ..Default::default()
+    };
+    let receipt = Controller::new(fixture.storage.clone())
+        .guard_tick(&mut system)
+        .unwrap();
+    assert_eq!(receipt["adopt_error"], "preflight_blocked");
+    // The unadopted process is not allowed to run unguarded.
+    assert_eq!(system.closes, 1);
+}
+
+#[test]
+fn an_adopted_claude_is_force_stopped_when_the_exit_changes() {
+    let fixture = Fixture::new();
+    let mut system = Fake {
+        running: true,
+        ..Default::default()
+    };
+    let controller = Controller::new(fixture.storage.clone());
+    controller.guard_tick(&mut system).unwrap();
+    system.ip = "2.2.2.2";
+    let receipt = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(
+        receipt["session_guard"]["reason"]["code"],
+        "egress_ip_changed"
+    );
+    assert_eq!(system.ip_force_calls, 1);
+    assert_eq!(system.closes, 1);
+    assert!(!system.running);
+}
+
+#[test]
+fn adoption_refuses_a_cn_exit() {
+    let fixture = Fixture::new();
+    let mut system = Fake {
+        running: true,
+        country: "CN",
+        ..Default::default()
+    };
+    let receipt = Controller::new(fixture.storage.clone())
+        .guard_tick(&mut system)
+        .unwrap();
+    // A mainland exit is never a supervision baseline, even with a clean
+    // preflight: adopting it would bless the leak this guard exists to stop.
+    assert!(receipt["adopt_error"].is_null());
+    assert_ne!(
+        receipt["session_guard"]["reason"]["code"],
+        "session_adopted"
+    );
+    assert_eq!(system.closes, 1);
+    assert!(!system.running);
+    assert!(SessionStore::new(fixture.storage.clone())
+        .load(system.now)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn adoption_refuses_a_stale_exit() {
+    let fixture = Fixture::new();
+    let mut system = Fake {
+        running: true,
+        // Older than GUARD_EGRESS_TTL, so the exit cannot anchor a session.
+        egress_age: 11.0,
+        ..Default::default()
+    };
+    let receipt = Controller::new(fixture.storage.clone())
+        .guard_tick(&mut system)
+        .unwrap();
+    assert!(receipt["adopt_error"].is_null());
+    assert_ne!(
+        receipt["session_guard"]["reason"]["code"],
+        "session_adopted"
+    );
+    assert_eq!(system.closes, 1);
+    assert!(SessionStore::new(fixture.storage.clone())
+        .load(system.now)
+        .unwrap()
+        .is_none());
 }

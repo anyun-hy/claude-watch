@@ -147,6 +147,54 @@ impl ReceiptStore {
     }
     /// The guard/launch path builds risk from persisted, context-bound receipts;
     /// callers cannot inject a bare `{state:"safe"}` value.
+    /// Raw probe receipts used to fingerprint the exit path. Unlike the
+    /// derived statuses these keep the original country and candidate lists.
+    pub fn probe_receipts(&self) -> (Value, Value) {
+        let dns = self
+            .storage
+            .read_json(
+                &self.storage.paths.base().join("dns-leak-receipt.json"),
+                json!({}),
+            )
+            .unwrap_or_else(|_| json!({}));
+        let webrtc = self
+            .storage
+            .read_json(
+                &self.storage.paths.base().join("webrtc-risk-receipt.json"),
+                json!({}),
+            )
+            .unwrap_or_else(|_| json!({}));
+        (dns, webrtc)
+    }
+    /// Running-session drift verdict against the baseline stored in the
+    /// session extra map. Absolute probe verdicts no longer close sessions;
+    /// only a change relative to the session's own baseline does.
+    pub fn probe_drift_risk(&self, extra: &Value, now: f64) -> Value {
+        let empty: Vec<String> = Vec::new();
+        let baseline_dns = extra
+            .get("baseline_dns_countries")
+            .and_then(Value::as_array)
+            .map(|v| {
+                v.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| empty.clone());
+        let baseline_webrtc = extra
+            .get("baseline_webrtc_addresses")
+            .and_then(Value::as_array)
+            .map(|v| {
+                v.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| empty.clone());
+        let (dns, webrtc) = self.probe_receipts();
+        claude_watch_core::risk::probe_drift(&baseline_dns, &baseline_webrtc, &dns, &webrtc, now)
+    }
+
     pub fn session_risk(&self, context: &str, current_ip: Option<&str>, now: f64) -> Value {
         let dns = self.dns_status(context, true, now, |v| format!("{v:.0}"));
         let webrtc = self.webrtc_status(context, now);

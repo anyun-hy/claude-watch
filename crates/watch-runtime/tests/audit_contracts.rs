@@ -198,10 +198,26 @@ fn sample_failure_is_local_and_recovery_does_not_poison_other_rows() {
     }
 }
 #[test]
-fn dns_stun_and_explicit_country_risks_cannot_be_disabled_by_optional_display_settings() {
+fn dns_and_stun_block_only_when_the_config_requires_them() {
+    // Default policy: the probes still run and stay visible as fail rows,
+    // but they no longer veto a launch.
     for id in ["dns", "stun"] {
         let mut value = case();
-        value["config"] = json!({"require_dns":false,"require_stun":false});
+        if id == "dns" {
+            value["online"]["dns"]["state"] = json!("fail");
+        } else {
+            value["online"]["stun"]["observations"][0]["address"] = json!("8.8.8.8");
+        }
+        let out = evaluate(&value);
+        assert_eq!(row(&out, id)["required"], false);
+        assert_eq!(row(&out, id)["state"], "fail");
+        assert_eq!(out["ready"], true);
+    }
+    // An explicit require_* config keeps the blocking behaviour for setups
+    // that want the probes to gate a launch.
+    for (id, key) in [("dns", "require_dns"), ("stun", "require_stun")] {
+        let mut value = case();
+        value["config"] = json!({key: true});
         if id == "dns" {
             value["online"]["dns"]["state"] = json!("fail");
         } else {
@@ -209,9 +225,9 @@ fn dns_stun_and_explicit_country_risks_cannot_be_disabled_by_optional_display_se
         }
         let out = evaluate(&value);
         assert_eq!(row(&out, id)["required"], true);
-        assert_eq!(row(&out, id)["state"], "fail");
         assert_eq!(out["ready"], false);
     }
+    // Probe sampling failures stay recorded either way.
     let mut value = case();
     value["online"]["dns"]["receipt"]["dns"]["countries"] = json!(["CN"]);
     value["local"]["context_transition"] =
@@ -450,7 +466,8 @@ fn stun_requires_a_public_accepted_response_and_preserves_mismatch_risk() {
     none["online"]["stun"]["observations"] = json!([]);
     none["online"]["stun"]["complete"] = json!(false);
     assert_eq!(row(&evaluate(&none), "stun")["state"], "unknown");
-    assert!(evaluate(&none)["blocked"]
+    // Default policy keeps the row visible without gating a launch.
+    assert!(!evaluate(&none)["blocked"]
         .as_array()
         .unwrap()
         .contains(&json!("stun")));
@@ -458,6 +475,13 @@ fn stun_requires_a_public_accepted_response_and_preserves_mismatch_risk() {
         .as_str()
         .unwrap()
         .contains("无法确认 UDP 出口"));
+    // An explicit require_stun config keeps the blocking behaviour.
+    let mut required = none.clone();
+    required["config"] = json!({"require_stun": true});
+    assert!(evaluate(&required)["blocked"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("stun")));
 
     for observation in [
         json!({"status":"timeout","address":""}),
@@ -468,7 +492,15 @@ fn stun_requires_a_public_accepted_response_and_preserves_mismatch_risk() {
         let mut unavailable = case();
         unavailable["online"]["stun"]["observations"] = json!([observation]);
         assert_eq!(row(&evaluate(&unavailable), "stun")["state"], "unknown");
-        assert!(evaluate(&unavailable)["blocked"]
+        // Default policy: visible, not blocking. With require_stun the same
+        // sample still gates a launch.
+        assert!(!evaluate(&unavailable)["blocked"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("stun")));
+        let mut gated = unavailable.clone();
+        gated["config"] = json!({"require_stun": true});
+        assert!(evaluate(&gated)["blocked"]
             .as_array()
             .unwrap()
             .contains(&json!("stun")));

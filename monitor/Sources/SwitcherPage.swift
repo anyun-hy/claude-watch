@@ -457,6 +457,37 @@ struct SwitcherPage: View {
             }
         }
     }
+    /// Per-criterion actions for a running Claude session. The backend
+    /// records a baseline at session start (HTTP exit, DNS recursive exit
+    /// countries, WebRTC public candidates) and compares each round; a drift
+    /// triggers the configured action, a missing or stale sample only warns.
+    private var protectionPolicyPanel: some View {
+        Surface(p) {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("会话处置策略", systemImage: "shield.lefthalf.filled.badge.checkmark")
+                    .font(WatchTypography.section)
+                Text("会话建立时记录当时的出口 IP、DNS 递归出口与 WebRTC 公网候选作为基线；运行中任一项偏离基线即按下表处置。探针采样缺失或过期只提示、不处置。ChatGPT / Codex 仅监控与提示，不在关闭目标内。")
+                    .font(WatchTypography.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
+                policyRow("出口 IP 变化", "claude_close_ip")
+                policyRow("出口国家为中国大陆", "claude_close_cn")
+                policyRow("DNS 递归出口偏离会话基线", "claude_close_dns")
+                policyRow("WebRTC 公网候选偏离会话基线", "claude_close_webrtc")
+            }
+        }
+    }
+    private func policyRow(_ title: String, _ key: String) -> some View {
+        HStack {
+            Text(title).font(WatchTypography.body)
+            Spacer()
+            Picker(title, selection: store.choice(key)) {
+                Text("强制关闭").tag("force")
+                Text("正常关闭").tag("close")
+                Text("仅提示").tag("warn")
+            }
+            .labelsHidden()
+            .frame(width: 128)
+        }
+    }
     private var protectionContent: some View {
         Group {
             if !store.backgroundError.isEmpty { InlineNotice(title: "后台状态读取未完成", detail: store.backgroundError, symbol: "exclamationmark.triangle", tint: p.amber, p: p) }
@@ -480,6 +511,7 @@ struct SwitcherPage: View {
             } else { Text(store.busy ? "正在读取后台…" : "尚无后台状态，请刷新。").foregroundStyle(p.secondary) }
             Text("会话保护在明确 IP 变化、中国出口、DNS/WebRTC 风险或会话缺失时请求退出 Claude；它是进程级策略，存在采样窗口，不是防火墙，也不保证账号状态。")
                 .font(WatchTypography.caption).foregroundStyle(p.secondary)
+            protectionPolicyPanel
             recoveryPanel
             Surface(p) {
                 DisclosureGroup("启动要求与高级维护", isExpanded: $showSettings) { settingsPanel.padding(.top, 14) }
@@ -566,10 +598,12 @@ struct SwitcherPage: View {
                 .font(WatchTypography.small).foregroundStyle(p.secondary)
             Toggle("启动前要求 IPv6 已关闭", isOn: store.flag("require_ipv6_off"))
             Toggle("启动前要求 Claude 使用英文", isOn: store.flag("require_english"))
-            Label("DNS 与 UDP/STUN：始终检查，未知或不匹配均阻止受控启动", systemImage: "lock.shield")
+            Label("DNS 与 UDP/STUN 探针", systemImage: "lock.shield")
                 .font(WatchTypography.bodyStrong).foregroundStyle(p.text)
-            Text("DNS 泄漏检测自动比较同轮 DNS 递归出口与公网出口的国家；同国通过，异国为泄漏风险，缺少国家或过期结果阻止受控启动。")
+            Text("两项检测始终运行并在面板显示结果。它们测量的是探针自身的 UDP/DNS 路径，不代表 Claude 的实际连接；默认只提示、不阻止受控启动。勾选后对应探针失败将阻止受控启动。运行中的会话由「会话处置策略」按出口变化处置，与这里的开关无关。")
                 .font(WatchTypography.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
+            Toggle("启动前要求 DNS 递归出口无泄漏", isOn: store.flag("require_dns"))
+            Toggle("启动前要求 UDP/STUN 出口一致", isOn: store.flag("require_stun"))
             ForEach(store.policyWarnings, id: \.self) { Text($0).font(WatchTypography.caption).foregroundStyle(p.amber) }
             Toggle("启动前要求代理规则覆盖通过", isOn: store.flag("require_pinned_rules"))
             DisclosureGroup("发布源与工具维护", isExpanded: $showSource) {

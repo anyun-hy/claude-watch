@@ -689,7 +689,12 @@ def apply_risk_rows(rows, automatic):
     for risk in automatic.get("risks", []):
         key = {"dns": "dns", "asn": "asn", "webrtc": "guard"}.get(risk.get("source"), "egress")
         if key in by_id:
-            by_id[key].update(state="fail", required=True, detail=risk["reason"])
+            # The dns row's required flag is owned by the require_dns config;
+            # absolute DNS verdicts stay visible as fail without gating.
+            if key == "dns":
+                by_id[key].update(state="fail", detail=risk["reason"])
+            else:
+                by_id[key].update(state="fail", required=True, detail=risk["reason"])
 
 
 def evaluate(config, local, online, history=(), now=None):
@@ -739,11 +744,11 @@ def evaluate(config, local, online, history=(), now=None):
     dns_state = dns.get("state") if isinstance(dns, dict) else "unknown"
     if dns_state not in ("ok", "fail", "unknown"):
         dns_state = "unknown"
-    # DNS remains mandatory for controlled launches.  The state comes solely
+    # DNS blocking is now configurable (require_dns).  The state comes solely
     # from the stored IPLeak DNS-leak receipt, not from a resolver allow
     # list or a new dig request made by this preflight.
     add("dns", dns_state, (dns.get("detail") if isinstance(dns, dict) else "") or "DNS 泄漏检测尚未完成",
-        required=True, scope="IPLeak.net DNS 泄漏采样；不代表所有应用或浏览器 DoH")
+        required=config["require_dns"], scope="IPLeak.net DNS 泄漏采样；不代表所有应用或浏览器 DoH")
     stun = online.get("stun", {})
     observations = stun.get("observations", []) if isinstance(stun, dict) else []
     observations = observations if isinstance(observations, list) else []
@@ -756,7 +761,7 @@ def evaluate(config, local, online, history=(), now=None):
     stun_state = ("unknown" if not reference else
                   ("fail" if not observed_candidates <= reference else "unknown" if not candidates else "ok"))
     stun_detail, stun_sampled_at, stun_observations = stun_presentation(stun, candidates, reference)
-    add("stun", stun_state, stun_detail, required=True,
+    add("stun", stun_state, stun_detail, required=config["require_stun"],
         scope="原生 UDP/STUN 探针，用于 AI 受控启动网络检查；不等于 Claude 实际 socket 或 WebRTC")
     rows[-1]["sampled_at"] = stun_sampled_at
     rows[-1]["stun_finished_at"] = stun_sampled_at

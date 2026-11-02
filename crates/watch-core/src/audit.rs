@@ -199,8 +199,12 @@ pub fn apply_risks(rows: &mut [Value], facts: &Value) {
         };
         if let Some(row) = rows.iter_mut().find(|v| v["id"] == id) {
             row["state"] = json!("fail");
-            row["required"] = json!(true);
             row["detail"] = risk["reason"].clone();
+            // The dns row's required flag is owned by the require_dns config:
+            // an absolute probe verdict stays visible as fail without gating.
+            if id != "dns" {
+                row["required"] = json!(true);
+            }
         }
     }
 }
@@ -401,7 +405,7 @@ pub fn evaluate_target(
         } else {
             text(dns, "detail")
         },
-        true,
+        config.require_dns,
         "IPLeak.net DNS 泄漏采样；不代表所有应用或浏览器 DoH",
     ));
     let stun = &online["stun"];
@@ -441,7 +445,7 @@ pub fn evaluate_target(
         "stun",
         state,
         detail,
-        true,
+        config.require_stun,
         "原生 UDP/STUN 探针，用于 AI 受控启动网络检查；不等于 Claude 实际 socket 或 WebRTC",
     );
     stun_row["sampled_at"] = json!(sampled);

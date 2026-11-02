@@ -32,6 +32,12 @@ pub struct Config {
     pub expected_resolvers: Vec<String>,
     /// Legacy prelaunch history policy. It never permits changing a running session's IP.
     pub allow_ip_change: bool,
+    /// Per-criterion action for a running Claude session: force | close | warn.
+    /// Empty or unknown values fall back to the documented default (force).
+    pub claude_close_ip: String,
+    pub claude_close_cn: String,
+    pub claude_close_dns: String,
+    pub claude_close_webrtc: String,
     pub update_url: String,
     pub update_public_key: String,
     pub verified_claude_versions: Vec<String>,
@@ -51,8 +57,8 @@ impl Default for Config {
             online_enabled: true,
             require_ipv6_off: true,
             require_english: true,
-            require_stun: true,
-            require_dns: true,
+            require_stun: false,
+            require_dns: false,
             require_pinned_rules: false,
             guard_enabled: false,
             timezone_watchdog: false,
@@ -62,6 +68,10 @@ impl Default for Config {
             expected_egress: Vec::new(),
             expected_resolvers: Vec::new(),
             allow_ip_change: true,
+            claude_close_ip: "force".into(),
+            claude_close_cn: "force".into(),
+            claude_close_dns: "force".into(),
+            claude_close_webrtc: "force".into(),
             update_url: String::new(),
             update_public_key: String::new(),
             verified_claude_versions: Vec::new(),
@@ -168,6 +178,16 @@ impl Config {
         }
         if !result.proxy_url.is_empty() && !valid_loopback_proxy(&result.proxy_url) {
             return Err(invalid("诊断代理必须为数字回环 HTTP 入口"));
+        }
+        for (key, value) in [
+            ("claude_close_ip", &result.claude_close_ip),
+            ("claude_close_cn", &result.claude_close_cn),
+            ("claude_close_dns", &result.claude_close_dns),
+            ("claude_close_webrtc", &result.claude_close_webrtc),
+        ] {
+            if !matches!(value.as_str(), "force" | "close" | "warn") {
+                return Err(invalid(&format!("{key} 必须为 force、close 或 warn")));
+            }
         }
         Ok(result)
     }
@@ -336,6 +356,38 @@ mod tests {
             "https://example.test/\npath",
         ] {
             assert!(!valid_https(bad), "{bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod protection_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn probe_blocking_defaults_to_off_and_policy_defaults_to_force() {
+        let config = Config::from_value(json!({})).unwrap();
+        assert!(!config.require_dns && !config.require_stun);
+        assert_eq!(config.claude_close_ip, "force");
+        assert_eq!(config.claude_close_cn, "force");
+        assert_eq!(config.claude_close_dns, "force");
+        assert_eq!(config.claude_close_webrtc, "force");
+    }
+    #[test]
+    fn close_actions_accept_only_the_three_documented_values() {
+        let warn = Config::from_value(json!({
+            "claude_close_ip":"warn","claude_close_cn":"close",
+            "claude_close_dns":"warn","claude_close_webrtc":"close"
+        }))
+        .unwrap();
+        assert_eq!(warn.claude_close_ip, "warn");
+        assert_eq!(warn.claude_close_cn, "close");
+        for bad in [
+            json!({"claude_close_ip":"kill"}),
+            json!({"claude_close_dns":"FORCE"}),
+            json!({"claude_close_webrtc":true}),
+        ] {
+            assert_eq!(Config::from_value(bad).unwrap_err().code, "invalid_config");
         }
     }
 }

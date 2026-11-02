@@ -302,15 +302,12 @@ pub fn verify_launch(
             "完整校验与启动前快速出口不一致，未建立会话",
         ));
     }
+    // Leak evidence is recorded for the session baseline and later drift
+    // comparison, but it no longer vetoes the launch: the probe measures its
+    // own UDP/DNS path, not Claude's, and a missing sample must not keep the
+    // desktop unguarded. Running-session drift is owned by the configured
+    // per-criterion actions.
     let initial_risk = risk(initial_risk, now);
-    if initial_risk.get("state").and_then(Value::as_str) != Some("safe")
-        || !risk_fresh(&initial_risk, now)
-    {
-        return Err(CoreError::new(
-            "risk_evidence_unavailable",
-            "启动前 DNS/WebRTC 风险证据未完整通过",
-        ));
-    }
     if current.country == "CN" {
         return Err(CoreError::new("egress_country_cn", "启动时检测到 CN 出口"));
     }
@@ -627,20 +624,15 @@ pub fn check(session: &Session, input: &CheckInput) -> Outcome {
         session.risk_evidence = evidence.clone();
     }
     if !risk_fresh(&session.risk_evidence, now) {
-        let baseline = session.baseline.clone();
-        let value = lock(
-            session,
+        // Stale probe evidence no longer locks the session: the probes measure
+        // their own UDP/DNS path, drift comparison owns freshness, and the
+        // egress baseline check above keeps running on its own TTL. The stale
+        // sample is recorded as unknown so the UI can show the gap.
+        session.risk_evidence = json!({"state":"unknown","reason":Reason::new(
             "evidence_expired",
             "DNS/WebRTC 有效风险证据已超过 300 秒或时间无效",
             now,
-            Some(current.clone()),
-            Some(evidence.clone()),
-        );
-        let mut out = Outcome::session("risk", value.clone(), value.reason.clone());
-        out.baseline = Some(baseline);
-        out.current = Some(current);
-        out.risk_evidence = Some(evidence);
-        return out;
+        )});
     }
     let safe = evidence.get("state").and_then(Value::as_str) == Some("safe");
     session.unknown_count = 0;

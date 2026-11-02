@@ -228,3 +228,108 @@ pub fn session_risk(input: &SessionRiskInput<'_>) -> Value {
     }
     json!({"state":"unknown","observed_at":observed,"sources":sources,"reason":{"code":"risk_evidence_unavailable","detail":"DNS/WebRTC 当前有效证据尚未齐全","source":"自动检测","observed_at":now}})
 }
+
+/// Probe exit fingerprint used for session drift detection. The DNS side
+/// compares by the country set of recursive exits (recursive servers rotate
+/// individual addresses inside one country without changing the exit path),
+/// the WebRTC side by the public srflx candidate address set. Both sets are
+/// sorted; an empty set means "no usable observation", never "no change".
+pub fn probe_fingerprint(
+    dns_receipt: &Value,
+    webrtc_receipt: &Value,
+) -> (Vec<String>, Vec<String>) {
+    let mut dns: Vec<String> = dns_receipt
+        .pointer("/dns/countries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|v| v.len() == 2 && v.bytes().all(|c| c.is_ascii_uppercase()))
+        .map(str::to_owned)
+        .collect();
+    dns.sort();
+    dns.dedup();
+    let mut rtc: Vec<String> = webrtc_receipt
+        .get("observations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|v| text(v, "kind") == Some("srflx"))
+        .filter_map(|v| v.get("address").and_then(Value::as_str))
+        .filter(|v| public_unicast(v).is_some())
+        .map(str::to_owned)
+        .collect();
+    rtc.sort();
+    rtc.dedup();
+    (dns, rtc)
+}
+
+fn probe_fresh(receipt: &Value, time_key: &str, now: f64) -> bool {
+    receipt
+        .get(time_key)
+        .and_then(Value::as_f64)
+        .is_some_and(|v| v.is_finite() && (0.0..=300.0).contains(&(now - v)))
+}
+
+/// Compare the running probe receipts against the session baseline. Returns
+/// the drift code only when both sides are usable: an absent baseline, a
+/// missing sample or a stale one is reported as unknown and must never close
+/// a session by itself.
+pub fn probe_drift(
+    baseline_dns: &[String],
+    baseline_webrtc: &[String],
+    dns_receipt: &Value,
+    webrtc_receipt: &Value,
+    now: f64,
+) -> Value {
+    let dns_ready = probe_fresh(dns_receipt, "finished_at", now);
+    let rtc_ready = probe_fresh(webrtc_receipt, "sampled_at", now);
+    let (current_dns, current_rtc) = probe_fingerprint(dns_receipt, webrtc_receipt);
+    let sources = json!({
+        "dns": {"observed": dns_ready, "countries": current_dns},
+        "webrtc": {"observed": rtc_ready, "addresses": current_rtc},
+    });
+    if !dns_ready || !rtc_ready {
+        return json!({"state":"unknown","observed_at":now,"sources":sources,"reason":Reason::new(
+            "risk_evidence_unavailable",
+            "DNS/WebRTC 探针样本缺失或已过期，暂不比较会话基线",
+            now,
+        )});
+    }
+    // A fresh sample with zero usable observations proves nothing either way:
+    // it cannot confirm the baseline, and it cannot confirm drift.
+    if current_dns.is_empty() || current_rtc.is_empty() {
+        return json!({"state":"unknown","observed_at":now,"sources":sources,"reason":Reason::new(
+            "probe_sample_empty",
+            "本轮探针未取得可用观测，暂不比较会话基线",
+            now,
+        )});
+    }
+    if baseline_dns.is_empty() || baseline_webrtc.is_empty() {
+        return json!({"state":"unknown","observed_at":now,"sources":sources,"reason":Reason::new(
+            "risk_baseline_missing",
+            "会话建立时缺少探针基线，无法比较漂移",
+            now,
+        )});
+    }
+    let dns_changed = baseline_dns != current_dns.as_slice();
+    let rtc_changed = baseline_webrtc != current_rtc.as_slice();
+    let (code, detail) = match (dns_changed, rtc_changed) {
+        (true, true) => (
+            "dns_and_webrtc_egress_changed",
+            "运行中 DNS 递归出口与 WebRTC 公网候选均偏离会话基线",
+        ),
+        (true, false) => (
+            "dns_egress_changed",
+            "运行中 DNS 递归出口国家集合偏离会话基线",
+        ),
+        (false, true) => (
+            "webrtc_egress_changed",
+            "运行中 WebRTC 公网候选偏离会话基线",
+        ),
+        (false, false) => {
+            return json!({"state":"safe","observed_at":now,"sources":sources});
+        }
+    };
+    json!({"state":"risk","observed_at":now,"reason":Reason::new(code, detail, now),"sources":sources})
+}

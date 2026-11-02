@@ -72,7 +72,21 @@ impl SessionStore {
             .ok_or_else(|| CoreError::new("egress_unconfirmed", "审计回执缺少当前网络上下文"))?;
         let current_ip = current.get("ip").and_then(Value::as_str);
         let risk = receipts.session_risk(context, current_ip, now);
-        self.begin(audit, current, &risk, now)
+        let mut session = self.begin(audit, current, &risk, now)?;
+        // Anchor the probe baseline to this session: later drift comparison
+        // judges change relative to what this session actually started with,
+        // not relative to an absolute verdict.
+        let (dns, webrtc) = receipts.probe_receipts();
+        let (dns_countries, rtc_addresses) =
+            claude_watch_core::risk::probe_fingerprint(&dns, &webrtc);
+        session
+            .extra
+            .insert("baseline_dns_countries".into(), json!(dns_countries));
+        session
+            .extra
+            .insert("baseline_webrtc_addresses".into(), json!(rtc_addresses));
+        self.save(&session)?;
+        Ok(session)
     }
     pub fn bind_launcher(&self, id: &str, launcher: Launcher, now: f64) -> Result<Session> {
         if launcher.pid <= 1 || launcher.start.is_empty() || launcher.start.len() > 80 {
@@ -104,6 +118,21 @@ impl SessionStore {
         value.state = Phase::Active;
         value.bound_at = Some(now);
         value.desktop = Some(desktop);
+        self.save(&value)?;
+        Ok(value)
+    }
+    /// A session adopted from an already-running Claude keeps its origin, so
+    /// later diagnostics and the UI can tell it apart from a controlled
+    /// launch without weakening any check.
+    pub fn mark_adopted(&self, id: &str, now: f64) -> Result<Session> {
+        let _lock = self.storage.lock("session-guard", None)?;
+        let mut value = self
+            .load(now)?
+            .filter(|v| v.session_id == id)
+            .ok_or_else(|| CoreError::new("session_changed", "会话已变化，未写入采纳来源"))?;
+        value
+            .extra
+            .insert("adopted_from".into(), json!("running_desktop"));
         self.save(&value)?;
         Ok(value)
     }
@@ -455,11 +484,16 @@ impl SessionStore {
         let risk = if immediate {
             json!({"state":"unknown"})
         } else {
-            let context = current
-                .as_ref()
-                .map(|s| s.context_id.as_str())
-                .unwrap_or_default();
-            receipts.session_risk(context, egress.get("ip").and_then(Value::as_str), now)
+            match current.as_ref() {
+                // Running supervision compares probe exits against this
+                // session's own baseline. The absolute probe verdict is a
+                // display fact, not a close trigger.
+                Some(session) => receipts.probe_drift_risk(
+                    &serde_json::to_value(&session.extra).unwrap_or_else(|_| serde_json::json!({})),
+                    now,
+                ),
+                None => json!({"state":"unknown"}),
+            }
         };
         self.apply_check_locked(
             id,

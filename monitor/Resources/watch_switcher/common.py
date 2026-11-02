@@ -36,10 +36,12 @@ DEFAULT_CONFIG = {
     "schema": SCHEMA, "enabled": True, "proxy_mode": "auto", "proxy_group": "", "proxy_url": "",
     "country": "", "timezone": "", "locale": "", "network_service": "Wi-Fi",
     "online_enabled": True, "require_ipv6_off": True, "require_english": True,
-    "require_stun": True, "require_dns": True, "require_pinned_rules": False,
+    "require_stun": False, "require_dns": False, "require_pinned_rules": False,
     "guard_enabled": False, "timezone_watchdog": False, "auto_update": False,
     "auto_check_on_open": True, "return_to_overview_after_launch": False,
     "expected_egress": [], "expected_resolvers": [], "allow_ip_change": True,
+    "claude_close_ip": "force", "claude_close_cn": "force",
+    "claude_close_dns": "force", "claude_close_webrtc": "force",
     "update_url": "", "update_public_key": "", "verified_claude_versions": [],
 }
 
@@ -182,6 +184,9 @@ def validate_config(value):
         raise SwitcherError("invalid_config", "无效时区")
     if result["locale"] and not re.fullmatch(r"[a-z]{2,3}_[A-Z]{2}(?:@[-a-zA-Z0-9_=;]+)?", result["locale"]):
         raise SwitcherError("invalid_config", "无效地区格式")
+    for key in ("claude_close_ip", "claude_close_cn", "claude_close_dns", "claude_close_webrtc"):
+        if result[key] not in ("force", "close", "warn"):
+            raise SwitcherError("invalid_config", key + " 必须为 force、close 或 warn")
     for key in ("proxy_group", "network_service"):
         if any(c in result[key] for c in "\n\r\x00") or len(result[key]) > 256:
             raise SwitcherError("invalid_config", "代理组或网络服务名称无效")

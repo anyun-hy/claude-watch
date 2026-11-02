@@ -237,31 +237,28 @@ fn launch_requires_current_audit_risk_and_egress() {
             .code,
         "egress_changed"
     );
-    assert_eq!(
-        store
-            .begin(
-                &audit(now),
-                &egress("1.1.1.1", "JP", now),
-                &json!({"state":"unknown"}),
-                now
-            )
-            .unwrap_err()
-            .code,
-        "risk_evidence_unavailable"
-    );
-    assert_eq!(
-        store
-            .begin(
-                &audit(now),
-                &egress("1.1.1.1", "JP", now),
-                &risk(5000.0),
-                now
-            )
-            .unwrap_err()
-            .code,
-        "risk_evidence_unavailable"
-    );
-    assert!(store.load(now).unwrap().is_none());
+    // Leak evidence no longer vetoes a launch: an unknown or stale probe
+    // sample is recorded with the session, and drift comparison judges it
+    // while the session runs. Only the audit, the egress agreement and the
+    // CN check still block a launch.
+    let unknown = store
+        .begin(
+            &audit(now),
+            &egress("1.1.1.1", "JP", now),
+            &json!({"state":"unknown"}),
+            now,
+        )
+        .unwrap();
+    assert_eq!(unknown.risk_evidence.get("state"), Some(&json!("unknown")));
+    let stale = store
+        .begin(
+            &audit(now),
+            &egress("1.1.1.1", "JP", now),
+            &risk(5000.0),
+            now,
+        )
+        .unwrap();
+    assert_eq!(stale.state, Phase::Pending);
     let mut cn = audit(now);
     cn["egress_reference"]["country"] = "CN".into();
     assert_eq!(
@@ -270,6 +267,12 @@ fn launch_requires_current_audit_risk_and_egress() {
             .unwrap_err()
             .code,
         "egress_country_cn"
+    );
+    // The refused CN launch must not replace or clear the session that the
+    // stale-evidence launch legitimately created.
+    assert_eq!(
+        store.load(now).unwrap().unwrap().session_id,
+        stale.session_id
     );
 }
 
@@ -444,17 +447,16 @@ fn unknown_risk_never_renews_safe_evidence_and_invalid_time_expires() {
         store.load(1010.0).unwrap().unwrap().risk_evidence,
         value.risk_evidence
     );
+    // Stale evidence is recorded as an unknown gap, it no longer locks the
+    // session: the probe measures its own path and the egress baseline check
+    // above keeps guarding on its own TTL.
     probe.now = 1301.0;
     probe.egress = egress("1.1.1.1", "JP", 1301.0);
-    assert_eq!(
-        store
-            .apply_check(Some(&value.session_id), &probe)
-            .unwrap()
-            .reason
-            .unwrap()
-            .code,
-        "evidence_expired"
-    );
+    let stale = store.apply_check(Some(&value.session_id), &probe).unwrap();
+    assert_eq!(stale.state, "unknown");
+    let stored = stale.session.unwrap();
+    assert_eq!(stored.state, Phase::Active);
+    assert_eq!(stored.risk_evidence["reason"]["code"], "evidence_expired");
     for invalid in [json!("NaN"), json!(5000), Value::Null] {
         let mut value = active(&store, 1000.0);
         value.risk_evidence["observed_at"] = invalid;
@@ -467,13 +469,10 @@ fn unknown_risk_never_renews_safe_evidence_and_invalid_time_expires() {
             .unwrap();
         let mut probe = input(1001.0);
         probe.risk = json!({"state":"unknown"});
+        let stale = store.apply_check(Some(&value.session_id), &probe).unwrap();
+        assert_eq!(stale.state, "unknown");
         assert_eq!(
-            store
-                .apply_check(Some(&value.session_id), &probe)
-                .unwrap()
-                .reason
-                .unwrap()
-                .code,
+            stale.session.unwrap().risk_evidence["reason"]["code"],
             "evidence_expired"
         );
     }
