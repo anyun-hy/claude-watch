@@ -1,10 +1,12 @@
 import AppKit
 
 /// Menu-bar presence for the monitor. The app keeps running with no visible
-/// window; the status item toggles the main window, and close/miniaturize
-/// collapse into the menu bar instead of the Dock or quitting. Windows that
-/// state restoration resurrects already miniaturized (the phantom blank Dock
-/// thumbnails attached to unrelated screens) are collapsed on adoption.
+/// window; the status item toggles the main window and close collapses into
+/// the menu bar instead of quitting. Minimize keeps the native macOS Dock
+/// thumbnail (a real window snapshot), like other Dock+menu-bar apps
+/// (Docker Desktop, 1Password). Windows that state restoration resurrects
+/// already miniaturized (the phantom blank Dock thumbnails attached to
+/// unrelated screens) are collapsed on adoption.
 final class StatusBarController: NSObject, NSWindowDelegate {
     private let item: NSStatusItem
     private var quitting = false
@@ -41,7 +43,7 @@ final class StatusBarController: NSObject, NSWindowDelegate {
     }
 
     static func mainWindowVisible() -> Bool {
-        NSApp.windows.contains { Self.isMainWindow($0) && $0.isVisible }
+        NSApp.windows.contains { Self.isMainWindow($0) && $0.isVisible && !$0.isMiniaturized }
     }
 
     @objc private func handleWindowKey(_ note: Notification) {
@@ -54,17 +56,13 @@ final class StatusBarController: NSObject, NSWindowDelegate {
     }
 
     /// Take over the window delegate so close can be folded into the menu
-    /// bar, and repoint the traffic-light minimize button at the same
-    /// collapse (NSWindowDelegate has no veto for miniaturize). SwiftUI
-    /// assigns its delegate once at window creation, so re-asserting on
-    /// each did-become-key is safe.
+    /// bar. The yellow minimize button keeps its native behavior (a real
+    /// Dock thumbnail); the tray can always deminiaturize and recall it.
+    /// SwiftUI assigns its delegate once at window creation, so
+    /// re-asserting on each did-become-key is safe.
     private func adopt(_ window: NSWindow) {
         guard Self.isMainWindow(window) else { return }
         window.delegate = self
-        if let miniaturizeButton = window.standardWindowButton(.miniaturizeButton) {
-            miniaturizeButton.target = self
-            miniaturizeButton.action = #selector(collapseToTray(_:))
-        }
         if window.isMiniaturized {
             // A window restored in miniaturized state shows up as a blank
             // phantom thumbnail on whatever screen owns the Dock. Collapse
@@ -112,7 +110,7 @@ final class StatusBarController: NSObject, NSWindowDelegate {
     }
 
     @objc func hideMainWindow() {
-        for window in NSApp.windows where Self.isMainWindow(window) {
+        for window in NSApp.windows where Self.isMainWindow(window) && !window.isMiniaturized {
             window.orderOut(nil)
         }
     }
@@ -126,17 +124,7 @@ final class StatusBarController: NSObject, NSWindowDelegate {
         quitting = true
     }
 
-    // MARK: NSWindowDelegate and traffic-light actions — close and minimize
-    // both collapse to the menu bar
-
-    /// The repointed yellow button: collapse its window into the tray.
-    @objc private func collapseToTray(_ sender: Any?) {
-        if let button = sender as? NSButton, let window = button.window, Self.isMainWindow(window) {
-            window.orderOut(nil)
-        } else {
-            hideMainWindow()
-        }
-    }
+    // MARK: NSWindowDelegate — close collapses to the menu bar
 
     func windowShouldClose(_ window: NSWindow) -> Bool {
         guard Self.isMainWindow(window), !quitting else { return true }
