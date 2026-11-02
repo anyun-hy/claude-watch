@@ -798,6 +798,25 @@ impl Controller {
                 receipt["session_id"] = json!(id);
                 receipt["session_guard"] =
                     session::status(current.as_ref().unwrap(), system.now(), Some(true));
+                // A warn-configured criterion keeps notifying without closing,
+                // including every round after the session latched to Locked.
+                // Codes without a warn tier (notably persistence failures)
+                // keep the configured close/force behavior below.
+                let code = current
+                    .as_ref()
+                    .and_then(|s| s.reason.as_ref())
+                    .map(|r| r.code.clone())
+                    .unwrap_or_default();
+                if self.close_action(&code) == "warn" {
+                    receipt["session_notice"] = json!({
+                        "code": code,
+                        "detail": current.as_ref().and_then(|s| s.reason.as_ref()).map(|r| r.detail.clone()),
+                        "action": "warn",
+                    });
+                    receipt["action"] = json!("observe");
+                    receipt["stop_state"] = json!("skipped_warn_only");
+                    return Ok(());
+                }
                 match sessions.close_if_current(id.as_deref(), system.now(), || {
                     self.timed_guard_quit(system, &mut receipt)
                 }) {
@@ -932,8 +951,11 @@ impl Controller {
                     .map(|r| r.code.clone())
                     .unwrap_or_default();
                 // A warn-configured criterion reports but never closes: the
-                // session stays active and the next round re-evaluates.
-                if outcome.state == "risk" && self.close_action(&code) == "warn" {
+                // session stays active and the next round re-evaluates. The
+                // risk round latches the session to Locked, so later rounds
+                // arrive as "locked" with the same reason; warn must cover
+                // those too, or it would degrade into a delayed close.
+                if self.close_action(&code) == "warn" {
                     receipt["session_notice"] = json!({
                         "code": code,
                         "detail": outcome.reason.as_ref().map(|r| r.detail.clone()),

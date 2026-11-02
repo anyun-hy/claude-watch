@@ -1951,6 +1951,34 @@ fn warn_configured_probe_drift_notifies_without_closing() {
 }
 
 #[test]
+fn warn_configured_drift_never_closes_on_later_locked_rounds() {
+    // Regression: the first risk round latches the session to Locked, so the
+    // next guard tick reports state "locked". Warn must intercept that state
+    // too; before the fix the second tick closed the desktop despite warn.
+    let fixture = Fixture::new();
+    policy_config(&fixture, "warn", "force");
+    let mut system = Fake {
+        running: true,
+        ..Default::default()
+    };
+    let controller = Controller::new(fixture.storage.clone());
+    controller.guard_tick(&mut system).unwrap();
+    drifted_receipts(&fixture, system.now + 1.0, "US", "1.1.1.1");
+    system.now += 2.0;
+    let first = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(first["stop_state"], "skipped_warn_only");
+    system.now += 2.0;
+    let second = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(second["session_guard"]["state"], "locked");
+    assert_eq!(second["session_notice"]["code"], "dns_egress_changed");
+    assert_eq!(second["action"], "observe");
+    assert_eq!(second["stop_state"], "skipped_warn_only");
+    assert_eq!(system.closes, 0);
+    assert_eq!(system.ip_force_calls, 0);
+    assert!(system.running);
+}
+
+#[test]
 fn combined_probe_drift_forces_by_default_and_never_softens() {
     // Regression: the combined dns+webrtc code must inherit the stricter of
     // the two configured actions. Before the fix it fell through to a plain
