@@ -113,11 +113,22 @@ fn present_rows(audit: &Value) -> Vec<Value> {
             "proxy" => {
                 let entry = &local["tag"]["entry"];
                 let endpoint = text(entry, "endpoint");
-                let current = if text(entry, "state") == "verified" && !endpoint.is_empty() {
+                let mut current = if text(entry, "state") == "verified" && !endpoint.is_empty() {
                     format!("{} · {endpoint}", text(local, "mode"))
                 } else {
                     text(local, "mode")
                 };
+                // The controller reports the live node selection; append it so
+                // the card matches the Python reference's "当前选择 <node>".
+                let api = &local["tag"]["api"];
+                let node = if text(api, "mode") == "global" {
+                    text(api, "global_node")
+                } else {
+                    text(api, "selected_node")
+                };
+                if !node.is_empty() {
+                    current = format!("{current}；当前选择 {node}");
+                }
                 (
                     current,
                     "运行进程与监听者身份".into(),
@@ -169,20 +180,54 @@ fn present_rows(audit: &Value) -> Vec<Value> {
                     text(&audit["display_facts"]["network"], "service")
                 ),
             ),
-            "dns" => (
-                text(&online["dns"], "current"),
-                "同轮 HTTP 出口国家".into(),
-                "IPLeak.net 权威 DNS 记录 + 同轮 HTTP 参考".into(),
-            ),
-            "stun" => (
-                "".into(),
-                if address.is_empty() {
-                    "本轮 HTTP 出口未确认".into()
-                } else {
-                    address.clone()
-                },
-                "原生 UDP/STUN 逐台探针".into(),
-            ),
+            "dns" => {
+                // `dns_row` already renders the authoritative card: resolver
+                // exits, countries, http reference, sample time and the cached
+                // fallback banner.  Prefer it over a bare `current` lookup that
+                // reads a field the status value never carried.
+                let rendered = claude_watch_core::receipts::dns_row(&online["dns"]);
+                (
+                    text(&rendered, "current"),
+                    text(&rendered, "reference"),
+                    text(&rendered, "source"),
+                )
+            }
+            "stun" => {
+                // The audit already computed the accepted public candidates and
+                // the per-server detail.  Surface the candidate set as the card
+                // current and keep the probe's own detail intact, rather than
+                // blanking the row the way the old display path did.
+                let candidates: Vec<String> = value["stun_probe"]["observations"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|v| {
+                        v["status"] == "ok"
+                            && v["accepted"] != false
+                            && v["deadline_exceeded"] != true
+                    })
+                    .filter_map(|v| {
+                        v["address"]
+                            .as_str()
+                            .and_then(claude_watch_core::network::public_unicast)
+                    })
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                (
+                    if candidates.is_empty() {
+                        "未取得公网 UDP 候选".into()
+                    } else {
+                        candidates.join("、")
+                    },
+                    if address.is_empty() {
+                        "本轮 HTTP 出口未确认".into()
+                    } else {
+                        address.clone()
+                    },
+                    "原生 UDP/STUN 逐台探针；用于 AI 受控启动网络检查，不等于 Claude 实际 socket 或 WebRTC".into(),
+                )
+            }
             "guard" => (
                 match text(local, "guard_state").as_str() {
                     "disabled" => "保护未启用".into(),
@@ -231,6 +276,7 @@ fn present_rows(audit: &Value) -> Vec<Value> {
             ),
             "reachability" => {
                 let homepage = &value["service_responses"]["claude"];
+                let api_response = &value["service_responses"]["api"];
                 let (state, _, _) =
                     presentation::service_response("claude", homepage, &Value::Null);
                 let current = if homepage["source"] == "https://claude.ai/"
@@ -242,12 +288,30 @@ fn present_rows(audit: &Value) -> Vec<Value> {
                         "warn" => "首页 HTTP 403 · 访问被拒绝",
                         _ => "网页/API 网络响应",
                     }
+                    .to_string()
                 } else {
-                    "网页/API 网络响应"
+                    // Match the Python card: distinguish web vs API state so a
+                    // single unreachable endpoint is visible at a glance.
+                    let web = presentation::service_label(
+                        "claude",
+                        homepage,
+                        &online["service_responses"]["claude"],
+                    );
+                    let api = presentation::service_label(
+                        "api",
+                        api_response,
+                        &online["service_responses"]["api"],
+                    );
+                    let prefix = match value["state"].as_str() {
+                        Some("ok") => "网络可达",
+                        Some("warn") => "网络响应提示",
+                        _ => "网络未确认",
+                    };
+                    format!("{prefix} · 网页：{web} / API：{api}")
                 };
                 (
                     current.into(),
-                    "不证明登录或账号可用".into(),
+                    "网页/API 分别展示网络与访问状态；不证明登录或账号可用".into(),
                     "本轮无账号凭据的 HTTPS 请求".into(),
                 )
             }
@@ -260,6 +324,25 @@ fn present_rows(audit: &Value) -> Vec<Value> {
             value["sampled_at"] = json!(source_time(online, "geo", now));
         } else if id == "asn" {
             value["sampled_at"] = json!(source_time(online, "asn", now));
+        } else if id == "dns" {
+            // The DNS receipt carries its own sample time; keep it so the card
+            // shows when the resolver observation was actually taken.
+            if let Some(sampled) = number(&online["dns"]["display_receipt"]["finished_at"])
+                .or_else(|| number(&online["dns"]["receipt"]["finished_at"]))
+            {
+                value["sampled_at"] = json!(sampled);
+            }
+        } else if id == "reachability" {
+            // The audit already attached service_responses and sampled_at via
+            // `p::services`; surface the sample time without overwriting it.
+            let sampled = value["sampled_at"]
+                .as_f64()
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .or_else(|| number(&online["source_times"]["claude"]))
+                .or_else(|| number(&online["source_times"]["api"]));
+            if let Some(sampled) = sampled {
+                value["sampled_at"] = json!(sampled);
+            }
         }
         // A confirmed disagreement is already `fail`; never disguise it as a
         // transient request failure.
@@ -267,6 +350,8 @@ fn present_rows(audit: &Value) -> Vec<Value> {
             "egress" | "timezone" | "locale" => &["trace", "geo", "netcoffee"],
             "asn" => &["asn", "geo", "netcoffee"],
             "reachability" => &["claude", "api"],
+            "dns" => &["dns"],
+            "stun" => &["stun"],
             _ => &[],
         };
         let failure = query_error(online, keys);
@@ -475,7 +560,10 @@ pub fn receipt(store: &StateStore, audit: Value, session: Value, persist: bool) 
     output["grants_launch_permission"] = json!(false);
     output["expires_at"] = json!(display_expires);
     output["rows"] = json!(rows);
-    output["candidates"] = json!([]);
+    // The native adapter already measured the running proxy candidates; expose
+    // them instead of the hard-coded empty list that made the Swift
+    // "多个运行中的代理候选" hint dead code.
+    output["candidates"] = output["display_facts"]["local"]["candidates"].clone();
     output["session_guard"] = session;
     // Keep the same audit's current persisted receipts available to the
     // initialization gate without exposing the rest of display_facts.
@@ -488,7 +576,14 @@ pub fn receipt(store: &StateStore, audit: Value, session: Value, persist: bool) 
                    "sampled_at": output["display_facts"]["online"]["webrtc"]["receipt"]["sampled_at"]}
     });
     output["source_notices"] = presentation::source_notices(&output["display_facts"]["online"]);
-    output["message"] = json!("本轮实测结果；未知项保留未知。受控启动仍需独立预检。");
+    // Append an online-detection failure reason when one is known, mirroring the
+    // Python footer that explains why the round fell back to local facts.
+    let online_failure = query_error(&output["display_facts"]["online"], &["online", "egress"]);
+    let mut message = "本轮实测结果；未知项保留未知。受控启动仍需独立预检。".to_owned();
+    if !online_failure.is_empty() {
+        message = format!("{message}\n{online_failure}");
+    }
+    output["message"] = json!(message);
     output["policy_evaluation"] = preview;
     if let Some(preview) = chatgpt_preview {
         output["chatgpt_policy_evaluation"] = preview;

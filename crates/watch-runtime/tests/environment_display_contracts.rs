@@ -112,13 +112,22 @@ fn homepage_403_is_visible_on_the_card_without_mislabeling_old_trace_results() {
     let row = observed["rows"].as_array_mut().unwrap().last_mut().unwrap();
     row["state"] = json!("unknown");
     let unavailable = receipt(&store, observed.clone(), session(), false).unwrap();
-    assert_eq!(current(&unavailable), "网页/API 网络响应");
+    // An unknown round must not surface the 403 label; the detailed web/API
+    // breakdown is still present so each endpoint's state stays visible.
+    let unavailable_text = current(&unavailable).as_str().unwrap_or("").to_owned();
+    assert!(unavailable_text.starts_with("网络未确认"));
+    assert!(!unavailable_text.contains("浏览器验证"));
+    assert!(!unavailable_text.contains("访问被拒绝"));
 
     let row = observed["rows"].as_array_mut().unwrap().last_mut().unwrap();
     row["state"] = json!("warn");
     row["service_responses"]["claude"]["source"] = json!("https://claude.ai/cdn-cgi/trace");
     let old_trace = receipt(&store, observed, session(), false).unwrap();
-    assert_eq!(current(&old_trace), "网页/API 网络响应");
+    // An old-trace source is not a real challenge page; it must never render
+    // the 403 challenge label regardless of state.
+    let old_trace_text = current(&old_trace).as_str().unwrap_or("").to_owned();
+    assert!(!old_trace_text.contains("浏览器验证"));
+    assert!(!old_trace_text.contains("访问被拒绝"));
     let _ = fs::remove_dir_all(home);
 }
 
@@ -264,5 +273,79 @@ fn a_reused_observation_is_marked_while_a_fresh_round_is_not() {
         .find(|r| r["id"] == "asn")
         .unwrap();
     assert!(asn.get("sample_reused").is_none());
+    let _ = fs::remove_dir_all(home);
+}
+
+/// The environment page must carry the card detail the Python reference
+/// rendered: STUN candidates, DNS resolver exits, proxy node selection,
+/// measured proxy candidates and the online-failure footer.  These are the
+/// fields the Rust migration originally dropped.
+#[test]
+fn cards_carry_stun_dns_proxy_and_candidate_detail_not_blank_or_empty() {
+    let (home, store) = store();
+    let mut observed = audit();
+    // Enrich local facts: a selected TAG node, measured candidates, and the
+    // controller selection the proxy card appends.
+    observed["display_facts"]["local"]["tag"]["api"] = json!({
+        "mode": "rule", "selected_node": "日本 01", "global_node": ""
+    });
+    observed["display_facts"]["local"]["candidates"] = json!(["tag"]);
+    // The audit must carry the proxy and dns rows for `present_rows` to enrich
+    // them; the real audit always emits these, the minimal fixture does not.
+    observed["rows"].as_array_mut().unwrap().push(json!(
+        {"id":"proxy","state":"ok","detail":"proxy detail","required":true}
+    ));
+    observed["rows"].as_array_mut().unwrap().push(json!(
+        {"id":"dns","state":"ok","detail":"dns detail","required":true}
+    ));
+    // A STUN receipt with one accepted public candidate.
+    observed["rows"].as_array_mut().unwrap().push(json!({
+        "id": "stun", "state": "ok", "required": true,
+        "stun_probe": {"observations": [
+            {"status": "ok", "accepted": true, "address": "8.8.8.8", "server": "s1"}
+        ]}
+    }));
+    // A DNS status with a resolver exit and country.
+    observed["display_facts"]["online"]["dns"] = json!({
+        "state": "ok", "detail": "DNS 泄漏检测完成",
+        "display_receipt": {"finished_at": NOW - 3.0,
+            "dns": {"egress_ips": ["8.8.8.8"], "countries": ["JP"]},
+            "http": {"countries": ["JP"]}},
+        "receipt": {"finished_at": NOW - 3.0}
+    });
+
+    let out = receipt(&store, observed, session(), false).unwrap();
+    let rows = out["rows"].as_array().unwrap();
+    let by_id = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap();
+
+    let stun = by_id("stun");
+    assert!(stun["current"].as_str().unwrap_or("").contains("8.8.8.8"));
+    assert!(stun["source"]
+        .as_str()
+        .unwrap_or("")
+        .contains("不等于 Claude 实际 socket"));
+
+    let dns = by_id("dns");
+    assert!(dns["current"].as_str().unwrap_or("").contains("8.8.8.8"));
+    assert!(dns["current"].as_str().unwrap_or("").contains("JP"));
+    assert!(dns.get("sampled_at").is_some());
+
+    let proxy = by_id("proxy");
+    assert!(proxy["current"].as_str().unwrap_or("").contains("日本 01"));
+
+    assert_eq!(out["candidates"], json!(["tag"]));
+    let _ = fs::remove_dir_all(home);
+}
+
+/// An online-detection failure must appear in the footer message, matching the
+/// Python behaviour that explained why the round fell back to local facts.
+#[test]
+fn footer_message_appends_online_detection_failure_reason() {
+    let (home, store) = store();
+    let mut observed = audit();
+    observed["display_facts"]["online"]["query_errors"] =
+        json!({"egress": {"source": "Cloudflare trace", "message": "未完成"}});
+    let out = receipt(&store, observed, session(), false).unwrap();
+    assert!(out["message"].as_str().unwrap_or("").contains("未完成"));
     let _ = fs::remove_dir_all(home);
 }
