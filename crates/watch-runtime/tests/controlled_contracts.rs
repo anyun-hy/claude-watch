@@ -1979,6 +1979,41 @@ fn warn_configured_drift_never_closes_on_later_locked_rounds() {
 }
 
 #[test]
+fn warn_configured_drift_resumes_supervision_once_recovered() {
+    // A warn tier never closes; when the drift clears, the session unlocks
+    // back to active supervision instead of latching the notice forever.
+    let fixture = Fixture::new();
+    policy_config(&fixture, "warn", "force");
+    let mut system = Fake {
+        running: true,
+        ..Default::default()
+    };
+    let controller = Controller::new(fixture.storage.clone());
+    controller.guard_tick(&mut system).unwrap();
+    drifted_receipts(&fixture, system.now + 1.0, "US", "1.1.1.1");
+    system.now += 2.0;
+    let warned = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(warned["stop_state"], "skipped_warn_only");
+    // Drift resolves back to the session baseline: supervision resumes.
+    drifted_receipts(&fixture, system.now + 1.0, "JP", "1.1.1.1");
+    system.now += 2.0;
+    let recovered = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(recovered["session_guard"]["state"], "active");
+    assert_eq!(recovered["session_notice"]["action"], "resume");
+    assert_eq!(recovered["stop_state"], "recovered");
+    assert_eq!(system.closes, 0);
+    assert!(system.running);
+    // A later drift warns again: the resume did not weaken the tier.
+    drifted_receipts(&fixture, system.now + 1.0, "US", "1.1.1.1");
+    system.now += 2.0;
+    let rewarned = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(rewarned["session_notice"]["code"], "dns_egress_changed");
+    assert_eq!(rewarned["stop_state"], "skipped_warn_only");
+    assert_eq!(system.closes, 0);
+    assert!(system.running);
+}
+
+#[test]
 fn combined_probe_drift_forces_by_default_and_never_softens() {
     // Regression: the combined dns+webrtc code must inherit the stricter of
     // the two configured actions. Before the fix it fell through to a plain

@@ -808,6 +808,36 @@ impl Controller {
                     .map(|r| r.code.clone())
                     .unwrap_or_default();
                 if self.close_action(&code) == "warn" {
+                    // A warn tier never closes. When the underlying condition
+                    // has cleared, resume normal supervision instead of
+                    // latching the notice until the session ends.
+                    let session = current.as_ref().unwrap();
+                    let resolved = match code.as_str() {
+                        "egress_ip_changed" | "egress_country_cn" => {
+                            let egress = system.egress();
+                            session::Egress::fresh(&egress, system.now(), session::GUARD_EGRESS_TTL)
+                                .is_some_and(|e| e.country != "CN" && e.ip == session.baseline.ip)
+                        }
+                        _ => {
+                            let extra = serde_json::to_value(&session.extra)
+                                .unwrap_or_else(|_| serde_json::json!({}));
+                            receipts.probe_drift_risk(&extra, system.now())["state"] == "safe"
+                        }
+                    };
+                    if resolved && sessions.resume_if_current(id.as_deref(), system.now())? {
+                        receipt["session_guard"] = json!({
+                            "state": "active", "phase": "active",
+                            "reason": {"code": "session_resumed", "detail": "仅提示判据的漂移已恢复，继续正常监管"}
+                        });
+                        receipt["session_notice"] = json!({
+                            "code": "session_resumed",
+                            "detail": "漂移已恢复，回到仅观察状态",
+                            "action": "resume",
+                        });
+                        receipt["action"] = json!("observe");
+                        receipt["stop_state"] = json!("recovered");
+                        return Ok(());
+                    }
                     receipt["session_notice"] = json!({
                         "code": code,
                         "detail": current.as_ref().and_then(|s| s.reason.as_ref()).map(|r| r.detail.clone()),

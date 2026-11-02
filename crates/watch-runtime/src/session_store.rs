@@ -554,6 +554,30 @@ impl SessionStore {
         }
         closer().map(Some)
     }
+    /// Resume normal supervision for a warn-tier session whose underlying
+    /// condition has cleared: the latch reverts to the active phase and the
+    /// stale reason is dropped. Only a still-current locked session can be
+    /// resumed, and the drift baseline stays untouched.
+    pub fn resume_if_current(&self, id: Option<&str>, now: f64) -> Result<bool> {
+        let _lock = self.storage.lock("session-guard", None)?;
+        let Some(mut value) = self.load(now)? else {
+            return Ok(false);
+        };
+        if value.session_id.as_str() != id.unwrap_or_default() || value.state != Phase::Locked {
+            return Ok(false);
+        }
+        value.state = Phase::Active;
+        value.reason = None;
+        value.last_reason = None;
+        value.locked_at = None;
+        value.last_risk_state = None;
+        value.unknown_count = 0;
+        value.unknown_since = None;
+        value.risk_evidence = json!({"state":"unknown"});
+        value.extra.insert("guard_checked_at".into(), json!(now));
+        self.save(&value)?;
+        Ok(true)
+    }
     pub fn mark_failure(
         &self,
         id: Option<&str>,
