@@ -396,12 +396,29 @@ impl Controller {
             storage: self.storage.clone(),
         }
         .load()
-        .map(|config| match code {
-            "egress_ip_changed" => config.claude_close_ip,
-            "egress_country_cn" => config.claude_close_cn,
-            "dns_egress_changed" => config.claude_close_dns,
-            "webrtc_egress_changed" => config.claude_close_webrtc,
-            _ => "close".to_string(),
+        .map(|config| {
+            let severity = |value: &str| match value {
+                "force" => 2,
+                "close" => 1,
+                _ => 0,
+            };
+            match code {
+                "egress_ip_changed" => config.claude_close_ip,
+                "egress_country_cn" => config.claude_close_cn,
+                "dns_egress_changed" => config.claude_close_dns,
+                "webrtc_egress_changed" => config.claude_close_webrtc,
+                // Both probe families drifted: apply the stricter of the two
+                // configured actions so a wider drift can never be handled
+                // more leniently than a single-family drift.
+                "dns_and_webrtc_egress_changed" => {
+                    if severity(&config.claude_close_dns) >= severity(&config.claude_close_webrtc) {
+                        config.claude_close_dns
+                    } else {
+                        config.claude_close_webrtc
+                    }
+                }
+                _ => "close".to_string(),
+            }
         })
         .unwrap_or_else(|_| {
             match code {

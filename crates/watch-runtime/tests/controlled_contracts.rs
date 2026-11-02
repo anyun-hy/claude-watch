@@ -1895,3 +1895,101 @@ fn adoption_refuses_a_stale_exit() {
         .unwrap()
         .is_none());
 }
+
+fn policy_config(fixture: &Fixture, dns: &str, webrtc: &str) {
+    let config = claude_watch_core::config::Config {
+        guard_enabled: true,
+        claude_close_dns: dns.into(),
+        claude_close_webrtc: webrtc.into(),
+        ..Default::default()
+    };
+    fixture
+        .storage
+        .atomic_json(&fixture.storage.paths.config(), &config.value().unwrap())
+        .unwrap();
+}
+/// Re-record fresh probe receipts with the given drift: DNS country set and
+/// WebRTC srflx address. The original Fixture baseline is JP / 1.1.1.1.
+fn drifted_receipts(fixture: &Fixture, now: f64, dns_country: &'static str, srflx: &'static str) {
+    let receipts = ReceiptStore {
+        storage: fixture.storage.clone(),
+    };
+    let local = json!({"context":"ctx","context_id":"ctx","proxy":"ok","tun":"ok"});
+    let probe = json!({"kind":"dns","status":"complete","contextChanged":false,"startedAt":now-1.0,"finishedAt":now,"errors":[],"observations":[{"kind":"http","address":"1.1.1.1"},{"kind":"resolver","address":"9.9.9.9"}],"externalJSON":serde_json::to_string(&json!({
+        "session":"a".repeat(40),"dns_servers":{"9.9.9.9":5},"http":{"address":"1.1.1.1","country":dns_country},"geoip":[{"ip":"9.9.9.9","country_code":dns_country}]
+    })).unwrap()});
+    receipts.record_dns(&probe, &local, None, now).unwrap();
+    receipts.record_webrtc(
+        &json!({"kind":"webrtc","status":"complete","contextChanged":false,"startedAt":now-1.0,"finishedAt":now,"errors":[],"observations":[{"kind":"http","address":"1.1.1.1","country":"JP"},{"kind":"srflx","address":srflx,"country":"JP"}]}),
+        &local,
+        None,
+        now,
+    )
+    .unwrap();
+}
+
+#[test]
+fn warn_configured_probe_drift_notifies_without_closing() {
+    let fixture = Fixture::new();
+    policy_config(&fixture, "warn", "force");
+    let mut system = Fake {
+        running: true,
+        ..Default::default()
+    };
+    let controller = Controller::new(fixture.storage.clone());
+    controller.guard_tick(&mut system).unwrap();
+    drifted_receipts(&fixture, system.now + 1.0, "US", "1.1.1.1");
+    system.now += 2.0;
+    let receipt = controller.guard_tick(&mut system).unwrap();
+    // A warn-configured criterion reports but never closes: the session
+    // survives and the next round re-evaluates.
+    assert_eq!(receipt["session_notice"]["code"], "dns_egress_changed");
+    assert_eq!(receipt["action"], "observe");
+    assert_eq!(receipt["stop_state"], "skipped_warn_only");
+    assert_eq!(system.closes, 0);
+    assert!(system.running);
+}
+
+#[test]
+fn combined_probe_drift_forces_by_default_and_never_softens() {
+    // Regression: the combined dns+webrtc code must inherit the stricter of
+    // the two configured actions. Before the fix it fell through to a plain
+    // close even with the default all-force policy.
+    let fixture = Fixture::new();
+    let mut system = Fake {
+        running: true,
+        ..Default::default()
+    };
+    let controller = Controller::new(fixture.storage.clone());
+    controller.guard_tick(&mut system).unwrap();
+    drifted_receipts(&fixture, system.now + 1.0, "US", "3.3.3.3");
+    system.now += 2.0;
+    let receipt = controller.guard_tick(&mut system).unwrap();
+    assert_eq!(
+        receipt["session_guard"]["reason"]["code"],
+        "dns_and_webrtc_egress_changed"
+    );
+    assert_eq!(receipt["stop_action"], "force");
+    assert_eq!(system.ip_force_calls, 1);
+    assert_eq!(system.closes, 1);
+    assert!(!system.running);
+}
+
+#[test]
+fn combined_probe_drift_applies_the_stricter_of_the_two_policies() {
+    let fixture = Fixture::new();
+    policy_config(&fixture, "warn", "force");
+    let mut system = Fake {
+        running: true,
+        ..Default::default()
+    };
+    let controller = Controller::new(fixture.storage.clone());
+    controller.guard_tick(&mut system).unwrap();
+    drifted_receipts(&fixture, system.now + 1.0, "US", "3.3.3.3");
+    system.now += 2.0;
+    let receipt = controller.guard_tick(&mut system).unwrap();
+    // DNS is warn but WebRTC is force: the wider drift keeps the strict tier.
+    assert_eq!(receipt["stop_action"], "force");
+    assert_eq!(system.ip_force_calls, 1);
+    assert!(!system.running);
+}
