@@ -7,7 +7,7 @@ struct MonitorView: View {
     let startMonitoring: Bool
     let restoresNavigation: Bool
     let refreshAction: (() -> Void)?
-    @AppStorage("darkAppearance") private var dark = true
+    @AppStorage("darkAppearance") private var dark = false
     @AppStorage("selectedPage") private var savedPage = Page.environment.rawValue
     @Environment(\.controlActiveState) private var controlActiveState
     @State private var sidebarVisibility: NavigationSplitViewVisibility = .all
@@ -88,6 +88,11 @@ struct MonitorView: View {
         }
         .foregroundStyle(p.text)
         .preferredColorScheme(dark ? .dark : .light)
+        .onChange(of: dark) { _, value in
+            // Keep window chrome, sheets and alerts in step with the palette;
+            // preferredColorScheme alone leaves them on the system appearance.
+            NSApp.appearance = NSAppearance(named: value ? .darkAqua : .aqua)
+        }
         .frame(minWidth: 1000, minHeight: 680)
         .onAppear {
             if restoresNavigation { store.page = Page.restored(savedPage) }
@@ -417,6 +422,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func applicationWillFinishLaunching(_ notification: Notification) {
         UNUserNotificationCenter.current().delegate = self
     }
+    /// A fresh install starts light; a stored choice still wins. Setting the
+    /// application appearance keeps the window chrome in step with the palette.
+    private func applyAppearance() {
+        let dark = UserDefaults.standard.object(forKey: "darkAppearance") as? Bool ?? false
+        NSApp.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+    }
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
            let icon = NSImage(contentsOf: url) {
@@ -424,6 +435,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        applyAppearance()
         let center = UNUserNotificationCenter.current()
         center.getNotificationSettings { settings in
             if settings.authorizationStatus == .notDetermined {

@@ -407,7 +407,7 @@ def perform(layout: Layout, runner: Runner, version: str, build: str, *, dry_run
     if dry_run:
         print("预演通过：没有卸载、删除、打包或安装。")
         return
-    if confirm("输入“重置并安装”继续，其他输入取消：").strip() != "重置并安装":
+    if confirm("输入 y/N 重置并安装继续，其他输入取消：").strip().lower() != "y":
         print("已取消，没有执行重置。")
         return
     with acquire_lock(layout, uid):

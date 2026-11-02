@@ -18,7 +18,7 @@ struct FirstRunView: View {
     @ObservedObject var initialization: FirstRunInitialization
     @ObservedObject private var switcher: SwitcherStore
     @ObservedObject private var leakChecks: LeakCheckStore
-    @AppStorage("darkAppearance") private var dark = true
+    @AppStorage("darkAppearance") private var dark = false
     @State private var showingApproval: InitializationApproval?
     @State private var showingReport = false
     @State private var lastPresentedApproval: String?
