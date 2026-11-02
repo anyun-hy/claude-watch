@@ -537,3 +537,166 @@ fn endpoints_and_schema_do_not_convert_uncertain_samples_into_a_bypass() {
     duplicate["records"] = json!([duplicate["records"][0], duplicate["records"][0]]);
     assert_eq!(correlate(&duplicate)["association"], "unconfirmed");
 }
+fn snapshot(configs: &Value, proxies: &Value) -> Value {
+    config::api_snapshot(
+        "http://127.0.0.1:9090",
+        "",
+        configs,
+        proxies,
+        &json!({"connections":[]}),
+        json!({"state":"available","entries":[]}),
+    )
+    .unwrap()
+    .0
+}
+#[test]
+fn a_global_group_without_an_entry_leaves_the_selection_unresolved() {
+    let configs = json!({"mode":"global","mixed-port":7890});
+    let proxies = json!({"proxies":{
+        "node-a":{"type":"Shadowsocks"},
+        "node-b":{"type":"Shadowsocks"}
+    }});
+    let result = snapshot(&configs, &proxies);
+    assert!(result["selected_node"].is_null());
+    assert!(
+        !result["direct_groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "GLOBAL"),
+        "组不存在不应被列入 direct_groups"
+    );
+}
+#[test]
+fn a_global_group_parked_on_direct_is_null_and_listed() {
+    let proxies = json!({"proxies":{
+        "GLOBAL":{"type":"Selector","now":"DIRECT"},
+        "DIRECT":{"type":"Direct"},
+        "node-a":{"type":"Shadowsocks"}
+    }});
+    let result = snapshot(&json!({"mode":"global","mixed-port":7890}), &proxies);
+    assert!(result["selected_node"].is_null(), "直连不产生节点");
+    assert!(result["direct_groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "GLOBAL"));
+}
+#[test]
+fn a_global_group_parked_on_reject_is_null_and_listed() {
+    let proxies = json!({"proxies":{
+        "GLOBAL":{"type":"Selector","now":"REJECT"},
+        "REJECT":{"type":"Reject"},
+        "node-a":{"type":"Shadowsocks"}
+    }});
+    let result = snapshot(&json!({"mode":"global","mixed-port":7890}), &proxies);
+    assert!(result["selected_node"].is_null());
+    // 注意：REJECT 是拒绝出站，与 DIRECT 语义相反，却进同一个列表。
+    assert!(result["direct_groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "GLOBAL"));
+}
+/// 记录 0B 必须处理的盲点：COMPATIBLE 让 resolve_chain 返回 null，
+/// 但 group_is_direct 不认它，于是“null 且不在 direct_groups”出现了反例。
+/// 这条只记录当前输出，不代表该输出安全。
+#[test]
+fn a_global_group_parked_on_compatible_is_null_but_not_listed() {
+    let proxies = json!({"proxies":{
+        "GLOBAL":{"type":"Selector","now":"COMPATIBLE"},
+        "COMPATIBLE":{"type":"Compatible"},
+        "node-a":{"type":"Shadowsocks"}
+    }});
+    let result = snapshot(&json!({"mode":"global","mixed-port":7890}), &proxies);
+    assert!(result["selected_node"].is_null());
+    assert!(
+        !result["direct_groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "GLOBAL"),
+        "COMPATIBLE 不在 group_is_direct 的名单里，因此不会被收录"
+    );
+}
+#[test]
+fn a_global_group_parked_on_a_real_node_selects_that_node() {
+    let proxies = json!({"proxies":{
+        "GLOBAL":{"type":"Selector","now":"node-a"},
+        "node-a":{"type":"Shadowsocks"},
+        "node-b":{"type":"Shadowsocks"}
+    }});
+    let result = snapshot(&json!({"mode":"global","mixed-port":7890}), &proxies);
+    assert_eq!(result["selected_node"], "node-a");
+    assert!(!result["direct_groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "GLOBAL"));
+}
+
+/// 交叉验证：把上面五组夹具原样交给 Python 参考实现，
+/// 只比对「选中节点」与「direct_groups」，确认两侧在这五种输入下判断一致。
+#[test]
+fn global_selection_outputs_match_the_python_reference() {
+    let fixtures = [
+        json!({"proxies":{
+            "node-a":{"type":"Shadowsocks"},
+            "node-b":{"type":"Shadowsocks"}
+        }}),
+        json!({"proxies":{
+            "GLOBAL":{"type":"Selector","now":"DIRECT"},
+            "DIRECT":{"type":"Direct"},
+            "node-a":{"type":"Shadowsocks"}
+        }}),
+        json!({"proxies":{
+            "GLOBAL":{"type":"Selector","now":"REJECT"},
+            "REJECT":{"type":"Reject"},
+            "node-a":{"type":"Shadowsocks"}
+        }}),
+        json!({"proxies":{
+            "GLOBAL":{"type":"Selector","now":"COMPATIBLE"},
+            "COMPATIBLE":{"type":"Compatible"},
+            "node-a":{"type":"Shadowsocks"}
+        }}),
+        json!({"proxies":{
+            "GLOBAL":{"type":"Selector","now":"node-a"},
+            "node-a":{"type":"Shadowsocks"},
+            "node-b":{"type":"Shadowsocks"}
+        }}),
+    ];
+    let cases: Vec<Value> = fixtures
+        .iter()
+        .map(|proxies| {
+            json!({"group":"","/configs":{"mode":"global","mixed-port":7890},
+                "/proxies":proxies,"/connections":{"connections":[]},"/rules":{"rules":[]}})
+        })
+        .collect();
+    let reference = oracle("tag_api_snapshot", &cases);
+    let groups = |v: &Value| -> Vec<String> {
+        let mut names: Vec<String> = v["direct_groups"]
+            .as_array()
+            .map(|a| a.iter().map(|x| x.as_str().unwrap_or("").to_owned()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    };
+    for (index, (case, pair)) in cases.iter().zip(reference).enumerate() {
+        // 参考实现与 Rust 同形：返回 [快照, 连接表] 二元组。
+        let py = &pair[0];
+        assert!(
+            py.get("error").is_none(),
+            "第 {index} 组：Python 参考实现报错 {py}"
+        );
+        let rust = snapshot(&case["/configs"], &case["/proxies"]);
+        assert_eq!(
+            rust["selected_node"], py["selected_node"],
+            "第 {index} 组选中节点与 Python 参考不一致"
+        );
+        assert_eq!(
+            groups(&rust),
+            groups(&py),
+            "第 {index} 组 direct_groups 与 Python 参考不一致"
+        );
+    }
+}
