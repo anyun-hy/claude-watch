@@ -82,7 +82,15 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
         let w = WKWebView(frame: NSRect(x:0,y:0,width:640,height:100), configuration: c); view = w; w.navigationDelegate = self
         let host = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 1, height: 1),
                             styleMask: .borderless, backing: .buffered, defer: false)
-        host.isReleasedWhenClosed = false; host.contentView = w; hiddenHost = host; host.orderFront(nil)
+        host.isReleasedWhenClosed = false
+        // The hidden host must never surface in the Dock, the Window menu,
+        // state restoration or spaces cycling: a miniaturized or restored
+        // copy shows up as a blank phantom thumbnail on unrelated screens.
+        host.isRestorable = false
+        host.excludedFromWindowsMenu = true
+        host.ignoresMouseEvents = true
+        host.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        host.contentView = w; hiddenHost = host; host.orderFront(nil)
         trace("host_attached")
         w.loadFileURL(document!, allowingReadAccessTo: document!.deletingLastPathComponent())
     }

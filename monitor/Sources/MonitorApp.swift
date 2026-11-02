@@ -414,6 +414,7 @@ func timeText(_ epoch: Double, date: Bool = false) -> String {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, ObservableObject {
     @Published var notificationTarget: String?
+    private var statusBarController: StatusBarController?
     static func notificationPage(_ target: String?) -> Page? {
         let pages: [String: Page] = ["events": .events, "environment": .environment, "protection": .protection]
         guard let target else { return nil }
@@ -436,6 +437,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         applyAppearance()
+        statusBarController = StatusBarController()
         let center = UNUserNotificationCenter.current()
         center.getNotificationSettings { settings in
             if settings.authorizationStatus == .notDetermined {
@@ -465,7 +467,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             completionHandler()
         }
     }
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    // The monitor lives in the menu bar: closing or miniaturizing the window
+    // collapses it into the status item instead of terminating the app.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if !StatusBarController.mainWindowVisible() {
+            statusBarController?.showMainWindow()
+        }
+        return true
+    }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        statusBarController?.prepareToQuit()
+        return .terminateNow
+    }
 }
 
 #if !UI_REVIEW

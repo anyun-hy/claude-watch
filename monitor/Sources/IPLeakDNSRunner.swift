@@ -94,6 +94,13 @@ final class IPLeakDNSRunner: NSObject, WKScriptMessageHandler, WKNavigationDeleg
         let host = NSWindow(contentRect: NSRect(x: -10_000, y: -10_000, width: 1, height: 1),
                             styleMask: .borderless, backing: .buffered, defer: false)
         host.isReleasedWhenClosed = false
+        // The hidden host must never surface in the Dock, the Window menu,
+        // state restoration or spaces cycling: a miniaturized or restored
+        // copy shows up as a blank phantom thumbnail on unrelated screens.
+        host.isRestorable = false
+        host.excludedFromWindowsMenu = true
+        host.ignoresMouseEvents = true
+        host.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         host.contentView = webView; hiddenHost = host; host.orderFront(nil)
         trace("host_attached")
         guard let document else { finish(failure(code: "component_missing", message: "IPLeak 检测页面不可用。")); return }
