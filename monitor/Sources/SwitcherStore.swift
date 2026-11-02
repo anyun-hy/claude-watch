@@ -1421,6 +1421,7 @@ final class SwitcherStore: ObservableObject {
     }
     static func fixtureEnvironmentRows(proposed: Bool = false, settings: [String: Any] = [:]) -> [[String: String]] {
         [("proxy_mode", "代理客户端", "tag", "运行进程身份"),
+         ("runtime_mode", "运行模式", "全局模式", "TAG 控制接口"),
          ("proxy_url", "HTTP 入口", "http://127.0.0.1:7890", "后台监听者身份样本"),
          ("proxy_group", "代理组", "海外 AI", "TAG 控制接口"),
          ("node", "当前节点", "Japan 1", "TAG 控制接口"),

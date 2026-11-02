@@ -22,9 +22,10 @@ from .region import reference as region_reference, date_summary, expected_date_s
 
 TTL = 300
 OPTIONS = ("apply_environment", "enable_policy", "guard_enabled", "timezone_watchdog", "auto_update")
-LABELS = {"proxy_mode": "代理客户端", "proxy_url": "HTTP 入口", "proxy_group": "代理组",
+LABELS = {"proxy_mode": "代理客户端", "runtime_mode": "运行模式", "proxy_url": "HTTP 入口", "proxy_group": "代理组",
           "node": "当前节点", "network_service": "活动网络服务", "country": "出口国家",
           "ip": "出口 IP", "timezone": "系统时区", "locale": "地区格式", "language": "Claude 语言"}
+RUNTIME_MODE_LABELS = {"rule": "规则模式", "global": "全局模式", "direct": "直连模式"}
 
 
 def _query_failure(values, *sources):
@@ -439,7 +440,8 @@ def current_values(network, local):
     verified = (local.get("mode") == "tag" and tag.get("entry", {}).get("state") == "verified"
                 and api.get("state") == "available" and api.get("covers_7890") is True)
     global_mode = api.get("mode") == "global"
-    return {"proxy_mode": local.get("mode"), "proxy_url": "http://127.0.0.1:7890" if verified else None,
+    return {"proxy_mode": local.get("mode"), "runtime_mode": api.get("mode") if verified else None,
+            "proxy_url": "http://127.0.0.1:7890" if verified else None,
             "proxy_group": ("GLOBAL" if global_mode else tag.get("expected_group")) if verified else None,
             "node": (api.get("global_node") if global_mode else api.get("selected_node")) if verified else None,
             "network_service": network.get("service"), "country": None, "ip": None,
@@ -452,7 +454,8 @@ def rows(paths, config, network, local, candidate=None):
     metadata = read_json(paths.base / "confirmed-environment.json", {})
     matches = metadata.get("policy") == digest(config)
     proposed = candidate.get("values", {}) if candidate else {}
-    source = {"proxy_mode": "运行进程身份 / scutil", "proxy_url": "后台监听者身份样本（非默认端口猜测）",
+    source = {"proxy_mode": "运行进程身份 / scutil", "runtime_mode": "TAG 控制接口",
+              "proxy_url": "后台监听者身份样本（非默认端口猜测）",
               "proxy_group": "TAG 控制接口", "node": "TAG 控制接口",
               "network_service": network.get("source", "scutil / networksetup"),
               "country": "未联网检测", "ip": "未联网检测", "timezone": "/etc/localtime",
@@ -461,10 +464,15 @@ def rows(paths, config, network, local, candidate=None):
     if candidate:
         current.update({k: proposed.get(k) for k in ("country", "ip")})
         source.update(country="Cloudflare + IPinfo 交叉确认", ip="Cloudflare + IPinfo 交叉确认")
+    # 运行模式为只读实测事实，与代理详情面板保持同一中文措辞。
+    for data in (current, proposed):
+        raw = data.get("runtime_mode")
+        if raw: data["runtime_mode"] = RUNTIME_MODE_LABELS.get(raw, "未知")
     result = []
     for key, title in LABELS.items():
         target = config.get(key)
         if key == "language": target = "English" if config["require_english"] else "未限定"
+        if key == "runtime_mode": target = "只读实测，无需配置"
         if key == "node": target = metadata.get("values", {}).get(key) if matches else None
         if key == "ip": target = ", ".join(config["expected_egress"]) or ("允许变化（保留历史提示）" if config["allow_ip_change"] else "按历史检测变化")
         if not paths.config.exists(): target = None

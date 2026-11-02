@@ -135,7 +135,7 @@ fn options_ok(v: &Value) -> bool {
 }
 pub fn current_values(network: &Value, local: &Value) -> Value {
     let verified = require_transport(local).is_ok();
-    json!({"proxy_mode":local.get("mode"),"proxy_url":if verified {Some("http://127.0.0.1:7890")}else{None},"proxy_group":if verified {local.pointer("/tag/expected_group")}else{None},"node":if verified {local.pointer("/tag/api/selected_node")}else{None},"network_service":network.get("service"),"timezone":local.get("timezone"),"locale":local.get("locale"),"language":local.get("language")})
+    json!({"proxy_mode":local.get("mode"),"proxy_url":if verified {Some("http://127.0.0.1:7890")}else{None},"proxy_group":if verified {local.pointer("/tag/expected_group")}else{None},"node":if verified {local.pointer("/tag/api/selected_node")}else{None},"runtime_mode":if verified {local.pointer("/tag/api/mode")}else{None},"network_service":network.get("service"),"timezone":local.get("timezone"),"locale":local.get("locale"),"language":local.get("language")})
 }
 
 /// Fail closed before any online candidate creation.  TAG evidence must bind

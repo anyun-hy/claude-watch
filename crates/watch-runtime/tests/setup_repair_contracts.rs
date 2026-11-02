@@ -376,6 +376,7 @@ fn auto_detection_still_pins_node_when_observed_proxy_is_tag() {
     let zones: ZoneCatalog = serde_json::from_value(json!({"JP":["Asia/Tokyo"]})).unwrap();
     let mut f = fake();
     let c = onboarding::detect(&store, &f, "auto", true, &zones).unwrap();
+    assert_eq!(c["values"]["runtime_mode"], "rule");
     let options = json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false});
     let p = onboarding::preview(&store, &f, c["id"].as_str().unwrap(), &options, None).unwrap();
     onboarding::apply(
@@ -402,6 +403,7 @@ fn non_tag_transport_never_writes_node_pin() {
     f.local["mode"] = json!("clashx");
     f.local["tag"] = json!(null);
     let c = onboarding::detect(&store, &f, "clashx", true, &zones).unwrap();
+    assert!(c["values"]["runtime_mode"].is_null());
     let options = json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false});
     let p = onboarding::preview(&store, &f, c["id"].as_str().unwrap(), &options, None).unwrap();
     onboarding::apply(

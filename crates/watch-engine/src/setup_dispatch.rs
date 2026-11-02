@@ -19,8 +19,9 @@ use claude_watch_runtime::{
 };
 use serde_json::{json, Value};
 
-const VALUE_IDS: [(&str, &str); 10] = [
+const VALUE_IDS: [(&str, &str); 11] = [
     ("proxy_mode", "代理客户端"),
+    ("runtime_mode", "运行模式"),
     ("proxy_url", "HTTP 入口"),
     ("proxy_group", "代理组"),
     ("node", "当前节点"),
@@ -55,6 +56,16 @@ fn display(value: &Value, fallback: &str) -> String {
         .unwrap_or(fallback)
         .to_owned()
 }
+/// Observed controller mode is a read-only fact; render it in the same
+/// Chinese wording used by the proxy detail panel.
+fn runtime_mode_label(value: &Value) -> String {
+    match value.as_str().unwrap_or("") {
+        "rule" => "规则模式".into(),
+        "global" => "全局模式".into(),
+        "direct" => "直连模式".into(),
+        _ => "未知".into(),
+    }
+}
 fn local(host: &Host, config: &Config) -> Result<Value> {
     RepairSystem::local(host, config)
 }
@@ -65,7 +76,7 @@ fn source(id: &str, local: &Value, network: &Value, candidate: bool) -> String {
     match id {
         "proxy_mode" => "运行进程身份 / 本机网络状态".into(),
         "proxy_url" => "后台监听者身份样本（非默认端口猜测）".into(),
-        "proxy_group" | "node" => "TAG 控制接口".into(),
+        "proxy_group" | "node" | "runtime_mode" => "TAG 控制接口".into(),
         "network_service" => text(network, "source").if_empty("scutil / networksetup"),
         "country" | "ip" if candidate => "Cloudflare + Net.Coffee 本轮交叉确认".into(),
         "country" | "ip" => "未联网检测".into(),
@@ -111,10 +122,12 @@ fn value_rows(
     Ok(VALUE_IDS.into_iter().map(|(id, title)| {
         let actual = match id {
             "country" | "ip" if candidate => proposed.unwrap()[id].clone(),
+            "runtime_mode" => json!(runtime_mode_label(&current[id])),
             _ => current[id].clone(),
         };
         let target = match id {
             "language" => json!(if config.require_english { "English" } else { "未限定" }),
+            "runtime_mode" => json!("只读实测，无需配置"),
             "node" if confirmed_matches => confirmed["values"][id].clone(),
             "ip" if !config.expected_egress.is_empty() => json!(config.expected_egress.join(", ")),
             "ip" if config.allow_ip_change => json!("检测历史变化仅提示；受控会话固定本次基准"),
@@ -122,7 +135,15 @@ fn value_rows(
             _ => config.value().ok().and_then(|v| v.get(id).cloned()).unwrap_or(Value::Null),
         };
         let target_source = if confirmed_matches { text(&confirmed["sources"], id) } else { "".into() };
-        json!({"id":id,"title":title,"current":display(&actual,"未知"),"target":display(&target,"未配置"),"proposed":proposed.map(|v| v[id].as_str().unwrap_or("")).unwrap_or(""),"source":source(id,&facts,&net,candidate),"target_source":if target_source.is_empty() { "已保存设置（手动或旧版，检测来源未记录）".to_owned() } else { target_source },"proposed_source":proposed.map(|v| text(&v["sources"],id)).unwrap_or_default()})
+        let proposed_text = match proposed {
+            Some(values) if id == "runtime_mode" => match values[id].as_str().unwrap_or("") {
+                "" => String::new(),
+                _ => runtime_mode_label(&values[id]),
+            },
+            Some(values) => values[id].as_str().unwrap_or("").to_owned(),
+            None => String::new(),
+        };
+        json!({"id":id,"title":title,"current":display(&actual,"未知"),"target":display(&target,"未配置"),"proposed":proposed_text,"source":source(id,&facts,&net,candidate),"target_source":if target_source.is_empty() { "已保存设置（手动或旧版，检测来源未记录）".to_owned() } else { target_source },"proposed_source":proposed.map(|v| text(&v["sources"],id)).unwrap_or_default()})
     }).collect())
 }
 
@@ -312,5 +333,20 @@ pub fn dispatch(request: &Request, paths: Paths) -> Result<Option<Value>> {
             )?))
         }
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::runtime_mode_label;
+    use serde_json::json;
+
+    #[test]
+    fn runtime_mode_labels_match_proxy_detail_wording() {
+        assert_eq!(runtime_mode_label(&json!("rule")), "规则模式");
+        assert_eq!(runtime_mode_label(&json!("global")), "全局模式");
+        assert_eq!(runtime_mode_label(&json!("direct")), "直连模式");
+        assert_eq!(runtime_mode_label(&json!("script")), "未知");
+        assert_eq!(runtime_mode_label(&serde_json::Value::Null), "未知");
     }
 }
