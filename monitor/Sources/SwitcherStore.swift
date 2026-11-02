@@ -697,9 +697,10 @@ final class SwitcherStore: ObservableObject {
     }
     func openClaudeWatchAccessibilitySettings() {
         guard !isFixture else { return }
-        AccessibilityPermission.request()
-        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
-        NSWorkspace.shared.open(url)
+        guard AccessibilityPermission.requestAndOpenSettings() else {
+            message = "系统设置未能自动打开，请手动前往 系统设置 › 隐私与安全性 › 辅助功能，并允许 Claude Watch。"
+            return
+        }
     }
     private func mutate(_ rows: [EnvironmentCheckRow], id: String, state: String, current: String, detail: String) -> [EnvironmentCheckRow] {
         rows.map { row in

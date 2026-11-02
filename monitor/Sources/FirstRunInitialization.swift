@@ -410,19 +410,15 @@ final class FirstRunInitialization: ObservableObject {
             self.running = false
         }
     }
+    /// Entry consumes the joint verification this round already produced. It
+    /// re-evaluates the same current-evidence predicate the verification step
+    /// ends with, but never runs that audit a second time: the last row must
+    /// not flip back to "checking" after the user has seen it pass.
     func enter() async {
+        guard !entered, !running else { return }
         guard canEnter(at: Date().timeIntervalSince1970) else { refreshReadiness(); return }
-        running = true
         let index = rows.count - 1
-        rows[index].status = .running
-        let result = await checks.check(.verification)
-        guard !Task.isCancelled else {
-            accept(.failed(code: "cancelled", detail: "本轮检查已取消，请重新检查。"), at: index)
-            running = false
-            return
-        }
-        guard accept(result, at: index),
-              accept(checks.validateCurrentEvidence(), at: index), allPassed else { running = false; return }
+        guard accept(checks.validateCurrentEvidence(), at: index), allPassed else { return }
         do {
             try saveCompletion()
             checks.finish()
@@ -430,7 +426,6 @@ final class FirstRunInitialization: ObservableObject {
         } catch {
             accept(.failed(code: "completion_write_failed", detail: "初始化记录未能保存，请检查 Watch 数据目录权限后重试。"), at: index)
         }
-        running = false
     }
     /// Diagnostic export is deliberately status-only. UI details can contain
     /// detected addresses, so they are never interpolated into this report.

@@ -120,13 +120,17 @@ struct InitializationTests {
         expect(!coordinator.allPassed && !coordinator.canEnter(at: Date().timeIntervalSince1970), "network changes revoke ready state before entry")
         fake.validation = .passed("current", validUntil: Date().timeIntervalSince1970 + 120)
         await coordinator.retry()
-        fake.overrides[.verification] = .failed(code: "real_risk", detail: "DNS risk")
+        let verificationsBeforeEntry = fake.calls.filter { $0 == .verification }.count
+        fake.validation = .failed(code: "context_changed", detail: "DNS risk at entry")
         await coordinator.enter()
-        expect(!coordinator.entered && writes == 0 && fake.finishes == 0, "last-moment risk during entry cannot save completion or open main view")
-        fake.overrides = [:]
+        expect(!coordinator.entered && writes == 0 && fake.finishes == 0,
+               "entry re-evaluates current evidence, so a last-moment change cannot save completion or open the main view")
+        expect(fake.calls.filter { $0 == .verification }.count == verificationsBeforeEntry,
+               "entry reuses the joint verification result instead of running that step a second time")
+        fake.validation = .passed("current", validUntil: Date().timeIntervalSince1970 + 120)
         await coordinator.retry()
         await coordinator.enter()
-        expect(coordinator.entered && writes == 1 && fake.finishes == 1, "completion is saved only after final recheck")
+        expect(coordinator.entered && writes == 1 && fake.finishes == 1, "completion is saved only after the final gate passes")
         await coordinator.enter()
         expect(writes == 1, "repeated entry cannot repeat completion side effects")
         let resumeChecks = ScriptedInitializationChecks()
