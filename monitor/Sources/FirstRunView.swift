@@ -50,8 +50,10 @@ struct FirstRunView: View {
                                     .font(WatchTypography.caption).foregroundStyle(p.secondary)
                                 ForEach(policy.rows.filter(\.required)) { row in
                                     HStack(alignment: .top, spacing: 12) {
-                                        Image(systemName: row.state == "ok" ? "checkmark.circle.fill" : "exclamationmark.circle")
-                                            .foregroundStyle(row.state == "ok" ? p.mint : p.amber)
+                                        Image(systemName: row.state == "ok" ? "checkmark.circle.fill"
+                                                : row.state == "fail" ? "xmark.octagon.fill" : "exclamationmark.circle")
+                                            .foregroundStyle(row.state == "ok" ? p.mint
+                                                    : row.state == "fail" ? p.red : p.amber)
                                         VStack(alignment: .leading, spacing: 4) {
                                             Text(row.name).font(WatchTypography.bodyStrong)
                                             Text(row.detail).font(WatchTypography.caption).foregroundStyle(p.secondary)
@@ -59,7 +61,8 @@ struct FirstRunView: View {
                                         }
                                         Spacer(minLength: 8)
                                         Text(row.statusLabel).font(WatchTypography.caption)
-                                            .foregroundStyle(row.state == "ok" ? p.mint : p.amber)
+                                            .foregroundStyle(row.state == "ok" ? p.mint
+                                                    : row.state == "fail" ? p.red : p.amber)
                                     }.accessibilityElement(children: .combine)
                                 }
                             }

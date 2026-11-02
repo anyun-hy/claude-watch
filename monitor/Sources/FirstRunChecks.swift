@@ -179,24 +179,44 @@ final class FirstRunChecks: InitializationChecking {
             store.leakChecks.invalidateInitializationReceipt(kind)
             return failure
         }
+        if let failure = await refreshStaleEnvironmentReadback(kind) { return failure }
         return .passed("检测通过，结果已提交后台；主界面与保护检查共用本次回执。")
     }
+    /// A receipt re-collected after the environment audit predates it in that
+    /// audit's backend readback. Refresh the audit the same way the protection
+    /// step does, so the readback references this round's receipt instead of
+    /// the next revocation pass condemning the fresh receipt as "changed".
+    private func refreshStaleEnvironmentReadback(_ kind: LeakKind) async -> InitializationResult? {
+        guard requireBackendContextMatch,
+              let receipt = kind == .dns ? store.switcher.initializationDNSReceipt : store.switcher.initializationWebRTCReceipt,
+              let observed = kind == .dns ? store.switcher.currentEnvironment?.initialization_receipts?.dns
+                                         : store.switcher.currentEnvironment?.initialization_receipts?.webrtc,
+              observed.state == "ok", observed.context_id == receipt.context,
+              observed.sampled_at != receipt.sampled else { return nil }
+        guard await store.switcher.detectCurrentEnvironment() else {
+            return .failed(code: "environment_unstable", detail: "重新检测后的环境回读未完成，请重试。")
+        }
+        return nil
+    }
     func refreshWaitingEvidence() async -> InitializationRefreshOutcome {
-        guard contextMatches else {
-            let result = Self.networkContextFailure(bound: boundContext, current: store.initializationContext, timeoutStage: nil)
-            if case .failed(let code, let detail) = result { return .failed(step: .connection, code: code, detail: detail) }
-            return .failed(step: .connection, code: "context_unavailable", detail: "代理上下文暂不可确认，请重新检查。")
-        }
-        guard snapshotIsCurrent else {
-            return .failed(step: .connection, code: "snapshot_unavailable", detail: "后台或代理采样状态暂不可确认，请重新检查。")
-        }
-        guard acceptedSettings != nil, acceptedSettings == settingsData else {
-            return .failed(step: .environment, code: "settings_changed", detail: "已确认的 Watch 设置发生变化，请重新检查。")
-        }
-        guard accessibilityTrusted() else {
-            return .failed(step: .accessibility, code: "permission_missing", detail: "辅助功能权限当前未确认，请重新检查。")
+        // One predicate defines "still current" for every rerun path: these
+        // are the same revocation rules the coordinator applies to kept
+        // greens, so a waiting-period refresh and a failed-round resume can
+        // never disagree about what counts as current evidence.
+        let blocking = currentEvidenceFailures()
+        for step in [InitializationStep.connection, .environment, .accessibility] {
+            if case .failed(let code, let detail)? = blocking[step] {
+                return .failed(step: step, code: code, detail: detail)
+            }
         }
         for step in [InitializationStep.dns, .webrtc] {
+            // A receipt that is still current (fresh result, same context,
+            // already accepted by the backend) must not be re-collected: a
+            // waiting-period refresh only re-runs the kind that actually
+            // expired. Forcing both probes every cycle turned each refresh
+            // into a full multi-minute restart of the network checks.
+            let kind: LeakKind = step == .dns ? .dns : .webrtc
+            if store.leakChecks.initializationReceiptIsCurrent(kind) { continue }
             let result = await checkNetwork(step, forceNew: true)
             guard !Task.isCancelled else { return .failed(step: step, code: "cancelled", detail: "自动刷新已取消，请重新检查。") }
             if case .failed(let code, let detail) = result {
@@ -257,9 +277,9 @@ final class FirstRunChecks: InitializationChecking {
         store.switcher.setupEnablePolicy = true
         // First collect/verify the environment. Enabling new protection is a
         // separate, explicit step only after DNS, WebRTC and precheck passed.
-        store.switcher.setupGuard = enableProtection || store.switcher.settings["guard_enabled"] as? Bool == true
-        store.switcher.setupWatchdog = enableProtection || store.switcher.settings["timezone_watchdog"] as? Bool == true
-        store.switcher.setupUpdater = store.switcher.settings["auto_update"] as? Bool ?? false
+        store.switcher.setupGuard = enableProtection || store.switcher.isOn(Setting.guardEnabled)
+        store.switcher.setupWatchdog = enableProtection || store.switcher.isOn(Setting.timezoneWatchdog)
+        store.switcher.setupUpdater = store.switcher.isOn(Setting.autoUpdate)
         await store.switcher.previewEnvironment()
         guard let plan = store.switcher.setupPlan, plan.candidate_id == candidate.id,
               plan.expires_at > Date().timeIntervalSince1970, Self.allowed(plan.actions), contextMatches,
@@ -282,7 +302,7 @@ final class FirstRunChecks: InitializationChecking {
     }
     private func preProtectionEvidence() -> InitializationResult {
         guard contextMatches, snapshotIsCurrent, acceptedSettings != nil, acceptedSettings == settingsData else { return changedFailure }
-        guard store.switcher.settings["enabled"] as? Bool == true else {
+        guard store.switcher.isOn(Setting.enabled) else {
             return .failed(code: "policy_not_enabled", detail: "环境设置与启动策略尚未确认，请重新检查。")
         }
         guard accessibilityTrusted() else { return .failed(code: "permission_missing", detail: "辅助功能权限未确认，请重新授权。") }
@@ -294,7 +314,7 @@ final class FirstRunChecks: InitializationChecking {
             policy: store.switcher.currentPolicyEvaluation, settings: store.switcher.settings,
             historical: store.switcher.currentEnvironmentIsHistorical, unsavedSettings: store.switcher.hasUnsavedSettings,
             now: Date().timeIntervalSince1970,
-            checkingBeforeGuardEnable: store.switcher.settings["guard_enabled"] as? Bool != true)
+            checkingBeforeGuardEnable: !store.switcher.isOn(Setting.guardEnabled))
     }
     func validateCurrentEvidence() -> InitializationResult {
         let now = Date().timeIntervalSince1970
@@ -405,7 +425,7 @@ final class FirstRunChecks: InitializationChecking {
     }
     private var settingsData: Data? { try? JSONSerialization.data(withJSONObject: store.switcher.settings, options: .sortedKeys) }
     private var protectionSettingsEnabled: Bool {
-        ["enabled", "guard_enabled", "timezone_watchdog"].allSatisfy { store.switcher.settings[$0] as? Bool == true }
+        [Setting.enabled, Setting.guardEnabled, Setting.timezoneWatchdog].allSatisfy { store.switcher.isOn($0) }
     }
     private var recoveryRequired: Bool {
         store.switcher.setupRecoveryRequired || store.switcher.updateRecoveryRequired || store.switcher.accounts?.recovery_required == true
@@ -549,8 +569,13 @@ enum InitializationEnvironmentGate {
         // Never accept an empty, truncated, duplicate or downgraded check list.
         let expected: Set<String> = ["proxy", "tun", "egress", "ip_history", "timezone", "locale", "ipv6",
                                      "dns", "stun", "guard", "routing", "language", "asn", "reachability"]
-        var mandatory: Set<String> = ["proxy", "tun", "egress", "timezone", "locale", "dns", "stun", "guard", "reachability"]
-        for (key, id) in [("require_ipv6_off", "ipv6"), ("require_english", "language"), ("require_pinned_rules", "routing")] {
+        var mandatory: Set<String> = ["proxy", "tun", "egress", "timezone", "locale", "guard", "reachability"]
+        // DNS and STUN rows are required only when their probes are explicitly
+        // requested (require_dns / require_stun). Backend audit marks them
+        // `required=false` otherwise; hardcoding them here would reject a valid
+        // receipt for "缺少必检项目".
+        for (key, id) in [("require_ipv6_off", "ipv6"), ("require_english", "language"),
+                          ("require_pinned_rules", "routing"), ("require_dns", "dns"), ("require_stun", "stun")] {
             if settings[key] as? Bool == true { mandatory.insert(id) }
         }
         let ids = policy.rows.map(\.id)

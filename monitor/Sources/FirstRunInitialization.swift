@@ -165,12 +165,32 @@ final class FirstRunInitialization: ObservableObject {
     }
     func retry() async {
         guard !running, !entered else { return }
-        // Rechecking all dependencies prevents combining greens from before
-        // a network/permission change with results obtained after it.
-        rows = InitializationStep.allCases.map { InitializationRow(step: $0) }
+        // A failed round resumes at the earliest step without current evidence
+        // instead of discarding every green. Kept greens stay trustworthy
+        // because currentEvidenceFailures revokes any whose context, snapshot,
+        // settings, permission or receipt no longer holds, and every step
+        // from the resume point onward is re-executed, so results from before
+        // a network or permission change cannot merge into this round.
         approval = nil; validUntil = nil; stopAccessibilityPolling()
         automaticRefreshEligible = false; nextAutomaticRefresh = nil
-        await run(from: 0)
+        for index in rows.indices where rows[index].status != .passed {
+            rows[index].status = .pending; rows[index].code = "pending"; rows[index].detail = ""
+        }
+        _ = reconcilePassedEvidence()
+        // Component integrity has no continuous evidence predicate; recheck it
+        // on every rerun instead of trusting a green from an earlier round.
+        if rows[0].status == .passed {
+            rows[0].status = .running; rows[0].detail = "正在读取实际状态…"
+            let result = await checks.check(.components)
+            guard !Task.isCancelled else {
+                accept(.failed(code: "cancelled", detail: "本轮检查已取消，请重新检查。"), at: 0)
+                return
+            }
+            guard accept(result, at: 0) else { return }
+        }
+        // Recompute after the recheck: a revocation during it may move the
+        // earliest missing evidence to an earlier dependency.
+        await run(from: rows.firstIndex { $0.status != .passed } ?? 0)
     }
     private func run(from index: Int) async {
         guard !running else { return }

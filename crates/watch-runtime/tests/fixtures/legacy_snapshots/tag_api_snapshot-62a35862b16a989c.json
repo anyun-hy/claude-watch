@@ -1,0 +1,94 @@
+[
+  [
+    {
+      "controller": "http://127.0.0.1:9090",
+      "covers_7890": true,
+      "direct_groups": [],
+      "global_node": "JP09",
+      "mode": "global",
+      "reason": "",
+      "route_chains": {
+        "AI": [
+          "JP11",
+          "AI"
+        ],
+        "GLOBAL": [
+          "JP09",
+          "GLOBAL"
+        ]
+      },
+      "rules": {
+        "broad": 0,
+        "disabled_domains": [],
+        "entries": [],
+        "reason": "",
+        "relevant": 0,
+        "state": "available",
+        "total": 0
+      },
+      "selected_node": "JP09",
+      "state": "available"
+    },
+    []
+  ],
+  [
+    {
+      "controller": "http://127.0.0.1:9090",
+      "covers_7890": true,
+      "direct_groups": [],
+      "global_node": "JP09",
+      "mode": "rule",
+      "reason": "",
+      "route_chains": {
+        "AI": [
+          "JP11",
+          "AI"
+        ],
+        "GLOBAL": [
+          "JP09",
+          "GLOBAL"
+        ]
+      },
+      "rules": {
+        "broad": 0,
+        "disabled_domains": [],
+        "entries": [],
+        "reason": "",
+        "relevant": 0,
+        "state": "available",
+        "total": 0
+      },
+      "selected_node": "JP11",
+      "state": "available"
+    },
+    []
+  ],
+  [
+    {
+      "controller": "http://127.0.0.1:9090",
+      "covers_7890": true,
+      "direct_groups": [],
+      "global_node": "JP09",
+      "mode": "global",
+      "reason": "",
+      "route_chains": {
+        "AI": [
+          "JP11",
+          "AI"
+        ],
+        "GLOBAL": [
+          "JP09",
+          "GLOBAL"
+        ]
+      },
+      "rules": {
+        "entries": [],
+        "reason": "控制接口规则表 HTTP 404",
+        "state": "unavailable"
+      },
+      "selected_node": "JP09",
+      "state": "available"
+    },
+    []
+  ]
+]

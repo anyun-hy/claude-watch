@@ -1,9 +1,48 @@
 //! AI roots require an observed executable/bundle or the actual interpreter entrypoint.
-use crate::processes::{Identity, Kind};
+use crate::policy::PolicyCatalog;
+use crate::processes::{Identity, Kind, Provider};
 use std::{
     collections::BTreeSet,
     path::{Component, Path, PathBuf},
 };
+
+/// The desktop bundle identifier one provider's own app lives under.
+fn provider_bundle_id(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "com.anthropic.claudefordesktop",
+        Provider::Codex | Provider::Openai => "com.openai.codex",
+        Provider::Chatgpt => "com.openai.chat",
+    }
+}
+
+/// The install prefix one provider's own app runs from, used when a process
+/// carries no bundle id but its executable path still names the app.
+fn provider_app_prefix(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "/Applications/Claude.app/Contents/",
+        Provider::Codex | Provider::Openai => "/Applications/Codex.app/Contents/",
+        Provider::Chatgpt => "/Applications/ChatGPT.app/Contents/",
+    }
+}
+
+/// Every desktop bundle the supervised target's policy family covers, and the
+/// matching install prefixes. A family supervises its providers as one
+/// service: ChatGPT and Codex enter and leave together, exactly as the policy
+/// table declares them. A target outside every family supervises nothing.
+pub fn family_desktop_scopes(provider: Provider) -> (Vec<&'static str>, Vec<&'static str>) {
+    let Some(family) = PolicyCatalog::family_for(provider) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut ids: Vec<&'static str> =
+        family.providers.iter().map(|p| provider_bundle_id(*p)).collect();
+    let mut prefixes: Vec<&'static str> =
+        family.providers.iter().map(|p| provider_app_prefix(*p)).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    (ids, prefixes)
+}
 
 pub struct RootEvidence<'a> {
     pub identity: &'a Identity,

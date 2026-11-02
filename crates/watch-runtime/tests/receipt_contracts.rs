@@ -1,14 +1,16 @@
+mod support;
+
 use claude_watch_core::receipts;
 use claude_watch_runtime::{
     receipt_store::ReceiptStore,
     storage::{Paths, StateStore},
 };
 use serde_json::{json, Value};
+use support::oracle;
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
 };
 use uuid::Uuid;
 
@@ -33,34 +35,6 @@ fn probe(kind: &str, now: f64) -> Value {
         "observations":[{"kind":"http","address":"1.1.1.1","country":"Japan","source":"fixture"},
                         {"kind":candidates,"address":address,"country":"Japan","source":"fixture"}],
         "externalJSON":serde_json::to_string(&evidence).unwrap()})
-}
-fn oracle(operation: &str, cases: &[Value]) -> Vec<Value> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    let mut child = Command::new("python3")
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .arg(root.join("tools/migration_reference.py"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(&serde_json::to_vec(&json!({"operation":operation,"cases":cases})).unwrap())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    serde_json::from_slice(&out.stdout).unwrap()
 }
 struct Fixture {
     home: PathBuf,

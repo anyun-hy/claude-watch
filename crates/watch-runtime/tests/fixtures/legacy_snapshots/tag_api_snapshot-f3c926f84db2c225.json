@@ -1,0 +1,134 @@
+[
+  [
+    {
+      "controller": "http://127.0.0.1:9090",
+      "covers_7890": true,
+      "direct_groups": [],
+      "global_node": null,
+      "mode": "global",
+      "reason": "",
+      "route_chains": {
+        "GLOBAL": null
+      },
+      "rules": {
+        "broad": 0,
+        "disabled_domains": [],
+        "entries": [],
+        "reason": "",
+        "relevant": 0,
+        "state": "available",
+        "total": 0
+      },
+      "selected_node": null,
+      "state": "available"
+    },
+    []
+  ],
+  [
+    {
+      "controller": "http://127.0.0.1:9090",
+      "covers_7890": true,
+      "direct_groups": [
+        "GLOBAL"
+      ],
+      "global_node": null,
+      "mode": "global",
+      "reason": "",
+      "route_chains": {
+        "GLOBAL": null
+      },
+      "rules": {
+        "broad": 0,
+        "disabled_domains": [],
+        "entries": [],
+        "reason": "",
+        "relevant": 0,
+        "state": "available",
+        "total": 0
+      },
+      "selected_node": null,
+      "state": "available"
+    },
+    []
+  ],
+  [
+    {
+      "controller": "http://127.0.0.1:9090",
+      "covers_7890": true,
+      "direct_groups": [
+        "GLOBAL"
+      ],
+      "global_node": null,
+      "mode": "global",
+      "reason": "",
+      "route_chains": {
+        "GLOBAL": null
+      },
+      "rules": {
+        "broad": 0,
+        "disabled_domains": [],
+        "entries": [],
+        "reason": "",
+        "relevant": 0,
+        "state": "available",
+        "total": 0
+      },
+      "selected_node": null,
+      "state": "available"
+    },
+    []
+  ],
+  [
+    {
+      "controller": "http://127.0.0.1:9090",
+      "covers_7890": true,
+      "direct_groups": [],
+      "global_node": null,
+      "mode": "global",
+      "reason": "",
+      "route_chains": {
+        "GLOBAL": null
+      },
+      "rules": {
+        "broad": 0,
+        "disabled_domains": [],
+        "entries": [],
+        "reason": "",
+        "relevant": 0,
+        "state": "available",
+        "total": 0
+      },
+      "selected_node": null,
+      "state": "available"
+    },
+    []
+  ],
+  [
+    {
+      "controller": "http://127.0.0.1:9090",
+      "covers_7890": true,
+      "direct_groups": [],
+      "global_node": "node-a",
+      "mode": "global",
+      "reason": "",
+      "route_chains": {
+        "GLOBAL": [
+          "node-a",
+          "GLOBAL"
+        ]
+      },
+      "rules": {
+        "broad": 0,
+        "disabled_domains": [],
+        "entries": [],
+        "reason": "",
+        "relevant": 0,
+        "state": "available",
+        "total": 0
+      },
+      "selected_node": "node-a",
+      "state": "available"
+    },
+    []
+  ]
+]

@@ -219,6 +219,22 @@ mod cli_settings_contracts {
         }
     }
     #[test]
+    fn default_policy_digest_is_pinned_so_a_field_reorder_cannot_break_heartbeats() {
+        // Heartbeats already on disk carry these digests. Adding, renaming or
+        // reordering a config field would invalidate every live heartbeat, so
+        // the default document's digest is pinned here. The 2026-11 pin moved
+        // when the ChatGPT / Codex family gained the ordinary close action.
+        let config = Config::default();
+        assert_eq!(
+            policy_digest(&config.value().unwrap()).unwrap(),
+            "e9ceefaa043947f7713d174a3f75e8beb1e1ea2162570ac0c57beb333ba4bdc4"
+        );
+        assert_eq!(
+            guard_policy_digest(&config).unwrap(),
+            "bb656255349123ab74bd33b3fcb1bf5ff1b6ac3e94bf3fadbf0cbc4d0167a579"
+        );
+    }
+    #[test]
     fn cli_proxy_read_filters_auth_values_and_never_updates_settings() {
         let root = std::env::temp_dir().join(format!("cli-settings-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join(".claude")).unwrap();

@@ -1,0 +1,35 @@
+[
+  {
+    "value": "8.8.8.8"
+  },
+  {
+    "value": "8.8.8.8"
+  },
+  {
+    "value": "2001:4860:4860::8888"
+  },
+  {
+    "value": "2001:4860:4860::8888"
+  },
+  {
+    "value": "::ffff:8.8.8.8"
+  },
+  {
+    "value": "::ffff:8.8.8.8"
+  },
+  {
+    "error": "nonpublic_address"
+  },
+  {
+    "error": "nonpublic_address"
+  },
+  {
+    "error": "unrelated_response"
+  },
+  {
+    "error": "invalid_length"
+  },
+  {
+    "error": "address_missing"
+  }
+]

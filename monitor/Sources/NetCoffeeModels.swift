@@ -114,18 +114,10 @@ final class CoffeeRequest: @unchecked Sendable {
             return .failure(kind, query: query, "构建包未声明后台类型，请重新构建界面。")
         }
         switch variant {
-        case .stable:
-            let script = resources.appendingPathComponent("netcoffee_client.py", isDirectory: false)
-            guard FileManager.default.isReadableFile(atPath: script.path),
-                  let python = ["/opt/homebrew/bin/python3","/usr/local/bin/python3","/usr/bin/python3"].first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-                return .failure(kind, query: query, "Net.Coffee 采集组件不可用")
-            }
-            p.executableURL = URL(fileURLWithPath: python)
-            p.arguments = [script.path, kind, query]
         case .rustCandidate:
             let engine = resources.appendingPathComponent("watch-engine", isDirectory: false)
             guard FileManager.default.isExecutableFile(atPath: engine.path) else {
-                return .failure(kind, query: query, "找不到 Rust Net.Coffee 采集组件，请重新构建候选包。")
+                return .failure(kind, query: query, "找不到 Rust Net.Coffee 采集组件，请重新构建。")
             }
             p.executableURL = engine
             p.arguments = ["coffee", kind, query]

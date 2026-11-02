@@ -192,7 +192,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                         let receipt=controller.guard_tick(&mut runtime)?;
                         guard_history.observe(&guard_diagnostics, &receipt, native::now());
                         if let Some(alerts)=&guard_alerts {
-                            if receipt["action"]=="close-desktop"{unknown_gate.observe(false);alerts.enqueue(Alert{title:"Claude Watch：已触发保护".into(),message:"检测到会话风险并关闭了 Claude。请查看具体检测结果；重新启动仍会执行完整校验。".into(),severity:Severity::Warning});}
+                            if receipt["action"]=="close-desktop"{unknown_gate.observe(false);alerts.enqueue(Alert{title:"Claude Watch：已触发保护".into(),message:"检测到会话风险并已按配置处置受监督的应用。请查看具体检测结果；重新启动仍会执行完整校验。".into(),severity:Severity::Warning});}
                             else if unknown_gate.observe(receipt["status"]=="unknown"){alerts.enqueue(Alert{title:"Claude Watch：保护采样异常".into(),message:"本轮保护证据未能完整取得，后台正在重试。详情见环境状态；这不等于已检测到网络泄漏。".into(),severity:Severity::Critical});}
                         }
                         sleep_until(started + PROCESS_INTERVAL, &stop);

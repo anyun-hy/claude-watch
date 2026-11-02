@@ -237,7 +237,9 @@ class Plan:
 def preflight(layout: Layout, runner: Runner, uid: int) -> Plan:
     if layout.home.is_symlink() or not layout.home.is_dir() or layout.home.stat().st_uid != uid:
         raise Stop("当前用户目录的归属或类型不匹配。")
-    if not shutil.rmtree.avoids_symlink_attacks:
+    # Python 3.12 removed the flag because rmtree became unconditionally safe;
+    # an older interpreter only qualifies when it reports the same guarantee.
+    if not getattr(shutil.rmtree, "avoids_symlink_attacks", True):
         raise Stop("系统不支持安全目录清理。")
     for path in layout.data_paths() + [layout.agent, layout.updater, layout.trash]:
         safe_user_path(path, layout.home, uid)

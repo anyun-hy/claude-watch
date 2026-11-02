@@ -3,6 +3,7 @@
 use claude_watch_core::{
     config::Config,
     error::{CoreError, Result},
+    processes::Provider,
     session::Desktop,
 };
 use claude_watch_runtime::{
@@ -87,6 +88,9 @@ impl EvidenceSystem for NativeEvidence {
     }
     fn cancelled(&self) -> bool {
         self.stop.load(Ordering::Acquire)
+    }
+    fn supervised_provider(&self) -> Provider {
+        self.desktop.provider()
     }
 }
 pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<thread::JoinHandle<()>> {

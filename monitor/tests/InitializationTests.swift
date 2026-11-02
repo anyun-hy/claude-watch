@@ -112,7 +112,8 @@ struct InitializationTests {
         fake.overrides = [:]
         await coordinator.retry()
         expect(coordinator.allPassed && !coordinator.entered && writes == 0, "all required checks must finish before entry becomes available")
-        expect(Array(fake.calls.suffix(InitializationStep.allCases.count)) == InitializationStep.allCases, "retry rechecks dependencies instead of merging pre-change greens")
+        expect(fake.calls.suffix(7) == [.components, .environment, .accessibility, .dns, .webrtc, .protection, .verification],
+               "retry rechecks components and resumes at the failed step instead of re-collecting current evidence")
         expect(coordinator.canEnter(at: Date().timeIntervalSince1970), "all current checks enable the entry control")
         fake.validation = .failed(code: "context_changed", detail: "actual network changed")
         coordinator.refreshReadiness()
@@ -128,6 +129,24 @@ struct InitializationTests {
         expect(coordinator.entered && writes == 1 && fake.finishes == 1, "completion is saved only after final recheck")
         await coordinator.enter()
         expect(writes == 1, "repeated entry cannot repeat completion side effects")
+        let resumeChecks = ScriptedInitializationChecks()
+        resumeChecks.overrides[.dns] = .failed(code: "dns_not_passed", detail: "risk")
+        let resumeCoordinator = FirstRunInitialization(checks: resumeChecks, completed: false, saveCompletion: {})
+        await resumeCoordinator.start()
+        expect(resumeCoordinator.rows.first { $0.step == .dns }!.status == .failed && !resumeCoordinator.allPassed,
+               "DNS failure stops the round at the DNS step")
+        let callsBeforeRetry = resumeChecks.calls.count
+        resumeChecks.overrides[.dns] = .passed("clean")
+        await resumeCoordinator.retry()
+        expect(resumeChecks.calls.count > callsBeforeRetry && resumeChecks.calls[callsBeforeRetry] == .components,
+               "retry rechecks component integrity, which has no continuous evidence predicate")
+        expect(resumeChecks.calls[(callsBeforeRetry + 1)...] == [.dns, .webrtc, .protection, .verification],
+               "a failed round resumes at the failed step instead of discarding earlier greens")
+        expect(!resumeChecks.calls[(callsBeforeRetry + 1)...].contains(.connection) &&
+               !resumeChecks.calls[(callsBeforeRetry + 1)...].contains(.environment),
+               "connection and environment evidence that is still current is not re-collected on retry")
+        expect(resumeCoordinator.allPassed && resumeCoordinator.canEnter(at: Date().timeIntervalSince1970),
+               "a resumed round grants entry only through the same final verification")
         let reopenedChecks = ScriptedInitializationChecks()
         let reopened = FirstRunInitialization(checks: reopenedChecks, completed: true, saveCompletion: { writes += 100 })
         await reopened.start()
@@ -488,21 +507,35 @@ struct InitializationTests {
         if let request = full.approval { await full.authorize(request) }
         expect(full.allPassed && !full.entered && fullStore.switcher.settings["guard_enabled"] as? Bool == true,
                "confirmed fixture guard still runs the real final verification before entry")
-        // Advance six scheduled intervals without waiting six real minutes;
-        // the real shared stores and fixture collectors produce new receipts.
-        for _ in 0..<6 {
+        // Scheduled cycles must not re-collect receipts that are still
+        // current: re-running both probes every cycle turned each waiting
+        // refresh into a full multi-minute restart of the network checks.
+        for _ in 0..<2 {
             let oldDNS = fullLeaks.dns.result!.finishedAt, oldRTC = fullLeaks.rtc.result!.finishedAt
             full.refreshReadiness(at: Date().addingTimeInterval(61))
             expect(full.running && !full.canEnter(at: Date().timeIntervalSince1970), "automatic refresh cannot grant entry while evidence is in flight")
             for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
-            expect(!full.running && full.allPassed && fullLeaks.dns.result!.finishedAt > oldDNS && fullLeaks.rtc.result!.finishedAt > oldRTC,
-                   "each scheduled cycle refreshes DNS and WebRTC before restoring ready state")
-            let readback = fullSwitcher.currentEnvironment?.initialization_receipts
-            expect(readback?.dns?.sampled_at == fullLeaks.dns.result?.finishedAt && readback?.webrtc?.sampled_at == fullLeaks.rtc.result?.finishedAt,
-                   "the environment page uses the exact newly submitted receipts")
+            expect(!full.running && full.allPassed && fullLeaks.dns.result!.finishedAt == oldDNS && fullLeaks.rtc.result!.finishedAt == oldRTC,
+                   "a scheduled cycle with current receipts skips re-collection and restores ready state")
         }
+        // A backend rejection invalidates exactly one receipt; the refresh
+        // re-runs only that kind and leaves the still-current kind untouched.
+        let skippedDNS = fullLeaks.dns.result!.finishedAt, skippedRTC = fullLeaks.rtc.result!.finishedAt
+        fullLeaks.invalidateInitializationReceipt(.dns)
+        // The tick that observes the invalidation only revokes the row; the
+        // next tick starts the scheduled refresh, exactly like the live UI.
+        full.refreshReadiness(at: Date().addingTimeInterval(31))
+        full.refreshReadiness(at: Date().addingTimeInterval(32))
+        for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
+        expect(!full.running && full.allPassed && fullLeaks.dns.result!.finishedAt > skippedDNS && fullLeaks.rtc.result!.finishedAt == skippedRTC,
+               "an invalidated DNS receipt re-runs DNS only; the current WebRTC receipt is not re-collected")
+        let readback = fullSwitcher.currentEnvironment?.initialization_receipts
+        expect(readback?.dns?.sampled_at == fullLeaks.dns.result?.finishedAt && readback?.webrtc?.sampled_at == fullLeaks.rtc.result?.finishedAt,
+               "the environment page uses the exact newly submitted receipts")
         fullLeaks.fixtureScenario = .timeout
-        full.refreshReadiness(at: Date().addingTimeInterval(61))
+        fullLeaks.invalidateInitializationReceipt(.dns)
+        full.refreshReadiness(at: Date().addingTimeInterval(31))
+        full.refreshReadiness(at: Date().addingTimeInterval(32))
         for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
         expect(full.rows[4].status == .failed && !full.canEnter(at: Date().timeIntervalSince1970),
                "an automatic DNS failure is visible and cannot reuse the previous green")

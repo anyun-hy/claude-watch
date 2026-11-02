@@ -18,16 +18,10 @@ enum SnapshotRunner {
         switch variant {
         case .rustCandidate:
             guard let engine = Bundle.main.url(forResource: "watch-engine", withExtension: nil) else {
-                return .failure("找不到 Rust 数据读取组件，请重新构建候选包。")
+                return .failure("找不到 Rust 数据读取组件，请重新构建。")
             }
             task.executableURL = engine
             task.arguments = ["snapshot"] + (full ? ["--full"] : [])
-        case .stable:
-            guard let script = Bundle.main.url(forResource: "snapshot", withExtension: "sh") else {
-                return .failure("找不到稳定版数据读取组件，请重新构建界面。")
-            }
-            task.executableURL = URL(fileURLWithPath: "/bin/bash")
-            task.arguments = [script.path] + (full ? ["--full"] : [])
         }
         task.standardOutput = output
         task.standardError = errors
@@ -87,10 +81,13 @@ struct DiagnosticContextTracker: Equatable {
     }
 }
 
-/// Wire-compatible with Rust `receipts::tag_signature`. Keep all four fields:
-/// global mode still needs the selected-node field for receipt validation.
+/// Wire-compatible with Rust `receipts::tag_signature`. A missing node value is
+/// emitted as an empty segment — exactly like `receipts.rs` joins `a|b|c|d` with
+/// `unwrap_or("")` — instead of collapsing the whole signature. `endpoint` and
+/// `mode` still must be present: without them there is no verified proxy to bind
+/// a receipt to, so the context stays unavailable.
 func tagReceiptContext(endpoint: String, mode: String, selectedNode: String, globalNode: String) -> String? {
-    guard !endpoint.isEmpty, !mode.isEmpty, !selectedNode.isEmpty, !globalNode.isEmpty else { return nil }
+    guard !endpoint.isEmpty, !mode.isEmpty else { return nil }
     return [endpoint, mode, selectedNode, globalNode].joined(separator: "|")
 }
 
@@ -188,9 +185,9 @@ final class MonitorStore: ObservableObject {
             guard let self else { return false }
             return await self.switcher.recordWebRTCRisk(result, runID: runID)
         }
-        self.switcher.awaitFreshDNSReceipt = { [weak self] in
+        self.switcher.awaitFreshDNSReceipt = { [weak self] maximumAge in
             guard let self else { return false }
-            return await self.leakChecks.ensureFreshDNSReceipt()
+            return await self.leakChecks.ensureFreshDNSReceipt(maximumAge: maximumAge)
         }
         self.switcher.onDNSReceiptRecorded = { [weak self] in
             self?.requestEnvironmentRefreshAfterDNS()

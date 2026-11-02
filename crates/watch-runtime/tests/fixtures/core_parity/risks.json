@@ -1,0 +1,128 @@
+[
+  {
+    "evidence": {
+      "country": "JP"
+    },
+    "risks": [],
+    "state": "ok"
+  },
+  {
+    "evidence": {
+      "country": "JP"
+    },
+    "risks": [
+      {
+        "id": "cn_egress",
+        "reason": "本轮出口来源显示中国归属",
+        "required": true,
+        "source": "trace",
+        "value": "CN"
+      },
+      {
+        "id": "egress_conflict",
+        "reason": "出口来源返回不一致",
+        "required": true,
+        "source": "egress_consistency",
+        "value": "conflict"
+      }
+    ],
+    "state": "fail"
+  },
+  {
+    "evidence": {
+      "country": "JP"
+    },
+    "risks": [
+      {
+        "id": "egress_conflict",
+        "reason": "出口来源返回不一致",
+        "required": true,
+        "source": "egress_consistency",
+        "value": "conflict"
+      }
+    ],
+    "state": "fail"
+  },
+  {
+    "evidence": {
+      "country": "JP"
+    },
+    "risks": [
+      {
+        "id": "cn_dns",
+        "reason": "同轮 DNS 递归出口含中国归属",
+        "required": true,
+        "source": "dns",
+        "value": "CN"
+      }
+    ],
+    "state": "fail"
+  },
+  {
+    "evidence": {
+      "country": "JP"
+    },
+    "risks": [
+      {
+        "id": "webrtc_mismatch",
+        "reason": "fixture",
+        "required": true,
+        "source": "webrtc",
+        "value": "mismatch"
+      }
+    ],
+    "state": "fail"
+  },
+  {
+    "evidence": {
+      "country": "JP"
+    },
+    "risks": [
+      {
+        "id": "cn_webrtc",
+        "reason": "同轮 WebRTC 公网候选含中国归属",
+        "required": true,
+        "source": "webrtc",
+        "value": "CN"
+      }
+    ],
+    "state": "fail"
+  },
+  {
+    "evidence": {
+      "country": "JP"
+    },
+    "risks": [
+      {
+        "id": "cn_asn_registration",
+        "reason": "当前 IP 的 ASN 注册归属为中国；这是归属风险，不等同已证实泄漏",
+        "required": true,
+        "source": "asn",
+        "value": "CN"
+      }
+    ],
+    "state": "fail"
+  },
+  {
+    "evidence": {
+      "country": "JP"
+    },
+    "risks": [],
+    "state": "ok"
+  },
+  {
+    "evidence": {
+      "country": "JP"
+    },
+    "risks": [
+      {
+        "id": "egress_conflict",
+        "reason": "出口来源返回不一致",
+        "required": true,
+        "source": "egress_consistency",
+        "value": "conflict"
+      }
+    ],
+    "state": "fail"
+  }
+]

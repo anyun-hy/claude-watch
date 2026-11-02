@@ -1,0 +1,42 @@
+[
+  {
+    "roleEvidence": "configured_mcp_entry",
+    "runtimeRole": "mcp",
+    "serviceName": "REA"
+  },
+  {
+    "roleEvidence": "configured_mcp_entry",
+    "runtimeRole": "mcp",
+    "serviceName": "REA"
+  },
+  {
+    "roleEvidence": "configured_mcp_entry",
+    "runtimeRole": "mcp",
+    "serviceName": "REA"
+  },
+  {},
+  {},
+  {},
+  {},
+  {},
+  {
+    "roleEvidence": "runtime_component",
+    "runtimeRole": "chromium_network",
+    "serviceName": "Chromium 网络服务"
+  },
+  {
+    "roleEvidence": "runtime_component",
+    "runtimeRole": "chromium_renderer",
+    "serviceName": "Chromium 渲染器"
+  },
+  {
+    "roleEvidence": "runtime_component",
+    "runtimeRole": "chromium_gpu",
+    "serviceName": "Chromium GPU 组件"
+  },
+  {
+    "roleEvidence": "runtime_component",
+    "runtimeRole": "chromium_crashpad",
+    "serviceName": "Chromium 崩溃报告"
+  }
+]

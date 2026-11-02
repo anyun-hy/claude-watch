@@ -122,14 +122,14 @@ fn quit_is_confirmed_by_the_full_tree_even_when_the_request_was_accepted() {
         Authority::ExplicitPermit,
     )
     .unwrap();
-    assert_eq!(lingering.quit().unwrap_err().code, "claude_still_running");
+    assert_eq!(lingering.quit().unwrap_err().code, "target_still_running");
     let mut forced = None;
     assert_eq!(
         lingering
             .quit_for_confirmed_ip_risk(&mut forced)
             .unwrap_err()
             .code,
-        "claude_still_running"
+        "target_still_running"
     );
     std::fs::write(
         &helper,
@@ -141,7 +141,7 @@ fn quit_is_confirmed_by_the_full_tree_even_when_the_request_was_accepted() {
             .quit_for_confirmed_ip_risk(&mut forced)
             .unwrap_err()
             .code,
-        "claude_still_running"
+        "target_still_running"
     );
     assert_eq!(
         forced,
@@ -202,14 +202,14 @@ fn forced_helper_entry_is_separate_and_rejected_without_explicit_authority() {
         Authority::ExplicitPermit,
     )
     .unwrap();
-    assert_eq!(adapter.quit().unwrap_err().code, "claude_still_running");
+    assert_eq!(adapter.quit().unwrap_err().code, "target_still_running");
     let mut forced = None;
     assert_eq!(
         adapter
             .quit_for_confirmed_ip_risk(&mut forced)
             .unwrap_err()
             .code,
-        "claude_still_running"
+        "target_still_running"
     );
     assert_eq!(forced, Some(1));
     assert_eq!(

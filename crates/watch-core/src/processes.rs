@@ -89,6 +89,16 @@ impl LaunchTarget {
             _ => None,
         }
     }
+    /// The service this target supervises. Everything that reads a policy,
+    /// filters processes or resolves an exit action derives its family from
+    /// here instead of assuming Claude.
+    pub fn provider(self) -> Provider {
+        match self {
+            Self::ClaudeDesktop | Self::ClaudeCli => Provider::Claude,
+            Self::CodexDesktop | Self::CodexCli => Provider::Codex,
+            Self::ChatgptDesktop => Provider::Chatgpt,
+        }
+    }
     pub fn accepts(self, kind: Kind) -> bool {
         match self {
             Self::ClaudeDesktop => kind == Kind::ClaudeMain,

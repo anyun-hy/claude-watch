@@ -601,7 +601,7 @@ fn old_launch_audit_cannot_authorize_the_replacement() {
     let audit = json!({"ready":true,"policy":policy,"observed_at":1001.,"expires_at":1030.,"context_id":"ctx","context_transition":{"state":"stable"},"egress_reference":{"ip":"1.1.1.1","country":"JP","checked_at":1001.,"context":"ctx"}});
     let sessions = SessionStore::new(f.store.clone());
     let error = sessions
-        .complete_recheck(&id, &desktop, "fixture", &audit, &egress(1003.), 1003.)
+        .complete_recheck(&id, &desktop, "fixture", &audit, &egress(1003.), 1003., claude_watch_core::processes::Provider::Claude)
         .unwrap_err();
     assert_eq!(error.code, "egress_unconfirmed");
     assert_eq!(
@@ -625,7 +625,7 @@ fn old_dns_and_webrtc_receipts_cannot_authorize_the_replacement() {
     let audit = json!({"ready":true,"policy":policy,"observed_at":1003.,"expires_at":1030.,"context_id":"ctx","context_transition":{"state":"stable"},"egress_reference":{"ip":"1.1.1.1","country":"JP","checked_at":1003.,"context":"ctx"}});
     let sessions = SessionStore::new(f.store.clone());
     let error = sessions
-        .complete_recheck(&id, &desktop, "fixture", &audit, &egress(1003.), 1003.)
+        .complete_recheck(&id, &desktop, "fixture", &audit, &egress(1003.), 1003., claude_watch_core::processes::Provider::Claude)
         .unwrap_err();
     assert_eq!(error.code, "risk_evidence_unavailable");
     assert_eq!(

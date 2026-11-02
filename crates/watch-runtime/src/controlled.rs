@@ -5,7 +5,8 @@ use crate::{
 };
 use claude_watch_core::{
     error::{CoreError, Result},
-    processes::{Identity as ProcessIdentity, LaunchTarget, Lease, Target},
+    policy::PolicyCatalog,
+    processes::{Identity as ProcessIdentity, LaunchTarget, Lease, Provider, Target},
     session::{self, Desktop, Identity, Launcher},
 };
 use serde_json::{json, Value};
@@ -113,13 +114,27 @@ impl Controller {
         }
         Ok(())
     }
-    pub(crate) fn lease(&self, desktop: &Desktop, stamp: &str, now: f64) -> Result<()> {
+    /// The lease record names the supervised service, parsed back by the
+    /// lease store's provider table.
+    pub(crate) fn lease(
+        &self,
+        desktop: &Desktop,
+        stamp: &str,
+        now: f64,
+        provider: Provider,
+    ) -> Result<()> {
         if stamp.contains(['|', '\n', '\r']) || stamp.is_empty() {
             return Err(CoreError::new(
                 "desktop_identity_unavailable",
                 "主进程启动时间未能确认",
             ));
         }
+        let name = match provider {
+            Provider::Claude => "claude",
+            Provider::Codex => "codex",
+            Provider::Chatgpt => "chatgpt",
+            Provider::Openai => "openai",
+        };
         let path = self
             .storage
             .paths
@@ -128,7 +143,7 @@ impl Controller {
         self.storage.atomic_bytes(
             &path,
             format!(
-                "desktop|claude|{}|{}|0|-|{}\n",
+                "desktop|{name}|{}|{}|0|-|{}\n",
                 desktop.pid,
                 stamp,
                 now.floor()
@@ -190,7 +205,7 @@ impl Controller {
                 if mains.len() == 1 {
                     let (desktop, _, stamp) = &mains[0];
                     sessions.bind_desktop(&id, desktop.clone(), system.now())?;
-                    self.lease(desktop, stamp, system.now())?;
+                    self.lease(desktop, stamp, system.now(), Provider::Claude)?;
                     self.clear_pending()?;
                     let logging_error =
                         self.record_launch(LaunchTarget::ClaudeDesktop, desktop.pid, system.now());
@@ -387,45 +402,29 @@ impl Controller {
             diagnostic,
         })
     }
-    /// Configured action for a confirmed risk code. Codes without a config
-    /// key keep the historical normal-exit path; a load failure falls back to
-    /// the same historical mapping so an unreadable policy neither widens nor
-    /// narrows the forced set.
-    fn close_action(&self, code: &str) -> String {
+    /// Configured action for a confirmed risk code, resolved in the policy
+    /// family of the service being supervised. Which service that is comes
+    /// from the launch target, so one engine answers for every family the
+    /// configuration declares. Codes without a config key keep the historical
+    /// normal-exit path; a load failure falls back to the same historical
+    /// mapping clamped to what the family can perform, so an unreadable
+    /// policy neither widens nor narrows the forced set.
+    fn close_action(&self, code: &str, provider: Provider) -> String {
         ConfigStore {
             storage: self.storage.clone(),
         }
         .load()
-        .map(|config| {
-            let severity = |value: &str| match value {
-                "force" => 2,
-                "close" => 1,
-                _ => 0,
-            };
-            match code {
-                "egress_ip_changed" => config.claude_close_ip,
-                "egress_country_cn" => config.claude_close_cn,
-                "dns_egress_changed" => config.claude_close_dns,
-                "webrtc_egress_changed" => config.claude_close_webrtc,
-                // Both probe families drifted: apply the stricter of the two
-                // configured actions so a wider drift can never be handled
-                // more leniently than a single-family drift.
-                "dns_and_webrtc_egress_changed" => {
-                    if severity(&config.claude_close_dns) >= severity(&config.claude_close_webrtc) {
-                        config.claude_close_dns
-                    } else {
-                        config.claude_close_webrtc
-                    }
-                }
-                _ => "close".to_string(),
-            }
-        })
+        .map(|config| config.close_action(code, provider))
         .unwrap_or_else(|_| {
-            match code {
+            let historical = match code {
                 "egress_ip_changed" | "egress_country_cn" => "force",
                 _ => "close",
+            };
+            match PolicyCatalog::family_for(provider) {
+                Some(family) if family.performable(historical) => historical.to_string(),
+                Some(family) => family.fallback().to_string(),
+                None => "warn".to_string(),
             }
-            .to_string()
         })
     }
     fn timed_guard_quit<S: DesktopSystem>(
@@ -438,10 +437,18 @@ impl Controller {
         let code = receipt["session_guard"]["reason"]["code"]
             .as_str()
             .unwrap_or("");
+        // The supervised service decides what may be done: only a family that
+        // declares `force` ever reaches the bounded force path, whatever the
+        // risk code is.
+        let provider = system.launch_target().provider();
+        let can_force =
+            PolicyCatalog::family_for(provider).is_some_and(|family| family.performable("force"));
         // A persistence failure means session state can no longer be tracked,
-        // so the bounded force fallback applies regardless of configuration.
-        let confirmed_ip = code == "egress_risk_persist_failed" || {
-            let action = self.close_action(code);
+        // so a force-capable service applies the bounded force fallback
+        // regardless of configuration; one that cannot force still closes the
+        // ordinary way.
+        let confirmed_ip = can_force && code == "egress_risk_persist_failed" || {
+            let action = self.close_action(code, provider);
             receipt["stop_action"] = json!(action);
             action == "force"
         };
@@ -459,10 +466,14 @@ impl Controller {
         result
     }
     pub fn guard_tick<S: DesktopSystem>(&self, system: &mut S) -> Result<Value> {
-        if !system.launch_target().protected() {
+        // Which services the guard supervises is declared by the policy
+        // table, and supervision is a desktop matter: a CLI target has its
+        // own shared lifecycle entry.
+        let target = system.launch_target();
+        if target.cli() || PolicyCatalog::family_for(target.provider()).is_none() {
             return Err(CoreError::new(
                 "protected_scope_mismatch",
-                "观察目标不能进入Claude自动退出保护",
+                "观察目标不能进入自动退出保护",
             ));
         }
         let config = match (ConfigStore {
@@ -624,7 +635,7 @@ impl Controller {
                             Some(&ended.session_id),
                             checked_at,
                             code,
-                            "Claude 关联进程尚未退出且保护风险已确认",
+                            "受监督应用的关联进程尚未退出且保护风险已确认",
                             true,
                         )?;
                         receipt["session_id"] = json!(ended.session_id);
@@ -652,7 +663,7 @@ impl Controller {
                         }
                     } else {
                         receipt["status"] = json!("unknown");
-                        receipt["session_guard"] = json!({"state":"unknown","phase":"ended","reason":{"code":"session_identity_unconfirmed","detail":"旧主进程已退出，仍有 Claude 关联进程待退出"}});
+                        receipt["session_guard"] = json!({"state":"unknown","phase":"ended","reason":{"code":"session_identity_unconfirmed","detail":"旧主进程已退出，仍有受监督应用的关联进程待退出"}});
                     }
                     return Ok(());
                 } else {
@@ -680,7 +691,7 @@ impl Controller {
                         if code.is_some() {
                             "新进程出口风险已确认"
                         } else {
-                            "存在多个 Claude 主进程，无法完成身份复核"
+                            "存在多个主进程，无法完成身份复核"
                         },
                         code.is_some(),
                     )?;
@@ -734,7 +745,12 @@ impl Controller {
                                 let id = pending.session_id.clone();
                                 sessions.bind_desktop(&id, desktop.clone(), system.now())?;
                                 sessions.mark_adopted(&id, system.now())?;
-                                self.lease(desktop, stamp, system.now())?;
+                                self.lease(
+                                    desktop,
+                                    stamp,
+                                    system.now(),
+                                    system.launch_target().provider(),
+                                )?;
                                 Ok(id)
                             });
                         match adopted {
@@ -744,7 +760,7 @@ impl Controller {
                                 receipt["session_guard"] = json!({
                                     "state": "active",
                                     "phase": "active",
-                                    "reason": {"code": "session_adopted", "detail": "手动启动的 Claude 已纳入当前确认出口的监管"}
+                                    "reason": {"code": "session_adopted", "detail": "手动启动的应用已纳入当前确认出口的监管"}
                                 });
                                 receipt["action"] = json!("observe");
                                 return Ok(());
@@ -807,7 +823,7 @@ impl Controller {
                     .and_then(|s| s.reason.as_ref())
                     .map(|r| r.code.clone())
                     .unwrap_or_default();
-                if self.close_action(&code) == "warn" {
+                if self.close_action(&code, system.launch_target().provider()) == "warn" {
                     // A warn tier never closes. When the underlying condition
                     // has cleared, resume normal supervision instead of
                     // latching the notice until the session ends.
@@ -985,7 +1001,7 @@ impl Controller {
                 // risk round latches the session to Locked, so later rounds
                 // arrive as "locked" with the same reason; warn must cover
                 // those too, or it would degrade into a delayed close.
-                if self.close_action(&code) == "warn" {
+                if self.close_action(&code, system.launch_target().provider()) == "warn" {
                     receipt["session_notice"] = json!({
                         "code": code,
                         "detail": outcome.reason.as_ref().map(|r| r.detail.clone()),

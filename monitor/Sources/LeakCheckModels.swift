@@ -148,6 +148,13 @@ struct LeakIPAddress: Hashable, Sendable {
 }
 
 enum LeakPolicy {
+    /// Single Swift-side source of truth for the display freshness window.
+    /// Mirrors watch-core receipts.rs (`DNS_DISPLAY_TTL` / `STUN_RECEIPT_TTL`,
+    /// both 300s): a recorded receipt stays valid for backend audits for five
+    /// minutes. Every local "expired" judgment must reference this constant so
+    /// the windows cannot drift apart again.
+    static let receiptDisplayTTL: TimeInterval = 300
+
     static func expectedAddresses(_ text: String) throws -> Set<String> {
         guard text.utf8.count <= 4096 else { throw PolicyError.invalid }
         let tokens = text.components(separatedBy: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",，;；"))).filter { !$0.isEmpty }
@@ -178,7 +185,7 @@ enum LeakPolicy {
               result.startedAt <= result.finishedAt, result.finishedAt <= now + 5,
               result.finishedAt - result.startedAt <= 120, result.observations.count <= 128,
               result.errors.count <= 32 else { return incomplete("采集结果无效，不能用于当前判断。") }
-        guard now - result.finishedAt <= 300 else { return .init(state: .incomplete, title: "结果已过期", detail: "这次采样已超过 5 分钟，请重新检测。") }
+        guard now - result.finishedAt <= LeakPolicy.receiptDisplayTTL else { return .init(state: .incomplete, title: "结果已过期", detail: "这次采样已超过 5 分钟，请重新检测。") }
         guard !result.contextChanged else { return incomplete("检测期间或之后网络/代理上下文发生变化，请在网络稳定后重新检测。") }
         guard !result.errors.contains(where: { $0.stage == "context" && $0.code == "context_unavailable" }) else {
             return incomplete("检测期间代理上下文未能持续确认，不能使用本次结果判断风险。")

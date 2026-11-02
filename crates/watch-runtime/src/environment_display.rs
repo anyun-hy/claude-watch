@@ -85,9 +85,34 @@ fn cache_context_matches(
         && saved["row"].is_object()
         && saved["row"]["state"] == "ok"
 }
+/// Regional-indicator flag for a 2-letter ISO country code; empty for
+/// anything else so unknown or non-ISO values render unchanged.
+fn flag_emoji(country: &str) -> String {
+    let bytes = country.as_bytes();
+    if bytes.len() == 2 && bytes.iter().all(|b| b.is_ascii_uppercase()) {
+        let base = 0x1F1E6 - b'A' as u32;
+        bytes
+            .iter()
+            .filter_map(|b| char::from_u32(base + *b as u32))
+            .collect()
+    } else {
+        String::new()
+    }
+}
+
+/// Country display with flag: "🇯🇵 JP"; falls back to the bare code when no
+/// flag can be derived.
+fn country_label(country: &str) -> String {
+    let flag = flag_emoji(country);
+    if flag.is_empty() {
+        country.to_string()
+    } else {
+        format!("{flag} {country}")
+    }
+}
+
 fn reference_conflict(online: &Value) -> bool {
-    let trace_ip = valid_ip(&online["trace"]["ip"]);
-    let geo_ip = valid_ip(&online["geo"]["ip"]);
+    let trace_ip = valid_ip(&online["trace"]["ip"]);    let geo_ip = valid_ip(&online["geo"]["ip"]);
     let trace_country = text(&online["trace"], "loc");
     let geo_country = text(&online["geo"], "country");
     (!trace_ip.is_empty() && !geo_ip.is_empty() && trace_ip != geo_ip)
@@ -113,22 +138,14 @@ fn present_rows(audit: &Value) -> Vec<Value> {
             "proxy" => {
                 let entry = &local["tag"]["entry"];
                 let endpoint = text(entry, "endpoint");
-                let mut current = if text(entry, "state") == "verified" && !endpoint.is_empty() {
+                // The card names the verified kernel and entry only ("tag ·
+                // http://127.0.0.1:7890"); node selection belongs to the
+                // 代理模式 and IP 一致性 cards, not here.
+                let current = if text(entry, "state") == "verified" && !endpoint.is_empty() {
                     format!("{} · {endpoint}", text(local, "mode"))
                 } else {
                     text(local, "mode")
                 };
-                // The controller reports the live node selection; append it so
-                // the card matches the Python reference's "当前选择 <node>".
-                let api = &local["tag"]["api"];
-                let node = if text(api, "mode") == "global" {
-                    text(api, "global_node")
-                } else {
-                    text(api, "selected_node")
-                };
-                if !node.is_empty() {
-                    current = format!("{current}；当前选择 {node}");
-                }
                 (
                     current,
                     "运行进程与监听者身份".into(),
@@ -144,16 +161,35 @@ fn present_rows(audit: &Value) -> Vec<Value> {
                 if country.is_empty() {
                     address.clone()
                 } else {
-                    format!("{address} / {country}")
+                    format!("{address} / {}", country_label(&country))
                 },
                 "Cloudflare 与 Net.Coffee 本轮出口一致".into(),
                 "Cloudflare trace + Net.Coffee lookup".into(),
             ),
-            "ip_history" => (
-                address.clone(),
-                "48 小时检测历史，仅提示变化".into(),
-                "本轮出口 / 独立检测历史".into(),
-            ),
+            "ip_history" => {
+                // IP 一致性 names the address, its country and the line the
+                // proxy currently exits through (one node in global mode; the
+                // selected node of the main group in rule mode).
+                let mut current = if country.is_empty() {
+                    address.clone()
+                } else {
+                    format!("{address} / {}", country_label(&country))
+                };
+                let api = &local["tag"]["api"];
+                let node = if text(api, "mode") == "global" {
+                    text(api, "global_node")
+                } else {
+                    text(api, "selected_node")
+                };
+                if !node.is_empty() {
+                    current = format!("{current} · 线路 {node}");
+                }
+                (
+                    current,
+                    "48 小时检测历史，仅提示变化".into(),
+                    "本轮出口 / 独立检测历史".into(),
+                )
+            }
             "timezone" => (
                 text(local, "timezone"),
                 if timezone.is_empty() {
@@ -355,7 +391,10 @@ fn present_rows(audit: &Value) -> Vec<Value> {
             _ => &[],
         };
         let failure = query_error(online, keys);
-        if value["state"] != "fail" && !failure.is_empty() {
+        // Mirror audit.rs: only unverified rows carry a query error. Attaching
+        // one to ok/warn rows made the card read "已核对" plus "本次查询失败"
+        // at the same time.
+        if value["state"] == "unknown" && !failure.is_empty() {
             value["query_error"] = json!(failure);
         }
     }
@@ -588,17 +627,25 @@ pub fn receipt(store: &StateStore, audit: Value, session: Value, persist: bool) 
     if let Some(preview) = chatgpt_preview {
         output["chatgpt_policy_evaluation"] = preview;
     }
-    output.as_object_mut().map(|v| v.remove("display_facts"));
+    // The environment page consumes a narrow subset of the captured sample:
+    // rule/mode evidence (mode card, global-mode recommendation, summary
+    // strip) and exit geo (flag, exit-local clock). Project exactly that and
+    // keep the raw local snapshot — process lists, guard internals, connection
+    // observations — out of the UI receipt.
+    if output["display_facts"].is_object() {
+        let facts = output["display_facts"].clone();
+        output["display_facts"] = json!({
+            "local": {
+                "rules": facts["local"]["rules"],
+                "tag": {"api": facts["local"]["tag"]["api"]},
+            },
+            "online": {
+                "trace": facts["online"]["trace"],
+                "geo": facts["online"]["geo"],
+            },
+        });
+    } else {
+        output.as_object_mut().map(|v| v.remove("display_facts"));
+    }
     Ok(output)
-}
-
-/// Make setup inspect/detect/preview output safe for the production Swift
-/// decoder. Existing values are preserved; absent presentation fields are
-/// explicit empty strings rather than omitted or null.
-pub fn setup_value_rows(value: &Value) -> Vec<Value> {
-    let values = value.get("values").unwrap_or(value);
-    ["proxy_mode", "proxy_url", "proxy_group", "node", "network_service", "country", "ip", "timezone", "locale", "language"]
-        .into_iter()
-        .map(|id| json!({"id":id,"title":id,"current":values[id].as_str().unwrap_or(""),"target":"","proposed":"","source":"本轮自动检测","target_source":"","proposed_source":""}))
-        .collect()
 }

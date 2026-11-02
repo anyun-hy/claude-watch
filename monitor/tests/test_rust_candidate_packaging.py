@@ -22,15 +22,16 @@ class RustCandidatePackagingTests(unittest.TestCase):
             result = subprocess.run(["/bin/bash", "-n", str(script)], text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_build_rejects_unknown_backend_variant_before_building(self):
-        result = subprocess.run(
-            ["/bin/bash", str(BUILD)],
-            env={**os.environ, "CW_BACKEND_VARIANT": "not-a-variant"},
-            text=True,
-            capture_output=True,
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Unsupported backend variant", result.stderr)
+    def test_build_rejects_a_retired_backend_variant_before_building(self):
+        for variant in ("not-a-variant", "stable"):
+            result = subprocess.run(
+                ["/bin/bash", str(BUILD)],
+                env={**os.environ, "CW_BACKEND_VARIANT": variant},
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("only rust-candidate can be built", result.stderr)
 
     def test_candidate_rejects_non_arm64_before_building(self):
         result = subprocess.run(
@@ -44,8 +45,8 @@ class RustCandidatePackagingTests(unittest.TestCase):
 
     def test_candidate_is_explicit_arm64_and_requires_component_manifest(self):
         text = BUILD.read_text(encoding="utf-8")
-        self.assertIn('CW_BACKEND_VARIANT="${CW_BACKEND_VARIANT:-stable}"', text)
-        self.assertIn('"$CW_BACKEND_VARIANT" == rust-candidate', text)
+        self.assertIn('CW_BACKEND_VARIANT="${CW_BACKEND_VARIANT:-rust-candidate}"', text)
+        self.assertIn('"$CW_BACKEND_VARIANT" != rust-candidate', text)
         self.assertIn('"$CW_BUILD_ARCH" != arm64', text)
         self.assertIn('RUST_COMPONENTS_MANIFEST', text)
         self.assertIn('Claude Watch Monitor Rust Candidate.app', text)
@@ -81,17 +82,20 @@ class RustCandidatePackagingTests(unittest.TestCase):
         self.assertIn('"native_observer", "process_control"', text)
         self.assertIn('requires an arm64 host', text)
 
-    def test_gui_runners_select_the_backend_declared_by_build_info(self):
+    def test_gui_runners_only_accept_the_rust_backend(self):
         monitor = MONITOR_STORE.read_text(encoding="utf-8")
         switcher = SWITCHER_STORE.read_text(encoding="utf-8")
         variant = (ROOT / "monitor/Sources/BundledBackendVariant.swift").read_text(encoding="utf-8")
         self.assertIn('values["BackendVariant"]', variant)
-        self.assertIn('case "stable": return .stable', variant)
-        self.assertIn('case "rust-candidate": return .rustCandidate', variant)
-        self.assertIn('case .stable:', monitor)
-        self.assertIn('forResource: "snapshot", withExtension: "sh"', monitor)
+        self.assertIn('raw == "rust-candidate"', variant)
+        # The Python backend is retired: no runner may keep a branch for it.
+        self.assertNotIn('case "stable"', variant)
+        self.assertIn('case .rustCandidate:', monitor)
+        self.assertIn('forResource: "watch-engine"', monitor)
         self.assertIn('case .rustCandidate:', switcher)
-        self.assertIn('forResource: "switcher", withExtension: "py"', switcher)
+        for source in (monitor, switcher):
+            self.assertNotIn('case .stable:', source)
+            self.assertNotIn('python3', source)
 
 
 if __name__ == "__main__":

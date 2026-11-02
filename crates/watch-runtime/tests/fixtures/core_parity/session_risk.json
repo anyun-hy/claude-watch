@@ -1,0 +1,168 @@
+[
+  {
+    "observed_at": 1000.0,
+    "sources": {
+      "dns": {
+        "detail": "DNS fixture",
+        "observed_at": 1000.0,
+        "state": "ok"
+      },
+      "webrtc": {
+        "detail": "RTC fixture",
+        "observed_at": 1002.0,
+        "state": "ok"
+      }
+    },
+    "state": "safe"
+  },
+  {
+    "observed_at": 1000.0,
+    "reason": {
+      "code": "dns_risk",
+      "detail": "DNS fixture",
+      "observed_at": 1000.0,
+      "source": "dns"
+    },
+    "reasons": [
+      {
+        "code": "dns_risk",
+        "detail": "DNS fixture",
+        "observed_at": 1000.0,
+        "source": "dns"
+      }
+    ],
+    "sources": {
+      "dns": {
+        "detail": "DNS fixture",
+        "observed_at": 1000.0,
+        "state": "fail"
+      },
+      "webrtc": {
+        "detail": "RTC fixture",
+        "observed_at": 1002.0,
+        "state": "ok"
+      }
+    },
+    "state": "risk"
+  },
+  {
+    "observed_at": 1002.0,
+    "reason": {
+      "code": "risk_evidence_unavailable",
+      "detail": "DNS/WebRTC 当前有效证据尚未齐全",
+      "observed_at": 1005.0,
+      "source": "自动检测"
+    },
+    "sources": {
+      "dns": {
+        "detail": "DNS fixture",
+        "observed_at": null,
+        "state": "unknown"
+      },
+      "webrtc": {
+        "detail": "RTC fixture",
+        "observed_at": 1002.0,
+        "state": "ok"
+      }
+    },
+    "state": "unknown"
+  },
+  {
+    "observed_at": 1000.0,
+    "reason": {
+      "code": "cn_dns",
+      "detail": "同轮 DNS 递归出口含中国归属",
+      "observed_at": 1000.0,
+      "source": "dns"
+    },
+    "reasons": [
+      {
+        "code": "cn_dns",
+        "detail": "同轮 DNS 递归出口含中国归属",
+        "observed_at": 1000.0,
+        "source": "dns"
+      }
+    ],
+    "sources": {
+      "dns": {
+        "detail": "DNS fixture",
+        "observed_at": 1000.0,
+        "state": "ok"
+      },
+      "webrtc": {
+        "detail": "RTC fixture",
+        "observed_at": 1002.0,
+        "state": "ok"
+      }
+    },
+    "state": "risk"
+  },
+  {
+    "observed_at": 1002.0,
+    "reason": {
+      "code": "risk_evidence_unavailable",
+      "detail": "DNS/WebRTC 当前有效证据尚未齐全",
+      "observed_at": 1005.0,
+      "source": "自动检测"
+    },
+    "sources": {
+      "dns": {
+        "detail": "检测参考 IP 与当前会话出口不同",
+        "observed_at": 1000.0,
+        "state": "unknown"
+      },
+      "webrtc": {
+        "detail": "RTC fixture",
+        "observed_at": 1002.0,
+        "state": "ok"
+      }
+    },
+    "state": "unknown"
+  },
+  {
+    "observed_at": 1000.0,
+    "sources": {
+      "dns": {
+        "detail": "DNS fixture",
+        "observed_at": 1000.0,
+        "state": "ok"
+      },
+      "webrtc": {
+        "detail": "RTC fixture",
+        "observed_at": 1002.0,
+        "state": "ok"
+      }
+    },
+    "state": "safe"
+  },
+  {
+    "observed_at": 1001.0,
+    "reason": {
+      "code": "cn_asn_registration",
+      "detail": "fixture",
+      "observed_at": 1001.0,
+      "source": "asn"
+    },
+    "reasons": [
+      {
+        "code": "cn_asn_registration",
+        "detail": "fixture",
+        "observed_at": 1001.0,
+        "source": "asn"
+      }
+    ],
+    "sources": {
+      "dns": {
+        "detail": "DNS fixture",
+        "observed_at": 1000.0,
+        "state": "ok"
+      },
+      "webrtc": {
+        "detail": "RTC fixture",
+        "observed_at": 1002.0,
+        "state": "ok"
+      }
+    },
+    "state": "risk"
+  }
+]

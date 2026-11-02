@@ -1,0 +1,274 @@
+[
+  {
+    "value": {
+      "context_id": "ctx",
+      "errors": [],
+      "kind": "webrtc",
+      "observations": [
+        {
+          "address": "1.1.1.1",
+          "country": "JP",
+          "kind": "http",
+          "source": "fixture"
+        },
+        {
+          "address": "1.1.1.1",
+          "country": "JP",
+          "kind": "srflx",
+          "source": "fixture"
+        }
+      ],
+      "recorded_at": 1700000001.0,
+      "risk": {
+        "cn_candidates": [],
+        "detail": "WebRTC 公网候选与同轮 HTTP 出口一致",
+        "state": "ok"
+      },
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "status": "complete"
+    }
+  },
+  {
+    "value": {
+      "context_id": "ctx",
+      "errors": [],
+      "kind": "webrtc",
+      "observations": [
+        {
+          "address": "1.1.1.1",
+          "country": "JP",
+          "kind": "http",
+          "source": "fixture"
+        },
+        {
+          "address": "1.1.1.1",
+          "country": "JP",
+          "kind": "srflx",
+          "source": "fixture"
+        }
+      ],
+      "recorded_at": 1700000001.0,
+      "risk": {
+        "cn_candidates": [],
+        "detail": "WebRTC 未取得完整的同轮 HTTP 出口与公网候选",
+        "state": "unknown"
+      },
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "status": "partial"
+    }
+  },
+  {
+    "value": {
+      "context_id": "ctx",
+      "errors": [
+        {
+          "code": "timeout",
+          "message": "endpoint did not respond",
+          "stage": "dns"
+        }
+      ],
+      "kind": "webrtc",
+      "observations": [
+        {
+          "address": "1.1.1.1",
+          "country": "JP",
+          "kind": "http",
+          "source": "fixture"
+        },
+        {
+          "address": "1.1.1.1",
+          "country": "JP",
+          "kind": "srflx",
+          "source": "fixture"
+        }
+      ],
+      "recorded_at": 1700000001.0,
+      "risk": {
+        "cn_candidates": [],
+        "detail": "WebRTC 未取得完整的同轮 HTTP 出口与公网候选",
+        "state": "unknown"
+      },
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "status": "complete"
+    }
+  },
+  {
+    "error": "webrtc_context_changed"
+  },
+  {
+    "error": "webrtc_stale"
+  },
+  {
+    "value": {
+      "context_id": "ctx",
+      "errors": [],
+      "kind": "webrtc",
+      "observations": [
+        {
+          "address": "1.1.1.1",
+          "country": "JP",
+          "kind": "http",
+          "source": "fixture"
+        },
+        {
+          "address": "1.1.1.1",
+          "country": "JP",
+          "kind": "srflx",
+          "source": "fixture"
+        }
+      ],
+      "recorded_at": 1700000001.0,
+      "risk": {
+        "cn_candidates": [],
+        "detail": "WebRTC 公网候选与同轮 HTTP 出口一致",
+        "state": "ok"
+      },
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "status": "complete"
+    }
+  },
+  {
+    "value": {
+      "context_id": "ctx",
+      "errors": [],
+      "kind": "webrtc",
+      "observations": [],
+      "recorded_at": 1700000001.0,
+      "risk": {
+        "cn_candidates": [],
+        "detail": "WebRTC 未取得完整的同轮 HTTP 出口与公网候选",
+        "state": "unknown"
+      },
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "status": "complete"
+    }
+  },
+  {
+    "value": {
+      "context_id": "ctx",
+      "errors": [],
+      "kind": "webrtc",
+      "observations": [
+        {
+          "address": "1.1.1.1",
+          "country": "JP",
+          "kind": "http",
+          "source": "fixture"
+        }
+      ],
+      "recorded_at": 1700000001.0,
+      "risk": {
+        "cn_candidates": [],
+        "detail": "WebRTC 未取得完整的同轮 HTTP 出口与公网候选",
+        "state": "unknown"
+      },
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "status": "complete"
+    }
+  },
+  {
+    "error": "invalid_webrtc_receipt"
+  },
+  {
+    "value": {
+      "context_id": "ctx",
+      "errors": [],
+      "kind": "webrtc",
+      "observations": [
+        {
+          "address": "1.1.1.1",
+          "country": "CN",
+          "kind": "http",
+          "source": "fixture"
+        },
+        {
+          "address": "1.1.1.1",
+          "country": "CN",
+          "kind": "srflx",
+          "source": "fixture"
+        }
+      ],
+      "recorded_at": 1700000001.0,
+      "risk": {
+        "cn_candidates": [
+          "1.1.1.1",
+          "1.1.1.1"
+        ],
+        "detail": "WebRTC 本轮公网出口或候选含中国归属",
+        "state": "fail"
+      },
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "status": "complete"
+    }
+  },
+  {
+    "error": "webrtc_context_changed"
+  },
+  {
+    "value": {
+      "context_id": "ctx",
+      "errors": [],
+      "kind": "webrtc",
+      "observations": [
+        {
+          "address": "1.1.1.1",
+          "country": "JP",
+          "kind": "http",
+          "source": "fixture"
+        },
+        {
+          "address": "1.1.1.1",
+          "country": "JP",
+          "kind": "srflx",
+          "source": "fixture"
+        }
+      ],
+      "recorded_at": 1700000001.0,
+      "risk": {
+        "cn_candidates": [],
+        "detail": "WebRTC 公网候选与同轮 HTTP 出口一致",
+        "state": "ok"
+      },
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "status": "complete"
+    }
+  },
+  {
+    "value": {
+      "context_id": "ctx",
+      "errors": [],
+      "kind": "webrtc",
+      "observations": [
+        {
+          "address": "1.1.1.1",
+          "country": "JP",
+          "kind": "http",
+          "source": "fixture"
+        },
+        {
+          "address": "9.9.9.9",
+          "country": "JP",
+          "kind": "srflx",
+          "source": "fixture"
+        }
+      ],
+      "recorded_at": 1700000001.0,
+      "risk": {
+        "cn_candidates": [],
+        "detail": "WebRTC 公网候选与同轮 HTTP 出口不一致",
+        "state": "fail"
+      },
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "status": "complete"
+    }
+  }
+]

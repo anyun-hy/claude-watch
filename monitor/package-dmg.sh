@@ -69,9 +69,6 @@ mkdir -p "$PAYLOAD"
 cp -R "$APP" "$PAYLOAD/$APP_NAME"
 ln -s /Applications "$PAYLOAD/Applications"
 cp "$ROOT/Packaging/安装说明.txt" "$ROOT/Packaging/安装或更新后台.command" "$ROOT/Packaging/卸载应用.command" "$PAYLOAD/"
-if [[ "$('/usr/libexec/PlistBuddy' -c 'Print :BackendVariant' "$APP/Contents/Resources/BuildInfo.plist")" == 'stable' ]]; then
-  cp "$ROOT/Packaging/app_lifecycle.py" "$PAYLOAD/"
-fi
 python3 - "$APP/Contents/Resources/BuildInfo.plist" "$PAYLOAD/安装说明.txt" "$ACTUAL_BUILD" <<'PY'
 from pathlib import Path
 import plistlib, sys

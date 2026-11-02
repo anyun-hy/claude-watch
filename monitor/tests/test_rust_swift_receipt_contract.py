@@ -22,6 +22,7 @@ SWITCHER = ROOT / "monitor" / "Sources" / "SwitcherStore.swift"
 MODELS = ROOT / "monitor" / "Sources" / "MonitorModels.swift"
 COFFEE = ROOT / "monitor" / "Sources" / "NetCoffeeModels.swift"
 LEAK = ROOT / "monitor" / "Sources" / "LeakCheckModels.swift"
+INIT_LOG = ROOT / "monitor" / "Sources" / "InitializationConnectionLog.swift"
 RUST_ONLINE_LOOKUP = ROOT / "monitor" / "tests" / "fixtures" / "rust-netcoffee-lookup-receipt.json"
 
 
@@ -65,6 +66,19 @@ def production_models() -> str:
         (SWITCHER, "EnvironmentAuditReceipt"),
         (SWITCHER, "EnvironmentContextTransition"),
         (SWITCHER, "EnvironmentPolicyEvaluation"),
+        # The audit receipt carries the engine's display evidence, so the
+        # declarations it decodes are part of the same production model.
+        (SWITCHER, "EnvironmentTagAPI"),
+        (SWITCHER, "EnvironmentTagEvidence"),
+        (SWITCHER, "EnvironmentRulesEvidence"),
+        (SWITCHER, "EnvironmentLocalFacts"),
+        (SWITCHER, "EnvironmentTraceFacts"),
+        (SWITCHER, "EnvironmentGeoFacts"),
+        (SWITCHER, "EnvironmentOnlineFacts"),
+        (SWITCHER, "EnvironmentDisplayFacts"),
+        (SWITCHER, "InitializationBackendReceipt"),
+        (SWITCHER, "InitializationReceiptEvidence"),
+        (INIT_LOG, "BackendInitializationDiagnostics"),
         (SWITCHER, "CurrentEnvironmentReceipt"),
         (SWITCHER, "BackgroundServiceRow"),
         (SWITCHER, "PolicyIssue"),

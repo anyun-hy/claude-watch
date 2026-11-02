@@ -1,0 +1,38 @@
+[
+  {
+    "date": "ok",
+    "expected": "ja_JP · 示例 2026/10/23",
+    "locale": "ok",
+    "summary": "ja_JP · 示例 2026/10/23"
+  },
+  {
+    "date": "fail",
+    "expected": "ja_JP · 示例 2026/10/23",
+    "locale": "fail",
+    "summary": "ja_JP · 示例 2026/10/23"
+  },
+  {
+    "date": "unknown",
+    "expected": "ja_JP · 示例 2026/10/23",
+    "locale": "unknown",
+    "summary": "ja_JP · 示例 2026/10/23"
+  },
+  {
+    "date": "unknown",
+    "expected": "ja_JP · 示例 2026/10/23",
+    "locale": "unknown",
+    "summary": "ja_JP · 示例 2026/10/23"
+  },
+  {
+    "date": "unknown",
+    "expected": "ja_JP · 示例 2026/10/23",
+    "locale": "fail",
+    "summary": "en_US · 示例 2026/10/23"
+  },
+  {
+    "date": "unknown",
+    "expected": "出口地区格式未确认",
+    "locale": "unknown",
+    "summary": "ja_JP · 示例 2026/10/23"
+  }
+]

@@ -1,0 +1,61 @@
+[
+  {
+    "detail": "WebRTC 公网候选与同轮 HTTP 出口一致",
+    "observations": [
+      {
+        "address": "1.1.1.1",
+        "country": "JP",
+        "kind": "http",
+        "source": "fixture"
+      },
+      {
+        "address": "1.1.1.1",
+        "country": "JP",
+        "kind": "srflx",
+        "source": "fixture"
+      }
+    ],
+    "receipt": {
+      "context_id": "ctx",
+      "errors": [],
+      "kind": "webrtc",
+      "observations": [
+        {
+          "address": "1.1.1.1",
+          "country": "JP",
+          "kind": "http",
+          "source": "fixture"
+        },
+        {
+          "address": "1.1.1.1",
+          "country": "JP",
+          "kind": "srflx",
+          "source": "fixture"
+        }
+      ],
+      "recorded_at": 1700000001.0,
+      "risk": {
+        "cn_candidates": [],
+        "detail": "WebRTC 公网候选与同轮 HTTP 出口一致",
+        "state": "ok"
+      },
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "status": "complete"
+    },
+    "sampled_at": 1700000000.0,
+    "state": "ok"
+  },
+  {
+    "detail": "WebRTC 检测回执已过期",
+    "state": "unknown"
+  },
+  {
+    "detail": "WebRTC 尚无当前网络的检测回执",
+    "state": "unknown"
+  },
+  {
+    "detail": "WebRTC 尚无当前网络的检测回执",
+    "state": "unknown"
+  }
+]

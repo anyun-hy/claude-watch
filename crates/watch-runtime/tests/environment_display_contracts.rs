@@ -45,7 +45,7 @@ fn no_record_reads_cache_but_never_creates_or_rewrites_it() {
     let path = store.paths.base().join("environment-valid-samples.json");
     let out = receipt(&store, audit(), session(), false).unwrap();
     assert!(!path.exists());
-    assert_eq!(out["rows"][0]["current"], "1.1.1.1 / JP");
+    assert_eq!(out["rows"][0]["current"], "1.1.1.1 / \u{1F1EF}\u{1F1F5} JP");
 
     let mut saved = audit();
     let first = receipt(&store, saved.clone(), session(), true).unwrap();
@@ -72,9 +72,15 @@ fn receipt_keeps_same_round_display_window_without_mutating_launch_audit() {
     assert_eq!(out["policy_evaluation"]["observed_at"], json!(NOW));
     assert_eq!(out["policy_evaluation"]["expires_at"], json!(NOW + 300.0));
     assert_eq!(out["policy_evaluation"]["grants_launch_permission"], false);
-    assert!(out.get("display_facts").is_none());
+    // The UI receipt keeps the curated display subset consumed by the mode
+    // card and summary strip; the raw local snapshot never crosses IPC.
+    assert!(out["display_facts"].is_object());
+    assert_eq!(out["display_facts"]["online"]["geo"]["country"], json!("JP"));
+    assert_eq!(out["display_facts"]["online"]["geo"]["timezone"], json!("Asia/Tokyo"));
+    assert!(out["display_facts"]["local"].get("proxy").is_none());
+    assert!(out["display_facts"]["local"].get("timezone").is_none());
     assert!(out["policy_evaluation"].get("display_facts").is_none());
-    assert_eq!(out["rows"][0]["current"], "1.1.1.1 / JP");
+    assert_eq!(out["rows"][0]["current"], "1.1.1.1 / \u{1F1EF}\u{1F1F5} JP");
     let _ = fs::remove_dir_all(home);
 }
 
@@ -331,7 +337,23 @@ fn cards_carry_stun_dns_proxy_and_candidate_detail_not_blank_or_empty() {
     assert!(dns.get("sampled_at").is_some());
 
     let proxy = by_id("proxy");
-    assert!(proxy["current"].as_str().unwrap_or("").contains("日本 01"));
+    // The proxy card names kernel and entry only; node selection moved to the
+    // 代理模式 / IP 一致性 cards by user decision.
+    assert!(proxy["current"]
+        .as_str()
+        .unwrap_or("")
+        .contains("tag · 127.0.0.1:7890"));
+    assert!(!proxy["current"].as_str().unwrap_or("").contains("日本 01"));
+
+    let history = by_id("ip_history");
+    assert!(history["current"]
+        .as_str()
+        .unwrap_or("")
+        .contains("1.1.1.1 / \u{1F1EF}\u{1F1F5} JP"));
+    assert!(history["current"]
+        .as_str()
+        .unwrap_or("")
+        .contains("线路 日本 01"));
 
     assert_eq!(out["candidates"], json!(["tag"]));
     let _ = fs::remove_dir_all(home);

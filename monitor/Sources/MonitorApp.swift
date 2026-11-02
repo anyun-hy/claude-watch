@@ -62,7 +62,7 @@ struct MonitorView: View {
                         case .network: network
                         case .processes: ProcessActivityPage(store: store, p: p)
                         case .events: EventTimelinePage(store: store, p: p)
-                        case .dns: DNSLeakPage(store: store.leakChecks, p: p, managePolicy: { store.page = .protection })
+                        case .dns: DNSLeakPage(store: store.leakChecks, p: p)
                         case .webrtc: WebRTCLeakPage(store: store.leakChecks, p: p)
                         case .claudeAI: AIInspectorPage(service: .claude, store: store, probes: store.aiChecks, p: p)
                         case .ipScore: NetCoffeeScorePage(store: store.netCoffee, p: p)
@@ -221,7 +221,7 @@ struct MonitorView: View {
     private var footer: some View {
         HStack(spacing: 7) {
             Circle().fill(statusTint).frame(width: 5, height: 5)
-            Text(store.error != nil ? "本次同步未完成" : !store.automatic ? "已暂停界面同步" : store.live ? "后台数据自动同步" : "等待有效状态")
+            Text(store.error != nil ? "本次同步未完成" : !store.automatic ? "界面同步已暂停" : store.live ? "后台数据自动同步" : "等待有效状态")
             Spacer()
             Text(pageSampleTime)
                 .monospacedDigit()

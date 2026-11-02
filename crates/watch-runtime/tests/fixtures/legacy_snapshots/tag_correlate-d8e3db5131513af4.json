@@ -1,0 +1,444 @@
+[
+  {
+    "association": "correlated",
+    "association_evidence": {
+      "address": "198.18.1.10",
+      "connection_start": "2023-11-14T22:13:15Z",
+      "dns_endpoint": "127.0.0.1:5353",
+      "dns_owner_pid": 100,
+      "dns_owner_started": "Tue Nov 14 22:00:00 2023",
+      "expires_at": 1700000000.5,
+      "host": "api.anthropic.com",
+      "kind": "same_core_fakeip_mapping",
+      "observed_at": 1699999999.5,
+      "peer": [
+        "198.18.1.10",
+        443
+      ],
+      "protocol": "tcp",
+      "source": [
+        "198.18.0.1",
+        50000
+      ],
+      "source_pid": 77,
+      "source_started": "Tue Nov 14 22:12:50 2023"
+    },
+    "chains": [
+      "JP11",
+      "AI"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "",
+    "destination_ip": "",
+    "destination_ip_state": "missing",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "path": "Tun",
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "match",
+    "protocol": "tcp",
+    "reason": "已按 TAG RULE 模式核对实际代理链与末端节点；同一 TAG 内核 DNS 映射与本机 fake-IP 已核对，公网目标 IP 未提供",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "TUN 目标经过 fake-IP 转换，但未取得同一 TAG 内核的有效映射证明；未关联，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "TUN 目标经过 fake-IP 转换，但未取得同一 TAG 内核的有效映射证明；未关联，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "TUN 目标经过 fake-IP 转换，但未取得同一 TAG 内核的有效映射证明；未关联，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "TUN 目标经过 fake-IP 转换，但未取得同一 TAG 内核的有效映射证明；未关联，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "TUN 目标经过 fake-IP 转换，但未取得同一 TAG 内核的有效映射证明；未关联，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "TUN 目标经过 fake-IP 转换，但未取得同一 TAG 内核的有效映射证明；未关联，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "TUN 目标经过 fake-IP 转换，但未取得同一 TAG 内核的有效映射证明；未关联，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "TUN 目标经过 fake-IP 转换，但未取得同一 TAG 内核的有效映射证明；未关联，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "TUN 目标经过 fake-IP 转换，但未取得同一 TAG 内核的有效映射证明；未关联，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "TUN 目标经过 fake-IP 转换，但未取得同一 TAG 内核的有效映射证明；未关联，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "TUN 目标经过 fake-IP 转换，但未取得同一 TAG 内核的有效映射证明；未关联，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "TUN 目标经过 fake-IP 转换，但未取得同一 TAG 内核的有效映射证明；未关联，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "correlated",
+    "association_evidence": {
+      "address": "198.18.1.10",
+      "connection_start": "2023-11-14T22:13:15Z",
+      "dns_endpoint": "127.0.0.1:5353",
+      "dns_owner_pid": 100,
+      "dns_owner_started": "Tue Nov 14 22:00:00 2023",
+      "expires_at": 1700000000.5,
+      "host": "api.anthropic.com",
+      "kind": "same_core_fakeip_mapping",
+      "observed_at": 1699999999.5,
+      "peer": [
+        "198.18.1.10",
+        443
+      ],
+      "protocol": "tcp",
+      "source": [
+        "198.18.0.1",
+        50000
+      ],
+      "source_pid": 77,
+      "source_started": "Tue Nov 14 22:12:50 2023"
+    },
+    "chains": [
+      "JP11",
+      "AI"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "JP",
+    "destination_ip": "160.79.104.10",
+    "destination_ip_state": "public",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "path": "Tun",
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "match",
+    "protocol": "tcp",
+    "reason": "已按 TAG RULE 模式核对实际代理链与末端节点；同一 TAG 内核 DNS 映射与本机 fake-IP 已核对",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  },
+  {
+    "association": "correlated",
+    "association_evidence": {
+      "address": "198.18.1.10",
+      "connection_start": "2023-11-14T22:13:15Z",
+      "dns_endpoint": "127.0.0.1:5353",
+      "dns_owner_pid": 100,
+      "dns_owner_started": "Tue Nov 14 22:00:00 2023",
+      "expires_at": 1700000000.5,
+      "host": "api.anthropic.com",
+      "kind": "same_core_fakeip_mapping",
+      "observed_at": 1699999999.5,
+      "peer": [
+        "198.18.1.10",
+        443
+      ],
+      "protocol": "tcp",
+      "source": [
+        "198.18.0.1",
+        50000
+      ],
+      "source_pid": 77,
+      "source_started": "Tue Nov 14 22:12:50 2023"
+    },
+    "chains": [
+      "JP-other",
+      "AI"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "",
+    "destination_ip": "",
+    "destination_ip_state": "missing",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "path": "Tun",
+    "peer": [
+      "198.18.1.10",
+      443
+    ],
+    "pid": 77,
+    "policy": "mismatch",
+    "protocol": "tcp",
+    "reason": "实际代理链与当前模式的分组选择或已固定节点不一致；同一 TAG 内核 DNS 映射与本机 fake-IP 已核对，公网目标 IP 未提供",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  }
+]

@@ -1,0 +1,152 @@
+[
+  {
+    "calls": 1,
+    "proofs": {
+      "conn-1": {
+        "address": "198.18.1.10",
+        "connection_start": "2023-11-14T22:13:15Z",
+        "dns_endpoint": "127.0.0.1:5353",
+        "dns_owner_pid": 100,
+        "dns_owner_started": "Tue Nov 14 22:00:00 2023",
+        "expires_at": 1700000001.0,
+        "host": "claude.ai",
+        "kind": "same_core_fakeip_mapping",
+        "observed_at": 1700000000.0,
+        "peer": [
+          "198.18.1.10",
+          443
+        ],
+        "protocol": "tcp",
+        "source": [
+          "198.18.0.1",
+          50000
+        ],
+        "source_pid": 77,
+        "source_started": "Tue Nov 14 22:12:50 2023"
+      }
+    }
+  },
+  {
+    "calls": 0,
+    "proofs": {}
+  },
+  {
+    "calls": 0,
+    "proofs": {}
+  },
+  {
+    "calls": 0,
+    "proofs": {}
+  },
+  {
+    "calls": 0,
+    "proofs": {}
+  },
+  {
+    "calls": 0,
+    "proofs": {}
+  },
+  {
+    "calls": 0,
+    "proofs": {}
+  },
+  {
+    "calls": 0,
+    "proofs": {}
+  },
+  {
+    "calls": 0,
+    "proofs": {}
+  },
+  {
+    "calls": 0,
+    "proofs": {}
+  },
+  {
+    "calls": 0,
+    "proofs": {}
+  },
+  {
+    "calls": 1,
+    "proofs": {}
+  },
+  {
+    "calls": 1,
+    "proofs": {}
+  },
+  {
+    "calls": 1,
+    "proofs": {}
+  },
+  {
+    "calls": 0,
+    "proofs": {}
+  },
+  {
+    "calls": 1,
+    "proofs": {}
+  },
+  {
+    "calls": 1,
+    "proofs": {}
+  },
+  {
+    "calls": 0,
+    "proofs": {}
+  },
+  {
+    "calls": 1,
+    "proofs": {
+      "conn-1": {
+        "address": "198.18.1.10",
+        "connection_start": "2023-11-14T22:13:15Z",
+        "dns_endpoint": "127.0.0.1:5353",
+        "dns_owner_pid": 100,
+        "dns_owner_started": "Tue Nov 14 22:00:00 2023",
+        "expires_at": 1700000001.0,
+        "host": "claude.ai",
+        "kind": "same_core_fakeip_mapping",
+        "observed_at": 1700000000.0,
+        "peer": [
+          "198.18.1.10",
+          443
+        ],
+        "protocol": "tcp",
+        "source": [
+          "198.18.0.1",
+          50000
+        ],
+        "source_pid": 77,
+        "source_started": "Tue Nov 14 22:12:50 2023"
+      }
+    }
+  },
+  {
+    "calls": 1,
+    "proofs": {}
+  },
+  {
+    "calls": 1,
+    "proofs": {}
+  },
+  {
+    "calls": 1,
+    "proofs": {}
+  },
+  {
+    "calls": 1,
+    "proofs": {}
+  },
+  {
+    "calls": 1,
+    "proofs": {}
+  },
+  {
+    "calls": 0,
+    "proofs": {}
+  },
+  {
+    "calls": 0,
+    "proofs": {}
+  }
+]

@@ -663,6 +663,7 @@ fn replacement_promotion_uses_the_real_launch_audit_pipeline() {
             &latest,
             &current(at + 0.6),
             at + 0.6,
+            claude_watch_core::processes::Provider::Claude,
         )
         .unwrap()
         .unwrap();

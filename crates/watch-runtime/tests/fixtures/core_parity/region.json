@@ -1,0 +1,37 @@
+[
+  {
+    "country": "JP",
+    "ip": "1.1.1.1",
+    "locale": "ja_JP",
+    "locale_source": "出口国家对应的地区格式；界面语言独立",
+    "timezone": "Asia/Tokyo",
+    "timezone_source": "Net.Coffee / IPinfo timezone"
+  },
+  {
+    "country": "JP",
+    "ip": "1.1.1.1",
+    "locale": "ja_JP",
+    "locale_source": "出口国家对应的地区格式；界面语言独立",
+    "timezone": "Asia/Tokyo",
+    "timezone_source": "出口国家唯一 IANA 时区"
+  },
+  {
+    "country": "JP",
+    "ip": "1.1.1.1",
+    "locale": "ja_JP",
+    "locale_source": "出口国家对应的地区格式；界面语言独立",
+    "timezone": null,
+    "timezone_source": "出口时区未确认"
+  },
+  {},
+  {},
+  {
+    "country": "US",
+    "ip": "1.1.1.1",
+    "locale": "en_US",
+    "locale_source": "出口国家对应的地区格式；界面语言独立",
+    "timezone": null,
+    "timezone_source": "出口时区未确认"
+  },
+  {}
+]

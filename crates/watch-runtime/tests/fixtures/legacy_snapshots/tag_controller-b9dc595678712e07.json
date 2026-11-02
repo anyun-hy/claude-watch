@@ -1,0 +1,26 @@
+[
+  {
+    "value": [
+      "http://127.0.0.1:9090",
+      "fixture-token"
+    ]
+  },
+  {
+    "value": [
+      "http://[::1]:9090",
+      "quoted'token"
+    ]
+  },
+  {
+    "value": [
+      "http://127.0.0.1:9090",
+      "plain"
+    ]
+  },
+  {
+    "value": [
+      "http://127.0.0.1:9090",
+      "plain"
+    ]
+  }
+]

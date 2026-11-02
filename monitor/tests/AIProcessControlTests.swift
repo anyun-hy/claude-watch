@@ -112,9 +112,15 @@ struct AIProcessControlTests {
             let result = AIProcessClosePolicy.forceRemaining(one, lookup: { _ in changed }, force: { _ in called = true; return true })
             expect(!called && result.skipped == 1, "force fallback rechecks PID start, path and owner")
         }
+        // Force eligibility is decided by the policy table upstream; the
+        // helper verifies identity alone, whatever product the plan carries.
         let otherPlan = AIProcessClosePlan(product: .openAI, uid: 501, targets: [rows[3]], protected: [])
-        let other = AIProcessClosePolicy.forceRemaining(otherPlan, lookup: { _ in fatalError() }, force: { _ in fatalError() })
-        expect(other.requested == 0 && other.skipped == 1, "force fallback cannot target other products")
+        var otherForced: [Int32] = []
+        let other = AIProcessClosePolicy.forceRemaining(otherPlan, lookup: { pid in
+            pid == 20 ? rows.first { $0.pid == pid } : nil
+        }, force: { otherForced.append($0); return true })
+        expect(otherForced == [20] && other.requested == 1 && other.skipped == 0,
+               "force follows the upstream policy decision and identity verification alone")
         let forceFailed = AIProcessClosePolicy.forceRemaining(plan, lookup: { pid in rows.first { $0.pid == pid } }, force: { _ in false })
         expect(forceFailed.requested == 0 && forceFailed.failed == 3, "failed force requests are never reported as successful")
         expect(AIProcessInventory.nodeEntry("/usr/bin/node /x/node_modules/@anthropic-ai/claude-code/cli.js")?.hasSuffix("cli.js") == true, "executed node script recognized")

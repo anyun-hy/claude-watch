@@ -65,23 +65,12 @@ private final class AIProbeRunner: @unchecked Sendable {
         if task?.isRunning == true { task?.terminate() }
     }
     func run(_ service: AIService) -> AIProbeResult {
-        let candidate = Bundle.main.url(forResource: "BuildInfo", withExtension: "plist")
-            .flatMap { NSDictionary(contentsOf: $0)?["BackendVariant"] as? String } == "rust-candidate"
-        let executable: URL
-        let arguments: [String]
-        if candidate {
-            guard let engine = Bundle.main.url(forResource: "watch-engine", withExtension: nil),
-                  FileManager.default.isExecutableFile(atPath: engine.path) else {
-                return .failure(service, code: "component_missing", message: "Rust AI 网络诊断组件不可用。")
-            }
-            executable = engine; arguments = ["ai-probe", "--service", service.rawValue]
-        } else {
-            guard let script = Bundle.main.url(forResource: "ai_probe", withExtension: "py"),
-                  let python = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"].first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-                return .failure(service, code: "component_missing", message: "AI 网络诊断组件或 Python 3 不可用。")
-            }
-            executable = URL(fileURLWithPath: python); arguments = [script.path, "--service", service.rawValue]
+        guard let engine = Bundle.main.url(forResource: "watch-engine", withExtension: nil),
+              FileManager.default.isExecutableFile(atPath: engine.path) else {
+            return .failure(service, code: "component_missing", message: "AI 网络诊断组件不可用，请重新构建。")
         }
+        let executable = engine
+        let arguments = ["ai-probe", "--service", service.rawValue]
         let task = Process(), output = Pipe()
         task.executableURL = executable; task.arguments = arguments
         task.standardOutput = output; task.standardError = FileHandle.nullDevice

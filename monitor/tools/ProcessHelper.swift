@@ -16,8 +16,18 @@ struct WatchProcessHelper {
         }
         return inventory
     }
-    static func plan(_ inventory: [AIProcessIdentity]) -> AIProcessClosePlan {
-        AIProcessClosePolicy.plan(.claude, inventory: inventory, uid: getuid(),
+    static func inventory(for product: MonitoredProduct) throws -> [AIProcessIdentity] {
+        switch product {
+        // A bare binary named like Claude is not a Claude install; only the
+        // app bundle's own tree is eligible.
+        case .claude: return try desktopInventory()
+        // ChatGPT / Codex also runs as an independent CLI, which carries no
+        // bundle, so the full inventory is the eligible set.
+        case .openAI: return try AIProcessInventory.read()
+        }
+    }
+    static func plan(_ product: MonitoredProduct, inventory: [AIProcessIdentity]) -> AIProcessClosePlan {
+        AIProcessClosePolicy.plan(product, inventory: inventory, uid: getuid(),
                                   protected: AIProcessInventory.protectedIDs(in: inventory, backendPID: nil))
     }
     static func encode(_ p: AIProcessIdentity) -> [String: Any] {
@@ -56,11 +66,69 @@ struct WatchProcessHelper {
             "short_sample": actual.string(from: sample), "reference_patterns": referencePatterns,
             "reference_samples": samples, "has_custom_formats": preferences["AppleICUDateFormatStrings"] != nil]]
     }
+    /// Closes one product's verified process tree and reports what is left.
+    /// `allowForce` mirrors the policy decision made upstream: the engine only
+    /// issues `guard-close-desktop` for a family whose policy declares force,
+    /// so the helper carries no per-product rule of its own.
+    static func close(_ product: MonitoredProduct, allowForce: Bool) throws -> [String: Any] {
+        let label = product == .claude ? "Claude" : "ChatGPT / Codex"
+        let selected = plan(product, inventory: try inventory(for: product))
+        let outcome = AIProcessClosePolicy.execute(selected, lookup: AIProcessInventory.identity,
+            quitApplication: { NSRunningApplication(processIdentifier: $0)?.terminate() ?? false },
+            terminate: { Darwin.kill($0, SIGTERM) == 0 })
+        var remaining = selected.targets
+        var forced = (requested: 0, skipped: 0, failed: 0)
+        if allowForce {
+            let original = selected
+            func originalStillRunning() -> Bool {
+                original.targets.contains { target in
+                    guard let live = AIProcessInventory.identity(target.pid) else { return false }
+                    return target.sameProcess(as: live)
+                }
+            }
+            let graceDeadline = ProcessInfo.processInfo.systemUptime + 2
+            while originalStillRunning() && ProcessInfo.processInfo.systemUptime < graceDeadline {
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            if originalStillRunning() {
+                forced = AIProcessClosePolicy.forceRemaining(original, lookup: AIProcessInventory.identity,
+                    force: { Darwin.kill($0, SIGKILL) == 0 })
+            }
+            let forceDeadline = ProcessInfo.processInfo.systemUptime + 5
+            while originalStillRunning() && ProcessInfo.processInfo.systemUptime < forceDeadline {
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            // Re-scan the tree for processes started during exit; only the
+            // original verified plan was eligible for force.
+            remaining = plan(product, inventory: try inventory(for: product)).targets
+        } else {
+            let until = ProcessInfo.processInfo.systemUptime + 15
+            repeat {
+                remaining = plan(product, inventory: try inventory(for: product)).targets
+                if remaining.isEmpty { break }
+                Thread.sleep(forTimeInterval: 0.2)
+            } while ProcessInfo.processInfo.systemUptime < until
+        }
+        return ["status": remaining.isEmpty ? "ok" : "error",
+                "code": remaining.isEmpty ? "" : "target_still_running",
+                "message": remaining.isEmpty ? "\(label) 已退出" : "\(label) 未完全退出",
+                "requested": outcome.requested, "remaining": remaining.count,
+                "force_requested": forced.requested, "force_skipped": forced.skipped, "force_failed": forced.failed]
+    }
+    /// The helper command names the supervised product the same way the
+    /// policy table does: one Claude family, one ChatGPT / Codex family.
+    static func product(_ name: String) -> MonitoredProduct? {
+        switch name {
+        case "claude": return .claude
+        case "openai": return .openAI
+        default: return nil
+        }
+    }
     static func main() {
         do {
             guard getuid() != 0 else { throw NSError(domain: "user_required", code: 1) }
             let args = Array(CommandLine.arguments.dropFirst())
-            guard !args.isEmpty, args.count == 1 || args[0] == "regional-status" else {
+            guard !args.isEmpty, args.count == 1 || args.count == 2 || args[0] == "regional-status" else {
                 throw NSError(domain: "invalid_arguments", code: 1)
             }
             var result: [String: Any]
@@ -68,51 +136,15 @@ struct WatchProcessHelper {
             case "regional-status": result = try regionalStatus(Array(args.dropFirst()))
             case "inventory":
                 result = ["status": "ok", "processes": try AIProcessInventory.read().map(encode)]
-            case "desktop-status":
-                result = ["status": "ok", "processes": plan(try desktopInventory()).targets.map(encode)]
+            // One exit routine for every supervised family: the product is a
+            // command argument, and `guard-close-desktop` is only issued when
+            // the family's policy declares force, so which trees may be forced
+            // follows the policy table, never a helper-side product check.
             case "close-desktop", "guard-close-desktop":
-                let allowForce = args[0] == "guard-close-desktop"
-                let selected = plan(try desktopInventory())
-                let outcome = AIProcessClosePolicy.execute(selected, lookup: AIProcessInventory.identity,
-                    quitApplication: { NSRunningApplication(processIdentifier: $0)?.terminate() ?? false },
-                    terminate: { Darwin.kill($0, SIGTERM) == 0 })
-                var remaining = selected.targets
-                var forced = (requested: 0, skipped: 0, failed: 0)
-                if allowForce {
-                    func originalStillRunning() -> Bool {
-                        selected.targets.contains { target in
-                            guard let live = AIProcessInventory.identity(target.pid) else { return false }
-                            return target.sameProcess(as: live)
-                        }
-                    }
-                    let graceDeadline = ProcessInfo.processInfo.systemUptime + 2
-                    while originalStillRunning() && ProcessInfo.processInfo.systemUptime < graceDeadline {
-                        Thread.sleep(forTimeInterval: 0.1)
-                    }
-                    if originalStillRunning() {
-                        forced = AIProcessClosePolicy.forceRemaining(selected, lookup: AIProcessInventory.identity,
-                            force: { Darwin.kill($0, SIGKILL) == 0 })
-                    }
-                    let forceDeadline = ProcessInfo.processInfo.systemUptime + 5
-                    while originalStillRunning() && ProcessInfo.processInfo.systemUptime < forceDeadline {
-                        Thread.sleep(forTimeInterval: 0.1)
-                    }
-                    // Re-scan the full tree for processes started during exit;
-                    // only the original verified plan was eligible for force.
-                    remaining = plan(try desktopInventory()).targets
-                } else {
-                    let until = ProcessInfo.processInfo.systemUptime + 15
-                    repeat {
-                        remaining = plan(try desktopInventory()).targets
-                        if remaining.isEmpty { break }
-                        Thread.sleep(forTimeInterval: 0.2)
-                    } while ProcessInfo.processInfo.systemUptime < until
+                guard args.count == 2, let product = product(args[1]) else {
+                    throw NSError(domain: "invalid_arguments", code: 1)
                 }
-                result = ["status": remaining.isEmpty ? "ok" : "error",
-                          "code": remaining.isEmpty ? "" : "claude_still_running",
-                          "message": remaining.isEmpty ? "Claude Desktop 已退出" : "Claude 未完全退出，禁止替换数据",
-                          "requested": outcome.requested, "remaining": remaining.count,
-                          "force_requested": forced.requested, "force_skipped": forced.skipped, "force_failed": forced.failed]
+                result = try close(product, allowForce: args[0] == "guard-close-desktop")
             default: throw NSError(domain: "invalid_action", code: 1)
             }
             let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])

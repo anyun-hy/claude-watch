@@ -1478,10 +1478,17 @@ fn observed_desktop_uses_shared_fresh_gate_and_only_creates_identity_leases() {
         assert_eq!(leases.load(&inventory, 501, false).unwrap().len(), 1);
         inventory.get_mut(&77).unwrap().start_microseconds += 1;
         assert!(leases.load(&inventory, 501, true).unwrap().is_empty());
+        // The observation target belongs to a supervised family, so the guard
+        // accepts it. The leftover unparseable session file is read as state
+        // corruption: protection refuses to run unverified, and the family's
+        // own action applies — a normal close, never the Claude force tier.
+        let guard_receipt = controller.guard_tick(&mut system).unwrap();
         assert_eq!(
-            controller.guard_tick(&mut system).unwrap_err().code,
-            "protected_scope_mismatch"
+            guard_receipt["session_guard"]["reason"]["code"],
+            "session_state_invalid"
         );
+        assert_eq!(guard_receipt["stop_action"], "close");
+        assert!(guard_receipt.get("stop_force_requested").is_none());
         let risk = ReceiptStore {
             storage: storage.clone(),
         };
@@ -1492,7 +1499,10 @@ fn observed_desktop_uses_shared_fresh_gate_and_only_creates_identity_leases() {
                 .code,
             "launch_target_mismatch"
         );
-        assert_eq!(system.closes, 0);
+        // The launch itself never closed anything: the single close above is
+        // the guard's corrupted-state response, not an effect of the
+        // observation entry.
+        assert_eq!(system.closes, 1);
     }
 }
 
@@ -1897,12 +1907,12 @@ fn adoption_refuses_a_stale_exit() {
 }
 
 fn policy_config(fixture: &Fixture, dns: &str, webrtc: &str) {
-    let config = claude_watch_core::config::Config {
-        guard_enabled: true,
-        claude_close_dns: dns.into(),
-        claude_close_webrtc: webrtc.into(),
-        ..Default::default()
-    };
+    let mut config = claude_watch_core::config::Config::default();
+    config.guard_enabled = true;
+    let claude = claude_watch_core::policy::PolicyCatalog::family("claude").unwrap();
+    config.policy_actions.insert(claude.key("dns"), dns.into());
+    config.policy_actions.insert(claude.key("webrtc"), webrtc.into());
+    let config = config;
     fixture
         .storage
         .atomic_json(&fixture.storage.paths.config(), &config.value().unwrap())

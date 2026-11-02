@@ -156,14 +156,12 @@ struct LeakCheckTests {
                "a sampler gap never displays cached evidence as a current pass")
         let unavailableAutomatic = LeakCheckStore(isFixture: true)
         unavailableAutomatic.contextProvider = { nil }
-        unavailableAutomatic.refreshLeakChecksIfNeeded(interval: 0)
         unavailableAutomatic.refreshWebRTCIfNeeded(interval: 0)
         expect(!unavailableAutomatic.dns.running && !unavailableAutomatic.rtc.running,
                "automatic probes wait for a verified context instead of manufacturing a context change")
         let retainedOnly = LeakCheckStore(isFixture: true)
         retainedOnly.contextProvider = { "old-but-bound" }
         retainedOnly.automaticContextProvider = { nil }
-        retainedOnly.refreshLeakChecksIfNeeded(interval: 0)
         retainedOnly.refreshWebRTCIfNeeded(interval: 0)
         let freshDuringGap = await retainedOnly.ensureFreshDNSReceipt(maximumWait: 1)
         expect(!retainedOnly.dns.running && !retainedOnly.rtc.running && !freshDuringGap,
@@ -181,6 +179,49 @@ struct LeakCheckTests {
         expect(primary.rtc.running, "cancelling DNS never cancels WebRTC")
         try await Task.sleep(nanoseconds: 450_000_000)
         expect(rtcWrites == 1 && dnsWrites == 1, "cancelled DNS cannot submit a late receipt")
+        // Stale-submit epoch guard: a slow submission of round A returning
+        // after round B was accepted must not overwrite the recorded receipt.
+        let epochGuard = LeakCheckStore(isFixture: true)
+        epochGuard.contextProvider = { "epoch-ctx" }
+        epochGuard.fixtureDelayNanoseconds = 1_000_000
+        var submitCalls = 0
+        var releaseFirstSubmit = false
+        epochGuard.onDNSComplete = { _, _ in
+            submitCalls += 1
+            if submitCalls == 1 {
+                while !releaseFirstSubmit { try? await Task.sleep(nanoseconds: 10_000_000) }
+            }
+            return true
+        }
+        epochGuard.start(.dns)
+        try await Task.sleep(nanoseconds: 450_000_000)
+        let staleFinishedAt = epochGuard.dns.result!.finishedAt
+        epochGuard.start(.dns)
+        try await Task.sleep(nanoseconds: 450_000_000)
+        let freshFinishedAt = epochGuard.dns.result!.finishedAt
+        expect(freshFinishedAt > staleFinishedAt && submitCalls == 2, "a second round completes while the first submission is still in flight")
+        expect(epochGuard.initializationReceiptIsCurrent(.dns), "the newer accepted receipt is the recorded one while the older submit is pending")
+        releaseFirstSubmit = true
+        try await Task.sleep(nanoseconds: 450_000_000)
+        expect(epochGuard.dns.result!.finishedAt == freshFinishedAt && epochGuard.initializationReceiptIsCurrent(.dns),
+               "a stale in-flight submission cannot overwrite the newer recorded receipt")
+        // Receipt-driven WebRTC cadence: while the backend still accepts the
+        // recorded receipt (display TTL), the schedule must not reopen a
+        // WebView for duplicate evidence; a context change always re-probes.
+        let cadence = LeakCheckStore(isFixture: true)
+        var cadenceContext = "rtc-ctx"
+        cadence.contextProvider = { cadenceContext }
+        cadence.automaticContextProvider = { cadenceContext }
+        cadence.fixtureDelayNanoseconds = 1_000_000
+        cadence.onWebRTCComplete = { _, _ in true }
+        cadence.refreshWebRTCIfNeeded(interval: 0)
+        try await Task.sleep(nanoseconds: 450_000_000)
+        expect(!cadence.rtc.running && cadence.initializationReceiptIsCurrent(.webrtc), "the automatic webrtc probe completes and records its receipt")
+        cadence.refreshWebRTCIfNeeded(interval: 0)
+        expect(!cadence.rtc.running, "a recorded receipt the backend still accepts suppresses duplicate webrtc re-probing")
+        cadenceContext = "rtc-ctx-2"
+        cadence.refreshWebRTCIfNeeded(interval: 0)
+        expect(cadence.rtc.running, "a proxy context change always re-probes webrtc")
         let receiptProbe = LeakCheckStore(isFixture: true)
         let receiptStore = SwitcherStore(isFixture: true)
         receiptProbe.contextProvider = { "ctx" }
@@ -206,14 +247,6 @@ struct LeakCheckTests {
         try await Task.sleep(nanoseconds: 450_000_000)
         expect(diagnostic?.0 == .webrtc && diagnostic?.2 == submittedRun && diagnostic?.3 == "webrtc_context_unavailable", "WebRTC rejection retains its own run and code")
         expect(SwitcherStore.safeReceiptCode("private-token-203.0.113.9") == "other", "unrecognized backend strings never enter receipt diagnostics")
-        let automatic = LeakCheckStore(isFixture: true)
-        automatic.refreshLeakChecksIfNeeded(interval: 0)
-        expect(automatic.dns.running && automatic.rtc.running, "DNS and WebRTC automatic probes remain independent")
-        automatic.cancel(.dns); automatic.cancel(.webrtc)
-        let manualRTC = LeakCheckStore(isFixture: true)
-        manualRTC.changeSource(.original); manualRTC.refreshLeakChecksIfNeeded(interval: 0)
-        expect(manualRTC.dns.running && !manualRTC.rtc.running, "DNS remains automatic when original WebRTC is manual")
-        manualRTC.cancel(.dns)
 
         if CommandLine.arguments.count == 2 {
             let bytes = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))

@@ -146,10 +146,9 @@ struct ConnectionGraphView: View {
 
             HStack(spacing: 22) {
                 legend(.confirmed, "已确认")
-                legend(.pending, "路径未关联")
+                legend(.pending, "路径未关联 / 参考路径")
                 legend(.mismatch, "路径差异")
                 legend(.configuration, "配置参考")
-                legend(.pending, "参考路径（静止）")
                 Spacer(minLength: 12)
                 Text("点击节点查看证据").font(WatchTypography.small).foregroundStyle(p.secondary)
             }.padding(.horizontal, 24).padding(.top, 2).padding(.bottom, 12)
@@ -435,6 +434,7 @@ struct ConnectionGraphView: View {
                 .background(tileBackground(.gateway, state: graph.gatewayState))
                 .contentShape(RoundedRectangle(cornerRadius: 12))
         }.buttonStyle(.plain).help(graph.gatewayDetail)
+            .accessibilityLabel("\(historicalTitle(gatewayIsProxy ? "本机代理" : graph.gatewayTitle))，\(evidenceLabel(graph.gatewayState))，点击查看证据")
     }
 
     private func tagHub(width: CGFloat) -> some View {
@@ -451,6 +451,7 @@ struct ConnectionGraphView: View {
                 .background(tileBackground(.tag, state: graph.groupState))
                 .contentShape(RoundedRectangle(cornerRadius: 12))
         }.buttonStyle(.plain).help("TAG 分组：\(graph.groupTitle)\n查看 TAG 分组与本次样本的关联证据")
+            .accessibilityLabel("TAG 分流，\(graph.groupTitle)，\(evidenceLabel(graph.groupState))，点击查看证据")
     }
 
     private func exitNode(width: CGFloat) -> some View {
@@ -477,6 +478,7 @@ struct ConnectionGraphView: View {
                 .background(tileBackground(.node, state: graph.nodeState))
                 .contentShape(RoundedRectangle(cornerRadius: 12))
         }.buttonStyle(.plain).help(graph.nodeTitle + "；当前检测未提供此节点的公网出口 IP")
+            .accessibilityLabel("代理节点，\(graph.nodeTitle)，\(evidenceLabel(graph.nodeState))，点击查看证据")
     }
 
     private func targetNode(width: CGFloat) -> some View {
@@ -497,6 +499,7 @@ struct ConnectionGraphView: View {
                 .background(tileBackground(.service, state: graph.targetEdgeState))
                 .contentShape(RoundedRectangle(cornerRadius: 12))
         }.buttonStyle(.plain).help(serverTarget.detail)
+            .accessibilityLabel("\(serverTarget.title)，\(serverTarget.addressLine)，\(serverTarget.regionLine)，点击查看证据")
     }
 
     private func selectNode(_ node: GraphNodeID) {

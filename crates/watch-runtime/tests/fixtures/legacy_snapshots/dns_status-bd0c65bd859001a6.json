@@ -1,0 +1,580 @@
+[
+  {
+    "detail": "本轮 DNS 递归出口与同轮公网出口国家一致；采样 T1700000000",
+    "display_cached": false,
+    "display_receipt": {
+      "comparison": {
+        "detail": "DNS 递归出口与同轮公网出口国家一致；范围仅限本次采样路径",
+        "reason": "same_country",
+        "state": "ok"
+      },
+      "context": "ctx",
+      "context_id": "ctx",
+      "display_expires_at": 1700000300.0,
+      "dns": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "8.8.8.8"
+        ],
+        "source": "IPLeak.net WebView authoritative DNS"
+      },
+      "errors": [],
+      "finished_at": 1700000000.0,
+      "http": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "1.1.1.1"
+        ],
+        "source": "IPLeak.net WebView HTTP reference"
+      },
+      "launch_expires_at": 1700000030.0,
+      "observed_at": 1700000001.0,
+      "provider": "ipleak",
+      "query_error": "",
+      "recorded_at": 1700000001.0,
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "scope": "IPLeak.net DNS 泄漏检测",
+      "started_at": 1699999998.0,
+      "status": "complete"
+    },
+    "last_valid": {
+      "available": true,
+      "context_matches": true,
+      "expired": false,
+      "fresh": true,
+      "sampled_at": 1700000000.0
+    },
+    "receipt": {
+      "comparison": {
+        "detail": "DNS 递归出口与同轮公网出口国家一致；范围仅限本次采样路径",
+        "reason": "same_country",
+        "state": "ok"
+      },
+      "context": "ctx",
+      "context_id": "ctx",
+      "display_expires_at": 1700000300.0,
+      "dns": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "8.8.8.8"
+        ],
+        "source": "IPLeak.net WebView authoritative DNS"
+      },
+      "errors": [],
+      "finished_at": 1700000000.0,
+      "http": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "1.1.1.1"
+        ],
+        "source": "IPLeak.net WebView HTTP reference"
+      },
+      "launch_expires_at": 1700000030.0,
+      "observed_at": 1700000001.0,
+      "provider": "ipleak",
+      "query_error": "",
+      "recorded_at": 1700000001.0,
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "scope": "IPLeak.net DNS 泄漏检测",
+      "started_at": 1699999998.0,
+      "status": "complete"
+    },
+    "state": "ok"
+  },
+  {
+    "detail": "本轮 DNS 递归出口与同轮公网出口国家一致；采样 T1700000000",
+    "display_cached": false,
+    "display_receipt": {
+      "comparison": {
+        "detail": "DNS 递归出口与同轮公网出口国家一致；范围仅限本次采样路径",
+        "reason": "same_country",
+        "state": "ok"
+      },
+      "context": "ctx",
+      "context_id": "ctx",
+      "display_expires_at": 1700000300.0,
+      "dns": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "8.8.8.8"
+        ],
+        "source": "IPLeak.net WebView authoritative DNS"
+      },
+      "errors": [],
+      "finished_at": 1700000000.0,
+      "http": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "1.1.1.1"
+        ],
+        "source": "IPLeak.net WebView HTTP reference"
+      },
+      "launch_expires_at": 1700000030.0,
+      "observed_at": 1700000001.0,
+      "provider": "ipleak",
+      "query_error": "",
+      "recorded_at": 1700000001.0,
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "scope": "IPLeak.net DNS 泄漏检测",
+      "started_at": 1699999998.0,
+      "status": "complete"
+    },
+    "last_valid": {
+      "available": true,
+      "context_matches": true,
+      "expired": false,
+      "fresh": true,
+      "sampled_at": 1700000000.0
+    },
+    "receipt": {
+      "comparison": {
+        "detail": "DNS 递归出口与同轮公网出口国家一致；范围仅限本次采样路径",
+        "reason": "same_country",
+        "state": "ok"
+      },
+      "context": "ctx",
+      "context_id": "ctx",
+      "display_expires_at": 1700000300.0,
+      "dns": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "8.8.8.8"
+        ],
+        "source": "IPLeak.net WebView authoritative DNS"
+      },
+      "errors": [],
+      "finished_at": 1700000000.0,
+      "http": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "1.1.1.1"
+        ],
+        "source": "IPLeak.net WebView HTTP reference"
+      },
+      "launch_expires_at": 1700000030.0,
+      "observed_at": 1700000001.0,
+      "provider": "ipleak",
+      "query_error": "",
+      "recorded_at": 1700000001.0,
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "scope": "IPLeak.net DNS 泄漏检测",
+      "started_at": 1699999998.0,
+      "status": "complete"
+    },
+    "state": "ok"
+  },
+  {
+    "detail": "DNS 检测结果已过期，请重新检测",
+    "display_cached": false,
+    "display_receipt": {
+      "comparison": {
+        "detail": "DNS 递归出口与同轮公网出口国家一致；范围仅限本次采样路径",
+        "reason": "same_country",
+        "state": "ok"
+      },
+      "context": "ctx",
+      "context_id": "ctx",
+      "display_expires_at": 1700000300.0,
+      "dns": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "8.8.8.8"
+        ],
+        "source": "IPLeak.net WebView authoritative DNS"
+      },
+      "errors": [],
+      "finished_at": 1700000000.0,
+      "http": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "1.1.1.1"
+        ],
+        "source": "IPLeak.net WebView HTTP reference"
+      },
+      "launch_expires_at": 1700000030.0,
+      "observed_at": 1700000001.0,
+      "provider": "ipleak",
+      "query_error": "",
+      "recorded_at": 1700000001.0,
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "scope": "IPLeak.net DNS 泄漏检测",
+      "started_at": 1699999998.0,
+      "status": "complete"
+    },
+    "last_valid": {
+      "available": true,
+      "context_matches": true,
+      "expired": true,
+      "fresh": false,
+      "sampled_at": 1700000000.0
+    },
+    "receipt": {
+      "comparison": {
+        "detail": "DNS 递归出口与同轮公网出口国家一致；范围仅限本次采样路径",
+        "reason": "same_country",
+        "state": "ok"
+      },
+      "context": "ctx",
+      "context_id": "ctx",
+      "display_expires_at": 1700000300.0,
+      "dns": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "8.8.8.8"
+        ],
+        "source": "IPLeak.net WebView authoritative DNS"
+      },
+      "errors": [],
+      "finished_at": 1700000000.0,
+      "http": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "1.1.1.1"
+        ],
+        "source": "IPLeak.net WebView HTTP reference"
+      },
+      "launch_expires_at": 1700000030.0,
+      "observed_at": 1700000001.0,
+      "provider": "ipleak",
+      "query_error": "",
+      "recorded_at": 1700000001.0,
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "scope": "IPLeak.net DNS 泄漏检测",
+      "started_at": 1699999998.0,
+      "status": "complete"
+    },
+    "state": "unknown"
+  },
+  {
+    "detail": "DNS 检测后的网络或代理上下文已变化，请重新检测",
+    "display_cached": false,
+    "display_receipt": {
+      "comparison": {
+        "detail": "DNS 递归出口与同轮公网出口国家一致；范围仅限本次采样路径",
+        "reason": "same_country",
+        "state": "ok"
+      },
+      "context": "ctx",
+      "context_id": "ctx",
+      "display_expires_at": 1700000300.0,
+      "dns": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "8.8.8.8"
+        ],
+        "source": "IPLeak.net WebView authoritative DNS"
+      },
+      "errors": [],
+      "finished_at": 1700000000.0,
+      "http": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "1.1.1.1"
+        ],
+        "source": "IPLeak.net WebView HTTP reference"
+      },
+      "launch_expires_at": 1700000030.0,
+      "observed_at": 1700000001.0,
+      "provider": "ipleak",
+      "query_error": "",
+      "recorded_at": 1700000001.0,
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "scope": "IPLeak.net DNS 泄漏检测",
+      "started_at": 1699999998.0,
+      "status": "complete"
+    },
+    "last_valid": {
+      "available": false,
+      "context_matches": false,
+      "expired": false,
+      "fresh": false,
+      "sampled_at": 1700000000.0
+    },
+    "receipt": {
+      "comparison": {
+        "detail": "DNS 递归出口与同轮公网出口国家一致；范围仅限本次采样路径",
+        "reason": "same_country",
+        "state": "ok"
+      },
+      "context": "ctx",
+      "context_id": "ctx",
+      "display_expires_at": 1700000300.0,
+      "dns": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "8.8.8.8"
+        ],
+        "source": "IPLeak.net WebView authoritative DNS"
+      },
+      "errors": [],
+      "finished_at": 1700000000.0,
+      "http": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "1.1.1.1"
+        ],
+        "source": "IPLeak.net WebView HTTP reference"
+      },
+      "launch_expires_at": 1700000030.0,
+      "observed_at": 1700000001.0,
+      "provider": "ipleak",
+      "query_error": "",
+      "recorded_at": 1700000001.0,
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "scope": "IPLeak.net DNS 泄漏检测",
+      "started_at": 1699999998.0,
+      "status": "complete"
+    },
+    "state": "unknown"
+  },
+  {
+    "detail": "DNS 泄漏检测尚未完成",
+    "display_cached": false,
+    "display_receipt": {},
+    "last_valid": {
+      "available": true,
+      "context_matches": true,
+      "expired": false,
+      "fresh": true,
+      "sampled_at": 1700000000.0
+    },
+    "receipt": {},
+    "state": "unknown"
+  },
+  {
+    "detail": "DNS 检测未完整完成，不能给出通过结论；查询失败：dns / timeout；采样 T1700000003",
+    "display_cached": true,
+    "display_receipt": {
+      "comparison": {
+        "detail": "DNS 递归出口与同轮公网出口国家一致；范围仅限本次采样路径",
+        "reason": "same_country",
+        "state": "ok"
+      },
+      "context": "ctx",
+      "context_id": "ctx",
+      "display_expires_at": 1700000300.0,
+      "dns": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "8.8.8.8"
+        ],
+        "source": "IPLeak.net WebView authoritative DNS"
+      },
+      "errors": [],
+      "finished_at": 1700000000.0,
+      "http": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "1.1.1.1"
+        ],
+        "source": "IPLeak.net WebView HTTP reference"
+      },
+      "launch_expires_at": 1700000030.0,
+      "observed_at": 1700000001.0,
+      "provider": "ipleak",
+      "query_error": "",
+      "recorded_at": 1700000001.0,
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "scope": "IPLeak.net DNS 泄漏检测",
+      "started_at": 1699999998.0,
+      "status": "complete"
+    },
+    "last_valid": {
+      "available": true,
+      "context_matches": true,
+      "expired": false,
+      "fresh": true,
+      "sampled_at": 1700000000.0
+    },
+    "receipt": {
+      "comparison": {
+        "detail": "DNS 检测未完整完成，不能给出通过结论",
+        "reason": "incomplete",
+        "state": "unknown"
+      },
+      "context": "ctx",
+      "context_id": "ctx",
+      "display_expires_at": 1700000303.0,
+      "dns": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "8.8.8.8"
+        ],
+        "source": "IPLeak.net WebView authoritative DNS"
+      },
+      "errors": [
+        {
+          "code": "timeout",
+          "message": "",
+          "stage": "dns"
+        }
+      ],
+      "finished_at": 1700000003.0,
+      "http": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "1.1.1.1"
+        ],
+        "source": "IPLeak.net WebView HTTP reference"
+      },
+      "launch_expires_at": 1700000033.0,
+      "observed_at": 1700000004.0,
+      "provider": "ipleak",
+      "query_error": "dns / timeout",
+      "recorded_at": 1700000004.0,
+      "sampled_at": 1700000003.0,
+      "schema": 1,
+      "scope": "IPLeak.net DNS 泄漏检测",
+      "started_at": 1700000001.0,
+      "status": "timeout"
+    },
+    "state": "unknown"
+  },
+  {
+    "detail": "DNS 检测结果已过期，请重新检测",
+    "display_cached": true,
+    "display_receipt": {
+      "comparison": {
+        "detail": "DNS 递归出口与同轮公网出口国家一致；范围仅限本次采样路径",
+        "reason": "same_country",
+        "state": "ok"
+      },
+      "context": "ctx",
+      "context_id": "ctx",
+      "display_expires_at": 1700000300.0,
+      "dns": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "8.8.8.8"
+        ],
+        "source": "IPLeak.net WebView authoritative DNS"
+      },
+      "errors": [],
+      "finished_at": 1700000000.0,
+      "http": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "1.1.1.1"
+        ],
+        "source": "IPLeak.net WebView HTTP reference"
+      },
+      "launch_expires_at": 1700000030.0,
+      "observed_at": 1700000001.0,
+      "provider": "ipleak",
+      "query_error": "",
+      "recorded_at": 1700000001.0,
+      "sampled_at": 1700000000.0,
+      "schema": 1,
+      "scope": "IPLeak.net DNS 泄漏检测",
+      "started_at": 1699999998.0,
+      "status": "complete"
+    },
+    "last_valid": {
+      "available": true,
+      "context_matches": true,
+      "expired": true,
+      "fresh": false,
+      "sampled_at": 1700000000.0
+    },
+    "receipt": {
+      "comparison": {
+        "detail": "DNS 检测未完整完成，不能给出通过结论",
+        "reason": "incomplete",
+        "state": "unknown"
+      },
+      "context": "ctx",
+      "context_id": "ctx",
+      "display_expires_at": 1700000303.0,
+      "dns": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "8.8.8.8"
+        ],
+        "source": "IPLeak.net WebView authoritative DNS"
+      },
+      "errors": [
+        {
+          "code": "timeout",
+          "message": "",
+          "stage": "dns"
+        }
+      ],
+      "finished_at": 1700000003.0,
+      "http": {
+        "countries": [
+          "JP"
+        ],
+        "egress_ips": [
+          "1.1.1.1"
+        ],
+        "source": "IPLeak.net WebView HTTP reference"
+      },
+      "launch_expires_at": 1700000033.0,
+      "observed_at": 1700000004.0,
+      "provider": "ipleak",
+      "query_error": "dns / timeout",
+      "recorded_at": 1700000004.0,
+      "sampled_at": 1700000003.0,
+      "schema": 1,
+      "scope": "IPLeak.net DNS 泄漏检测",
+      "started_at": 1700000001.0,
+      "status": "timeout"
+    },
+    "state": "unknown"
+  }
+]

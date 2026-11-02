@@ -468,8 +468,14 @@ pub fn api_snapshot(
         .map(|root| (root, resolve_chain(proxies, root)))
         .collect();
     let global = resolve_chain(proxies, "GLOBAL").and_then(|v| v.first().cloned());
-    let selected = resolve_chain(proxies, if mode == "global" { "GLOBAL" } else { group })
-        .and_then(|v| v.first().cloned());
+    // An empty group is a normal default (e.g. the observe path hardcodes "").
+    // Fall back to GLOBAL for both `global` mode and an empty rule group so the
+    // selected node is still resolvable instead of silently reading as null.
+    let selected = resolve_chain(
+        proxies,
+        if mode == "global" || group.is_empty() { "GLOBAL" } else { group },
+    )
+    .and_then(|v| v.first().cloned());
     // Rules pointing at a selector whose current selection is DIRECT/REJECT
     // never reach a proxy node.  Nested groups are followed; an unresolvable
     // chain is never guessed into either answer.

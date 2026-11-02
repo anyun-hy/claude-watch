@@ -1,0 +1,242 @@
+[
+  [
+    "node",
+    "next"
+  ],
+  [
+    "node",
+    "space value"
+  ],
+  [
+    "node",
+    "x\\y"
+  ],
+  [
+    "node",
+    "escaped value"
+  ],
+  [
+    "node",
+    "word",
+    "next"
+  ],
+  [
+    "node",
+    "word",
+    "space value"
+  ],
+  [
+    "node",
+    "word",
+    "x\\y"
+  ],
+  [
+    "node",
+    "word",
+    "escaped value"
+  ],
+  [
+    "node",
+    "",
+    "next"
+  ],
+  [
+    "node",
+    "",
+    "space value"
+  ],
+  [
+    "node",
+    "",
+    "x\\y"
+  ],
+  [
+    "node",
+    "",
+    "escaped value"
+  ],
+  [
+    "node",
+    "",
+    "next"
+  ],
+  [
+    "node",
+    "",
+    "space value"
+  ],
+  [
+    "node",
+    "",
+    "x\\y"
+  ],
+  [
+    "node",
+    "",
+    "escaped value"
+  ],
+  [
+    "node",
+    "two words",
+    "next"
+  ],
+  [
+    "node",
+    "two words",
+    "space value"
+  ],
+  [
+    "node",
+    "two words",
+    "x\\y"
+  ],
+  [
+    "node",
+    "two words",
+    "escaped value"
+  ],
+  [
+    "node",
+    "two words",
+    "next"
+  ],
+  [
+    "node",
+    "two words",
+    "space value"
+  ],
+  [
+    "node",
+    "two words",
+    "x\\y"
+  ],
+  [
+    "node",
+    "two words",
+    "escaped value"
+  ],
+  [
+    "node",
+    "a\"b",
+    "next"
+  ],
+  [
+    "node",
+    "a\"b",
+    "space value"
+  ],
+  [
+    "node",
+    "a\"b",
+    "x\\y"
+  ],
+  [
+    "node",
+    "a\"b",
+    "escaped value"
+  ],
+  [
+    "node",
+    "a\\$b",
+    "next"
+  ],
+  [
+    "node",
+    "a\\$b",
+    "space value"
+  ],
+  [
+    "node",
+    "a\\$b",
+    "x\\y"
+  ],
+  [
+    "node",
+    "a\\$b",
+    "escaped value"
+  ],
+  [
+    "node",
+    "word;literal",
+    "next"
+  ],
+  [
+    "node",
+    "word;literal",
+    "space value"
+  ],
+  [
+    "node",
+    "word;literal",
+    "x\\y"
+  ],
+  [
+    "node",
+    "word;literal",
+    "escaped value"
+  ],
+  [],
+  [],
+  [],
+  [],
+  [
+    "node",
+    "x next"
+  ],
+  [
+    "node",
+    "x space value"
+  ],
+  [
+    "node",
+    "x x\\y"
+  ],
+  [
+    "node",
+    "x escaped value"
+  ],
+  [
+    "node",
+    "#literal",
+    "next"
+  ],
+  [
+    "node",
+    "#literal",
+    "space value"
+  ],
+  [
+    "node",
+    "#literal",
+    "x\\y"
+  ],
+  [
+    "node",
+    "#literal",
+    "escaped value"
+  ],
+  [
+    "node",
+    "word\u000bword",
+    "next"
+  ],
+  [
+    "node",
+    "word\u000bword",
+    "space value"
+  ],
+  [
+    "node",
+    "word\u000bword",
+    "x\\y"
+  ],
+  [
+    "node",
+    "word\u000bword",
+    "escaped value"
+  ],
+  [
+    "/Applications/ChatGPT.app/Contents/MacOS/Codex (Service)",
+    "--type=utility"
+  ]
+]

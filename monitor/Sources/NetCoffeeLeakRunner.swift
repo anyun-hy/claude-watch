@@ -87,7 +87,7 @@ final class NetCoffeeLeakRunner: NSObject, WKScriptMessageHandler, WKNavigationD
         // state restoration or spaces cycling: a miniaturized or restored
         // copy shows up as a blank phantom thumbnail on unrelated screens.
         host.isRestorable = false
-        host.excludedFromWindowsMenu = true
+        host.isExcludedFromWindowsMenu = true
         host.ignoresMouseEvents = true
         host.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         host.contentView = w; hiddenHost = host; host.orderFront(nil)

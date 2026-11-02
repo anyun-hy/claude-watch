@@ -1,0 +1,1103 @@
+[
+  {
+    "before": {
+      "context": "ctx",
+      "context_changed": false,
+      "context_id": "ctx",
+      "context_transition": {
+        "after": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "before": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "changed_fields": [],
+        "state": "stable",
+        "unavailable": []
+      },
+      "date_format": {
+        "configured_locale": "ja_JP",
+        "patterns": {
+          "long": "y年M月d日",
+          "medium": "y/MM/dd",
+          "short": "y/MM/dd"
+        },
+        "reference_patterns": {
+          "ja_JP": {
+            "long": "y年M月d日",
+            "medium": "y/MM/dd",
+            "short": "y/MM/dd"
+          }
+        },
+        "reference_samples": {
+          "ja_JP": "2023/11/14"
+        },
+        "short_sample": "2023/11/14",
+        "state": "available"
+      },
+      "guard": true,
+      "guard_state": "ok",
+      "ipv6": "ok",
+      "language": "(\"en-JP\")",
+      "locale": "ja_JP",
+      "mode": "tag",
+      "network_identity": {
+        "entry": "127.0.0.1:7890",
+        "mode": "tag",
+        "selection": "JP-node",
+        "tun": "utun4"
+      },
+      "proxy": "ok",
+      "proxy_detail": "entry confirmed",
+      "rules": {
+        "detail": "13/13 已覆盖",
+        "state": "ok"
+      },
+      "timezone": "Asia/Tokyo",
+      "tun": "ok"
+    },
+    "transition": {
+      "after": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "before": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "changed_fields": [],
+      "state": "stable",
+      "unavailable": []
+    }
+  },
+  {
+    "before": {
+      "context": "ctx",
+      "context_changed": false,
+      "context_id": "ctx",
+      "context_transition": {
+        "after": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "before": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "changed_fields": [],
+        "state": "sampling_unavailable",
+        "unavailable": [
+          "timezone"
+        ]
+      },
+      "date_format": {
+        "configured_locale": "ja_JP",
+        "patterns": {
+          "long": "y年M月d日",
+          "medium": "y/MM/dd",
+          "short": "y/MM/dd"
+        },
+        "reference_patterns": {
+          "ja_JP": {
+            "long": "y年M月d日",
+            "medium": "y/MM/dd",
+            "short": "y/MM/dd"
+          }
+        },
+        "reference_samples": {
+          "ja_JP": "2023/11/14"
+        },
+        "short_sample": "2023/11/14",
+        "state": "available"
+      },
+      "guard": true,
+      "guard_state": "ok",
+      "ipv6": "ok",
+      "language": "(\"en-JP\")",
+      "locale": "ja_JP",
+      "mode": "tag",
+      "network_identity": {
+        "entry": "127.0.0.1:7890",
+        "mode": "tag",
+        "selection": "JP-node",
+        "tun": "utun4"
+      },
+      "proxy": "ok",
+      "proxy_detail": "entry confirmed",
+      "rules": {
+        "detail": "13/13 已覆盖",
+        "state": "ok"
+      },
+      "timezone": null,
+      "tun": "ok"
+    },
+    "transition": {
+      "after": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "before": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "changed_fields": [],
+      "state": "sampling_unavailable",
+      "unavailable": [
+        "timezone"
+      ]
+    }
+  },
+  {
+    "before": {
+      "context": "ctx",
+      "context_changed": true,
+      "context_id": "ctx",
+      "context_transition": {
+        "after": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "before": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "changed_fields": [
+          "timezone"
+        ],
+        "state": "changed",
+        "unavailable": []
+      },
+      "date_format": {
+        "configured_locale": "ja_JP",
+        "patterns": {
+          "long": "y年M月d日",
+          "medium": "y/MM/dd",
+          "short": "y/MM/dd"
+        },
+        "reference_patterns": {
+          "ja_JP": {
+            "long": "y年M月d日",
+            "medium": "y/MM/dd",
+            "short": "y/MM/dd"
+          }
+        },
+        "reference_samples": {
+          "ja_JP": "2023/11/14"
+        },
+        "short_sample": "2023/11/14",
+        "state": "available"
+      },
+      "guard": true,
+      "guard_state": "ok",
+      "ipv6": "ok",
+      "language": "(\"en-JP\")",
+      "locale": "ja_JP",
+      "mode": "tag",
+      "network_identity": {
+        "entry": "127.0.0.1:7890",
+        "mode": "tag",
+        "selection": "JP-node",
+        "tun": "utun4"
+      },
+      "proxy": "ok",
+      "proxy_detail": "entry confirmed",
+      "rules": {
+        "detail": "13/13 已覆盖",
+        "state": "ok"
+      },
+      "timezone": "Asia/Tokyo",
+      "tun": "ok"
+    },
+    "transition": {
+      "after": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "before": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "changed_fields": [
+        "timezone"
+      ],
+      "state": "changed",
+      "unavailable": []
+    }
+  },
+  {
+    "before": {
+      "context": "ctx",
+      "context_changed": false,
+      "context_id": "ctx",
+      "context_transition": {
+        "after": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "before": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "changed_fields": [],
+        "state": "sampling_unavailable",
+        "unavailable": [
+          "date_format"
+        ]
+      },
+      "date_format": {
+        "configured_locale": "ja_JP",
+        "patterns": {
+          "long": "y年M月d日",
+          "medium": "y/MM/dd",
+          "short": "y/MM/dd"
+        },
+        "reference_patterns": {
+          "ja_JP": {
+            "long": "y年M月d日",
+            "medium": "y/MM/dd",
+            "short": "y/MM/dd"
+          }
+        },
+        "reference_samples": {
+          "ja_JP": "2023/11/14"
+        },
+        "short_sample": "2023/11/14",
+        "state": "unknown"
+      },
+      "guard": true,
+      "guard_state": "ok",
+      "ipv6": "ok",
+      "language": "(\"en-JP\")",
+      "locale": "ja_JP",
+      "mode": "tag",
+      "network_identity": {
+        "entry": "127.0.0.1:7890",
+        "mode": "tag",
+        "selection": "JP-node",
+        "tun": "utun4"
+      },
+      "proxy": "ok",
+      "proxy_detail": "entry confirmed",
+      "rules": {
+        "detail": "13/13 已覆盖",
+        "state": "ok"
+      },
+      "timezone": "Asia/Tokyo",
+      "tun": "ok"
+    },
+    "transition": {
+      "after": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "before": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "changed_fields": [],
+      "state": "sampling_unavailable",
+      "unavailable": [
+        "date_format"
+      ]
+    }
+  },
+  {
+    "before": {
+      "context": "ctx",
+      "context_changed": false,
+      "context_id": "ctx",
+      "context_transition": {
+        "after": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "before": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "changed_fields": [],
+        "state": "sampling_unavailable",
+        "unavailable": [
+          "proxy_sampling"
+        ]
+      },
+      "date_format": {
+        "configured_locale": "ja_JP",
+        "patterns": {
+          "long": "y年M月d日",
+          "medium": "y/MM/dd",
+          "short": "y/MM/dd"
+        },
+        "reference_patterns": {
+          "ja_JP": {
+            "long": "y年M月d日",
+            "medium": "y/MM/dd",
+            "short": "y/MM/dd"
+          }
+        },
+        "reference_samples": {
+          "ja_JP": "2023/11/14"
+        },
+        "short_sample": "2023/11/14",
+        "state": "available"
+      },
+      "guard": true,
+      "guard_state": "ok",
+      "ipv6": "ok",
+      "language": "(\"en-JP\")",
+      "locale": "ja_JP",
+      "mode": "tag",
+      "network_identity": {
+        "entry": "127.0.0.1:7890",
+        "mode": "tag",
+        "selection": "JP-node",
+        "tun": "utun4"
+      },
+      "proxy": "unknown",
+      "proxy_detail": "entry confirmed",
+      "rules": {
+        "detail": "13/13 已覆盖",
+        "state": "ok"
+      },
+      "timezone": "Asia/Tokyo",
+      "tun": "ok"
+    },
+    "transition": {
+      "after": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "before": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "changed_fields": [],
+      "state": "sampling_unavailable",
+      "unavailable": [
+        "proxy_sampling"
+      ]
+    }
+  },
+  {
+    "before": {
+      "context": "ctx",
+      "context_changed": false,
+      "context_id": "ctx",
+      "context_transition": {
+        "after": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "before": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "changed_fields": [],
+        "state": "stable",
+        "unavailable": []
+      },
+      "date_format": {
+        "configured_locale": "ja_JP",
+        "patterns": {
+          "long": "y年M月d日",
+          "medium": "y/MM/dd",
+          "short": "y/MM/dd"
+        },
+        "reference_patterns": {
+          "ja_JP": {
+            "long": "y年M月d日",
+            "medium": "y/MM/dd",
+            "short": "y/MM/dd"
+          }
+        },
+        "reference_samples": {
+          "ja_JP": "2023/11/14"
+        },
+        "short_sample": "2023/11/14",
+        "state": "available"
+      },
+      "guard": true,
+      "guard_state": "ok",
+      "ipv6": "ok",
+      "language": "(\"en-JP\")",
+      "locale": "ja_JP",
+      "mode": "tag",
+      "network_identity": {
+        "entry": "127.0.0.1:7890",
+        "mode": "tag",
+        "selection": "JP-node",
+        "tun": "utun4"
+      },
+      "proxy": "ok",
+      "proxy_detail": "entry confirmed",
+      "rules": {
+        "detail": "13/13 已覆盖",
+        "state": "ok"
+      },
+      "timezone": "Asia/Tokyo",
+      "tun": "fail"
+    },
+    "transition": {
+      "after": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "before": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "changed_fields": [],
+      "state": "stable",
+      "unavailable": []
+    }
+  },
+  {
+    "before": {
+      "context": "ctx",
+      "context_changed": false,
+      "context_id": "ctx",
+      "context_transition": {
+        "after": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "before": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "changed_fields": [],
+        "state": "stable",
+        "unavailable": []
+      },
+      "date_format": {
+        "configured_locale": "ja_JP",
+        "patterns": {
+          "long": "y年M月d日",
+          "medium": "y/MM/dd",
+          "short": "y/MM/dd"
+        },
+        "reference_patterns": {
+          "ja_JP": {
+            "long": "y年M月d日",
+            "medium": "y/MM/dd",
+            "short": "y/MM/dd"
+          }
+        },
+        "reference_samples": {
+          "ja_JP": "2023/11/14"
+        },
+        "short_sample": "2023/11/14",
+        "state": "available"
+      },
+      "guard": false,
+      "guard_detail": "本轮保护心跳或后台身份未能持续确认",
+      "guard_state": "unknown",
+      "ipv6": "ok",
+      "language": "(\"en-JP\")",
+      "locale": "ja_JP",
+      "mode": "tag",
+      "network_identity": {
+        "entry": "127.0.0.1:7890",
+        "mode": "tag",
+        "selection": "JP-node",
+        "tun": "utun4"
+      },
+      "proxy": "ok",
+      "proxy_detail": "entry confirmed",
+      "rules": {
+        "detail": "13/13 已覆盖",
+        "state": "ok"
+      },
+      "timezone": "Asia/Tokyo",
+      "tun": "ok"
+    },
+    "transition": {
+      "after": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "before": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "changed_fields": [],
+      "state": "stable",
+      "unavailable": []
+    }
+  },
+  {
+    "before": {
+      "context": "ctx",
+      "context_changed": true,
+      "context_id": "ctx",
+      "context_transition": {
+        "after": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "other",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "before": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "changed_fields": [
+          "selection"
+        ],
+        "state": "changed",
+        "unavailable": []
+      },
+      "date_format": {
+        "configured_locale": "ja_JP",
+        "patterns": {
+          "long": "y年M月d日",
+          "medium": "y/MM/dd",
+          "short": "y/MM/dd"
+        },
+        "reference_patterns": {
+          "ja_JP": {
+            "long": "y年M月d日",
+            "medium": "y/MM/dd",
+            "short": "y/MM/dd"
+          }
+        },
+        "reference_samples": {
+          "ja_JP": "2023/11/14"
+        },
+        "short_sample": "2023/11/14",
+        "state": "available"
+      },
+      "guard": true,
+      "guard_state": "ok",
+      "ipv6": "ok",
+      "language": "(\"en-JP\")",
+      "locale": "ja_JP",
+      "mode": "tag",
+      "network_identity": {
+        "entry": "127.0.0.1:7890",
+        "mode": "tag",
+        "selection": "JP-node",
+        "tun": "utun4"
+      },
+      "proxy": "ok",
+      "proxy_detail": "entry confirmed",
+      "rules": {
+        "detail": "13/13 已覆盖",
+        "state": "ok"
+      },
+      "timezone": "Asia/Tokyo",
+      "tun": "ok"
+    },
+    "transition": {
+      "after": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "other",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "before": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "changed_fields": [
+        "selection"
+      ],
+      "state": "changed",
+      "unavailable": []
+    }
+  },
+  {
+    "before": {
+      "context": "ctx",
+      "context_changed": false,
+      "context_id": "ctx",
+      "context_transition": {
+        "after": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": [
+            "controller"
+          ]
+        },
+        "before": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "changed_fields": [],
+        "state": "sampling_unavailable",
+        "unavailable": [
+          "controller"
+        ]
+      },
+      "date_format": {
+        "configured_locale": "ja_JP",
+        "patterns": {
+          "long": "y年M月d日",
+          "medium": "y/MM/dd",
+          "short": "y/MM/dd"
+        },
+        "reference_patterns": {
+          "ja_JP": {
+            "long": "y年M月d日",
+            "medium": "y/MM/dd",
+            "short": "y/MM/dd"
+          }
+        },
+        "reference_samples": {
+          "ja_JP": "2023/11/14"
+        },
+        "short_sample": "2023/11/14",
+        "state": "available"
+      },
+      "guard": true,
+      "guard_state": "ok",
+      "ipv6": "ok",
+      "language": "(\"en-JP\")",
+      "locale": "ja_JP",
+      "mode": "tag",
+      "network_identity": {
+        "entry": "127.0.0.1:7890",
+        "mode": "tag",
+        "selection": "JP-node",
+        "tun": "utun4"
+      },
+      "proxy": "ok",
+      "proxy_detail": "entry confirmed",
+      "rules": {
+        "detail": "13/13 已覆盖",
+        "state": "ok"
+      },
+      "timezone": "Asia/Tokyo",
+      "tun": "ok"
+    },
+    "transition": {
+      "after": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": [
+          "controller"
+        ]
+      },
+      "before": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "changed_fields": [],
+      "state": "sampling_unavailable",
+      "unavailable": [
+        "controller"
+      ]
+    }
+  },
+  {
+    "before": {
+      "context": "ctx",
+      "context_changed": true,
+      "context_id": "ctx",
+      "context_transition": {
+        "after": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "before": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "changed_fields": [
+          "app_language"
+        ],
+        "state": "changed",
+        "unavailable": []
+      },
+      "date_format": {
+        "configured_locale": "ja_JP",
+        "patterns": {
+          "long": "y年M月d日",
+          "medium": "y/MM/dd",
+          "short": "y/MM/dd"
+        },
+        "reference_patterns": {
+          "ja_JP": {
+            "long": "y年M月d日",
+            "medium": "y/MM/dd",
+            "short": "y/MM/dd"
+          }
+        },
+        "reference_samples": {
+          "ja_JP": "2023/11/14"
+        },
+        "short_sample": "2023/11/14",
+        "state": "available"
+      },
+      "guard": true,
+      "guard_state": "ok",
+      "ipv6": "ok",
+      "language": "(\"en-JP\")",
+      "locale": "ja_JP",
+      "mode": "tag",
+      "network_identity": {
+        "entry": "127.0.0.1:7890",
+        "mode": "tag",
+        "selection": "JP-node",
+        "tun": "utun4"
+      },
+      "proxy": "ok",
+      "proxy_detail": "entry confirmed",
+      "rules": {
+        "detail": "13/13 已覆盖",
+        "state": "ok"
+      },
+      "timezone": "Asia/Tokyo",
+      "tun": "ok"
+    },
+    "transition": {
+      "after": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "before": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "changed_fields": [
+        "app_language"
+      ],
+      "state": "changed",
+      "unavailable": []
+    }
+  },
+  {
+    "before": {
+      "context": "ctx",
+      "context_changed": false,
+      "context_id": "ctx",
+      "context_transition": {
+        "after": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "before": {
+          "context_id": "ctx",
+          "identity": {
+            "entry": "127.0.0.1:7890",
+            "mode": "tag",
+            "selection": "JP-node",
+            "tun": "utun4"
+          },
+          "unavailable": []
+        },
+        "changed_fields": [],
+        "state": "stable",
+        "unavailable": []
+      },
+      "date_format": {
+        "configured_locale": "ja_JP",
+        "patterns": {
+          "long": "y年M月d日",
+          "medium": "y/MM/dd",
+          "short": "y/MM/dd"
+        },
+        "reference_patterns": {
+          "ja_JP": {
+            "long": "y年M月d日",
+            "medium": "y/MM/dd",
+            "short": "y/MM/dd"
+          }
+        },
+        "reference_samples": {
+          "ja_JP": "2023/11/14"
+        },
+        "short_sample": "2023/11/14",
+        "state": "available"
+      },
+      "guard": false,
+      "guard_detail": "保护策略已禁用",
+      "guard_state": "disabled",
+      "ipv6": "ok",
+      "language": "(\"en-JP\")",
+      "locale": "ja_JP",
+      "mode": "tag",
+      "network_identity": {
+        "entry": "127.0.0.1:7890",
+        "mode": "tag",
+        "selection": "JP-node",
+        "tun": "utun4"
+      },
+      "proxy": "ok",
+      "proxy_detail": "entry confirmed",
+      "rules": {
+        "detail": "13/13 已覆盖",
+        "state": "ok"
+      },
+      "timezone": "Asia/Tokyo",
+      "tun": "ok"
+    },
+    "transition": {
+      "after": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "before": {
+        "context_id": "ctx",
+        "identity": {
+          "entry": "127.0.0.1:7890",
+          "mode": "tag",
+          "selection": "JP-node",
+          "tun": "utun4"
+        },
+        "unavailable": []
+      },
+      "changed_fields": [],
+      "state": "stable",
+      "unavailable": []
+    }
+  }
+]

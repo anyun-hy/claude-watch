@@ -1,12 +1,17 @@
 use crate::error::{CoreError, Result};
 use crate::network::public_unicast;
+use crate::policy::PolicyCatalog;
+use crate::processes::Provider;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeSet, net::IpAddr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
+};
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     pub schema: u32,
     pub enabled: bool,
@@ -32,12 +37,16 @@ pub struct Config {
     pub expected_resolvers: Vec<String>,
     /// Legacy prelaunch history policy. It never permits changing a running session's IP.
     pub allow_ip_change: bool,
-    /// Per-criterion action for a running Claude session: force | close | warn.
-    /// Empty or unknown values fall back to the documented default (force).
-    pub claude_close_ip: String,
-    pub claude_close_cn: String,
-    pub claude_close_dns: String,
-    pub claude_close_webrtc: String,
+    /// Per-criterion disposition keyed by each AI service family's own
+    /// `{prefix}_close_{criterion}` keys, declared in `PolicyCatalog`.
+    ///
+    /// Flattened so the on-disk shape is one flat object: a family added to
+    /// the catalog extends this map without a new field. Unknown keys are
+    /// rejected in `from_value`, which checks every incoming key against the
+    /// default document, so flattening silently collecting them is not
+    /// reachable.
+    #[serde(flatten)]
+    pub policy_actions: BTreeMap<String, String>,
     pub update_url: String,
     pub update_public_key: String,
     pub verified_claude_versions: Vec<String>,
@@ -68,10 +77,7 @@ impl Default for Config {
             expected_egress: Vec::new(),
             expected_resolvers: Vec::new(),
             allow_ip_change: true,
-            claude_close_ip: "force".into(),
-            claude_close_cn: "force".into(),
-            claude_close_dns: "force".into(),
-            claude_close_webrtc: "force".into(),
+            policy_actions: PolicyCatalog::default_actions(),
             update_url: String::new(),
             update_public_key: String::new(),
             verified_claude_versions: Vec::new(),
@@ -179,17 +185,76 @@ impl Config {
         if !result.proxy_url.is_empty() && !valid_loopback_proxy(&result.proxy_url) {
             return Err(invalid("诊断代理必须为数字回环 HTTP 入口"));
         }
-        for (key, value) in [
-            ("claude_close_ip", &result.claude_close_ip),
-            ("claude_close_cn", &result.claude_close_cn),
-            ("claude_close_dns", &result.claude_close_dns),
-            ("claude_close_webrtc", &result.claude_close_webrtc),
-        ] {
-            if !matches!(value.as_str(), "force" | "close" | "warn") {
-                return Err(invalid(&format!("{key} 必须为 force、close 或 warn")));
+        // Each family is validated against the actions it declared, so a
+        // service is never configured to perform something it cannot do, and
+        // a family added to the catalog is validated without an edit here.
+        for family in PolicyCatalog::families() {
+            for criterion in PolicyCatalog::keyed_criteria() {
+                let key = family.key(criterion.id);
+                let value = result.action(family.id, criterion.id);
+                if !family.performable(&value) {
+                    return Err(invalid(&format!("{key} 必须为 {}", family.actions.join("、"))));
+                }
             }
         }
         Ok(result)
+    }
+    /// Actions a service can be configured to take, from the family that
+    /// supervises it. The services are not the same shape, and the shape is
+    /// declared in the catalog: anything that renders or validates a policy
+    /// reads this instead of assuming one service's set.
+    pub fn allowed_actions(provider: Provider) -> &'static [&'static str] {
+        PolicyCatalog::family_for(provider)
+            .map(|family| family.actions)
+            .unwrap_or(&["warn"])
+    }
+    /// Configured action of one family and criterion, defaulting to the
+    /// action the family declared for a missing key.
+    pub fn action(&self, family: &str, criterion: &str) -> String {
+        let Some(family) = PolicyCatalog::family(family) else {
+            return String::new();
+        };
+        self.policy_actions
+            .get(&family.key(criterion))
+            .cloned()
+            .unwrap_or_else(|| family.default_action.to_string())
+    }
+    /// Configured action for a confirmed risk code within one service's own
+    /// policy family. Families are kept separate, so an action is always
+    /// resolved against the service being supervised and one service's policy
+    /// can never be read from the other's keys. Codes without a config key
+    /// keep the historical normal-exit path.
+    pub fn close_action(&self, code: &str, provider: Provider) -> String {
+        let Some(family) = PolicyCatalog::family_for(provider) else {
+            return "close".to_string();
+        };
+        let Some(criterion) = PolicyCatalog::criterion_for(code) else {
+            return "close".to_string();
+        };
+        // A stored value the service cannot perform (a policy written before
+        // a capability existed) degrades to that service's mildest action
+        // instead of being performed as written.
+        let performable = |value: String| -> String {
+            if family.performable(&value) {
+                value
+            } else {
+                family.fallback().to_string()
+            }
+        };
+        if criterion.combines.is_empty() {
+            return performable(self.action(family.id, criterion.id));
+        }
+        // A code spanning several criteria: apply the strictest configured
+        // action so a wider drift can never be handled more leniently than a
+        // single-criterion drift.
+        let mut strictest = String::new();
+        for part in criterion.combines {
+            let value = self.action(family.id, part);
+            if strictest.is_empty() || family.severity(&value) > family.severity(&strictest) {
+                strictest = value;
+            }
+        }
+        performable(strictest)
     }
     pub fn value(&self) -> Result<Value> {
         serde_json::to_value(self).map_err(|_| invalid("配置无法序列化"))
@@ -368,10 +433,12 @@ mod protection_tests {
     fn probe_blocking_defaults_to_off_and_policy_defaults_to_force() {
         let config = Config::from_value(json!({})).unwrap();
         assert!(!config.require_dns && !config.require_stun);
-        assert_eq!(config.claude_close_ip, "force");
-        assert_eq!(config.claude_close_cn, "force");
-        assert_eq!(config.claude_close_dns, "force");
-        assert_eq!(config.claude_close_webrtc, "force");
+        for criterion in ["ip", "cn", "dns", "webrtc"] {
+            assert_eq!(config.action("claude", criterion), "force");
+            // ChatGPT / Codex closes the ordinary way: the family offers
+            // close and warn, never the Claude force tier.
+            assert_eq!(config.action("openai", criterion), "close");
+        }
     }
     #[test]
     fn close_actions_accept_only_the_three_documented_values() {
@@ -380,8 +447,8 @@ mod protection_tests {
             "claude_close_dns":"warn","claude_close_webrtc":"close"
         }))
         .unwrap();
-        assert_eq!(warn.claude_close_ip, "warn");
-        assert_eq!(warn.claude_close_cn, "close");
+        assert_eq!(warn.action("claude", "ip"), "warn");
+        assert_eq!(warn.action("claude", "cn"), "close");
         for bad in [
             json!({"claude_close_ip":"kill"}),
             json!({"claude_close_dns":"FORCE"}),
@@ -389,5 +456,80 @@ mod protection_tests {
         ] {
             assert_eq!(Config::from_value(bad).unwrap_err().code, "invalid_config");
         }
+    }
+    #[test]
+    fn gpt_policy_closes_by_default_and_is_configured_independently() {
+        let config = Config::from_value(json!({})).unwrap();
+        for code in [
+            "egress_ip_changed",
+            "egress_country_cn",
+            "dns_egress_changed",
+            "webrtc_egress_changed",
+        ] {
+            assert_eq!(config.close_action(code, Provider::Codex), "close");
+            assert_eq!(config.close_action(code, Provider::Chatgpt), "close");
+            assert_eq!(config.close_action(code, Provider::Claude), "force");
+        }
+        // Each service reads only its own family: setting one never moves
+        // the other.
+        let split = Config::from_value(json!({"claude_close_cn":"warn","gpt_close_ip":"warn"})).unwrap();
+        assert_eq!(split.close_action("egress_country_cn", Provider::Claude), "warn");
+        assert_eq!(split.close_action("egress_ip_changed", Provider::Chatgpt), "warn");
+        assert_eq!(split.close_action("egress_ip_changed", Provider::Claude), "force");
+        assert_eq!(split.close_action("egress_country_cn", Provider::Codex), "close");
+        // Codes are resolved inside the family, and the stricter of two
+        // drifting probe families wins.
+        let strict =
+            Config::from_value(json!({"claude_close_dns":"warn","claude_close_webrtc":"close"}))
+                .unwrap();
+        assert_eq!(
+            strict.close_action("dns_and_webrtc_egress_changed", Provider::Claude),
+            "close"
+        );
+        // Forcing an OpenAI process tree is not a capability of this service,
+        // so a stored value must never claim to perform one.
+        for bad in [
+            json!({"gpt_close_ip":"kill"}),
+            json!({"gpt_close_cn":true}),
+            json!({"gpt_close_cn":"force"}),
+        ] {
+            assert_eq!(Config::from_value(bad).unwrap_err().code, "invalid_config");
+        }
+        // A value written by an older build, before the exit path existed,
+        // degrades to the notice action instead of being performed as stored.
+        let mut stale = Config::default();
+        stale
+            .policy_actions
+            .insert("gpt_close_webrtc".into(), "force".into());
+        assert_eq!(stale.close_action("webrtc_egress_changed", Provider::Codex), "warn");
+        assert_eq!(stale.close_action("webrtc_egress_changed", Provider::Claude), "force");
+    }
+    #[test]
+    fn a_family_added_to_the_catalog_is_validated_and_resolved_without_an_edit() {
+        // The catalog is the single declaration: every family in it is
+        // defaulted, validated against its own actions, and resolvable.
+        for family in PolicyCatalog::families() {
+            for criterion in PolicyCatalog::keyed_criteria() {
+                let config = Config::from_value(json!({})).unwrap();
+                assert_eq!(config.action(family.id, criterion.id), family.default_action);
+                for action in family.actions {
+                    let key = family.key(criterion.id);
+                    let stored = Config::from_value(json!({ key: action })).unwrap();
+                    assert_eq!(stored.action(family.id, criterion.id), *action);
+                }
+                let rejected = family.key(criterion.id);
+                assert_eq!(
+                    Config::from_value(json!({ rejected: "kill" })).unwrap_err().code,
+                    "invalid_config"
+                );
+            }
+        }
+        // An undeclared family's key is not a config field at all.
+        assert_eq!(
+            Config::from_value(json!({"gemini_close_ip": "warn"}))
+                .unwrap_err()
+                .code,
+            "invalid_config"
+        );
     }
 }

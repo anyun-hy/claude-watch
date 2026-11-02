@@ -29,8 +29,9 @@ struct MonitorSnapshotTimingTests {
         expect(tagReceiptContext(endpoint: endpoint, mode: "global", selectedNode: "JP-a", globalNode: "JP-b") ==
                "\(endpoint)|global|JP-a|JP-b",
                "diagnostic binding matches the four-field Rust TAG receipt signature")
-        expect(tagReceiptContext(endpoint: endpoint, mode: "global", selectedNode: "", globalNode: "JP-b") == nil,
-               "partial TAG identity cannot start a new probe")
+        expect(tagReceiptContext(endpoint: endpoint, mode: "global", selectedNode: "", globalNode: "JP-b") ==
+               "\(endpoint)|global||JP-b",
+               "a missing selected node is an empty segment, matching Rust tag_signature, not a nil context")
         var sourceTime = DiagnosticContextTracker()
         expect(sourceTime.observe("tag|rule|JP-a", observedAt: now) == .initial,
                "source timestamp fixture initializes")

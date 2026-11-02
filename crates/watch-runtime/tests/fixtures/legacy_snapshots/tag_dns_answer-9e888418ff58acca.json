@@ -1,0 +1,32 @@
+[
+  {
+    "value": [
+      "198.18.1.10",
+      2
+    ]
+  },
+  {
+    "error": "dns_query_failed"
+  },
+  {
+    "error": "dns_query_failed"
+  },
+  {
+    "error": "dns_query_failed"
+  },
+  {
+    "error": "dns_answer_invalid"
+  },
+  {
+    "error": "dns_answer_invalid"
+  },
+  {
+    "error": "dns_answer_invalid"
+  },
+  {
+    "error": "dns_query_failed"
+  },
+  {
+    "error": "dns_answer_not_unique"
+  }
+]

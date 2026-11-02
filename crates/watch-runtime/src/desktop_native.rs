@@ -13,7 +13,8 @@ use crate::{
 };
 use claude_watch_core::{
     error::{CoreError, Result},
-    processes::{Identity as ProcessIdentity, Kind, LaunchTarget, Target},
+    policy::PolicyCatalog,
+    processes::{Identity as ProcessIdentity, Kind, LaunchTarget, Provider, Target},
     session::{Desktop, Launcher},
 };
 use serde_json::Value;
@@ -597,9 +598,18 @@ impl<R: ReadRunner> NativeDesktop<R> {
             runner: &self.runner,
         }
         .inventory()?;
+        // Which desktops belong to this target is decided by its policy
+        // family, not by a hardcoded bundle: the supervised service is
+        // whatever the configuration supervises.
+        let (bundle_ids, _) =
+            claude_watch_core::process_roots::family_desktop_scopes(self.target.provider());
         let mut result = Vec::new();
         for record in inventory.processes.values() {
-            if record.bundle_id.as_deref() != Some("com.anthropic.claudefordesktop") {
+            if !record
+                .bundle_id
+                .as_deref()
+                .is_some_and(|id| bundle_ids.contains(&id))
+            {
                 continue;
             }
             let Some(bundle) = &record.bundle_path else {
@@ -656,15 +666,19 @@ impl<R: ReadRunner> NativeDesktop<R> {
         if !inventory.complete {
             return Err(CoreError::new(
                 "desktop_inventory_incomplete",
-                "进程清单不完整，无法确认 Claude 是否完全退出",
+                "进程清单不完整，无法确认目标是否完全退出",
             ));
         }
+        let (bundle_ids, app_prefixes) =
+            claude_watch_core::process_roots::family_desktop_scopes(self.target.provider());
         Ok(inventory.processes.values().any(|record| {
-            record.bundle_id.as_deref() == Some("com.anthropic.claudefordesktop")
-                || record
-                    .identity
-                    .executable
-                    .starts_with("/Applications/Claude.app/Contents/")
+            record
+                .bundle_id
+                .as_deref()
+                .is_some_and(|id| bundle_ids.contains(&id))
+                || app_prefixes
+                    .iter()
+                    .any(|prefix| record.identity.executable.starts_with(prefix))
         }))
     }
     pub fn launcher(&self) -> Result<Launcher> {
@@ -739,11 +753,18 @@ impl<R: ReadRunner> NativeDesktop<R> {
             Duration::from_secs(15),
         )
     }
+    /// The launch target this desktop adapter supervises; the policy family
+    /// and every provider-specific decision derive from it.
+    pub fn provider(&self) -> Provider {
+        self.target.provider()
+    }
     fn require_quit_authority(&self) -> Result<()> {
-        if !self.target.protected() {
+        // Which targets this entry may close is declared by the policy table:
+        // a target outside every family is nobody's supervised service.
+        if PolicyCatalog::family_for(self.target.provider()).is_none() {
             return Err(CoreError::new(
                 "protected_scope_mismatch",
-                "观察目标不能通过Claude退出入口关闭",
+                "观察目标不属于受监督的服务，不能通过退出入口关闭",
             ));
         }
         if self.authority != Authority::ExplicitPermit {
@@ -756,21 +777,39 @@ impl<R: ReadRunner> NativeDesktop<R> {
     }
     pub fn quit(&self) -> Result<()> {
         self.require_quit_authority()?;
-        let request = execute(&self.helper, &["close-desktop"], Duration::from_secs(20));
+        // The helper's plan is per product and only Claude may be forced, so
+        // the family the target belongs to selects the tree and the action.
+        let product = PolicyCatalog::family_for(self.target.provider())
+            .map(|family| family.id)
+            .ok_or_else(|| {
+                CoreError::new(
+                    "protected_scope_mismatch",
+                    "观察目标不属于受监督的服务，不能通过退出入口关闭",
+                )
+            })?;
+        let request = execute(&self.helper, &["close-desktop", product], Duration::from_secs(20));
         if !self.desktop_tree_running()? {
             return Ok(());
         }
         request?;
-        Err(CoreError::new("claude_still_running", "Claude尚未完全退出"))
+        Err(CoreError::new("target_still_running", "受监督的应用尚未完全退出"))
     }
     /// Only the confirmed IP-risk path requests the bounded force fallback.
     /// The actual process tree decides success even if another guard closed it.
     pub fn quit_for_confirmed_ip_risk(&self, forced: &mut Option<u32>) -> Result<()> {
         *forced = None;
         self.require_quit_authority()?;
+        let product = PolicyCatalog::family_for(self.target.provider())
+            .map(|family| family.id)
+            .ok_or_else(|| {
+                CoreError::new(
+                    "protected_scope_mismatch",
+                    "观察目标不属于受监督的服务，不能通过退出入口关闭",
+                )
+            })?;
         let request = execute_output(
             &self.helper,
-            &["guard-close-desktop"],
+            &["guard-close-desktop", product],
             Duration::from_secs(20),
         );
         *forced = request
@@ -783,7 +822,7 @@ impl<R: ReadRunner> NativeDesktop<R> {
             .filter(|count| *count <= 4096);
         if self.desktop_tree_running()? {
             request?;
-            return Err(CoreError::new("claude_still_running", "Claude尚未完全退出"));
+            return Err(CoreError::new("target_still_running", "受监督的应用尚未完全退出"));
         }
         Ok(())
     }
@@ -1003,7 +1042,9 @@ mod target_contracts {
         desktop.select_target(LaunchTarget::ChatgptDesktop).unwrap();
         assert_eq!(desktop.selected.as_ref().unwrap().kind, Kind::OpenaiMain);
         assert_eq!(desktop.open().unwrap_err().code, "write_not_authorized");
-        assert_eq!(desktop.quit().unwrap_err().code, "protected_scope_mismatch");
+        // The target belongs to a supervised family, so the exit entry accepts
+        // it in principle; only the read-only authority refuses the action.
+        assert_eq!(desktop.quit().unwrap_err().code, "write_not_authorized");
         app(&root, "ChatGPT.app", "com.other.spoof", "ChatGPT");
         assert_eq!(
             desktop

@@ -1,0 +1,23 @@
+[
+  {
+    "value": "literal"
+  },
+  {
+    "value": "quoted'value"
+  },
+  {
+    "value": "space value"
+  },
+  {
+    "value": "literal"
+  },
+  {
+    "error": "unsupported_scalar"
+  },
+  {
+    "error": "unsupported_scalar"
+  },
+  {
+    "error": "unsupported_scalar"
+  }
+]

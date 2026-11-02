@@ -396,7 +396,7 @@ fn present_event(e: Event) -> Value {
             "incomplete" => Some("结果不完整"),
             "native_listener_worker_failed" => Some("系统监听通道中断"),
             "backend_error" => Some("后台执行异常"),
-            "claude_still_running" => Some("退出后进程仍在运行"),
+            "claude_still_running" | "target_still_running" => Some("退出后进程仍在运行"),
             "permission_denied" => Some("退出权限未确认"),
             "component_unavailable" => Some("退出组件不可用"),
             "identity_unconfirmed" => Some("进程身份未确认"),

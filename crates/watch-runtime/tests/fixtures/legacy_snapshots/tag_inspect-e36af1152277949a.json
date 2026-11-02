@@ -1,0 +1,95 @@
+[
+  {
+    "endpoint": "http://127.0.0.1:7890",
+    "owners": [
+      {
+        "executable": "/Applications/TAG.app/Contents/Resources/bin/mihomo-tag",
+        "pid": 100,
+        "stamp": "Tue Nov 14 22:00:00 2023",
+        "uid": 501
+      }
+    ],
+    "public_listener": false,
+    "reason": "端口可连接，监听进程路径及启动身份匹配 TAG",
+    "source": "lsof",
+    "state": "verified"
+  },
+  {
+    "endpoint": "http://127.0.0.1:7890",
+    "owners": [],
+    "public_listener": false,
+    "reason": "7890 不可连接",
+    "source": "lsof",
+    "state": "unavailable"
+  },
+  {
+    "endpoint": "http://127.0.0.1:7890",
+    "owners": [],
+    "public_listener": false,
+    "reason": "端口可连接，但监听者身份读取不完整",
+    "source": "lsof",
+    "state": "unconfirmed"
+  },
+  {
+    "endpoint": "http://127.0.0.1:7890",
+    "owners": [],
+    "public_listener": false,
+    "reason": "端口可连接，但监听者身份读取不完整",
+    "source": "lsof",
+    "state": "unconfirmed"
+  },
+  {
+    "endpoint": "http://127.0.0.1:7890",
+    "owners": [
+      {
+        "executable": "/Applications/TAG.app/Contents/Resources/bin/mihomo-tag",
+        "pid": 100,
+        "stamp": "Tue Nov 14 22:00:00 2023",
+        "uid": 501
+      }
+    ],
+    "public_listener": true,
+    "reason": "端口可连接，监听进程路径及启动身份匹配 TAG",
+    "source": "lsof",
+    "state": "verified"
+  },
+  {
+    "endpoint": "http://127.0.0.1:7890",
+    "owners": [],
+    "public_listener": false,
+    "reason": "监听进程身份在采样间变化或不可读取",
+    "source": "lsof",
+    "state": "unconfirmed"
+  },
+  {
+    "endpoint": "http://127.0.0.1:7890",
+    "owners": [],
+    "public_listener": false,
+    "reason": "监听进程身份在采样间变化或不可读取",
+    "source": "lsof",
+    "state": "unconfirmed"
+  },
+  {
+    "endpoint": "http://127.0.0.1:7890",
+    "owners": [],
+    "public_listener": false,
+    "reason": "监听进程身份在采样间变化或不可读取",
+    "source": "lsof",
+    "state": "unconfirmed"
+  },
+  {
+    "endpoint": "http://127.0.0.1:7890",
+    "owners": [
+      {
+        "executable": "/usr/bin/python3",
+        "pid": 100,
+        "stamp": "Tue Nov 14 22:00:00 2023",
+        "uid": 501
+      }
+    ],
+    "public_listener": false,
+    "reason": "7890 监听者不匹配 TAG 安装目录中的 Mihomo",
+    "source": "lsof",
+    "state": "mismatch"
+  }
+]

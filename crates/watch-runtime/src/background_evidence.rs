@@ -11,6 +11,7 @@ use crate::{
 use claude_watch_core::{
     config::Config,
     error::{CoreError, Result},
+    processes::Provider,
     session::{Desktop, Phase},
 };
 use serde_json::{json, Value};
@@ -100,6 +101,12 @@ pub trait EvidenceSystem {
     }
     fn cancelled(&self) -> bool {
         false
+    }
+    /// The service whose session is revalidated; its policy family decides
+    /// what the lease records. Defaults to the supervised Claude desktop and
+    /// is overridden by adapters that supervise other families.
+    fn supervised_provider(&self) -> Provider {
+        Provider::Claude
     }
 }
 fn err(code: &str, detail: &str) -> CoreError {
@@ -326,6 +333,7 @@ pub fn refresh_active_session<S: EvidenceSystem>(
                 &audit,
                 &egress,
                 system.now(),
+                system.supervised_provider(),
             )?
             .is_none()
         {

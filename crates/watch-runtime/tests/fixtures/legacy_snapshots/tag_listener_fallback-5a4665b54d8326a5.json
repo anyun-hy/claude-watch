@@ -1,0 +1,26 @@
+[
+  {
+    "source": "netstat",
+    "status": 0,
+    "stderr": "",
+    "stdout": "p100\nn127.0.0.1:7890"
+  },
+  {
+    "source": "lsof",
+    "status": 1,
+    "stderr": "permission denied",
+    "stdout": ""
+  },
+  {
+    "source": "netstat",
+    "status": 1,
+    "stderr": "kernel listener metadata incomplete",
+    "stdout": ""
+  },
+  {
+    "source": "netstat",
+    "status": 1,
+    "stderr": "kernel listener metadata incomplete",
+    "stdout": ""
+  }
+]

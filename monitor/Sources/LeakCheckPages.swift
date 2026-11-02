@@ -4,13 +4,12 @@ import WebKit
 struct DNSLeakPage: View {
     @ObservedObject var store: LeakCheckStore
     let p: Palette
-    var managePolicy: () -> Void = {}
-    var body: some View { LeakInspectorPage(kind: .dns, store: store, p: p, managePolicy: managePolicy) }
+    var body: some View { LeakInspectorPage(kind: .dns, store: store, p: p) }
 }
 struct WebRTCLeakPage: View {
     @ObservedObject var store: LeakCheckStore
     let p: Palette
-    var body: some View { LeakInspectorPage(kind: .webrtc, store: store, p: p, managePolicy: {}) }
+    var body: some View { LeakInspectorPage(kind: .webrtc, store: store, p: p) }
 }
 
 /// The existing store still owns validation, probe execution, cancellation,
@@ -19,7 +18,6 @@ private struct LeakInspectorPage: View {
     let kind: LeakKind
     @ObservedObject var store: LeakCheckStore
     let p: Palette
-    let managePolicy: () -> Void
     @ObservedObject private var diagnosticLog = DiagnosticLogStatus.shared
     @State private var detailsExpanded = false
     @State private var localExpanded = false

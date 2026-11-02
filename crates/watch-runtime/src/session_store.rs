@@ -1,5 +1,6 @@
 use crate::storage::StateStore;
 use claude_watch_core::error::{CoreError, Result};
+use claude_watch_core::processes::Provider;
 use claude_watch_core::session::{self, CheckInput, Desktop, Launcher, Outcome, Phase, Session};
 use serde_json::json;
 use serde_json::Value;
@@ -110,7 +111,7 @@ impl SessionStore {
         if !desktop.valid() {
             return Err(CoreError::new(
                 "desktop_identity_unavailable",
-                "Claude 主进程启动身份不完整",
+                "主进程启动身份不完整",
             ));
         }
         let _lock = self.storage.lock("session-guard", None)?;
@@ -279,6 +280,7 @@ impl SessionStore {
         audit: &Value,
         egress: &Value,
         now: f64,
+        provider: Provider,
     ) -> Result<Option<Session>> {
         // Policy writes use this lock. Keep it short and outside network work;
         // the fast guard does not acquire it.
@@ -365,7 +367,7 @@ impl SessionStore {
             .watch()
             .join(format!("state/sessions/rust-{}.session", desktop.pid));
         let old_lease = self.storage.read_bytes(&lease_path, 16 * 1024)?;
-        crate::controlled::Controller::new(self.storage.clone()).lease(desktop, stamp, now)?;
+        crate::controlled::Controller::new(self.storage.clone()).lease(desktop, stamp, now, provider)?;
         if let Err(error) = self.save(&verified) {
             let rollback = match old_lease {
                 Some(bytes) => self.storage.atomic_bytes(&lease_path, &bytes, 0o600),

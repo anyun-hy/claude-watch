@@ -1,0 +1,651 @@
+[
+  {
+    "association": "correlated",
+    "chains": [
+      "JP11",
+      "AI"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "JP",
+    "destination_ip": "8.8.8.8",
+    "destination_ip_state": "public",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "path": "local_proxy",
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "match",
+    "protocol": "tcp",
+    "reason": "已按 TAG RULE 模式核对实际代理链与末端节点",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "correlated",
+    "chains": [],
+    "connection_id": "connection-1",
+    "destination_country": "JP",
+    "destination_ip": "8.8.8.8",
+    "destination_ip_state": "public",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "path": "local_proxy",
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "缺少实际代理链",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  },
+  {
+    "association": "correlated",
+    "chains": [
+      "DIRECT"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "JP",
+    "destination_ip": "8.8.8.8",
+    "destination_ip_state": "public",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "path": "local_proxy",
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "mismatch",
+    "protocol": "tcp",
+    "reason": "实测为直连或拒绝路径，未通过代理路径要求",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  },
+  {
+    "association": "correlated",
+    "chains": [
+      "JP-other",
+      "AI"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "JP",
+    "destination_ip": "8.8.8.8",
+    "destination_ip_state": "public",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "path": "local_proxy",
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "mismatch",
+    "protocol": "tcp",
+    "reason": "实际代理链与当前模式的分组选择或已固定节点不一致",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  },
+  {
+    "association": "correlated",
+    "chains": [
+      "JP11",
+      "AI"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "JP",
+    "destination_ip": "8.8.8.8",
+    "destination_ip_state": "public",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "path": "local_proxy",
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "规则模式未提供这条连接的命中规则",
+    "rule": "",
+    "rule_payload": "anthropic.com"
+  },
+  {
+    "association": "correlated",
+    "chains": [
+      "JP11",
+      "AI"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "",
+    "destination_ip": "",
+    "destination_ip_state": "synthetic",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "path": "local_proxy",
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "match",
+    "protocol": "tcp",
+    "reason": "已按 TAG RULE 模式核对实际代理链与末端节点",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  },
+  {
+    "association": "correlated",
+    "chains": [
+      "JP11",
+      "AI"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "",
+    "destination_ip": "",
+    "destination_ip_state": "missing",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "path": "local_proxy",
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "match",
+    "protocol": "tcp",
+    "reason": "已按 TAG RULE 模式核对实际代理链与末端节点",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  },
+  {
+    "association": "correlated",
+    "chains": [
+      "JP11",
+      "AI"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "",
+    "destination_ip": "",
+    "destination_ip_state": "nonpublic",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "path": "local_proxy",
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "match",
+    "protocol": "tcp",
+    "reason": "已按 TAG RULE 模式核对实际代理链与末端节点",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  },
+  {
+    "association": "correlated",
+    "chains": [
+      "JP11",
+      "AI"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "JP",
+    "destination_ip": "::ffff:8.8.8.8",
+    "destination_ip_state": "public",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "path": "local_proxy",
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "match",
+    "protocol": "tcp",
+    "reason": "已按 TAG RULE 模式核对实际代理链与末端节点",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "控制接口不可用或属于另一内核，不能把 7890 连接与外层 TUN 链强行对应"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "控制接口不可用或属于另一内核，不能把 7890 连接与外层 TUN 链强行对应"
+  },
+  {
+    "association": "correlated",
+    "chains": [
+      "JP11",
+      "AI"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "JP",
+    "destination_ip": "8.8.8.8",
+    "destination_ip_state": "public",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "path": "local_proxy",
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "mismatch",
+    "protocol": "tcp",
+    "reason": "实测为直连或拒绝路径，未通过代理路径要求",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  },
+  {
+    "association": "correlated",
+    "chains": [
+      "JP11",
+      "AI"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "JP",
+    "destination_ip": "8.8.8.8",
+    "destination_ip_state": "public",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "path": "local_proxy",
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "TAG 实际模式未能确认",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  },
+  {
+    "association": "correlated",
+    "chains": [
+      "JP11",
+      "AI"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "JP",
+    "destination_ip": "8.8.8.8",
+    "destination_ip_state": "public",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "path": "local_proxy",
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "未能独立解析当前模式下的分组选择及末端代理节点",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "local_service",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      9001
+    ],
+    "pid": 77,
+    "policy": "not_applicable",
+    "protocol": "tcp",
+    "reason": "其他本机服务连接，不视为代理绕过"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "控制器连接标识重复，未关联"
+  },
+  {
+    "association": "unconfirmed",
+    "chains": [],
+    "local": [
+      "127.0.0.1",
+      50000
+    ],
+    "peer": [
+      "127.0.0.1",
+      7890
+    ],
+    "pid": 77,
+    "policy": "unconfirmed",
+    "protocol": "tcp",
+    "reason": "没有唯一且时间有效的完整连接匹配；可能被 TUN 接管，不能认定直连泄漏"
+  },
+  {
+    "association": "correlated",
+    "chains": [
+      "JP11",
+      "AI"
+    ],
+    "connection_id": "connection-1",
+    "destination_country": "JP",
+    "destination_ip": "8.8.8.8",
+    "destination_ip_state": "public",
+    "destination_port": 443,
+    "host": "api.anthropic.com",
+    "interface": "utun4",
+    "local": [
+      "198.18.0.1",
+      50000
+    ],
+    "path": "Tun",
+    "peer": [
+      "8.8.8.8",
+      443
+    ],
+    "pid": 77,
+    "policy": "match",
+    "protocol": "tcp",
+    "reason": "已按 TAG RULE 模式核对实际代理链与末端节点",
+    "rule": "DomainSuffix",
+    "rule_payload": "anthropic.com"
+  }
+]

@@ -53,9 +53,15 @@ struct EnvironmentSourceNotice: Decodable, Identifiable {
     let id, title, detail, severity: String
 }
 struct EgressReference: Decodable {
-    let ip, country, timezone, context_id: String?
+    let ip, country, timezone: String?
     let checked_at: Double?
     var observed_at: Double? = nil
+    // The real backend names this field `context` in egress_reference blocks;
+    // Swift fixtures historically wrote `context_id`. Decode either so the
+    // value survives both producers instead of silently decoding to nil.
+    var context: String? = nil
+    var context_id: String? = nil
+    var resolvedContext: String? { context ?? context_id }
 }
 struct GuardRisk: Decodable, Identifiable {
     let id: String
@@ -146,6 +152,22 @@ struct InitializationBackendReceipt: Decodable {
 /// exact domains instead of showing a bare count.
 struct EnvironmentDisplayFacts: Decodable {
     var local: EnvironmentLocalFacts?
+    var online: EnvironmentOnlineFacts?
+}
+/// Online half of the captured sample, used by the summary strip (exit
+/// country flag, IP, live exit-local clock). Evidence-only; never gates.
+struct EnvironmentOnlineFacts: Decodable {
+    var trace: EnvironmentTraceFacts?
+    var geo: EnvironmentGeoFacts?
+}
+struct EnvironmentTraceFacts: Decodable {
+    var ip: String?
+    var loc: String?
+}
+struct EnvironmentGeoFacts: Decodable {
+    var ip: String?
+    var country: String?
+    var timezone: String?
 }
 struct EnvironmentLocalFacts: Decodable {
     var rules: EnvironmentRulesEvidence?
@@ -173,6 +195,8 @@ struct EnvironmentTagAPI: Decodable {
     var mode: String?
     var global_node: String?
     var selected_node: String?
+    var state: String?
+    var reason: String?
 }
 /// A neutral recommendation, deliberately not a gate.  When the proxy runs in
 /// rule mode the product suggests global mode, where one node handles every
@@ -346,20 +370,13 @@ enum SwitcherCommandRunner {
         switch variant {
         case .rustCandidate:
             guard let engine = Bundle.main.url(forResource: "watch-engine", withExtension: nil) else {
-                throw NSError(domain: "Switcher", code: 1, userInfo: [NSLocalizedDescriptionKey: "缺少 Rust 账号与环境组件，请重新构建候选包。"])
+                throw NSError(domain: "Switcher", code: 1, userInfo: [NSLocalizedDescriptionKey: "缺少 Rust 账号与环境组件，请重新构建。"])
             }
             task.executableURL = engine
             task.arguments = args
-        case .stable:
-            guard let script = Bundle.main.url(forResource: "switcher", withExtension: "py") else {
-                throw NSError(domain: "Switcher", code: 1, userInfo: [NSLocalizedDescriptionKey: "缺少稳定版账号与环境组件，请重新构建界面。"])
-            }
-            task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            task.arguments = ["python3", script.path] + args
         }
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
-        if case .stable = variant { env["PYTHONDONTWRITEBYTECODE"] = "1" }
         env.removeValue(forKey: "BASH_ENV")
         env.removeValue(forKey: "CLAUDE_WATCH_DNS_REFRESH_TOKEN")
         env.removeValue(forKey: "CW_SETUP_PROGRESS")
@@ -428,6 +445,10 @@ final class SwitcherStore: ObservableObject {
     @Published private(set) var currentPolicyEvaluation: EnvironmentPolicyEvaluation?
     @Published private(set) var auditOperationMessage = ""
     @Published private(set) var currentEnvironment: CurrentEnvironmentReceipt?
+    /// The receipt that preceded the current one, kept so the environment page
+    /// can show what a refresh actually changed (刷新前后对比). Fixture and
+    /// readback paths do not rotate it; only live re-detections do.
+    @Published private(set) var previousEnvironment: CurrentEnvironmentReceipt?
     @Published private(set) var currentEnvironmentIsHistorical = false
     @Published private(set) var detectionError = ""
     @Published private(set) var dnsReceiptError = ""
@@ -460,7 +481,10 @@ final class SwitcherStore: ObservableObject {
     /// MonitorStore consumes a new observation to refresh the matching IP
     /// quality summary.  No policy/configuration is changed by this callback.
     var onCurrentEnvironment: ((CurrentEnvironmentReceipt) -> Void)?
-    var awaitFreshDNSReceipt: (() async -> Bool)?
+    /// The parameter is the receipt-age budget in seconds that the upcoming
+    /// backend audit will actually apply: 300 (display TTL) for environment
+    /// detections, 30 (DNS_LAUNCH_TTL) for launch-grade rounds.
+    var awaitFreshDNSReceipt: ((TimeInterval) async -> Bool)?
     var onDNSReceiptRecorded: (() -> Void)?
     var onWebRTCRiskRecorded: (() -> Void)?
     var onReceiptDiagnostic: ((LeakKind, String, UUID?, String?) -> Void)?
@@ -481,6 +505,9 @@ final class SwitcherStore: ObservableObject {
     @Published var diagnosticProxy = "http://127.0.0.1:7890"
     @Published private(set) var diagnostic: ProxyDiagnosticReceipt?
     @Published private(set) var diagnosticError = ""
+    /// Separate from `busy` so the panel can show progress for this specific
+    /// action instead of a blank panel until results pop in.
+    @Published private(set) var diagnosticRunning = false
     let isFixture: Bool
     private var savedSettings: [String: Any] = [:]
     private var protectionChanges: [String: Bool]?
@@ -534,7 +561,7 @@ final class SwitcherStore: ObservableObject {
         var environment = try! JSONDecoder().decode(CurrentEnvironmentReceipt.self, from: Self.fixtureCurrentEnvironment(settings: settings))
         var rows = normalizeReviewRows(environment.rows)
         let jp = EgressReference(ip: "8.8.8.8", country: "JP", timezone: "Asia/Tokyo",
-                                 context_id: environment.context_id, checked_at: now)
+                                 checked_at: now, context_id: environment.context_id)
         var facts = ProtectionFacts(state: "ok", risks: [], evidence: nil)
         var blocked: [String] = []
         var previewReady = true
@@ -593,7 +620,7 @@ final class SwitcherStore: ObservableObject {
                            guard_backend_healthy: true, backend_sampling_state: "complete",
                            services: base.services, policy_issues: base.policy_issues, egress_reference: jp, facts: facts,
                            session_guard: .init(state: guardState, baseline: jp,
-                                                current: scenario == .ipChanged ? .init(ip: "8.8.4.4", country: "JP", timezone: "Asia/Tokyo", context_id: environment.context_id, checked_at: now) : jp,
+                                                current: scenario == .ipChanged ? .init(ip: "8.8.4.4", country: "JP", timezone: "Asia/Tokyo", checked_at: now, context_id: environment.context_id) : jp,
                                                 reason: guardReason, risk_evidence: nil))
         sourceNotices = []
     }
@@ -701,16 +728,25 @@ final class SwitcherStore: ObservableObject {
             }
         }
     }
-    func text(_ key: String) -> Binding<String> {
-        Binding(get: { self.settings[key] as? String ?? "" }, set: { self.settings[key] = $0; self.markDraft() })
+    /// Read-only accessors. Every read goes through a declared handle so no
+    /// call site carries a key literal.
+    func isOn(_ key: FlagSetting) -> Bool {
+        settings[key.key] as? Bool ?? false
     }
-    func flag(_ key: String) -> Binding<Bool> {
-        Binding(get: { self.settings[key] as? Bool ?? false }, set: { self.settings[key] = $0; self.markDraft() })
+    func value(_ key: TextSetting) -> String {
+        settings[key.key] as? String ?? ""
     }
-    /// Three-state action selector for the protection policy keys; the
-    /// backend defaults to "force" when the key is absent.
-    func choice(_ key: String) -> Binding<String> {
-        Binding(get: { self.settings[key] as? String ?? "force" }, set: { self.settings[key] = $0; self.markDraft() })
+    func text(_ key: TextSetting) -> Binding<String> {
+        Binding(get: { self.value(key) }, set: { self.settings[key.key] = $0; self.markDraft() })
+    }
+    func flag(_ key: FlagSetting) -> Binding<Bool> {
+        Binding(get: { self.isOn(key) }, set: { self.settings[key.key] = $0; self.markDraft() })
+    }
+    /// Three-state action selector. The fallback travels with the key, so a
+    /// service is never read with another service's default.
+    func choice(_ setting: ChoiceSetting) -> Binding<String> {
+        Binding(get: { self.settings[setting.key] as? String ?? setting.fallback },
+                set: { self.settings[setting.key] = $0; self.markDraft() })
     }
     func addresses(_ key: String) -> Binding<String> {
         Binding(get: { (self.settings[key] as? [String] ?? []).joined(separator: ", ") }, set: {
@@ -727,7 +763,7 @@ final class SwitcherStore: ObservableObject {
     func dismissMessage() { message = "" }
     var policyWarnings: [String] {
         var items: [String] = []
-        if settings["auto_update"] as? Bool == true && !updateSourceReady { items.append("保存的自动更新意愿为开启，但发布源与公钥尚未配置。实际状态见后台保护。") }
+        if isOn(Setting.autoUpdate) && !updateSourceReady { items.append("保存的自动更新意愿为开启，但发布源与公钥尚未配置。实际状态见后台保护。") }
         return items
     }
     func load(automaticCheck: Bool = false) async {
@@ -772,6 +808,9 @@ final class SwitcherStore: ObservableObject {
             if !isFixture { GuardDiagnosticLogger.submit(from: data) }
             guard generation == environmentGeneration else { return false }
             advanceLoginClock(Date())
+            if let previous = currentEnvironment, previous.observation_id != result.observation_id {
+                previousEnvironment = previous
+            }
             currentEnvironment = result
             // A newly received failed/unavailable observation is still current;
             // only an older receipt retained after a later context change is historical.
@@ -1064,7 +1103,7 @@ final class SwitcherStore: ObservableObject {
          "guard_enabled": setupGuard, "timezone_watchdog": setupWatchdog, "auto_update": setupUpdater]
     }
     var updateSourceReady: Bool {
-        !(settings["update_url"] as? String ?? "").isEmpty && !(settings["update_public_key"] as? String ?? "").isEmpty
+        !value(Setting.updateURL).isEmpty && !value(Setting.updatePublicKey).isEmpty
     }
     var setupCanConfirm: Bool {
         guard let setupPlan else { return false }
@@ -1134,8 +1173,9 @@ final class SwitcherStore: ObservableObject {
     func diagnoseProxy() async {
         guard !busy else { return }
         busy = true
+        diagnosticRunning = true
         diagnostic = nil; diagnosticError = ""
-        defer { busy = false }
+        defer { busy = false; diagnosticRunning = false }
         do {
             // Credentials never enter process arguments, saved settings or status refreshes.
             let input = try JSONSerialization.data(withJSONObject: ["proxy_url": diagnosticProxy])
@@ -1163,9 +1203,21 @@ final class SwitcherStore: ObservableObject {
         while !Task.isCancelled {
             if let id = bridge.pendingRequestID(), !answered.contains(id) {
                 answered.insert(id)
-                let ready = await awaitFreshDNSReceipt?() ?? false
+                let ready = await awaitFreshDNSReceipt?(30) ?? false
                 guard !Task.isCancelled else { return }
-                try? bridge.writeReply(id: id, ready: ready)
+                // A silently dropped reply leaves the backend waiting on the
+                // rendezvous until its own timeout, stalling the account
+                // switch for nothing. One retry covers a transient filesystem
+                // hiccup; the backend's conservative timeout remains the
+                // backstop when the reply truly cannot land.
+                do {
+                    try bridge.writeReply(id: id, ready: ready)
+                } catch {
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    guard !Task.isCancelled else { return }
+                    do { try bridge.writeReply(id: id, ready: ready) }
+                    catch { NSLog("ClaudeWatch: dns-refresh reply %@ could not be written: %@", id, error.localizedDescription) }
+                }
             }
             try? await Task.sleep(nanoseconds: 150_000_000)
         }
@@ -1208,7 +1260,13 @@ final class SwitcherStore: ObservableObject {
             (args.starts(with: ["account", "switch"]) && args.contains("--apply"))
         if requiresFreshDNS, let awaitFreshDNSReceipt {
             updateActivity("正在完成 DNS 泄漏检测并同步启动预检…", token: activityToken)
-            let ready = await awaitFreshDNSReceipt()
+            // Environment detections evaluate the stored receipt with the
+            // backend display TTL (300s); only launch-grade rounds apply the
+            // 30s launch window. Demanding 10s freshness here used to force a
+            // redundant full DNS re-run before nearly every detection.
+            let launchGrade = args.first == "launch" ||
+                (args.starts(with: ["account", "switch"]) && args.contains("--apply"))
+            let ready = await awaitFreshDNSReceipt(launchGrade ? 30 : 300)
             guard ready else {
                 failure = true
                 invalidateCurrentEnvironmentRequest()
@@ -1237,15 +1295,15 @@ final class SwitcherStore: ObservableObject {
                 }
                 else if args.starts(with: ["config", "set"]) { savedSettings = settings; hasUnsavedSettings = false }
                 else if fullInitializationFixture && args.starts(with: ["setup", "apply"]) {
-                    settings["enabled"] = setupEnablePolicy
-                    settings["guard_enabled"] = setupGuard
-                    settings["timezone_watchdog"] = setupWatchdog
-                    settings["auto_update"] = setupUpdater
+                    settings[Setting.enabled.key] = setupEnablePolicy
+                    settings[Setting.guardEnabled.key] = setupGuard
+                    settings[Setting.timezoneWatchdog.key] = setupWatchdog
+                    settings[Setting.autoUpdate.key] = setupUpdater
                     savedSettings = settings; hasUnsavedSettings = false; fixtureInitialized = true
                 }
                 else if args.starts(with: ["protection", "apply"]), let protectionChanges {
                     for (key, value) in protectionChanges { settings[key] = value }
-                    if protectionChanges["guard_enabled"] == true { settings["enabled"] = true }
+                    if protectionChanges[Setting.guardEnabled.key] == true { settings[Setting.enabled.key] = true }
                     savedSettings = settings
                 }
                 else if args.first == "logs" { operationLog = "隔离记录：没有访问真实操作日志。" }
@@ -1275,11 +1333,13 @@ final class SwitcherStore: ObservableObject {
                 let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
                 let status = raw["status"] as? String ?? ""
                 failure = ["error", "partial"].contains(status)
+                var auditDecoded = false
                 if let value = try? JSONDecoder().decode(EnvironmentAuditReceipt.self, from: data) {
                     audit = value
                     auditOperationMessage = value.message
                     message = ""
                     failure = !value.ready
+                    auditDecoded = true
                 } else if let value = try? JSONDecoder().decode(SwitcherRepairPlan.self, from: data), !args.contains("--apply") {
                     plan = value; message = value.actions.isEmpty ? "没有需要应用的修复项。" : "请核对变更列表后再应用。"
                 } else {
@@ -1301,6 +1361,13 @@ final class SwitcherStore: ObservableObject {
                     if args.count >= 2, args[0] == "protection", args[1] == "preview", !failure {
                         failure = true
                         message = "预览回执未能识别为变更计划，未生成变更列表。请重新预览；若仍然如此，请查看操作记录。"
+                    }
+                    // A launch-condition receipt that fails to decode must not
+                    // report "操作已完成": the gate would keep judging on a
+                    // stale audit while the user believes this round succeeded.
+                    if args.first == "checkdetail", !auditDecoded {
+                        failure = true
+                        message = "启动条件回执无法识别（后台版本可能不匹配），本轮未更新启动预检结论。请重新检测；若仍然如此，请查看操作记录。"
                     }
                 }
                 if args.first == "logs" { operationLog = raw["message"] as? String ?? "暂无操作记录" }
@@ -1344,10 +1411,10 @@ final class SwitcherStore: ObservableObject {
         proxyGroups = raw["proxy_groups"] as? [String] ?? []
         updateRecoveryRequired = raw["update_recovery_required"] as? Bool ?? false
         setupRecoveryRequired = raw["setup_recovery_required"] as? Bool ?? false
-        setupGuard = settings["guard_enabled"] as? Bool ?? false
-        setupWatchdog = settings["timezone_watchdog"] as? Bool ?? false
-        setupUpdater = settings["auto_update"] as? Bool ?? false
-        setupEnablePolicy = settings["enabled"] as? Bool ?? false
+        setupGuard = isOn(Setting.guardEnabled)
+        setupWatchdog = isOn(Setting.timezoneWatchdog)
+        setupUpdater = isOn(Setting.autoUpdate)
+        setupEnablePolicy = isOn(Setting.enabled)
         if let object = raw["service_status"] {
             publishBackground(try JSONDecoder().decode(BackgroundServiceReceipt.self, from: JSONSerialization.data(withJSONObject: object)))
         }
@@ -1380,7 +1447,7 @@ final class SwitcherStore: ObservableObject {
         webRTCReceipt: (context: String, state: String, sampled: Double)? = nil) -> Data {
         let audit = fixtureAudit()
         let now = Date().timeIntervalSince1970
-        let guardOn = settings["guard_enabled"] as? Bool == true && settings["enabled"] as? Bool == true
+        let guardOn = settings[Setting.guardEnabled.key] as? Bool == true && settings[Setting.enabled.key] as? Bool == true
         let values = ["tag · http://127.0.0.1:7890", "utun4", "8.8.8.8 / JP", "8.8.8.8", "Asia/Tokyo", "ja_JP · 示例 2026/10/23",
                       "已关闭", "8.8.8.8 / JP", "未知", guardOn ? "保护心跳有效" : "保护未启用", "未知", "en-JP", "fixture ISP", "Claude HTTP 403 / API HTTP 401"]
         let references = ["运行进程与监听者身份", "实际 TUN 路由", "本轮两个来源一致", "48 小时检测历史", "Asia/Tokyo（本轮出口）",
@@ -1466,10 +1533,10 @@ final class SwitcherStore: ObservableObject {
         return try! JSONSerialization.data(withJSONObject: raw)
     }
     static func fixtureBackground(settings: [String: Any] = [:], scenario: SwitcherReviewScenario? = nil) -> Data {
-        let guardOn = settings["guard_enabled"] as? Bool == true && settings["enabled"] as? Bool == true
-        let clockOn = settings["timezone_watchdog"] as? Bool == true
+        let guardOn = settings[Setting.guardEnabled.key] as? Bool == true && settings[Setting.enabled.key] as? Bool == true
+        let clockOn = settings[Setting.timezoneWatchdog.key] as? Bool == true
         var issues: [[String: String]] = []
-        if settings["enabled"] as? Bool != true { issues.append(["id":"policy", "title":"启动策略尚未启用", "detail":"先确认自动检测的环境，再预览启用保护。"] ) }
+        if settings[Setting.enabled.key] as? Bool != true { issues.append(["id":"policy", "title":"启动策略尚未启用", "detail":"先确认自动检测的环境，再预览启用保护。"] ) }
         let now = Date().timeIntervalSince1970
         let session: [String: Any]
         switch scenario {
@@ -1505,10 +1572,10 @@ final class SwitcherStore: ObservableObject {
             "facts": ["state": "ok", "risks": []],
             "session_guard": session,
             "services": [
-                ["id":"guard", "title":"Claude Watch 保镖", "state":guardOn ? "running" : "inactive", "detail":guardOn ? "后台及保护心跳均有效。" : "保护已停用；后台采集继续运行。", "source":"本工具保护心跳 / 采集后台", "desired":settings["guard_enabled"] as? Bool ?? false],
+                ["id":"guard", "title":"Claude Watch 保镖", "state":guardOn ? "running" : "inactive", "detail":guardOn ? "后台及保护心跳均有效。" : "保护已停用；后台采集继续运行。", "source":"本工具保护心跳 / 采集后台", "desired":settings[Setting.guardEnabled.key] as? Bool ?? false],
                 ["id":"original", "title":"原版 Claude切换器保镖", "state":"scheduled", "detail":"已加载，每 10 秒检查；最近退出码：0。", "source":"原版系统任务；独立管理"],
                 ["id":"watchdog", "title":"时区守护", "state":clockOn ? "scheduled" : "inactive", "detail":clockOn ? "实际目标：Asia/Tokyo；已接受目标：Asia/Tokyo。任务按计划运行。" : "实际目标：未设置；已接受目标：未配置。", "source":"系统任务 / 目标文件", "desired":clockOn],
-                ["id":"updater", "title":"自动更新", "state":"unavailable", "detail":"尚未配置本项目发布源与固定公钥。", "source":"发布配置 / 用户任务", "desired":settings["auto_update"] as? Bool ?? false]]]
+                ["id":"updater", "title":"自动更新", "state":"unavailable", "detail":"尚未配置本项目发布源与固定公钥。", "source":"发布配置 / 用户任务", "desired":settings[Setting.autoUpdate.key] as? Bool ?? false]]]
         return try! JSONSerialization.data(withJSONObject: raw)
     }
 }

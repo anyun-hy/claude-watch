@@ -1,0 +1,20 @@
+[
+  {
+    "value": [
+      5353,
+      "198.18.0.0/16"
+    ]
+  },
+  {
+    "error": "dns_listener_not_loopback_reachable"
+  },
+  {
+    "error": "unsupported_fakeip_range"
+  },
+  {
+    "error": "dns_not_fakeip"
+  },
+  {
+    "error": "dns_config_duplicate"
+  }
+]

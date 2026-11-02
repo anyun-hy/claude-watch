@@ -376,7 +376,9 @@ impl GuardHistory {
             let stop_code = if receipt["stop_state"] == "failed" {
                 Some(
                     match receipt["stop_error"].as_str() {
-                        Some("claude_still_running") => "claude_still_running",
+                        Some("claude_still_running" | "target_still_running") => {
+                            "target_still_running"
+                        }
                         Some("write_not_authorized" | "protected_scope_mismatch") => {
                             "permission_denied"
                         }
@@ -521,7 +523,7 @@ mod tests {
             .iter()
             .find(|e| e.fields.status.as_deref() == Some("confirmed"))
             .unwrap();
-        assert_eq!(failed.fields.code.as_deref(), Some("claude_still_running"));
+        assert_eq!(failed.fields.code.as_deref(), Some("target_still_running"));
         assert_ne!(
             failed.fields.correlation_id,
             confirmed.fields.correlation_id
@@ -583,7 +585,7 @@ mod tests {
         let rows = events.history().unwrap().events;
         assert!(rows.iter().any(|e| e.fields.code.as_deref() == Some("force_requested") && e.fields.count == Some(2)));
         assert!(rows.iter().any(|e| e.fields.code.as_deref() == Some("force_report_unavailable") && e.fields.count.is_none()));
-        assert!(rows.iter().any(|e| e.fields.code.as_deref() == Some("claude_still_running") && e.fields.count == Some(1)));
+        assert!(rows.iter().any(|e| e.fields.code.as_deref() == Some("target_still_running") && e.fields.count == Some(1)));
         drop(queue);
         fs::remove_dir_all(path).unwrap();
     }

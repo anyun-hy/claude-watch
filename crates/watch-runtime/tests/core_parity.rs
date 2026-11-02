@@ -4,39 +4,30 @@ use claude_watch_core::{
     risk::{self, SessionRiskInput},
 };
 use serde_json::{json, Value};
-use std::{
-    io::Write,
-    path::Path,
-    process::{Command, Stdio},
-};
+use std::path::Path;
 
+/// Recorded answers of the retired Python implementation, captured once before
+/// it was removed. They are a reviewed baseline, not a live oracle: the test
+/// compares Rust against a frozen document, so it neither runs Python nor
+/// keeps the legacy sources around. A snapshot only changes when a behaviour
+/// change is intended and reviewed.
 fn oracle(operation: &str, cases: &[Value]) -> Vec<Value> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    let mut child = Command::new("python3")
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .arg(root.join("tools/migration_reference.py"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(&serde_json::to_vec(&json!({"operation":operation,"cases":cases})).unwrap())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/core_parity")
+        .join(format!("{operation}.json"));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!(
+            "missing recorded snapshot {}; update it deliberately, never by regenerating it from the implementation under test",
+            path.display()
+        )
+    });
+    let values: Vec<Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        values.len(),
+        cases.len(),
+        "snapshot {operation} covers a different number of cases than the test"
     );
-    serde_json::from_slice(&output.stdout).unwrap()
+    values
 }
 
 #[test]

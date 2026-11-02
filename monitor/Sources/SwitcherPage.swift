@@ -74,7 +74,7 @@ struct SwitcherPage: View {
                         else { await store.perform(pendingArguments) }
                         await store.refreshBackground()
                         if !store.failure && pendingArguments.contains("switch") &&
-                            store.settings["return_to_overview_after_launch"] as? Bool == true { finished() }
+                            store.isOn(Setting.returnToOverview) { finished() }
                     }
                 }
             } message: { Text(pendingMessage) }
@@ -148,6 +148,9 @@ struct SwitcherPage: View {
                     if result.candidates.count > 1 {
                         InlineNotice(title: "检测到多个运行中的代理候选", detail: result.candidates.joined(separator: "、") + "。请核对实际监听入口与路由后重新检测；当前保持未确认。", symbol: "exclamationmark.triangle", tint: p.amber, p: p)
                     }
+                    EnvironmentSummaryStrip(result: result, p: p,
+                        stale: result.expires_at < Date().timeIntervalSince1970 || store.currentEnvironmentIsHistorical,
+                        previousObserved: store.previousEnvironment?.observed_at)
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         let expired = result.expires_at < context.date.timeIntervalSince1970
                         let historical = expired || store.currentEnvironmentIsHistorical
@@ -169,8 +172,14 @@ struct SwitcherPage: View {
                                           systemImage: "clock.badge.exclamationmark").foregroundStyle(p.amber)
                                 }
                             }.font(WatchTypography.small).foregroundStyle(p.secondary)
+                            let previousRows = Dictionary(store.previousEnvironment.map { $0.rows.map { ($0.id, $0) } } ?? [],
+                                                          uniquingKeysWith: { first, _ in first })
                             LazyVGrid(columns: [GridItem(.adaptive(minimum: 310), spacing: 10, alignment: .top)], spacing: 10) {
-                                ForEach(result.rows) { row in EnvironmentCheckTile(row: row, p: p, stale: historical) }
+                                ForEach(result.rows) { row in
+                                    EnvironmentCheckTile(row: row, p: p, stale: historical, previous: previousRows[row.id],
+                                                         flags: row.id == "dns" ? dnsRecursiveFlags(leakChecks) : nil)
+                                }
+                                if let local = result.display_facts?.local { EnvironmentModeTile(local: local, p: p, stale: historical) }
                                 if let leakChecks { EnvironmentWebRTCTile(state: leakChecks.rtc, p: p, stale: historical, open: { openLeakCheck(.webrtc) }) }
                             }
                         }
@@ -197,7 +206,24 @@ struct SwitcherPage: View {
         }
     }
     private func stateCount(_ count: Int, _ title: String, _ symbol: String, _ tint: Color) -> some View {
-        Label("\(count) \(title)", systemImage: symbol).font(WatchTypography.caption).foregroundStyle(tint)
+        Label("\(count) \(title)", systemImage: symbol)
+            .font(WatchTypography.caption)
+            .foregroundStyle(count > 0 ? tint : p.secondary)
+            .padding(.horizontal, 9).padding(.vertical, 4)
+            .background((count > 0 ? tint : p.secondary).opacity(count > 0 ? 0.12 : 0.07), in: Capsule())
+            .overlay(Capsule().strokeBorder((count > 0 ? tint : p.secondary).opacity(0.30), lineWidth: 1))
+            .accessibilityLabel("\(title) \(count) 项")
+    }
+    /// Recursive-resolver countries from the latest DNS probe, de-duplicated
+    /// in observation order; nil when nothing is on record.
+    private func dnsRecursiveFlags(_ leakChecks: LeakCheckStore?) -> [String]? {
+        guard let observations = leakChecks?.dns.result?.observations else { return nil }
+        var seen = Set<String>()
+        var order: [String] = []
+        for item in observations where item.kind == "resolver" {
+            if let country = item.country, !country.isEmpty, seen.insert(country).inserted { order.append(country) }
+        }
+        return order.isEmpty ? nil : order
     }
     private func sourceNoticeTint(_ notices: [EnvironmentSourceNotice]) -> Color {
         notices.contains { $0.severity == "fail" || $0.severity == "error" } ? p.red : notices.contains { $0.severity == "warn" } ? p.amber : p.secondary
@@ -302,6 +328,7 @@ struct SwitcherPage: View {
                             } label: {
                                 accountCard(account)
                             }.buttonStyle(.plain).disabled(store.busy || store.hasUnsavedSettings || store.accounts?.recovery_required == true)
+                                .accessibilityLabel("切换到账号 \(account.id)，当前账号是 \(store.accounts?.current ?? "未知")，切换会自动保存与恢复资料")
                             }
                         }
                     }
@@ -312,7 +339,7 @@ struct SwitcherPage: View {
                             .buttonStyle(.borderless).disabled(store.loginProbeRunning)
                         claudeLoginStatus.padding(.top, 8)
                     }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
-                    Toggle("切换完成后返回环境状态", isOn: store.flag("return_to_overview_after_launch")).disabled(store.busy)
+                    Toggle("切换完成后返回环境状态", isOn: store.flag(Setting.returnToOverview)).disabled(store.busy)
                     if store.hasUnsavedSettings { draftActions }
                     if store.accounts?.recovery_required == true {
                         Button("恢复未完成账号切换") { confirm("恢复账号资料", "将按事务记录找回原目录，保留可能产生的新资料供核对。", ["account", "recover", "--apply"], action: "恢复账号资料") }.disabled(store.busy)
@@ -473,31 +500,41 @@ struct SwitcherPage: View {
     /// records a baseline at session start (HTTP exit, DNS recursive exit
     /// countries, WebRTC public candidates) and compares each round; a drift
     /// triggers the configured action, a missing or stale sample only warns.
+    /// Each AI service declares its own policy, so the panel renders the
+    /// catalog instead of one shape copied per service.
     private var protectionPolicyPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            ForEach(AIPolicyCatalog.services) { policy in policyCard(policy) }
+        }
+    }
+    private func policyCard(_ policy: AIServicePolicy) -> some View {
         Surface(p) {
             VStack(alignment: .leading, spacing: 12) {
-                Label("会话处置策略", systemImage: "shield.lefthalf.filled.badge.checkmark")
+                Label(policy.title, systemImage: "shield.lefthalf.filled.badge.checkmark")
                     .font(WatchTypography.section)
-                Text("会话建立时记录当时的出口 IP、DNS 递归出口与 WebRTC 公网候选作为基线；运行中任一项偏离基线即按下表处置。探针采样缺失或过期只提示、不处置。ChatGPT / Codex 仅监控与提示，不在关闭目标内。")
+                Text(policy.subtitle)
                     .font(WatchTypography.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
-                policyRow("出口 IP 变化", "claude_close_ip")
-                policyRow("出口国家为中国大陆", "claude_close_cn")
-                policyRow("DNS 递归出口偏离会话基线", "claude_close_dns")
-                policyRow("WebRTC 公网候选偏离会话基线", "claude_close_webrtc")
+                ForEach(policy.criteria) { criterion in
+                    policyRow(criterion, in: policy)
+                }
+                if let note = policy.note {
+                    InlineNotice(title: "可配置动作少于 Claude", detail: note,
+                                 symbol: "exclamationmark.triangle", tint: p.amber, p: p)
+                }
             }
         }
     }
-    private func policyRow(_ title: String, _ key: String) -> some View {
+    private func policyRow(_ criterion: PolicyCriterion, in policy: AIServicePolicy) -> some View {
         HStack {
-            Text(title).font(WatchTypography.body)
+            Text(criterion.title).font(WatchTypography.body)
             Spacer()
-            Picker(title, selection: store.choice(key)) {
-                Text("强制关闭").tag("force")
-                Text("正常关闭").tag("close")
-                Text("仅提示").tag("warn")
+            Picker(criterion.title, selection: store.choice(policy.setting(criterion))) {
+                ForEach(policy.actions) { Text($0.title).tag($0.id) }
             }
             .labelsHidden()
             .frame(width: 128)
+            .disabled(policy.actions.count < 2)
+            .help(policy.actions.count < 2 ? "该服务当前只能配置为提示" : "选择偏离时的处置动作")
         }
     }
     private var protectionContent: some View {
@@ -532,10 +569,11 @@ struct SwitcherPage: View {
         }
     }
     private func serviceCard(_ service: BackgroundServiceRow, stale: Bool) -> some View {
-        Surface(p) {
+        let descriptor = BackgroundServiceCatalog.descriptor(service.id)
+        return Surface(p) {
             VStack(alignment: .leading, spacing: 11) {
                 HStack {
-                    Label(service.title, systemImage: service.id == "updater" ? "arrow.down.circle" : service.id == "watchdog" ? "clock.badge.checkmark" : "shield.lefthalf.filled").font(WatchTypography.section)
+                    Label(service.title, systemImage: descriptor.symbol).font(WatchTypography.section)
                     Spacer()
                     Label(stale ? "上次状态 · 请刷新" : service.statusLabel, systemImage: stale ? "clock" : service.healthy ? "checkmark.circle.fill" : service.state == "inactive" ? "pause.circle" : "exclamationmark.circle")
                         .font(WatchTypography.caption).foregroundStyle(stale ? p.secondary : service.healthy ? p.mint : service.state == "inactive" ? p.secondary : p.amber)
@@ -544,28 +582,36 @@ struct SwitcherPage: View {
                 if let desired = service.desired { Text("保存设置：" + (desired ? "开启" : "关闭") + " · 实际状态见回读结果").font(WatchTypography.small).foregroundStyle(p.secondary) }
                 if let checked = service.last_checked { Text("最近检查：" + timeLabel(checked)).font(WatchTypography.small).foregroundStyle(p.secondary) }
                 HStack {
-                    if service.id == "original" {
-                        Label("原版独立管理，与 Claude Watch 保持并行", systemImage: "link").font(WatchTypography.caption).foregroundStyle(p.secondary)
-                    } else if service.id == "updater" && !store.updateSourceReady {
-                        Button("配置本项目发布源…") { showSettings = true; showSource = true }
-                        if service.desired == true { serviceButton("预览关闭更新设置", key: "auto_update", enable: false) }
-                    } else {
-                        let key = service.id == "guard" ? "guard_enabled" : service.id == "watchdog" ? "timezone_watchdog" : "auto_update"
-                        if service.state == "mismatch" || (service.id == "guard" && service.desired == true && store.settings["enabled"] as? Bool != true) {
-                            serviceButton("预览同步后台状态", key: key, enable: service.desired ?? true)
-                        }
-                        let actionTitle = service.id == "guard"
-                            ? (service.desired == true ? "预览停用保护" : "启用保护")
-                            : (service.desired == true ? "预览停用" : "预览启用")
-                        serviceButton(actionTitle, key: key, enable: service.desired != true)
-                    }
+                    serviceControls(service, descriptor)
                 }.disabled(store.busy || store.hasUnsavedSettings)
                 Text("来源：" + service.source).font(WatchTypography.small).foregroundStyle(p.secondary)
             }
         }
     }
-    private func serviceButton(_ title: String, key: String, enable: Bool) -> some View {
-        Button(title) { Task { await store.previewProtection(key, enable: enable); showReview = store.plan != nil } }
+    /// What a service offers is read from its descriptor — which setting its
+    /// switch owns, how the action reads and what it requires first — instead
+    /// of comparing the service id against a list of known names.
+    @ViewBuilder
+    private func serviceControls(_ service: BackgroundServiceRow,
+                                 _ descriptor: BackgroundServiceCatalog.Descriptor) -> some View {
+        if let toggle = descriptor.toggle {
+            if descriptor.requiresSource && !store.updateSourceReady {
+                Button("配置本项目发布源…") { showSettings = true; showSource = true }
+                if service.desired == true { serviceButton("预览关闭更新设置", toggle, enable: false) }
+            } else {
+                let outOfSync = service.state == "mismatch"
+                    || (descriptor.requiresEnabled && service.desired == true && !store.isOn(Setting.enabled))
+                if outOfSync { serviceButton(descriptor.syncTitle, toggle, enable: service.desired ?? true) }
+                serviceButton(service.desired == true ? descriptor.disableTitle : descriptor.enableTitle,
+                              toggle, enable: service.desired != true)
+            }
+        } else {
+            Label(descriptor.note ?? "此服务由本工具单独管理。", systemImage: "link")
+                .font(WatchTypography.caption).foregroundStyle(p.secondary)
+        }
+    }
+    private func serviceButton(_ title: String, _ setting: FlagSetting, enable: Bool) -> some View {
+        Button(title) { Task { await store.previewProtection(setting.key, enable: enable); showReview = store.plan != nil } }
     }
     private func sessionGuardCard(_ evidence: SessionProtectionEvidence) -> some View {
         let session = evidence.session
@@ -608,22 +654,22 @@ struct SwitcherPage: View {
                 .font(WatchTypography.caption).foregroundStyle(p.secondary)
             Text("受控启动按当前实测环境独立检查；无需填写国家、时区、DNS 或出口 IP。")
                 .font(WatchTypography.small).foregroundStyle(p.secondary)
-            Toggle("启动前要求 IPv6 已关闭", isOn: store.flag("require_ipv6_off"))
-            Toggle("启动前要求 Claude 使用英文", isOn: store.flag("require_english"))
+            Toggle("启动前要求 IPv6 已关闭", isOn: store.flag(Setting.requireIPv6Off))
+            Toggle("启动前要求 Claude 使用英文", isOn: store.flag(Setting.requireEnglish))
             Label("DNS 与 UDP/STUN 探针", systemImage: "lock.shield")
                 .font(WatchTypography.bodyStrong).foregroundStyle(p.text)
-            Text("两项检测始终运行并在面板显示结果。它们测量的是探针自身的 UDP/DNS 路径，不代表 Claude 的实际连接；默认只提示、不阻止受控启动。勾选后对应探针失败将阻止受控启动。运行中的会话由「会话处置策略」按出口变化处置，与这里的开关无关。")
+            Text("两项检测始终运行并在面板显示结果。它们测量的是探针自身的 UDP/DNS 路径，不代表 Claude 的实际连接；默认只提示、不阻止受控启动。勾选后对应探针失败将阻止受控启动。运行中的会话由「Claude 会话处置策略」按出口变化处置，与这里的开关无关。")
                 .font(WatchTypography.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
-            Toggle("启动前要求 DNS 递归出口无泄漏", isOn: store.flag("require_dns"))
-            Toggle("启动前要求 UDP/STUN 出口一致", isOn: store.flag("require_stun"))
+            Toggle("启动前要求 DNS 递归出口无泄漏", isOn: store.flag(Setting.requireDNS))
+            Toggle("启动前要求 UDP/STUN 出口一致", isOn: store.flag(Setting.requireStun))
             ForEach(store.policyWarnings, id: \.self) { Text($0).font(WatchTypography.caption).foregroundStyle(p.amber) }
-            Toggle("启动前要求代理规则覆盖通过", isOn: store.flag("require_pinned_rules"))
+            Toggle("启动前要求代理规则覆盖通过", isOn: store.flag(Setting.requirePinnedRules))
             DisclosureGroup("发布源与工具维护", isExpanded: $showSource) {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("此处供本项目发布维护使用。缺少发布源或固定公钥时，自动更新显示尚不可用。")
-                    TextField("本项目 HTTPS 发布清单", text: store.text("update_url")).textFieldStyle(.roundedBorder)
+                    TextField("本项目 HTTPS 发布清单", text: store.text(Setting.updateURL)).textFieldStyle(.roundedBorder)
                     Text("固定 RSA 公钥（PEM）").font(WatchTypography.caption)
-                    TextEditor(text: store.text("update_public_key")).font(WatchTypography.mono).frame(height: 100)
+                    TextEditor(text: store.text(Setting.updatePublicKey)).font(WatchTypography.mono).frame(height: 100)
                     HStack {
                         Button("检查本项目更新") { Task { await store.perform(["update"], refresh: false) } }.disabled(!store.updateSourceReady || store.hasUnsavedSettings)
                         Button("更新系统辅助组件…") {
@@ -707,6 +753,13 @@ struct SwitcherPage: View {
                 Button(showProxyAddress ? "隐藏" : "显示") { showProxyAddress.toggle() }
                 Button("诊断传输") { Task { await store.diagnoseProxy() } }.disabled(store.diagnosticProxy.isEmpty)
             }.disabled(store.busy)
+            if store.diagnosticRunning {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("正在诊断代理传输，通常需要数十秒；期间不会保存地址或凭据。")
+                        .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                }
+            }
             if !store.diagnosticError.isEmpty { Text(store.diagnosticError).foregroundStyle(p.amber) }
             if let result = store.diagnostic {
                 Text(result.message).font(WatchTypography.caption)
@@ -750,6 +803,12 @@ struct EnvironmentCheckTile: View {
     let row: EnvironmentCheckRow
     let p: Palette
     var stale = false
+    /// Same row from the previous detection receipt; when its value or state
+    /// differs, the tile shows what this refresh actually changed.
+    var previous: EnvironmentCheckRow?
+    /// Recursive-resolver country codes for the DNS row; displayed as small
+    /// flag chips under the value.
+    var flags: [String]? = nil
     @State private var presentation = EnvironmentDetailPresentation()
     @State private var previewTask: Task<Void, Never>?
     @State private var closeTask: Task<Void, Never>?
@@ -760,6 +819,13 @@ struct EnvironmentCheckTile: View {
     private var value: String {
         guard let current = row.current, !current.isEmpty else { return row.detail }
         return current == "unknown" ? "尚未取得验证依据" : current
+    }
+    /// Only live, current samples carry the diff; a historical badge already
+    /// tells the whole "not current" story without mixing in a change marker.
+    private var changeNote: String? {
+        guard !stale, let previous, previous.current != row.current || previous.state != row.state else { return nil }
+        if let old = previous.current, !old.isEmpty, old != row.current { return "上一轮：" + old }
+        return "上一轮：" + previous.statusLabel
     }
     private var showReference: Bool { row.id == "timezone" || row.id == "locale" || row.state == "fail" || row.state == "cached" }
 
@@ -811,6 +877,25 @@ struct EnvironmentCheckTile: View {
                         }
                         Text(value).font(WatchTypography.caption).foregroundStyle(p.text)
                             .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+                        if let note = changeNote {
+                            Label(note, systemImage: "arrow.triangle.2.circlepath")
+                                .font(WatchTypography.small).foregroundStyle(p.blue)
+                                .lineLimit(1)
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(p.blue.opacity(0.10), in: Capsule())
+                                .accessibilityLabel("与上一轮相比有变化，" + note)
+                        }
+                        if !stale, let flags, !flags.isEmpty {
+                            HStack(spacing: 6) {
+                                Text("递归出口").font(WatchTypography.small).foregroundStyle(p.secondary)
+                                ForEach(flags, id: \.self) { code in
+                                    Text(countryFlag(code) + " " + code)
+                                        .font(WatchTypography.small).foregroundStyle(p.secondary)
+                                        .monospacedDigit()
+                                }
+                            }.accessibilityElement(children: .combine)
+                                .accessibilityLabel("DNS 递归出口国家：" + flags.joined(separator: "、"))
+                        }
                         if showReference, let reference = row.reference {
                             Text("要求：" + reference).font(WatchTypography.small).foregroundStyle(p.secondary).lineLimit(2)
                         }
@@ -851,6 +936,145 @@ struct EnvironmentCheckTile: View {
     }
 }
 
+/// Synthetic grid card (same pattern as the WebRTC tile): names the proxy
+/// routing mode the audit actually observed — 全局 or 规则 — plus the exit
+/// node and rule-table coverage. Evidence-only display; never gates.
+private struct EnvironmentModeTile: View {
+    let local: EnvironmentLocalFacts
+    let p: Palette
+    let stale: Bool
+    private var api: EnvironmentTagAPI? { local.tag?.api }
+    private var rules: EnvironmentRulesEvidence? { local.rules }
+    private var mode: String { api?.mode ?? rules?.actual_mode ?? "" }
+    private var status: (label: String, symbol: String, tint: Color, value: String) {
+        if stale { return ("历史样本", "clock", p.secondary, "环境采样已过期；重新检测后显示当前模式。") }
+        if mode.isEmpty {
+            let reason = api?.reason ?? rules?.detail ?? ""
+            return ("未取得", "questionmark.circle.fill", p.amber,
+                    "未能读取代理路由模式" + (reason.isEmpty ? "；请确认代理客户端控制接口可用。" : "；" + reason))
+        }
+        if mode == "global" {
+            let node = api?.global_node ?? api?.selected_node ?? ""
+            return ("全局模式", "arrow.triangle.branch", p.mint,
+                    "全部流量统一走单一出口节点，规则表不参与匹配。" + (node.isEmpty ? "" : "出口节点：" + node))
+        }
+        if mode == "rule" {
+            let missing = rules?.missing_domains?.count ?? 0
+            let covered = rules?.covered_domains?.count ?? 0
+            let coverage = missing > 0 ? "规则表缺失 \(missing) 项域名覆盖。" : (covered > 0 ? "规则表覆盖 \(covered) 项域名。" : "")
+            return ("规则模式", "list.bullet.rectangle", p.blue,
+                    "流量按规则表逐条匹配，未覆盖的域名可能绕过代理直连。" + coverage)
+        }
+        return ("未识别模式", "questionmark.circle.fill", p.amber, "代理运行在 \(mode) 模式；实际流量走向见连接页。")
+    }
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: status.symbol)
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(status.tint).frame(width: 30, height: 30)
+                .background(status.tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Text("代理模式").font(WatchTypography.bodyStrong).foregroundStyle(p.text)
+                    Spacer(minLength: 0)
+                    Label(status.label, systemImage: status.symbol).font(WatchTypography.small).foregroundStyle(status.tint)
+                        .padding(.horizontal, 6).padding(.vertical, 3).background(status.tint.opacity(0.10), in: Capsule())
+                }
+                Text(status.value).font(WatchTypography.caption).foregroundStyle(p.text)
+                    .lineLimit(3).frame(maxWidth: .infinity, alignment: .leading)
+                if let detail = rules?.detail, !detail.isEmpty, !stale, !mode.isEmpty {
+                    Text(detail).font(WatchTypography.small).foregroundStyle(p.secondary).lineLimit(2)
+                }
+            }
+        }.frame(maxWidth: .infinity, minHeight: 48, alignment: .topLeading).padding(10)
+            .background(p.elevated.opacity(0.65), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(
+                !stale && mode == "rule" && (rules?.missing_domains?.count ?? 0) > 0 ? p.amber.opacity(0.4) : p.border.opacity(0.65), lineWidth: 1))
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("代理模式，" + status.label + "，" + status.value)
+    }
+}
+
+/// One-glance context bar above the tile grid: exit country/IP, routing mode
+/// with the live node, and the exit-local clock. Everything shown already
+/// exists in the captured sample; the strip only removes the need to scan the
+/// whole grid to answer "我现在在哪、走的什么线".
+private struct EnvironmentSummaryStrip: View {
+    let result: CurrentEnvironmentReceipt
+    let p: Palette
+    var stale = false
+    /// When the previous detection ran, so the strip anchors 刷新前后对比
+    /// in time as well as in per-row change markers.
+    var previousObserved: Double? = nil
+
+    private var egressCurrent: String { result.rows.first { $0.id == "egress" }?.current ?? "" }
+    private var mode: String {
+        result.display_facts?.local?.tag?.api?.mode ?? result.display_facts?.local?.rules?.actual_mode ?? ""
+    }
+    private var node: String {
+        let api = result.display_facts?.local?.tag?.api
+        if mode == "global" { return api?.global_node ?? api?.selected_node ?? "" }
+        return api?.selected_node ?? ""
+    }
+    private var exitTimezone: TimeZone? {
+        result.display_facts?.online?.geo?.timezone.flatMap(TimeZone.init(identifier:))
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if !egressCurrent.isEmpty {
+                pill(symbol: "globe", text: egressCurrent, tint: stale ? p.secondary : p.mint)
+            }
+            if !mode.isEmpty {
+                let label = (mode == "global" ? "全局模式" : mode == "rule" ? "规则模式" : mode)
+                    + (node.isEmpty ? "" : " · \(node)")
+                pill(symbol: mode == "global" ? "arrow.triangle.branch" : "list.bullet.rectangle",
+                     text: label, tint: stale ? p.secondary : mode == "global" ? p.mint : p.blue)
+            }
+            if let tz = exitTimezone {
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    pill(symbol: "clock", text: exitClock(tz, context.date), tint: p.secondary)
+                }
+            }
+            if let previousObserved, previousObserved > 0 {
+                pill(symbol: "clock.arrow.circlepath", text: "上一轮 " + environmentSummaryTime(previousObserved), tint: p.secondary)
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func pill(symbol: String, text: String, tint: Color) -> some View {
+        Label(text, systemImage: symbol)
+            .font(WatchTypography.caption)
+            .foregroundStyle(stale ? p.secondary : p.text)
+            .lineLimit(1)
+            // Long node names must survive truncation: hover shows the full text.
+            .help(text)
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(p.elevated.opacity(0.8), in: Capsule())
+            .overlay(Capsule().strokeBorder(tint.opacity(0.35), lineWidth: 1))
+    }
+
+    /// Live exit-local time plus the offset against this Mac, e.g.
+    /// "出口 18:52 · 与本机差 +1h" or "+30m" for half-hour zones.
+    private func exitClock(_ tz: TimeZone, _ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.timeZone = tz
+        formatter.dateFormat = "HH:mm"
+        let offset = (tz.secondsFromGMT(for: date) - TimeZone.current.secondsFromGMT(for: date)) / 60
+        let diff: String
+        if offset == 0 {
+            diff = "与本机同"
+        } else {
+            var text = offset > 0 ? "+" : "-"
+            let hours = abs(offset) / 60, minutes = abs(offset) % 60
+            if hours > 0 { text += "\(hours)h" }
+            if minutes > 0 { text += "\(minutes)m" }
+            diff = "与本机差 \(text)"
+        }
+        return "出口 \(formatter.string(from: date)) · \(diff)"
+    }
+}
+
 private struct EnvironmentWebRTCTile: View {
     let state: LeakCheckState
     let p: Palette
@@ -861,7 +1085,7 @@ private struct EnvironmentWebRTCTile: View {
         if state.running { return ("更新中", "arrow.triangle.2.circlepath", p.blue, state.result == nil ? "正在采集当前 WebView 的 ICE/STUN 候选" : "正在更新；保留上次检测结果") }
         switch state.verdict.state {
         case .matched: return ("已核对", "checkmark.circle.fill", p.mint, state.verdict.title)
-        case .difference: return ("需处理", "xmark.octagon.fill", p.red, state.verdict.title)
+        case .difference: return ("出口差异", "exclamationmark.triangle", p.amber, state.verdict.title)
         case .incomplete, .unconfigured: return ("检测未完成", "exclamationmark.triangle.fill", p.amber, state.verdict.detail)
         case .cancelled: return ("已取消", "stop.circle", p.amber, state.verdict.detail)
         case .idle: return ("尚未检测", "clock", p.secondary, "等待自动检测或打开详情立即检测")
@@ -935,6 +1159,17 @@ private struct EnvironmentIPQualitySummary: View {
 private func environmentSummaryTime(_ epoch: Double) -> String {
     Date(timeIntervalSince1970: epoch).formatted(date: .numeric, time: .shortened)
 }
+
+/// Any ISO 3166-1 alpha-2 code renders as its regional flag via Unicode
+/// regional indicators (same mechanism the backend uses for egress cards).
+/// Non-2-letter input degrades to the plain text instead of garbage.
+func countryFlag(_ code: String) -> String {
+    let upper = code.uppercased()
+    guard upper.count == 2, upper.unicodeScalars.allSatisfy({ ("A"..."Z").contains(String($0)) }) else { return code }
+    let scalars = upper.unicodeScalars.map { Unicode.Scalar(0x1F1E6 + ($0.value - 65)) }.compactMap { $0 }
+    return scalars.count == 2 ? String(String.UnicodeScalarView(scalars)) : code
+}
+
 
 struct EnvironmentCheckDetails: View {
     let row: EnvironmentCheckRow

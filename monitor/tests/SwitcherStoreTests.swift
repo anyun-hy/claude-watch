@@ -39,7 +39,7 @@ struct SwitcherStoreTests {
         expect(replaceable.source_notices?.first?.id == "metadata" && replaceable.rows.first { $0.id == "egress" }?.current == originalEgress,
                "DNS success preserves metadata source notices and unrelated environment rows")
         let store = SwitcherStore(isFixture: true)
-        let reference = EgressReference(ip: "222.10.87.169", country: "JP", timezone: nil, context_id: nil, checked_at: nil, observed_at: 900)
+        let reference = EgressReference(ip: "222.10.87.169", country: "JP", timezone: nil, checked_at: nil, observed_at: 900, context_id: nil)
         var service = BackgroundServiceReceipt(observed_at: 1000, backend_healthy: true, update_source_ready: false,
             guard_backend_healthy: true, backend_sampling_state: "complete",
             services: [.init(id: "guard", title: "保护", state: "running", detail: "", source: "fixture", desired: true, last_checked: 1000)],
@@ -225,7 +225,7 @@ struct SwitcherStoreTests {
                chatgptLaunch.blockReason(store: review, at: Date()) != nil,
                "a blocked environment preview never enables either button")
         review.loadReviewScenario(.normal)
-        review.text("country").wrappedValue = "GB"
+        review.text(Setting.country).wrappedValue = "GB"
         expect(claudeLaunch.blockReason(store: review, at: Date()) != nil,
                "unsaved settings disable graph launch")
         review.loadReviewScenario(.normal)
@@ -233,7 +233,7 @@ struct SwitcherStoreTests {
         expect(claudeLaunch.blockReason(store: review, at: Date()) != nil,
                "a failed refresh cannot keep the previous green launch state")
         review.loadReviewScenario(.normal)
-        review.awaitFreshDNSReceipt = { false }
+        review.awaitFreshDNSReceipt = { _ in false }
         await review.perform(chatgptLaunch.arguments)
         expect(review.failure && review.message.contains("ChatGPT") && !review.message.contains("启动 Claude"),
                "a failed DNS prerequisite reports the correct selected target without launching it")
@@ -252,7 +252,7 @@ struct SwitcherStoreTests {
         await coordinated.load()
         coordinated.fixtureEnvironmentReadDelayNanoseconds = 150_000_000
         var freshCalls = 0
-        coordinated.awaitFreshDNSReceipt = {
+        coordinated.awaitFreshDNSReceipt = { _ in
             freshCalls += 1
             try? await Task.sleep(nanoseconds: 100_000_000)
             return true
@@ -327,7 +327,7 @@ struct SwitcherStoreTests {
         expect(store.accounts?.accounts.count == 2, "A/B slots are represented")
         expect(store.accounts?.current == nil, "no invented logged-in account")
         expect(!store.hasUnsavedSettings, "initial state is clean")
-        expect(store.environment?.rows.count == 10, "first open performs isolated local discovery")
+        expect(store.environment?.rows.count == 11, "first open performs isolated local discovery")
         expect(store.environment?.rows.first { $0.id == "country" }?.current == "未知", "offline discovery does not invent a country")
         expect(store.candidate == nil, "first open does not request online candidates")
         expect(store.environment?.rows.first { $0.id == "network_service" }?.current == "Ethernet", "active service is observed instead of assuming Wi-Fi")
@@ -346,7 +346,7 @@ struct SwitcherStoreTests {
         expect(store.background?.services.first { $0.id == "original" }?.state == "scheduled", "original bodyguard remains independently visible")
         expect(store.background?.services.first { $0.id == "updater" }?.state == "unavailable", "missing publication source is not shown as active updating")
         await store.detectEnvironment()
-        store.text("locale").wrappedValue = "en_GB"
+        store.text(Setting.locale).wrappedValue = "en_GB"
         await store.previewEnvironment()
         expect(store.setupPlan == nil, "unsaved manual settings cannot be overwritten by candidate confirmation")
         await store.inspectEnvironment()
@@ -358,7 +358,7 @@ struct SwitcherStoreTests {
         expect(store.settings["locale"] as? String == "en_GB" && store.hasUnsavedSettings, "reloading authoritative status cannot replace a draft")
         store.discardChanges()
         expect(store.settings["locale"] as? String == "" && !store.hasUnsavedSettings, "discard restores the saved settings without saving")
-        store.text("locale").wrappedValue = "en_GB"
+        store.text(Setting.locale).wrappedValue = "en_GB"
         expect(!store.updateSourceReady, "missing update manifest and key remain unavailable")
         _ = await store.detectCurrentEnvironment()
         expect(store.currentEnvironment?.rows.count == 14, "current-state detection always exposes all fourteen checks")
@@ -367,7 +367,7 @@ struct SwitcherStoreTests {
         expect(store.settings["locale"] as? String == "en_GB", "direct live detection cannot replace draft settings")
         expect(store.currentEnvironment?.rows.first?.source != nil, "live row source is available to the UI")
         await store.save()
-        store.text("country").wrappedValue = "GB"
+        store.text(Setting.country).wrappedValue = "GB"
         expect(store.hasUnsavedSettings, "editing policy requires save")
         await store.save()
         expect(!store.hasUnsavedSettings, "fixture save stays in memory")
@@ -375,7 +375,7 @@ struct SwitcherStoreTests {
         expect(store.audit?.rows.count == 14, "all fourteen rows reach the UI")
         expect(store.audit?.ready == false, "unknown STUN is not ready")
         expect(store.audit?.rows.contains { $0.state == "unknown" } == true, "unknown remains visible")
-        store.text("country").wrappedValue = "JP"
+        store.text(Setting.country).wrappedValue = "JP"
         expect(store.audit == nil, "editing policy invalidates the previous launch-check display")
         store.diagnosticProxy = "socks5h://fixture:private@127.0.0.1:1080"
         await store.diagnoseProxy()
@@ -396,7 +396,7 @@ struct SwitcherStoreTests {
         expect(store.accounts?.current == "B", "fixture switching updates only fixture state")
         expect(store.message.contains("隔离预览"), "fixture boundary remains visible")
         expect(!store.busy, "operation state returns to idle")
-        store.flag("require_dns").wrappedValue = true
+        store.flag(Setting.requireDNS).wrappedValue = true
         expect(!store.policyWarnings.contains { $0.contains("DNS") }, "DNS has no manual trusted-resolver warning")
         store.discardChanges()
         let planJSON = Data(#"{"id":"clock","title":"设置时区","scope":"administrator","before":"Asia/Tokyo","after":"Asia/Seoul"}"#.utf8)
@@ -473,6 +473,32 @@ struct SwitcherStoreTests {
         expect(failedRoundStore.currentEnvironment?.observed_at == priorTime, "failure does not renew previous evidence time")
         _ = await failedRoundStore.detectCurrentEnvironment()
         expect(!failedRoundStore.currentEnvironmentIsHistorical && failedRoundStore.currentPolicyEvaluation != nil, "fresh successful round restores the shared current preview")
+        // Each AI service declares its own policy: no key is shared, and a
+        // service can only offer actions it can perform.
+        let keys = AIPolicyCatalog.services.flatMap { policy in policy.criteria.map { policy.setting($0).key } }
+        expect(Set(keys).count == keys.count, "policy keys belong to exactly one service")
+        expect(AIPolicyCatalog.services.allSatisfy { policy in
+            policy.criteria.allSatisfy { policy.setting($0).key == "\(policy.keyPrefix)_close_\($0.id)" }
+        }, "a criterion's key is derived from its own family")
+        let claude = AIPolicyCatalog.services.first { $0.id == "claude" }
+        let openAI = AIPolicyCatalog.services.first { $0.id == "openai" }
+        expect(claude?.actions.count == 3 && claude?.criteria.allSatisfy { policy in
+            claude?.setting(policy).fallback == "force"
+        } == true, "the supervised session keeps the full action set")
+        expect(openAI?.actions.map(\.id) == ["warn"]
+                   && openAI?.criteria.allSatisfy { policy in
+                       openAI?.setting(policy).fallback == "warn"
+                   } == true,
+               "a service without an exit path cannot be configured to close")
+        expect(openAI?.note?.isEmpty == false, "the reduced action set is explained where it is shown")
+        // Service differences are declared, not compared against an id string.
+        expect(BackgroundServiceCatalog.descriptor("guard").toggle == Setting.guardEnabled
+                   && BackgroundServiceCatalog.descriptor("watchdog").toggle == Setting.timezoneWatchdog,
+               "each service's switch is looked up, never derived by name")
+        expect(BackgroundServiceCatalog.descriptor("original").toggle == nil,
+               "a service with no switch of its own has no key to write")
+        expect(BackgroundServiceCatalog.descriptor("unknown").toggle == nil,
+               "an unknown service gets no switch instead of a guessed key")
         print("SwitcherStore: \(checks) isolated assertions passed")
     }
 }

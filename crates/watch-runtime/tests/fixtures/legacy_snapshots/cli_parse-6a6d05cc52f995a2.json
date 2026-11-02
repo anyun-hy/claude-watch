@@ -1,0 +1,313 @@
+[
+  {
+    "value": {
+      "command": "status"
+    }
+  },
+  {
+    "value": {
+      "command": "self-check"
+    }
+  },
+  {
+    "value": {
+      "command": "service-status"
+    }
+  },
+  {
+    "value": {
+      "action": "preview",
+      "apply": false,
+      "command": "protection",
+      "plan_id": null
+    }
+  },
+  {
+    "value": {
+      "action": "apply",
+      "apply": true,
+      "command": "protection",
+      "plan_id": "plan"
+    }
+  },
+  {
+    "value": {
+      "command": "environment",
+      "mode": "auto",
+      "online": true,
+      "record": true
+    }
+  },
+  {
+    "value": {
+      "command": "environment",
+      "mode": "tag",
+      "online": false,
+      "record": false
+    }
+  },
+  {
+    "value": {
+      "apply": true,
+      "command": "dns-leak-record"
+    }
+  },
+  {
+    "value": {
+      "apply": true,
+      "command": "webrtc-risk-record"
+    }
+  },
+  {
+    "value": {
+      "action": "inspect",
+      "apply": false,
+      "candidate_id": null,
+      "command": "setup",
+      "mode": "auto",
+      "online": false,
+      "plan_id": null
+    }
+  },
+  {
+    "value": {
+      "action": "detect",
+      "apply": false,
+      "candidate_id": null,
+      "command": "setup",
+      "mode": "auto",
+      "online": true,
+      "plan_id": null
+    }
+  },
+  {
+    "value": {
+      "action": "preview",
+      "apply": false,
+      "candidate_id": "candidate",
+      "command": "setup",
+      "mode": "auto",
+      "online": false,
+      "plan_id": null
+    }
+  },
+  {
+    "value": {
+      "action": "apply",
+      "apply": true,
+      "candidate_id": "c",
+      "command": "setup",
+      "mode": "auto",
+      "online": false,
+      "plan_id": "p"
+    }
+  },
+  {
+    "value": {
+      "action": "recover",
+      "apply": true,
+      "candidate_id": null,
+      "command": "setup",
+      "mode": "auto",
+      "online": false,
+      "plan_id": null
+    }
+  },
+  {
+    "value": {
+      "command": "check",
+      "no_report": true,
+      "online": true,
+      "require_ready": true
+    }
+  },
+  {
+    "value": {
+      "command": "checkdetail",
+      "no_report": false,
+      "online": false,
+      "require_ready": false
+    }
+  },
+  {
+    "value": {
+      "action": "show",
+      "apply": false,
+      "command": "config"
+    }
+  },
+  {
+    "value": {
+      "action": "set",
+      "apply": true,
+      "command": "config"
+    }
+  },
+  {
+    "value": {
+      "action": "enabled",
+      "apply": false,
+      "command": "config"
+    }
+  },
+  {
+    "value": {
+      "ack_unverified_version": false,
+      "action": "status",
+      "apply": false,
+      "command": "account",
+      "target": null
+    }
+  },
+  {
+    "value": {
+      "ack_unverified_version": true,
+      "action": "switch",
+      "apply": true,
+      "command": "account",
+      "target": "A"
+    }
+  },
+  {
+    "value": {
+      "ack_unverified_version": false,
+      "action": "recover",
+      "apply": true,
+      "command": "account",
+      "target": null
+    }
+  },
+  {
+    "value": {
+      "ack_unverified_version": false,
+      "action": "import",
+      "apply": false,
+      "command": "account",
+      "target": null
+    }
+  },
+  {
+    "value": {
+      "apply": true,
+      "command": "launch"
+    }
+  },
+  {
+    "value": {
+      "allow_country": null,
+      "apply": false,
+      "command": "repair",
+      "plan_id": null
+    }
+  },
+  {
+    "value": {
+      "allow_country": null,
+      "apply": true,
+      "command": "fix",
+      "plan_id": "p"
+    }
+  },
+  {
+    "value": {
+      "allow_country": "CN",
+      "apply": false,
+      "command": "set-region",
+      "plan_id": null
+    }
+  },
+  {
+    "value": {
+      "apply": true,
+      "command": "restore-settings",
+      "receipt_id": "receipt"
+    }
+  },
+  {
+    "value": {
+      "command": "guard-tick"
+    }
+  },
+  {
+    "value": {
+      "action": "update-on",
+      "apply": true,
+      "command": "services"
+    }
+  },
+  {
+    "value": {
+      "action": "update-off",
+      "apply": true,
+      "command": "services"
+    }
+  },
+  {
+    "value": {
+      "action": "disable-legacy",
+      "apply": true,
+      "command": "services"
+    }
+  },
+  {
+    "value": {
+      "action": "refresh-admin",
+      "apply": true,
+      "command": "services"
+    }
+  },
+  {
+    "value": {
+      "apply": false,
+      "auto": false,
+      "command": "update",
+      "recover": false
+    }
+  },
+  {
+    "value": {
+      "apply": false,
+      "auto": true,
+      "command": "update",
+      "recover": false
+    }
+  },
+  {
+    "value": {
+      "apply": true,
+      "auto": false,
+      "command": "update",
+      "recover": true
+    }
+  },
+  {
+    "value": {
+      "apply": false,
+      "command": "uninstall",
+      "confirm_data_removal": false,
+      "purge_accounts": false,
+      "remove_managed_rules": false
+    }
+  },
+  {
+    "value": {
+      "apply": true,
+      "command": "uninstall",
+      "confirm_data_removal": true,
+      "purge_accounts": true,
+      "remove_managed_rules": true
+    }
+  },
+  {
+    "value": {
+      "command": "logs",
+      "export": null
+    }
+  },
+  {
+    "value": {
+      "command": "logs",
+      "export": "/fixture/report.json"
+    }
+  }
+]
