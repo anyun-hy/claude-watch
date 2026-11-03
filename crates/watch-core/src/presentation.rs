@@ -14,123 +14,63 @@ pub fn number(v: &Value) -> Option<f64> {
 pub fn clip(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
+/// The only question these cards answer: did the service respond?
+///
+/// The probe is deliberately anonymous, so 401, 403 and 3xx all mean the
+/// service answered normally. They are not failures and not missing settings,
+/// and must never be narrated as such.
 pub fn http_result(status: &Value) -> (&'static str, String) {
     let Some(status) = status.as_i64().filter(|v| *v > 0) else {
-        return ("unknown", "未收到有效 HTTP 响应".into());
+        return ("unknown", "无响应".into());
     };
-    match status {
-        401 => ("ok", "HTTP 401，需要账号认证（本轮未携带凭据）".into()),
-        403 => (
-            "warn",
-            "HTTP 403，访问被拒绝；不能仅据此判断是地区或账号问题".into(),
-        ),
-        429 => ("warn", "HTTP 429，请求受到限流".into()),
-        500..=i64::MAX => ("warn", format!("HTTP {status}，服务端错误")),
-        400..=499 => ("warn", format!("HTTP {status}，请求未被接受")),
-        _ => ("ok", format!("HTTP {status}，已收到响应")),
-    }
+    ("ok", format!("已响应 HTTP {status}"))
 }
 pub fn service_response(
-    service: &str,
+    _service: &str,
     response: &Value,
     status: &Value,
 ) -> (&'static str, String, Option<String>) {
-    let (fallback_state, fallback_detail) = http_result(status);
     if !response.is_object() {
-        return (fallback_state, fallback_detail, None);
+        let (state, detail) = http_result(status);
+        return (state, detail, None);
     }
-    let expected: &[&str] = match service {
-        // Current observations check the homepage; keep trace receipts
-        // readable for snapshots made by earlier runtime versions.
-        "claude" => &["https://claude.ai/", "https://claude.ai/cdn-cgi/trace"],
-        "chatgpt" => &[
-            "https://chatgpt.com/",
-            "https://chatgpt.com/cdn-cgi/trace",
-        ],
-        "openai_api" => &["https://api.openai.com/v1/models"],
-        _ => &["https://api.anthropic.com/v1/models"],
-    };
     let source = clip(text(response, "source"), 160);
-    let observed = response["http_status"].as_i64();
-    // 旧扁平字段只在回执里没有 http_status 时才作数；回执自带状态码时以回执为准。
-    // 之前要求两者必须相等，一旦运行时不写旧字段，成功回执会被判成“未收到有效响应”。
-    let conflict = match status.as_i64() {
-        Some(legacy) => observed != Some(legacy),
-        None => false,
-    };
-    if !expected.contains(&source.as_str()) || observed.is_none() || conflict {
-        return (fallback_state, fallback_detail, Some(expected[0].into()));
-    }
-    let code = observed.unwrap_or(0);
-    let (fallback_state, fallback_detail) = http_result(&json!(code));
+    let code = response["http_status"]
+        .as_i64()
+        .or_else(|| status.as_i64());
     let reached = response["transport_reached"] == true;
-    if matches!(service, "api" | "openai_api")
-        && response["status"] == "ok"
-        && reached
-        && response["access"] == "authentication_required"
-        && code == 401
-    {
+    let responded = response["status"] == "ok" && reached && code.is_some();
+    if responded {
         return (
             "ok",
-            "网络可达；API HTTP 401，未提供密钥，需要认证。".into(),
+            format!("已响应 HTTP {}", code.unwrap_or(0)),
             Some(source),
         );
     }
-    if matches!(service, "claude" | "chatgpt")
-        && response["status"] == "ok"
-        && reached
-        && response["access"] == "challenge"
-        && code == 403
-        && response["challenge"]["provider"] == "cloudflare"
-        && response["challenge"]["mitigated"] == "challenge"
-    {
-        return (
-            "ok",
-            "网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）。".into(),
-            Some(source),
-        );
+    let error = text(response, "error");
+    let error_code = text(response, "error_code");
+    let detail = if !error.is_empty() {
+        error
+    } else if !error_code.is_empty() {
+        error_code
+    } else {
+        "未收到 HTTP 响应"
+    };
+    ("unknown", format!("无响应：{}", clip(detail, 240)), Some(source))
+}
+/// Short label for one endpoint: the response code when it answered, or a
+/// plain "no response". Used by both service cards.
+pub fn probe_label(response: &Value) -> String {
+    let (state, detail, _) = service_response("", response, &Value::Null);
+    if state == "unknown" {
+        "无响应".into()
+    } else {
+        detail
     }
-    if response["status"] == "unknown" || response["access"] == "network_error" || !reached {
-        let error = text(response, "error");
-        let code = text(response, "error_code");
-        let detail = if !error.is_empty() {
-            error
-        } else if !code.is_empty() {
-            code
-        } else {
-            "请求未完成"
-        };
-        return (
-            "unknown",
-            format!("网络未确认：{}", clip(detail, 240)),
-            Some(source),
-        );
-    }
-    (fallback_state, fallback_detail, Some(source))
 }
 pub fn service_label(service: &str, response: &Value, status: &Value) -> String {
-    let (state, detail, _) = service_response(service, response, status);
-    if state == "ok"
-        && matches!(service, "claude" | "chatgpt")
-        && response["access"] == "challenge"
-    {
-        return "需要浏览器验证".into();
-    }
-    if state == "ok"
-        && matches!(service, "api" | "openai_api")
-        && response["access"] == "authentication_required"
-    {
-        return "未提供密钥".into();
-    }
-    if state == "unknown" {
-        return "网络未确认".into();
-    }
-    let code = if response.is_object() {
-        &response["http_status"]
-    } else {
-        status
-    };
-    code.as_i64().map_or(detail, |n| format!("HTTP {n}"))
+    let _ = (service, status);
+    probe_label(response)
 }
 pub fn services(online: &Value) -> (&'static str, String, Value, Option<f64>) {
     let values = &online["service_responses"];
@@ -138,15 +78,12 @@ pub fn services(online: &Value) -> (&'static str, String, Value, Option<f64>) {
     let api = service_response("api", &values["api"], &online["api"]);
     let state = if [web.0, api.0].contains(&"unknown") {
         "unknown"
-    } else if [web.0, api.0].contains(&"warn") {
-        "warn"
     } else {
         "ok"
     };
     let detail = format!(
-        "网页：{}\nAPI：{}\n范围：网络可达不代表已登录、账号可用或订阅状态。",
-        web.1.trim_end_matches(['。', '；']),
-        api.1.trim_end_matches(['。', '；'])
+        "网页：{}\nAPI：{}\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
+        web.1, api.1
     );
     let sampled = values
         .as_object()
@@ -174,15 +111,12 @@ pub fn chatgpt_services(online: &Value) -> Option<(&'static str, String, Value, 
     let api = service_response("openai_api", &values["openai_api"], &Value::Null);
     let state = if [web.0, api.0].contains(&"unknown") {
         "unknown"
-    } else if [web.0, api.0].contains(&"warn") {
-        "warn"
     } else {
         "ok"
     };
     let detail = format!(
-        "网页：{}\nAPI：{}\n范围：网络可达不代表已登录、账号可用或订阅状态。",
-        web.1.trim_end_matches(['。', '；']),
-        api.1.trim_end_matches(['。', '；'])
+        "网页：{}\nAPI：{}\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
+        web.1, api.1
     );
     let sampled = ["chatgpt", "openai_api"]
         .iter()
@@ -459,8 +393,12 @@ mod chatgpt_service_tests {
         let (state, detail, responses, sampled) =
             chatgpt_services(&online).expect("both endpoints were measured");
         assert_eq!(state, "ok");
-        assert!(detail.contains("需要浏览器验证"), "{detail}");
-        assert!(detail.contains("API HTTP 401"), "{detail}");
+        // Both endpoints answered. The probe is anonymous by design, so a
+        // challenge page and a missing API key are answers, not defects.
+        assert!(detail.contains("已响应 HTTP 403"), "{detail}");
+        assert!(detail.contains("已响应 HTTP 401"), "{detail}");
+        assert!(!detail.contains("需要浏览器验证"), "{detail}");
+        assert!(!detail.contains("未提供密钥"), "{detail}");
         assert_eq!(responses["chatgpt"]["source"], "https://chatgpt.com/");
         assert_eq!(sampled, Some(10.0));
     }
@@ -485,6 +423,6 @@ mod chatgpt_service_tests {
         assert_eq!(state, "unknown");
         // Same wording the Claude card uses for an endpoint that never answered,
         // so an unreachable service is never rendered as a pass.
-        assert!(detail.contains("未收到有效 HTTP 响应"), "{detail}");
+        assert!(detail.contains("无响应"), "{detail}");
     }
 }

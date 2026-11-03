@@ -85,55 +85,63 @@ fn receipt_keeps_same_round_display_window_without_mutating_launch_audit() {
 }
 
 #[test]
-fn homepage_403_is_visible_on_the_card_without_mislabeling_old_trace_results() {
+fn every_service_card_reports_the_same_way_for_the_same_measurement() {
     let (home, store) = store();
+    let service = |source: &str, code: i64| {
+        json!({"source":source,"status":"ok","transport_reached":true,"http_status":code})
+    };
     let mut observed = audit();
+    // Both services answered: claude.ai with a challenge page, the API with a
+    // missing key. Neither is a failure — the probe carries no credentials.
     observed["rows"].as_array_mut().unwrap().push(json!({
-        "id":"reachability", "state":"ok", "required":true,
-        "service_responses":{"claude":{
-            "source":"https://claude.ai/", "status":"ok", "transport_reached":true,
-            "http_status":403, "access":"challenge",
-            "challenge":{"provider":"cloudflare","mitigated":"challenge"}
-        }}
+        "id":"reachability","state":"ok","required":true,
+        "service_responses":{
+            "claude":service("https://claude.ai/",403),
+            "api":service("https://api.anthropic.com/v1/models",401)
+        }
     }));
-    let current = |value: &Value| {
+    observed["rows"].as_array_mut().unwrap().push(json!({
+        "id":"chatgpt_reachability","state":"ok","required":false,
+        "service_responses":{
+            "chatgpt":service("https://chatgpt.com/",403),
+            "openai_api":service("https://api.openai.com/v1/models",401)
+        }
+    }));
+    let current = |value: &Value, id: &str| {
         value["rows"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|row| row["id"] == "reachability")
+            .find(|row| row["id"] == id)
             .unwrap()["current"]
-            .clone()
+            .as_str()
+            .unwrap_or("")
+            .to_owned()
     };
-    let challenged = receipt(&store, observed.clone(), session(), false).unwrap();
-    assert_eq!(current(&challenged), "首页 HTTP 403 · 需要浏览器验证");
+    let answered = receipt(&store, observed.clone(), session(), false).unwrap();
+    let claude = current(&answered, "reachability");
+    let chatgpt = current(&answered, "chatgpt_reachability");
+    assert_eq!(claude, "网页：已响应 HTTP 403 · API：已响应 HTTP 401");
+    // Same measurement, same sentence: the two cards must not drift apart.
+    assert_eq!(claude, chatgpt);
 
-    let row = observed["rows"].as_array_mut().unwrap().last_mut().unwrap();
-    row["state"] = json!("warn");
-    row["service_responses"]["claude"]["access"] = json!("unknown");
-    row["service_responses"]["claude"]["challenge"] = Value::Null;
-    let denied = receipt(&store, observed.clone(), session(), false).unwrap();
-    assert_eq!(current(&denied), "首页 HTTP 403 · 访问被拒绝");
-
-    let row = observed["rows"].as_array_mut().unwrap().last_mut().unwrap();
-    row["state"] = json!("unknown");
-    let unavailable = receipt(&store, observed.clone(), session(), false).unwrap();
-    // An unknown round must not surface the 403 label; the detailed web/API
-    // breakdown is still present so each endpoint's state stays visible.
-    let unavailable_text = current(&unavailable).as_str().unwrap_or("").to_owned();
-    assert!(unavailable_text.starts_with("网络未确认"));
-    assert!(!unavailable_text.contains("浏览器验证"));
-    assert!(!unavailable_text.contains("访问被拒绝"));
-
-    let row = observed["rows"].as_array_mut().unwrap().last_mut().unwrap();
-    row["state"] = json!("warn");
-    row["service_responses"]["claude"]["source"] = json!("https://claude.ai/cdn-cgi/trace");
-    let old_trace = receipt(&store, observed, session(), false).unwrap();
-    // An old-trace source is not a real challenge page; it must never render
-    // the 403 challenge label regardless of state.
-    let old_trace_text = current(&old_trace).as_str().unwrap_or("").to_owned();
-    assert!(!old_trace_text.contains("浏览器验证"));
-    assert!(!old_trace_text.contains("访问被拒绝"));
+    // One endpoint silent, one answering: the difference is visible, and the
+    // wording still matches between the two services.
+    let mut silent = observed.clone();
+    for row in silent["rows"].as_array_mut().unwrap() {
+        for key in ["claude", "chatgpt"] {
+            if row["service_responses"][key].is_object() {
+                row["service_responses"][key]["status"] = json!("unknown");
+                row["service_responses"][key]["transport_reached"] = json!(false);
+                row["service_responses"][key]["http_status"] = Value::Null;
+                row["service_responses"][key]["error"] = json!("timeout: connect");
+            }
+        }
+    }
+    let partial = receipt(&store, silent, session(), false).unwrap();
+    let claude = current(&partial, "reachability");
+    assert_eq!(claude, "网页：无响应 · API：已响应 HTTP 401");
+    assert_eq!(claude, current(&partial, "chatgpt_reachability"));
     let _ = fs::remove_dir_all(home);
 }
 

@@ -317,7 +317,10 @@ fn environment_observes_homepage_challenge_instead_of_trace_status() {
     assert_eq!(homepage["http_status"], 403);
     assert_eq!(homepage["access"], "challenge");
     let (_, detail, _, _) = claude_watch_core::presentation::services(&out);
-    assert!(detail.contains("HTTP 403"), "{detail}");
-    assert!(detail.contains("需要浏览器验证"), "{detail}");
-    assert!(detail.contains("API HTTP 401"), "{detail}");
+    // The card reports what the homepage actually answered. It does not
+    // narrate a challenge page or a keyless API as a defect.
+    assert!(detail.contains("已响应 HTTP 403"), "{detail}");
+    assert!(detail.contains("已响应 HTTP 401"), "{detail}");
+    assert!(!detail.contains("需要浏览器验证"), "{detail}");
+    assert!(!detail.contains("未提供密钥"), "{detail}");
 }

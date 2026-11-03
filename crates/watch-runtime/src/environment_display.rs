@@ -119,6 +119,16 @@ fn reference_conflict(online: &Value) -> bool {
         || (!trace_country.is_empty() && !geo_country.is_empty() && trace_country != geo_country)
 }
 
+/// One line for the two endpoints of a service probe. Every service card uses
+/// this, so the same measurement can never be worded two different ways.
+fn service_probe_line(web: &Value, api: &Value) -> String {
+    format!(
+        "网页：{} · API：{}",
+        presentation::probe_label(web),
+        presentation::probe_label(api)
+    )
+}
+
 /// Adds every optional field consumed by Swift's `EnvironmentCheckRow` and
 /// supplies descriptive values from the single captured sample.
 fn present_rows(audit: &Value) -> Vec<Value> {
@@ -311,61 +321,27 @@ fn present_rows(audit: &Value) -> Vec<Value> {
                 "Net.Coffee lookup / RIPEstat RIR".into(),
             ),
             "reachability" => {
-                let homepage = &value["service_responses"]["claude"];
-                let api_response = &value["service_responses"]["api"];
-                let (state, _, _) =
-                    presentation::service_response("claude", homepage, &Value::Null);
-                let current = if homepage["source"] == "https://claude.ai/"
-                    && homepage["http_status"] == 403
-                    && matches!(value["state"].as_str(), Some("ok" | "warn"))
-                {
-                    match state {
-                        "ok" => "首页 HTTP 403 · 需要浏览器验证",
-                        "warn" => "首页 HTTP 403 · 访问被拒绝",
-                        _ => "网页/API 网络响应",
-                    }
-                    .to_string()
-                } else {
-                    // Match the Python card: distinguish web vs API state so a
-                    // single unreachable endpoint is visible at a glance.
-                    let web = presentation::service_label(
-                        "claude",
-                        homepage,
-                        &online["service_responses"]["claude"],
-                    );
-                    let api = presentation::service_label(
-                        "api",
-                        api_response,
-                        &online["service_responses"]["api"],
-                    );
-                    let prefix = match value["state"].as_str() {
-                        Some("ok") => "网络可达",
-                        Some("warn") => "网络响应提示",
-                        _ => "网络未确认",
-                    };
-                    format!("{prefix} · 网页：{web} / API：{api}")
-                };
+                // One card, one question: did each endpoint answer? Both
+                // services render from the same helper so an identical
+                // measurement can never read differently on two cards.
+                let current = service_probe_line(
+                    &value["service_responses"]["claude"],
+                    &value["service_responses"]["api"],
+                );
                 (
-                    current.into(),
-                    "网页/API 分别展示网络与访问状态；不证明登录或账号可用".into(),
+                    current,
+                    "只验证服务是否有 HTTP 响应；本轮请求不带账号凭据，响应码不代表登录或账号可用".into(),
                     "本轮无账号凭据的 HTTPS 请求".into(),
                 )
             }
             "chatgpt_reachability" => {
-                // The same shape as the Claude card, resolved against the
-                // ChatGPT / OpenAI endpoints this round actually measured.
-                let homepage = &value["service_responses"]["chatgpt"];
-                let api_response = &value["service_responses"]["openai_api"];
-                let web = presentation::service_label("chatgpt", homepage, &Value::Null);
-                let api = presentation::service_label("openai_api", api_response, &Value::Null);
-                let prefix = match value["state"].as_str() {
-                    Some("ok") => "网络可达",
-                    Some("warn") => "网络响应提示",
-                    _ => "网络未确认",
-                };
+                let current = service_probe_line(
+                    &value["service_responses"]["chatgpt"],
+                    &value["service_responses"]["openai_api"],
+                );
                 (
-                    format!("{prefix} · 网页：{web} / API：{api}"),
-                    "网页/API 分别展示网络与访问状态；不证明登录或账号可用".into(),
+                    current,
+                    "只验证服务是否有 HTTP 响应；本轮请求不带账号凭据，响应码不代表登录或账号可用".into(),
                     "本轮无账号凭据的 HTTPS 请求".into(),
                 )
             }

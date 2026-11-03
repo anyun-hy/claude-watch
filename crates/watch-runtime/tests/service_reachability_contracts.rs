@@ -46,7 +46,10 @@ fn legacy_flat_status_still_drives_the_row() {
 }
 
 #[test]
-fn a_conflicting_legacy_status_is_never_silently_dropped() {
+fn a_stale_legacy_status_cannot_override_the_receipt() {
+    // The runtime stopped writing these flat fields. When an old snapshot still
+    // carries them they cannot fabricate a verdict: the receipt that measured
+    // this round is the only answer, and it answered 200.
     let online = json!({
         "claude": 404,
         "api": 401,
@@ -56,8 +59,9 @@ fn a_conflicting_legacy_status_is_never_silently_dropped() {
         }
     });
     let (state, detail, _, _) = presentation::services(&online);
-    assert_eq!(state, "warn", "detail={detail}");
-    assert!(detail.contains("HTTP 404"), "detail={detail}");
+    assert_eq!(state, "ok", "detail={detail}");
+    assert!(detail.contains("已响应 HTTP 200"), "detail={detail}");
+    assert!(!detail.contains("404"), "detail={detail}");
 }
 
 #[test]
@@ -73,7 +77,9 @@ fn an_unreachable_receipt_still_reports_unknown() {
 }
 
 #[test]
-fn homepage_403_distinguishes_verified_challenge_from_plain_denial() {
+fn every_http_answer_counts_as_a_response() {
+    // The probe is anonymous, so a challenge page and a plain denial are both
+    // answers. They must read identically; the only failure is silence.
     let api = receipt(
         "https://api.anthropic.com/v1/models",
         401,
@@ -83,16 +89,17 @@ fn homepage_403_distinguishes_verified_challenge_from_plain_denial() {
     homepage["challenge"] = json!({"provider":"cloudflare","mitigated":"challenge"});
     let online = json!({"service_responses":{"claude":homepage,"api":api}});
     let (state, detail, _, _) = presentation::services(&online);
-    assert_eq!(
-        state, "ok",
-        "a verified challenge establishes network reachability"
-    );
-    assert!(detail.contains("HTTP 403") && detail.contains("需要浏览器验证"));
+    assert_eq!(state, "ok", "HTTP 403 is a response");
+    assert!(detail.contains("已响应 HTTP 403"), "detail={detail}");
+    let challenged_detail = detail.clone();
 
     let mut denied = online;
     denied["service_responses"]["claude"]["access"] = json!("unknown");
     denied["service_responses"]["claude"]["challenge"] = serde_json::Value::Null;
     let (state, detail, _, _) = presentation::services(&denied);
-    assert_eq!(state, "warn");
-    assert!(detail.contains("HTTP 403") && detail.contains("访问被拒绝"));
+    assert_eq!(state, "ok");
+    assert_eq!(
+        detail, challenged_detail,
+        "the same response code must read the same way regardless of how the site chose to answer"
+    );
 }

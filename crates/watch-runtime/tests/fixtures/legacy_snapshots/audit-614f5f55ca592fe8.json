@@ -195,7 +195,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -427,7 +427,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -659,7 +659,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -891,7 +891,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -1123,7 +1123,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -1355,7 +1355,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -1587,7 +1587,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -1817,7 +1817,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -2047,7 +2047,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -2277,7 +2277,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -2507,7 +2507,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -2737,7 +2737,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -2917,7 +2917,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -3147,7 +3147,7 @@
         "state": "unknown"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -3377,7 +3377,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：HTTP 403，访问被拒绝；不能仅据此判断是地区或账号问题\nAPI：HTTP 401，需要账号认证（本轮未携带凭据）\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -3387,16 +3387,14 @@
           "api": null,
           "claude": null
         },
-        "state": "warn"
+        "state": "ok"
       }
     ],
     "schema": 1,
     "source_notices": []
   },
   {
-    "blocked": [
-      "reachability"
-    ],
+    "blocked": [],
     "context": "ctx",
     "egress_reference": {
       "checked_at": 1700000000.0,
@@ -3421,11 +3419,11 @@
       "risks": [],
       "state": "ok"
     },
-    "message": "启动预检未通过：Claude 服务：网页：未收到有效 HTTP 响应\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+    "message": "预检通过，仅限当前策略和采样范围",
     "netcoffee_lookup": null,
     "observed_at": 1700000000.0,
     "policy": "test-policy",
-    "ready": false,
+    "ready": true,
     "rows": [
       {
         "detail": "entry confirmed",
@@ -3591,7 +3589,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：未收到有效 HTTP 响应\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -3619,7 +3617,7 @@
             "transport_reached": true
           }
         },
-        "state": "unknown"
+        "state": "ok"
       }
     ],
     "schema": 1,
@@ -3833,7 +3831,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -4075,7 +4073,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -4310,7 +4308,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -4548,7 +4546,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -4788,7 +4786,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -5028,7 +5026,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -5492,7 +5490,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -5722,7 +5720,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -5952,7 +5950,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -6182,7 +6180,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -6412,7 +6410,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -6642,7 +6640,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -7126,7 +7124,7 @@
         "state": "fail"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,
@@ -7356,7 +7354,7 @@
         "state": "ok"
       },
       {
-        "detail": "网页：网络可达；网页 HTTP 403，需要浏览器验证（Cloudflare challenge）\nAPI：网络可达；API HTTP 401，未提供密钥，需要认证\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        "detail": "网页：已响应 HTTP 403\nAPI：已响应 HTTP 401\n本轮请求不带账号凭据，只验证服务是否有 HTTP 响应。",
         "id": "reachability",
         "name": "Claude 服务",
         "required": true,

@@ -205,44 +205,40 @@ fn dns_and_stun_block_only_when_the_config_requires_them() {
     assert_eq!(row(&evaluate(&value), "dns")["state"], "fail");
 }
 #[test]
-fn service_status_only_expected_auth_and_verified_challenge_are_green() {
-    let normal = case();
-    let mut cases = vec![];
-    for service in ["claude", "api"] {
-        let base = json!({"service":service,"status":normal["online"][service],"response":normal["online"]["service_responses"][service]});
-        cases.push(base.clone());
-        for (key, value) in [
-            ("source", json!("https://wrong.test/")),
-            ("transport_reached", json!(false)),
-            ("status", json!("unknown")),
-            ("challenge", json!({})),
-            ("http_status", json!(200)),
-            ("access", json!("denied")),
-        ] {
-            let mut c = base.clone();
-            c["response"][key] = value;
-            cases.push(c);
-        }
-        for status in [0, 200, 301, 401, 403, 429, 500] {
-            cases.push(json!({"service":service,"status":status,"response":Value::Null}));
-        }
-    }
-    for (c, expected) in cases.iter().zip(oracle("service_response", &cases)) {
-        let service = c["service"].as_str().unwrap();
-        let result = presentation::service_response(service, &c["response"], &c["status"]);
+fn a_service_card_reports_only_whether_each_endpoint_responded() {
+    // The card answers one question. The probe is anonymous by design, so a
+    // redirect, a challenge page, a missing API key and a rate limit are all
+    // answers — the only failure is silence.
+    let answered = |code: i64| {
+        json!({"source":"https://claude.ai/","status":"ok","transport_reached":true,"http_status":code})
+    };
+    for code in [200, 301, 302, 401, 403, 429, 500] {
+        let (state, detail, source) =
+            presentation::service_response("claude", &answered(code), &Value::Null);
+        assert_eq!(state, "ok", "HTTP {code} is a response");
+        assert_eq!(detail, format!("已响应 HTTP {code}"));
+        assert_eq!(source.as_deref(), Some("https://claude.ai/"));
         assert_eq!(
-            json!({"result":[json!(result.0),json!(result.1),json!(result.2)],"label":presentation::service_label(service,&c["response"],&c["status"])}),
-            expected,
-            "{c}"
+            presentation::service_label("claude", &answered(code), &Value::Null),
+            detail,
+            "the label and the detail must never disagree"
         );
     }
-    assert_eq!(presentation::http_result(&json!(403)).0, "warn");
-    let trace = json!({"status":"ok","transport_reached":true,"http_status":403,"access":"challenge","source":"https://claude.ai/cdn-cgi/trace","challenge":{"provider":"cloudflare","mitigated":"challenge"}});
+
+    let silent = json!({"source":"https://claude.ai/","status":"unknown",
+        "transport_reached":false,"http_status":Value::Null,
+        "error":"timeout: connect","error_code":"timeout"});
+    let (state, detail, _) = presentation::service_response("claude", &silent, &Value::Null);
+    assert_eq!(state, "unknown");
+    assert!(detail.starts_with("无响应"), "{detail}");
     assert_eq!(
-        presentation::service_response("claude", &trace, &json!(403)).0,
-        "ok"
+        presentation::service_label("claude", &silent, &Value::Null),
+        "无响应"
     );
-    assert_eq!(evaluate(&normal)["ready"], true);
+
+    assert_eq!(presentation::http_result(&json!(403)).0, "ok");
+    assert_eq!(presentation::http_result(&Value::Null).0, "unknown");
+    assert_eq!(evaluate(&case())["ready"], true);
 }
 #[test]
 fn context_transitions_match_original_and_preserve_later_sampling_failures() {
