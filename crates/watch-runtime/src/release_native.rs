@@ -165,7 +165,12 @@ impl FixedCommandExecutor for SystemExecutor {
             .stdout(Redirection::Pipe)
             .stderr(Redirection::Pipe)
             .start()
-            .map_err(|_| error("release_command_unavailable", "受权发布命令无法启动"))?;
+            .map_err(|e| {
+                error(
+                    "release_command_unavailable",
+                    &format!("受权发布命令无法启动：{}（{e}）", command.program.display()),
+                )
+            })?;
         let output = match job.communicate() {
             Ok(communicator) => communicator
                 .limit_time(command.timeout)

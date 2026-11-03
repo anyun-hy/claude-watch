@@ -276,12 +276,14 @@ impl Runner for Fake {
                 "",
             )),
             "/bin/launchctl" => {
-                let loaded = self
-                    .jobs
-                    .borrow()
-                    .get(args.get(2).map(String::as_str).unwrap_or_default())
-                    .copied()
-                    .unwrap_or(false);
+                let sub = args.get(1).map(String::as_str).unwrap_or_default();
+                let label = args.get(2).map(String::as_str).unwrap_or_default().to_string();
+                if sub == "bootout" {
+                    // A real bootout stops the job, so later reads must agree.
+                    self.jobs.borrow_mut().insert(label, false);
+                    return Ok(result(0, "", ""));
+                }
+                let loaded = self.jobs.borrow().get(&label).copied().unwrap_or(false);
                 Ok(result(if loaded { 0 } else { 113 }, "", ""))
             }
             "/usr/bin/plutil" => {
@@ -870,11 +872,21 @@ fn app_created_during_build_is_not_replaced() {
 }
 
 #[test]
-fn missing_app_with_residual_data_stops() {
+fn missing_app_with_residual_data_is_cleaned_and_reinstalled() {
+    // A stopped run leaves the app gone and Watch's own data behind. That is
+    // the state this flow must be able to recover from, so the leftover is
+    // cleaned instead of blocking the machine without an app.
     let h = Harness::new();
     std::fs::remove_dir_all(&h.fake.layout.app).expect("app");
-    h.blocked(h.perform("3.0.0", "314", false, "y"), "仍有残留");
-    assert!(h.fake.layout.base().exists());
+    assert_eq!(
+        h.perform("3.0.0", "314", false, "y").expect("flow"),
+        flow::Outcome::Installed
+    );
+    assert_eq!(
+        h.fake.identity(&h.fake.layout.app),
+        ("3.0.0".into(), "314".into())
+    );
+    assert!(!h.fake.layout.base().exists());
     h.assert_preserved();
 }
 
@@ -890,4 +902,28 @@ fn current_state_change_after_confirmation_stops() {
     assert!(h.fake.layout.app.exists());
     assert!(h.fake.layout.base().exists());
     h.assert_preserved();
+}
+
+#[test]
+fn leftovers_of_the_retired_copy_do_not_block_a_fresh_install() {
+    // Repro of the reinstall that stalled after data cleanup: the bundle and
+    // the data directory were already gone, but a process started from the
+    // old paths was still listed. Blocking there leaves the machine without
+    // an app at all, so a retired leftover must be reported, not obeyed.
+    let h = Harness::new();
+    std::fs::remove_dir_all(&h.fake.layout.app).expect("app removed");
+    std::fs::remove_dir_all(h.fake.layout.base()).expect("data removed");
+    *h.fake.process_output.borrow_mut() = format!(
+        "{} {}/runtime/watch-engine daemon\n",
+        h.fake.uid,
+        h.fake.layout.base().display()
+    );
+    assert_eq!(
+        h.perform("3.0.0", "314", false, "y").expect("flow must finish"),
+        flow::Outcome::Installed
+    );
+    assert_eq!(
+        h.fake.identity(&h.fake.layout.app),
+        ("3.0.0".into(), "314".into())
+    );
 }

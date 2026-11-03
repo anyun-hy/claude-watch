@@ -212,8 +212,11 @@ fn check_helper(layout: &Layout, runner: &dyn Runner, app_present: bool) -> Resu
     if !exists(&layout.system_root) && !exists(&layout.system_plist) && !job_loaded {
         return Ok(None);
     }
+    // The helper outlives the app: an uninstall moves the bundle to the trash
+    // and leaves this behind. Resetting must be able to remove a helper whose
+    // app is already gone, so presence of the app is not required here.
     require(
-        app_present && is_directory(&layout.system_root) && layout.helper().is_file(),
+        is_directory(&layout.system_root) && layout.helper().is_file(),
         "Watch 系统辅助组件不完整，请先检查残留。",
     )?;
     let root_info = std::fs::symlink_metadata(&layout.system_root)
@@ -249,8 +252,13 @@ fn check_helper(layout: &Layout, runner: &dyn Runner, app_present: bool) -> Resu
             return Err(blocked("Watch 系统辅助目录中有无法确认的文件。"));
         }
     }
+    // Without an app there is nothing to compare against; the helper is then
+    // removed by hash, which is what the caller uses to authorise the sudo step.
     let bundled = layout.app.join("Contents/Resources/watch-admin.sh");
-    if path_is_symlink(&bundled) || !bundled.is_file() || digest(&bundled)? != digest(&layout.helper())?
+    if app_present
+        && (path_is_symlink(&bundled)
+            || !bundled.is_file()
+            || digest(&bundled)? != digest(&layout.helper())?)
     {
         return Err(blocked("系统辅助程序与已安装应用不一致。"));
     }
@@ -390,16 +398,16 @@ fn preflight(layout: &Layout, runner: &dyn Runner, uid: u32) -> Result<LayoutPla
         engine_hash = Some(digest(&engine)?);
         old_identity = Some(identity);
     } else {
+        // No app, but Watch-owned leftovers may still be here. They are the
+        // shape this very flow leaves behind when it stops between cleanup and
+        // install, and every one of these paths belongs to Watch. Refusing to
+        // continue would strand the machine without an app, so the reset goes
+        // on and clear_data removes them under the same ownership checks.
         let mut residual = layout.data_paths();
         residual.push(layout.agent());
-        if residual.iter().any(|path| exists(path)) {
-            return Err(blocked(
-                "应用已不存在，但 Watch 数据或后台任务仍有残留；请先检查。",
-            ));
+        for path in residual.iter().filter(|path| exists(path)) {
+            println!("发现 Watch 残留：{}（随后清理）", path.display());
         }
-    }
-    if !app_present && loaded(runner, &layout.agent_label(uid))? {
-        return Err(blocked("应用已不存在，但 Watch 主后台仍在运行。"));
     }
     if !app_present && is_directory(&layout.trash()) {
         let mut found = false;
@@ -495,19 +503,37 @@ fn wait_for_watch_exit(
     if let Some(old) = old {
         needles.push(format!("{}/Contents/", old.display()));
     }
+    // Once the application bundle and the data directory are gone, a process
+    // that still names either path is a leftover of the retired copy: it was
+    // started before the move and cannot be the install this flow is about to
+    // place. Blocking on it leaves the machine without an app, so such rows
+    // are reported and ignored instead.
+    let retired = !exists(&layout.app) && !exists(&layout.base());
+    let mut blocking: Vec<String> = Vec::new();
     for attempt in 0..11 {
-        let rows = process_rows(runner, uid)?;
-        if !rows
-            .iter()
-            .any(|row| needles.iter().any(|needle| row.contains(needle)))
-        {
+        blocking.clear();
+        for row in process_rows(runner, uid)? {
+            if !needles.iter().any(|needle| row.contains(needle)) {
+                continue;
+            }
+            if retired {
+                println!("忽略已随旧版移出的残留进程：{row}");
+                let _ = std::io::stdout().flush();
+            } else {
+                blocking.push(row);
+            }
+        }
+        if blocking.is_empty() {
             return Ok(());
         }
         if attempt < 10 {
             sleep(Duration::from_secs(1));
         }
     }
-    Err(blocked("Watch 进程尚未退出，未清理数据。"))
+    Err(blocked(format!(
+        "Watch 进程尚未退出，未执行后续步骤：{}",
+        blocking.join(" | ")
+    )))
 }
 
 fn clean_data(
@@ -525,18 +551,37 @@ fn clean_data(
         layout.updater_label(uid),
         layout.helper_label(),
     ];
+    // Stopping Watch's own background jobs is part of a reset, not a reason
+    // to stop: a run that died after uninstall leaves them behind with no app
+    // to own them. Boot each one out, then verify it is really gone.
+    for label in &labels {
+        if loaded(runner, label)? {
+            println!("正在停止后台任务：{label}");
+            runner.run(
+                &[
+                    "/bin/launchctl".to_string(),
+                    "bootout".to_string(),
+                    label.clone(),
+                ],
+                None,
+                RunMode::Capture,
+            )?;
+        }
+    }
     for label in &labels {
         if loaded(runner, label)? {
             return Err(blocked(format!("后台任务仍在运行：{label}")));
         }
     }
     check_transactions(layout)?;
-    if exists(&layout.agent()) || exists(&layout.updater()) {
-        return Err(blocked("Watch 后台任务文件仍存在。"));
-    }
     let trashed_app = trashed.map(|path| path.join("Claude Watch Monitor.app"));
     wait_for_watch_exit(layout, runner, uid, trashed_app.as_deref(), sleep)?;
-    let paths = layout.data_paths();
+    let mut paths = layout.data_paths();
+    // The launch agent plists are Watch's own files. Once the job is booted
+    // out they are just leftovers, so a reset removes them rather than
+    // refusing to continue when the app that used to own them is gone.
+    paths.push(layout.agent());
+    paths.push(layout.updater());
     for path in &paths {
         safe_user_path(path, &layout.home, uid)?;
     }
@@ -1017,6 +1062,15 @@ pub fn perform(
         && installed.get("version").and_then(Value::as_str) == Some(version)
         && installed.get("build").and_then(Value::as_str) == Some(build)
         && installed.get("architecture").and_then(Value::as_str) == Some("arm64");
+    if !installed_ok {
+        // The old app is already gone at this point, so the operator needs a
+        // way back without rebuilding anything.
+        println!("安装未完成；应用当前不在 /Applications 中。");
+        println!("安装包已生成：{}", dmg.display());
+        println!("可手动完成安装：");
+        println!("  \"{}\" app-install --source \"{}\" --apply", engine.display(), app_out.display());
+        let _ = std::io::stdout().flush();
+    }
     require(installed_ok, "安装结果未通过版本核对，请检查实际安装状态。")?;
     require(
         app_identity_with(runner, &layout.app)? == (version.to_string(), build.to_string())
