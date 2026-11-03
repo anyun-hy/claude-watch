@@ -19,6 +19,10 @@ pub struct PolicyCriterion {
     /// the parts wins. A criterion with parts owns no config key of its own,
     /// so it is neither defaulted nor validated — it only resolves codes.
     pub combines: &'static [&'static str],
+    /// Default action for this criterion, overriding the family default.
+    /// A criterion whose historical behaviour was the normal exit keeps that
+    /// behaviour even when its family defaults to something stricter.
+    pub default_action: Option<&'static str>,
 }
 
 /// The criteria every family is configured by, in the order they are shown.
@@ -27,28 +31,60 @@ pub const CRITERIA: &[PolicyCriterion] = &[
         id: "ip",
         codes: &["egress_ip_changed"],
         combines: &[],
+        default_action: None,
     },
     PolicyCriterion {
         id: "cn",
         codes: &["egress_country_cn"],
         combines: &[],
+        default_action: None,
     },
     PolicyCriterion {
         id: "dns",
-        codes: &["dns_egress_changed"],
+        codes: &["dns_egress_changed", "dns_risk"],
         combines: &[],
+        default_action: None,
     },
     PolicyCriterion {
         id: "webrtc",
-        codes: &["webrtc_egress_changed"],
+        codes: &["webrtc_egress_changed", "webrtc_risk"],
         combines: &[],
+        default_action: None,
     },
     // Both probe families drifted: one code, resolved from the two criteria
-    // that own keys.
+    // that own keys. A leak risk that names no single probe family is judged
+    // by both, so it can never be handled more leniently than the strictest
+    // configured probe criterion.
     PolicyCriterion {
         id: "probe_drift",
-        codes: &["dns_and_webrtc_egress_changed"],
+        codes: &["dns_and_webrtc_egress_changed", "network_leak_risk"],
         combines: &["dns", "webrtc"],
+        default_action: None,
+    },
+    // A supervised desktop is running but its protection state could not be
+    // confirmed: no session was established, the sampled identity no longer
+    // matches, the local proxy/TUN could not be verified, or a sampling round
+    // never completed. None of these is a confirmed drift, so they carry their
+    // own switch instead of an implicit close. The default stays the
+    // historical normal exit — this guard fails closed — but because the row
+    // is configurable, a user who prefers a notice can now actually get one
+    // instead of being closed by a rule they never saw.
+    PolicyCriterion {
+        id: "session",
+        codes: &[
+            "session_missing",
+            "session_identity_unconfirmed",
+            "session_identity_changed",
+            "session_state_invalid",
+            "revalidation_context_changed",
+            "guard_sampling_failed",
+            "revalidation_timeout",
+            "proxy_or_tun_failed",
+            "proxy_or_tun_unconfirmed",
+            "egress_unconfirmed",
+        ],
+        combines: &[],
+        default_action: Some("close"),
     },
 ];
 
@@ -152,13 +188,29 @@ impl PolicyCatalog {
     pub fn criterion_for(code: &str) -> Option<&'static PolicyCriterion> {
         CRITERIA.iter().find(|criterion| criterion.codes.contains(&code))
     }
+    pub fn criterion(id: &str) -> Option<&'static PolicyCriterion> {
+        CRITERIA.iter().find(|criterion| criterion.id == id)
+    }
+    /// Action assumed for a key that is absent. A criterion may pin its own
+    /// default (the historical normal exit for an unestablished session, for
+    /// example); a pinned value the family cannot perform degrades to the
+    /// family default so the table can never name an impossible action.
+    pub fn fallback_action(family: &PolicyFamily, criterion: &str) -> &'static str {
+        Self::criterion(criterion)
+            .and_then(|value| value.default_action)
+            .filter(|action| family.performable(action))
+            .unwrap_or(family.default_action)
+    }
     /// Every key a config may carry, with the value assumed when it is
     /// absent. Adding a family extends this without touching any caller.
     pub fn default_actions() -> BTreeMap<String, String> {
         let mut actions = BTreeMap::new();
         for family in FAMILIES {
             for criterion in Self::keyed_criteria() {
-                actions.insert(family.key(criterion.id), family.default_action.to_string());
+                actions.insert(
+                    family.key(criterion.id),
+                    Self::fallback_action(family, criterion.id).to_string(),
+                );
             }
         }
         actions

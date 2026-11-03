@@ -351,6 +351,24 @@ fn present_rows(audit: &Value) -> Vec<Value> {
                     "本轮无账号凭据的 HTTPS 请求".into(),
                 )
             }
+            "chatgpt_reachability" => {
+                // The same shape as the Claude card, resolved against the
+                // ChatGPT / OpenAI endpoints this round actually measured.
+                let homepage = &value["service_responses"]["chatgpt"];
+                let api_response = &value["service_responses"]["openai_api"];
+                let web = presentation::service_label("chatgpt", homepage, &Value::Null);
+                let api = presentation::service_label("openai_api", api_response, &Value::Null);
+                let prefix = match value["state"].as_str() {
+                    Some("ok") => "网络可达",
+                    Some("warn") => "网络响应提示",
+                    _ => "网络未确认",
+                };
+                (
+                    format!("{prefix} · 网页：{web} / API：{api}"),
+                    "网页/API 分别展示网络与访问状态；不证明登录或账号可用".into(),
+                    "本轮无账号凭据的 HTTPS 请求".into(),
+                )
+            }
             _ => (String::new(), String::new(), String::new()),
         };
         value["current"] = json!(current);
@@ -379,6 +397,15 @@ fn present_rows(audit: &Value) -> Vec<Value> {
             if let Some(sampled) = sampled {
                 value["sampled_at"] = json!(sampled);
             }
+        } else if id == "chatgpt_reachability" {
+            let sampled = value["sampled_at"]
+                .as_f64()
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .or_else(|| number(&online["source_times"]["chatgpt"]))
+                .or_else(|| number(&online["source_times"]["openai_api"]));
+            if let Some(sampled) = sampled {
+                value["sampled_at"] = json!(sampled);
+            }
         }
         // A confirmed disagreement is already `fail`; never disguise it as a
         // transient request failure.
@@ -386,6 +413,7 @@ fn present_rows(audit: &Value) -> Vec<Value> {
             "egress" | "timezone" | "locale" => &["trace", "geo", "netcoffee"],
             "asn" => &["asn", "geo", "netcoffee"],
             "reachability" => &["claude", "api"],
+            "chatgpt_reachability" => &["chatgpt", "openai_api"],
             "dns" => &["dns"],
             "stun" => &["stun"],
             _ => &[],

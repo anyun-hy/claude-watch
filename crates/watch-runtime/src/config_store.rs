@@ -223,15 +223,16 @@ mod cli_settings_contracts {
         // Heartbeats already on disk carry these digests. Adding, renaming or
         // reordering a config field would invalidate every live heartbeat, so
         // the default document's digest is pinned here. The 2026-11 pin moved
-        // when the ChatGPT / Codex family gained the ordinary close action.
+        // when the ChatGPT / Codex family gained the ordinary close action, and
+        // again when the unestablished-session criterion gained its own switch.
         let config = Config::default();
         assert_eq!(
             policy_digest(&config.value().unwrap()).unwrap(),
-            "e9ceefaa043947f7713d174a3f75e8beb1e1ea2162570ac0c57beb333ba4bdc4"
+            "460959ad0e5f9d406f38cc8ee2109f403517730559b6215beb4ef88c84920c36"
         );
         assert_eq!(
             guard_policy_digest(&config).unwrap(),
-            "bb656255349123ab74bd33b3fcb1bf5ff1b6ac3e94bf3fadbf0cbc4d0167a579"
+            "820b249fb027c2f719dc7d1b433cfecf9c6895e5dc4034f1ca2c37b0edd4ff5e"
         );
     }
     #[test]

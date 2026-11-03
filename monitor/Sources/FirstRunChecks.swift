@@ -567,8 +567,13 @@ enum InitializationEnvironmentGate {
             return .failed(code: "environment_not_ready", detail: "本轮环境、策略或保护证据没有全部通过，请重新检查。")
         }
         // Never accept an empty, truncated, duplicate or downgraded check list.
-        let expected: Set<String> = ["proxy", "tun", "egress", "ip_history", "timezone", "locale", "ipv6",
+        // The ChatGPT service card is measured only by display rounds, so a
+        // receipt either carries every base check plus that card, or the base
+        // checks alone — never a partial or unknown set.
+        let required: Set<String> = ["proxy", "tun", "egress", "ip_history", "timezone", "locale", "ipv6",
                                      "dns", "stun", "guard", "routing", "language", "asn", "reachability"]
+        var expected = required
+        expected.insert("chatgpt_reachability")
         var mandatory: Set<String> = ["proxy", "tun", "egress", "timezone", "locale", "guard", "reachability"]
         // DNS and STUN rows are required only when their probes are explicitly
         // requested (require_dns / require_stun). Backend audit marks them
@@ -579,7 +584,9 @@ enum InitializationEnvironmentGate {
             if settings[key] as? Bool == true { mandatory.insert(id) }
         }
         let ids = policy.rows.map(\.id)
-        guard ids.count == expected.count, Set(ids) == expected,
+        let found = Set(ids)
+        guard ids.count == found.count,
+              found == required || found == expected,
               mandatory.allSatisfy({ id in policy.rows.contains { $0.id == id && $0.required } }) else {
             return .failed(code: "required_checks_missing", detail: "最终回执缺少必检项目或项目要求不符，未允许进入主界面。")
         }

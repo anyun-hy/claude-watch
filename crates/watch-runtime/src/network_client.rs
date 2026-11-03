@@ -750,6 +750,8 @@ impl<T: Transport> NetworkClient<T> {
                 | "https://www.cloudflare.com/cdn-cgi/trace"
                 | "https://claude.ai/cdn-cgi/trace"
                 | "https://api.anthropic.com/v1/models"
+                | "https://chatgpt.com/cdn-cgi/trace"
+                | "https://api.openai.com/v1/models"
         ) {
             return Receipt::error(
                 "trace",
@@ -796,6 +798,8 @@ impl<T: Transport> NetworkClient<T> {
         match service {
             "claude" => client.trace("https://claude.ai/cdn-cgi/trace"),
             "api" => client.trace("https://api.anthropic.com/v1/models"),
+            "chatgpt" => client.trace("https://chatgpt.com/cdn-cgi/trace"),
+            "openai_api" => client.trace("https://api.openai.com/v1/models"),
             _ => Receipt::error(
                 "service",
                 service,
@@ -813,6 +817,14 @@ impl<T: Transport> NetworkClient<T> {
         self.clone()
             .with_timeout(Duration::from_secs(8))
             .request_limited("service", "", "https://claude.ai/".into(), 0)
+    }
+    /// The ChatGPT / Codex counterpart of `claude_homepage`: the supervised
+    /// service is asked about its own origin, never through the other family's
+    /// endpoint.
+    pub fn chatgpt_homepage(&self) -> Receipt {
+        self.clone()
+            .with_timeout(Duration::from_secs(8))
+            .request_limited("service", "", "https://chatgpt.com/".into(), 0)
     }
 }
 
@@ -892,14 +904,17 @@ pub fn service_observation(service: &str, receipt: &Receipt) -> Value {
     let reached = receipt.http_status.is_some();
     let cloudflare_challenge = matches!(
         receipt.source_url.as_str(),
-        "https://claude.ai/" | "https://claude.ai/cdn-cgi/trace"
+        "https://claude.ai/"
+            | "https://claude.ai/cdn-cgi/trace"
+            | "https://chatgpt.com/"
+            | "https://chatgpt.com/cdn-cgi/trace"
     ) && receipt
         .response_headers
         .get("cf-mitigated")
         .is_some_and(|v| v.eq_ignore_ascii_case("challenge"));
     let (access, challenge) = match (service, status) {
-        ("api", Some(401)) => ("authentication_required", Value::Null),
-        ("claude", Some(403)) if cloudflare_challenge => (
+        ("api" | "openai_api", Some(401)) => ("authentication_required", Value::Null),
+        ("claude" | "chatgpt", Some(403)) if cloudflare_challenge => (
             "challenge",
             json!({"provider":"cloudflare","mitigated":"challenge"}),
         ),

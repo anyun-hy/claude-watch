@@ -236,7 +236,14 @@ impl AuditStore {
             && config.online_enabled
             && transport
         {
-            system.online_for_target(&config, &before, target)?
+            if guard_capture.is_some() {
+                // A display round reports both services side by side, so the
+                // environment grid can show a ChatGPT card next to the Claude
+                // one. A launch round only measures the service it supervises.
+                system.online(&config, &before)?
+            } else {
+                system.online_for_target(&config, &before, target)?
+            }
         } else {
             json!({"query_errors":{"online": {"source":"audit","message":"联网检测未获允许或传输未确认"}}})
         };

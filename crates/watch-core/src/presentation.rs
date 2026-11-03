@@ -39,12 +39,16 @@ pub fn service_response(
     if !response.is_object() {
         return (fallback_state, fallback_detail, None);
     }
-    let expected: &[&str] = if service == "claude" {
+    let expected: &[&str] = match service {
         // Current observations check the homepage; keep trace receipts
         // readable for snapshots made by earlier runtime versions.
-        &["https://claude.ai/", "https://claude.ai/cdn-cgi/trace"]
-    } else {
-        &["https://api.anthropic.com/v1/models"]
+        "claude" => &["https://claude.ai/", "https://claude.ai/cdn-cgi/trace"],
+        "chatgpt" => &[
+            "https://chatgpt.com/",
+            "https://chatgpt.com/cdn-cgi/trace",
+        ],
+        "openai_api" => &["https://api.openai.com/v1/models"],
+        _ => &["https://api.anthropic.com/v1/models"],
     };
     let source = clip(text(response, "source"), 160);
     let observed = response["http_status"].as_i64();
@@ -60,7 +64,7 @@ pub fn service_response(
     let code = observed.unwrap_or(0);
     let (fallback_state, fallback_detail) = http_result(&json!(code));
     let reached = response["transport_reached"] == true;
-    if service == "api"
+    if matches!(service, "api" | "openai_api")
         && response["status"] == "ok"
         && reached
         && response["access"] == "authentication_required"
@@ -72,7 +76,7 @@ pub fn service_response(
             Some(source),
         );
     }
-    if service == "claude"
+    if matches!(service, "claude" | "chatgpt")
         && response["status"] == "ok"
         && reached
         && response["access"] == "challenge"
@@ -106,10 +110,16 @@ pub fn service_response(
 }
 pub fn service_label(service: &str, response: &Value, status: &Value) -> String {
     let (state, detail, _) = service_response(service, response, status);
-    if state == "ok" && service == "claude" && response["access"] == "challenge" {
+    if state == "ok"
+        && matches!(service, "claude" | "chatgpt")
+        && response["access"] == "challenge"
+    {
         return "需要浏览器验证".into();
     }
-    if state == "ok" && service == "api" && response["access"] == "authentication_required" {
+    if state == "ok"
+        && matches!(service, "api" | "openai_api")
+        && response["access"] == "authentication_required"
+    {
         return "未提供密钥".into();
     }
     if state == "unknown" {
@@ -152,8 +162,41 @@ pub fn services(online: &Value) -> (&'static str, String, Value, Option<f64>) {
         sampled,
     )
 }
-pub fn query_errors(online: &Value, keys: &[&str]) -> String {
-    keys.iter()
+/// The ChatGPT / Codex service observations, when this round probed them.
+/// `None` keeps the card out of the grid entirely, so a round that never
+/// measured these endpoints cannot render a stale or invented verdict.
+pub fn chatgpt_services(online: &Value) -> Option<(&'static str, String, Value, Option<f64>)> {
+    let values = &online["service_responses"];
+    if !values["chatgpt"].is_object() && !values["openai_api"].is_object() {
+        return None;
+    }
+    let web = service_response("chatgpt", &values["chatgpt"], &Value::Null);
+    let api = service_response("openai_api", &values["openai_api"], &Value::Null);
+    let state = if [web.0, api.0].contains(&"unknown") {
+        "unknown"
+    } else if [web.0, api.0].contains(&"warn") {
+        "warn"
+    } else {
+        "ok"
+    };
+    let detail = format!(
+        "网页：{}\nAPI：{}\n范围：网络可达不代表已登录、账号可用或订阅状态。",
+        web.1.trim_end_matches(['。', '；']),
+        api.1.trim_end_matches(['。', '；'])
+    );
+    let sampled = ["chatgpt", "openai_api"]
+        .iter()
+        .filter_map(|key| number(&values[*key]["queried_at"]))
+        .filter(|value| *value > 0.0)
+        .max_by(f64::total_cmp);
+    Some((
+        state,
+        detail,
+        json!({"chatgpt":values["chatgpt"],"openai_api":values["openai_api"]}),
+        sampled,
+    ))
+}
+pub fn query_errors(online: &Value, keys: &[&str]) -> String {    keys.iter()
         .filter_map(|key| {
             online["query_errors"]
                 .get(key)
@@ -390,4 +433,58 @@ pub fn stun(
         ))
     }
     (lines.join("\n"), sampled, json!(observations))
+}
+
+#[cfg(test)]
+mod chatgpt_service_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn observation(source: &str, status: u16, access: &str) -> Value {
+        let challenge = if access == "challenge" {
+            json!({"provider":"cloudflare","mitigated":"challenge"})
+        } else {
+            Value::Null
+        };
+        json!({"source":source,"status":"ok","http_status":status,"transport_reached":true,
+               "access":access,"challenge":challenge,"queried_at":10.0})
+    }
+
+    #[test]
+    fn a_round_that_probed_chatgpt_reports_its_own_state_and_endpoints() {
+        let online = json!({"service_responses":{
+            "chatgpt": observation("https://chatgpt.com/", 403, "challenge"),
+            "openai_api": observation("https://api.openai.com/v1/models", 401, "authentication_required")
+        }});
+        let (state, detail, responses, sampled) =
+            chatgpt_services(&online).expect("both endpoints were measured");
+        assert_eq!(state, "ok");
+        assert!(detail.contains("需要浏览器验证"), "{detail}");
+        assert!(detail.contains("API HTTP 401"), "{detail}");
+        assert_eq!(responses["chatgpt"]["source"], "https://chatgpt.com/");
+        assert_eq!(sampled, Some(10.0));
+    }
+
+    #[test]
+    fn an_unmeasured_round_renders_no_card_instead_of_an_invented_verdict() {
+        let online = json!({"service_responses":{
+            "claude": observation("https://claude.ai/", 403, "challenge"),
+            "api": observation("https://api.anthropic.com/v1/models", 401, "authentication_required")
+        }});
+        assert!(chatgpt_services(&online).is_none());
+    }
+
+    #[test]
+    fn an_unreachable_chatgpt_endpoint_is_reported_as_unconfirmed() {
+        let online = json!({"service_responses":{
+            "chatgpt": json!({"source":"https://chatgpt.com/","status":"unknown","http_status":Value::Null,
+                              "transport_reached":false,"access":"unknown","error":"timeout: connect"}),
+            "openai_api": observation("https://api.openai.com/v1/models", 401, "authentication_required")
+        }});
+        let (state, detail, _, _) = chatgpt_services(&online).expect("the round probed the service");
+        assert_eq!(state, "unknown");
+        // Same wording the Claude card uses for an endpoint that never answered,
+        // so an unreachable service is never rendered as a pass.
+        assert!(detail.contains("未收到有效 HTTP 响应"), "{detail}");
+    }
 }

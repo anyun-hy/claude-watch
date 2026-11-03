@@ -1979,6 +1979,62 @@ fn drifted_receipts(fixture: &Fixture, now: f64, dns_country: &'static str, srfl
     .unwrap();
 }
 
+/// Set only the unestablished-session row, leaving every other criterion at
+/// its default, so a test can prove that this one row alone decides the
+/// outcome for an app the user opened by hand.
+fn session_policy(fixture: &Fixture, action: &str) {
+    let mut config = claude_watch_core::config::Config::default();
+    config.guard_enabled = true;
+    let claude = claude_watch_core::policy::PolicyCatalog::family("claude").unwrap();
+    config.policy_actions.insert(claude.key("session"), action.into());
+    fixture
+        .storage
+        .atomic_json(&fixture.storage.paths.config(), &config.value().unwrap())
+        .unwrap();
+}
+
+#[test]
+fn warn_configured_unestablished_session_notifies_without_closing() {
+    let fixture = Fixture::new();
+    session_policy(&fixture, "warn");
+    // The app is running but its protection state cannot be established, which
+    // is exactly the state a user reaches by opening the app from the Dock.
+    let mut system = Fake {
+        running: true,
+        ready: false,
+        ..Default::default()
+    };
+    let receipt = Controller::new(fixture.storage.clone())
+        .guard_tick(&mut system)
+        .unwrap();
+    assert_eq!(
+        receipt["session_guard"]["reason"]["code"],
+        "session_missing"
+    );
+    assert_eq!(receipt["action"], "observe");
+    assert_eq!(receipt["stop_state"], "skipped_warn_only");
+    assert_eq!(system.closes, 0, "a notice-only row never closes the app");
+    assert!(system.running);
+}
+
+#[test]
+fn close_configured_unestablished_session_still_closes() {
+    let fixture = Fixture::new();
+    session_policy(&fixture, "close");
+    let mut system = Fake {
+        running: true,
+        ready: false,
+        ..Default::default()
+    };
+    Controller::new(fixture.storage.clone())
+        .guard_tick(&mut system)
+        .unwrap();
+    // The row is a real switch: choosing close must actually close, otherwise
+    // the previous test would pass for the wrong reason.
+    assert_eq!(system.closes, 1);
+    assert!(!system.running);
+}
+
 #[test]
 fn warn_configured_probe_drift_notifies_without_closing() {
     let fixture = Fixture::new();

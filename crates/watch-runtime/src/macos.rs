@@ -531,7 +531,13 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         };
         Ok(out)
     }
-    fn online_facts(&self, _: &Config, local: &Value, include_claude: bool) -> Result<Value> {
+    fn online_facts(
+        &self,
+        _: &Config,
+        local: &Value,
+        include_claude: bool,
+        include_chatgpt: bool,
+    ) -> Result<Value> {
         let context = local
             .get("context_id")
             .and_then(Value::as_str)
@@ -735,6 +741,12 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                 self.network.service_metadata("api"),
             )
         });
+        let openai_services = include_chatgpt.then(|| {
+            (
+                self.network.chatgpt_homepage(),
+                self.network.service_metadata("openai_api"),
+            )
+        });
         let stun = self.stun_fact(context);
         let mut result = json!({"stun":stun,"trace":trace,"geo":geo,"asn":asn_value,"netcoffee_lookup":lookup,"query_errors":query_errors,
             "source_times":{"trace":egress.finished_at,"geo":geo_sampled_at,"asn":asn_value.get("registered_queried_at").or_else(||asn_value.get("queried_at"))}});
@@ -742,6 +754,17 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             result["source_times"]["claude"] = json!(claude.queried_at);
             result["source_times"]["api"] = json!(api.queried_at);
             result["service_responses"] = json!({"claude":crate::network_client::service_observation("claude",&claude),"api":crate::network_client::service_observation("api",&api)});
+        }
+        if let Some((chatgpt, openai_api)) = openai_services {
+            result["source_times"]["chatgpt"] = json!(chatgpt.queried_at);
+            result["source_times"]["openai_api"] = json!(openai_api.queried_at);
+            if !result["service_responses"].is_object() {
+                result["service_responses"] = json!({});
+            }
+            result["service_responses"]["chatgpt"] =
+                crate::network_client::service_observation("chatgpt", &chatgpt);
+            result["service_responses"]["openai_api"] =
+                crate::network_client::service_observation("openai_api", &openai_api);
         }
         Ok(result)
     }
@@ -812,7 +835,9 @@ impl<R: ReadRunner, T: Transport, M: Mutator> AuditSystem for Macos<R, T, M> {
         Ok(local)
     }
     fn online(&mut self, c: &Config, l: &Value) -> Result<Value> {
-        self.online_facts(c, l, true)
+        // The environment view is not tied to one family: it reports both
+        // services so the grid can show a ChatGPT card beside the Claude one.
+        self.online_facts(c, l, true, true)
     }
     fn online_for_target(
         &mut self,
@@ -820,7 +845,16 @@ impl<R: ReadRunner, T: Transport, M: Mutator> AuditSystem for Macos<R, T, M> {
         l: &Value,
         target: claude_watch_core::processes::LaunchTarget,
     ) -> Result<Value> {
-        self.online_facts(c, l, target.protected())
+        // A launch audit only measures the service this target supervises: the
+        // other family's endpoint must never decide whether this one launches.
+        // The environment view opts into both explicitly through `online`.
+        let openai = matches!(
+            target.provider(),
+            claude_watch_core::processes::Provider::Codex
+                | claude_watch_core::processes::Provider::Chatgpt
+                | claude_watch_core::processes::Provider::Openai
+        );
+        self.online_facts(c, l, !openai, openai)
     }
     fn refresh_dns(&mut self) -> Result<Option<Value>> {
         let token = std::env::var("CLAUDE_WATCH_DNS_REFRESH_TOKEN").ok();
@@ -878,7 +912,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> RepairSystem for Macos<R, T, M> {
     }
     fn egress_reference(&self, c: &Config) -> Result<Value> {
         let local = self.local_facts(c)?;
-        let online = self.online_facts(c, &local, true)?;
+        let online = self.online_facts(c, &local, true, false)?;
         let trace = &online["trace"];
         Ok(json!({"trace":{"ip":trace["ip"],"loc":trace["loc"]},"geo":online["geo"]}))
     }

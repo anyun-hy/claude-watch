@@ -16,7 +16,8 @@ struct EnvironmentCheckRow: Decodable, Identifiable {
     var query_error: String? = nil
     var statusLabel: String {
         switch state {
-        case "ok": return id == "reachability" ? "网络可达" : "已核对"
+        case "ok":
+            return id == "reachability" || id == "chatgpt_reachability" ? "网络可达" : "已核对"
         case "fail": return "需处理"
         case "warn": return "提示"
         case "info": return "已读取"
@@ -45,6 +46,7 @@ struct EnvironmentCheckRow: Decodable, Identifiable {
         case "language": return "character.bubble"
         case "asn": return "building.2"
         case "reachability": return "link"
+        case "chatgpt_reachability": return "bubble.left.and.text.bubble.right"
         default: return "checklist"
         }
     }
@@ -731,6 +733,9 @@ final class SwitcherStore: ObservableObject {
                 return .init(id: row.id, name: row.name, state: "warn", detail: "ASN 注册资料仅供参考。",
                              scope: row.scope, required: row.required, current: "AS2516 · JP", reference: row.reference, source: "隔离 fixture")
             case "reachability":
+                return .init(id: row.id, name: row.name, state: "warn", detail: "网页 403 需要浏览器验证；API 401 未提供密钥。",
+                             scope: row.scope, required: row.required, current: "网络响应提示 · 网页：HTTP 403 / API：HTTP 401", reference: row.reference, source: "隔离 fixture")
+            case "chatgpt_reachability":
                 return .init(id: row.id, name: row.name, state: "warn", detail: "网页 403 需要浏览器验证；API 401 未提供密钥。",
                              scope: row.scope, required: row.required, current: "网络响应提示 · 网页：HTTP 403 / API：HTTP 401", reference: row.reference, source: "隔离 fixture")
             default: return row
@@ -1436,8 +1441,9 @@ final class SwitcherStore: ObservableObject {
     }
     static func fixtureAudit() -> EnvironmentAuditReceipt {
         let names = ["代理内核", "TUN 网卡", "出口国家", "IP 一致性", "时区", "地区与日期格式", "IPv6 策略",
-                     "DNS", "UDP/STUN 出口", "保护后台", "代理规则覆盖", "Claude 语言", "ASN 属性", "Claude 服务"]
-        let ids = ["proxy", "tun", "egress", "ip_history", "timezone", "locale", "ipv6", "dns", "stun", "guard", "routing", "language", "asn", "reachability"]
+                     "DNS", "UDP/STUN 出口", "保护后台", "代理规则覆盖", "Claude 语言", "ASN 属性", "Claude 服务",
+                     "ChatGPT 服务"]
+        let ids = ["proxy", "tun", "egress", "ip_history", "timezone", "locale", "ipv6", "dns", "stun", "guard", "routing", "language", "asn", "reachability", "chatgpt_reachability"]
         return .init(observed_at: Date().timeIntervalSince1970, expires_at: Date().timeIntervalSince1970 + 30,
                      ready: false, rows: names.enumerated().map {
             .init(id: ids[$0.offset], name: $0.element, state: $0.offset == 8 ? "unknown" : "ok",
@@ -1458,12 +1464,15 @@ final class SwitcherStore: ObservableObject {
         let now = Date().timeIntervalSince1970
         let guardOn = settings[Setting.guardEnabled.key] as? Bool == true && settings[Setting.enabled.key] as? Bool == true
         let values = ["tag · http://127.0.0.1:7890", "utun4", "8.8.8.8 / JP", "8.8.8.8", "Asia/Tokyo", "ja_JP · 示例 2026/10/23",
-                      "已关闭", "8.8.8.8 / JP", "未知", guardOn ? "保护心跳有效" : "保护未启用", "未知", "en-JP", "fixture ISP", "Claude HTTP 403 / API HTTP 401"]
+                      "已关闭", "8.8.8.8 / JP", "未知", guardOn ? "保护心跳有效" : "保护未启用", "未知", "en-JP", "fixture ISP", "Claude HTTP 403 / API HTTP 401",
+                      "ChatGPT HTTP 403 / API HTTP 401"]
         let references = ["运行进程与监听者身份", "实际 TUN 路由", "本轮两个来源一致", "48 小时检测历史", "Asia/Tokyo（本轮出口）",
-                          "ja_JP · 示例 2026/10/23", "实际 IPv6 状态", "本轮 HTTP 出口国家 JP", "8.8.8.8（本轮 HTTP 出口）", "当前心跳", "实际规则证据", "英文偏好", "仅供参考", "响应不代表账号可用"]
+                          "ja_JP · 示例 2026/10/23", "实际 IPv6 状态", "本轮 HTTP 出口国家 JP", "8.8.8.8（本轮 HTTP 出口）", "当前心跳", "实际规则证据", "英文偏好", "仅供参考", "响应不代表账号可用",
+                          "响应不代表账号可用"]
         let sources = ["进程清单 / 后台新鲜样本", "ifconfig / route", "Cloudflare + IPinfo", "独立检测历史", "/etc/localtime / IPinfo",
-                       "Foundation 日期模板 / AppleLocale / 本轮 GeoIP", "networksetup Ethernet", "dig / Akamai", "原生 UDP/STUN", "保护心跳", "规则 / 连接证据", "系统 AppleLanguages", "IPinfo", "本轮 HTTPS"]
-        let states = ["ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "unknown", guardOn ? "ok" : "fail", "unknown", "ok", "warn", "warn"]
+                       "Foundation 日期模板 / AppleLocale / 本轮 GeoIP", "networksetup Ethernet", "dig / Akamai", "原生 UDP/STUN", "保护心跳", "规则 / 连接证据", "系统 AppleLanguages", "IPinfo", "本轮 HTTPS",
+                       "本轮 HTTPS"]
+        let states = ["ok", "ok", "ok", "ok", "ok", "ok", "ok", "ok", "unknown", guardOn ? "ok" : "fail", "unknown", "ok", "warn", "warn", "warn"]
         let mandatory: Set<String> = ["proxy", "tun", "egress", "timezone", "locale", "dns", "stun", "guard", "reachability"]
         let rows: [[String: Any]] = audit.rows.enumerated().map { index, row in
             ["id": row.id, "name": row.name, "state": initialization ? (row.id == "guard" && !guardOn ? "fail" : "ok") : states[index], "detail": "隔离检测样本；未读取目标配置",

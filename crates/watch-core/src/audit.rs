@@ -12,7 +12,7 @@ use crate::{
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
-pub const CHECKS: [(&str, &str); 14] = [
+pub const CHECKS: [(&str, &str); 15] = [
     ("proxy", "代理内核"),
     ("tun", "TUN 网卡"),
     ("egress", "出口国家"),
@@ -27,6 +27,7 @@ pub const CHECKS: [(&str, &str); 14] = [
     ("language", "Claude 语言"),
     ("asn", "ASN 属性"),
     ("reachability", "Claude 服务"),
+    ("chatgpt_reachability", "ChatGPT 服务"),
 ];
 pub struct AuditInput<'a> {
     pub config: &'a Config,
@@ -589,11 +590,28 @@ pub fn evaluate_target(
         reach["sampled_at"] = json!(sampled);
         rows.push(reach);
     }
+    // The ChatGPT / Codex service is measured on its own endpoints whenever the
+    // round probes them. It is informational here: the supervised service is
+    // the one this target protects, so a second service's reachability must
+    // never decide whether the current target may launch.
+    if let Some((state, detail, responses, sampled)) = p::chatgpt_services(online) {
+        let mut reach = row(
+            "chatgpt_reachability",
+            state,
+            detail,
+            false,
+            "无账号凭据的诊断请求",
+        );
+        reach["service_responses"] = responses;
+        reach["sampled_at"] = json!(sampled);
+        rows.push(reach);
+    }
     for row in &mut rows {
         let keys: &[&str] = match text(row, "id") {
             "egress" | "timezone" | "locale" => &["trace", "geo"],
             "asn" => &["geo", "asn"],
             "reachability" => &["claude", "api"],
+            "chatgpt_reachability" => &["chatgpt", "openai_api"],
             _ => &[],
         };
         if row["state"] == "unknown" {

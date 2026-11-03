@@ -209,7 +209,7 @@ impl Config {
             .unwrap_or(&["warn"])
     }
     /// Configured action of one family and criterion, defaulting to the
-    /// action the family declared for a missing key.
+    /// action the criterion (or its family) declared for a missing key.
     pub fn action(&self, family: &str, criterion: &str) -> String {
         let Some(family) = PolicyCatalog::family(family) else {
             return String::new();
@@ -217,7 +217,7 @@ impl Config {
         self.policy_actions
             .get(&family.key(criterion))
             .cloned()
-            .unwrap_or_else(|| family.default_action.to_string())
+            .unwrap_or_else(|| PolicyCatalog::fallback_action(family, criterion).to_string())
     }
     /// Configured action for a confirmed risk code within one service's own
     /// policy family. Families are kept separate, so an action is always
@@ -225,11 +225,16 @@ impl Config {
     /// can never be read from the other's keys. Codes without a config key
     /// keep the historical normal-exit path.
     pub fn close_action(&self, code: &str, provider: Provider) -> String {
+        // A service or a code this table does not describe cannot be mapped to
+        // a key, so nothing was configured for it. Falling back to `close`
+        // here would let a code the user never saw bypass every policy they
+        // did set, which is exactly the "I changed it and it still closed"
+        // failure. An unmapped code therefore only ever reports.
         let Some(family) = PolicyCatalog::family_for(provider) else {
-            return "close".to_string();
+            return "warn".to_string();
         };
         let Some(criterion) = PolicyCatalog::criterion_for(code) else {
-            return "close".to_string();
+            return "warn".to_string();
         };
         // A stored value the service cannot perform (a policy written before
         // a capability existed) degrades to that service's mildest action
@@ -516,7 +521,14 @@ mod protection_tests {
         for family in PolicyCatalog::families() {
             for criterion in PolicyCatalog::keyed_criteria() {
                 let config = Config::from_value(json!({})).unwrap();
-                assert_eq!(config.action(family.id, criterion.id), family.default_action);
+                // A criterion may pin its own default (an unestablished
+                // session keeps the historical normal exit even where the
+                // family defaults to something stricter), so the declared
+                // fallback — not the family default alone — is the contract.
+                assert_eq!(
+                    config.action(family.id, criterion.id),
+                    PolicyCatalog::fallback_action(family, criterion.id)
+                );
                 for action in family.actions {
                     let key = family.key(criterion.id);
                     let stored = Config::from_value(json!({ key: action })).unwrap();

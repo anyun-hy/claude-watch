@@ -43,11 +43,15 @@ struct T {
     lookup: Lookup,
     geo_calls: AtomicUsize,
     service_calls: AtomicUsize,
+    chatgpt_calls: AtomicUsize,
 }
 impl Transport for T {
     fn get(&self, request: &Request) -> std::result::Result<Response, TransportError> {
         if request.url.contains("claude.ai") || request.url.contains("api.anthropic.com") {
             self.service_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        if request.url.contains("chatgpt.com") || request.url.contains("api.openai.com") {
+            self.chatgpt_calls.fetch_add(1, Ordering::SeqCst);
         }
         let ripe_asn = if matches!(self.lookup, Lookup::CountryConflict) {
             4134
@@ -144,6 +148,7 @@ fn online_target(
         lookup,
         geo_calls: AtomicUsize::new(0),
         service_calls: AtomicUsize::new(0),
+        chatgpt_calls: AtomicUsize::new(0),
     });
     let mut macos = Macos {
         runner: R,
@@ -271,18 +276,36 @@ fn missing_fields_are_query_failures_while_real_ip_conflicts_block_fallback() {
 }
 
 #[test]
-fn observed_target_reuses_exit_metadata_without_claude_service_requests() {
+fn observed_target_probes_only_its_own_service() {
     use claude_watch_core::processes::LaunchTarget;
     let (claude, transport) = online_target(Lookup::CamelCase, LaunchTarget::ClaudeDesktop);
     assert_eq!(transport.service_calls.load(Ordering::SeqCst), 2);
     assert!(claude["service_responses"].is_object());
+    assert!(
+        transport.chatgpt_calls.load(Ordering::SeqCst) == 0,
+        "a Claude launch audit must not contact the ChatGPT endpoints"
+    );
     for target in [LaunchTarget::CodexDesktop, LaunchTarget::ChatgptDesktop] {
         let (observed, transport) = online_target(Lookup::CamelCase, target);
-        assert_eq!(transport.service_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            transport.service_calls.load(Ordering::SeqCst),
+            0,
+            "a ChatGPT launch audit must not be decided by Claude's endpoint"
+        );
+        assert_eq!(
+            transport.chatgpt_calls.load(Ordering::SeqCst),
+            2,
+            "the supervised service is measured on its own two endpoints"
+        );
         assert_eq!(observed["trace"]["ip"], claude["trace"]["ip"]);
         assert_eq!(observed["trace"]["loc"], claude["trace"]["loc"]);
         assert_eq!(observed["geo"], claude["geo"]);
-        assert!(observed.get("service_responses").is_none());
+        assert!(observed["service_responses"]["chatgpt"].is_object());
+        assert!(observed["service_responses"]["openai_api"].is_object());
+        assert!(
+            observed["service_responses"]["claude"].is_null(),
+            "the other family's observation must never be attached"
+        );
     }
 }
 

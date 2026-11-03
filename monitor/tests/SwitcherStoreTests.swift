@@ -278,7 +278,7 @@ struct SwitcherStoreTests {
         _ = await timeoutRead.value
         let automatic = SwitcherStore(isFixture: true)
         await automatic.load(automaticCheck: true)
-        expect(automatic.currentEnvironment?.rows.count == 14, "opening the page starts detection without an online-policy setting")
+        expect(automatic.currentEnvironment?.rows.count == 15, "opening the page starts detection without an online-policy setting")
         expect(automatic.currentEnvironment?.context_transition?.state == "stable", "real-shaped context transition decodes while opaque summaries are ignored")
         expect(automatic.currentPolicyEvaluation?.grants_launch_permission == false &&
                automatic.currentPolicyEvaluation?.observed_at == automatic.currentEnvironment?.observed_at,
@@ -361,7 +361,7 @@ struct SwitcherStoreTests {
         store.text(Setting.locale).wrappedValue = "en_GB"
         expect(!store.updateSourceReady, "missing update manifest and key remain unavailable")
         _ = await store.detectCurrentEnvironment()
-        expect(store.currentEnvironment?.rows.count == 14, "current-state detection always exposes all fourteen checks")
+        expect(store.currentEnvironment?.rows.count == 15, "current-state detection always exposes every check, including the ChatGPT service card")
         expect(store.currentEnvironment?.grants_launch_permission == false, "live observation cannot grant launch permission")
         expect(store.hasUnsavedSettings, "direct live detection does not require saving a manual draft")
         expect(store.settings["locale"] as? String == "en_GB", "direct live detection cannot replace draft settings")
@@ -372,7 +372,7 @@ struct SwitcherStoreTests {
         await store.save()
         expect(!store.hasUnsavedSettings, "fixture save stays in memory")
         await store.perform(["checkdetail", "--online"])
-        expect(store.audit?.rows.count == 14, "all fourteen rows reach the UI")
+        expect(store.audit?.rows.count == 15, "every row reaches the UI")
         expect(store.audit?.ready == false, "unknown STUN is not ready")
         expect(store.audit?.rows.contains { $0.state == "unknown" } == true, "unknown remains visible")
         store.text(Setting.country).wrappedValue = "JP"
@@ -424,7 +424,7 @@ struct SwitcherStoreTests {
         if CommandLine.arguments.count > 1 {
             let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
             let audit = try JSONDecoder().decode(EnvironmentAuditReceipt.self, from: data)
-            expect(audit.rows.count == 14, "Python-to-Swift JSON contract")
+            expect(audit.rows.count == 15, "Python-to-Swift JSON contract")
             expect(audit.rows.contains { $0.id == "language" }, "client language is not dropped")
             expect(audit.rows.contains { $0.id == "asn" }, "ASN is not dropped")
             expect(audit.rows.contains { $0.id == "reachability" }, "reachability is not dropped")
@@ -447,7 +447,7 @@ struct SwitcherStoreTests {
         if CommandLine.arguments.count > 4 {
             let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[4]))
             let detection = try JSONDecoder().decode(CurrentEnvironmentReceipt.self, from: data)
-            expect(detection.rows.count == 14, "Python-to-Swift direct detection contract")
+            expect(detection.rows.count == 15, "Python-to-Swift direct detection contract")
             expect(!detection.grants_launch_permission, "Python detection remains separate from launch authority")
             expect(detection.rows.first { $0.id == "timezone" }?.reference == "Asia/Tokyo", "reference timezone comes from current egress")
         }
@@ -482,14 +482,18 @@ struct SwitcherStoreTests {
         }, "a criterion's key is derived from its own family")
         let claude = AIPolicyCatalog.services.first { $0.id == "claude" }
         let openAI = AIPolicyCatalog.services.first { $0.id == "openai" }
-        expect(claude?.actions.count == 3 && claude?.criteria.allSatisfy { policy in
+        expect(claude?.actions.count == 3 && claude?.criteria.filter { $0.id != "session" }.allSatisfy { policy in
             claude?.setting(policy).fallback == "force"
         } == true, "the supervised session keeps the full action set")
+        expect(claude?.criteria.first { $0.id == "session" }?.fallback == "close",
+               "an unestablished session keeps the historical normal exit for Claude")
         expect(openAI?.actions.map(\.id) == ["force", "close", "warn"]
-                   && openAI?.criteria.allSatisfy { policy in
+                   && openAI?.criteria.filter { $0.id != "session" }.allSatisfy { policy in
                        openAI?.setting(policy).fallback == "close"
                    } == true,
                "the OpenAI service offers the full action set and assumes close")
+        expect(openAI?.criteria.first { $0.id == "session" }?.fallback == "close",
+               "an unestablished session keeps the historical normal exit for ChatGPT")
         expect(openAI?.actions.contains(.force) == true,
                "force is available for every supervised family")
         expect(openAI?.note == nil, "no reduced action set means no explanation note")

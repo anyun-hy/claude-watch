@@ -15,6 +15,10 @@ struct PolicyAction: Identifiable, Hashable {
 struct PolicyCriterion: Identifiable {
     let id: String
     let title: String
+    /// Assumed value when this criterion's key is absent. A criterion whose
+    /// backend default differs from its family's keeps that value here, so the
+    /// UI can never show a title the backend would not resolve to.
+    var fallback: String? = nil
 }
 
 /// Disposition policy for one AI service.
@@ -40,7 +44,7 @@ struct AIServicePolicy: Identifiable {
     /// Shown only when this service's options differ from the full set.
     let note: String?
     func setting(_ criterion: PolicyCriterion) -> ChoiceSetting {
-        .init(key: "\(keyPrefix)_close_\(criterion.id)", fallback: defaultAction)
+        .init(key: "\(keyPrefix)_close_\(criterion.id)", fallback: criterion.fallback ?? defaultAction)
     }
     func actionTitle(_ id: String) -> String {
         actions.first { $0.id == id }?.title ?? actions.last?.title ?? id
@@ -64,7 +68,7 @@ enum AIPolicyCatalog {
         let parts = policy.criteria.map { criterion in
             let key = policy.setting(criterion).key
             let stored = settings[key] as? String
-            let actionID = stored ?? policy.defaultAction
+            let actionID = stored ?? criterion.fallback ?? policy.defaultAction
             let title = policy.actionTitle(actionID)
             return "\(criterion.title)→\(title)"
         }
@@ -80,6 +84,10 @@ enum AIPolicyCatalog {
             .init(id: "cn", title: "出口国家为中国大陆"),
             .init(id: "dns", title: "DNS 递归出口偏离会话基线"),
             .init(id: "webrtc", title: "WebRTC 公网候选偏离会话基线"),
+            // Not a drift: the app runs but its protection state could not be
+            // confirmed. It has its own switch so a warn-only matrix can keep
+            // the app open instead of being overridden by an implicit close.
+            .init(id: "session", title: "未能建立受管会话", fallback: "close"),
         ],
         actions: [.force, .close, .warn],
         defaultAction: "force",
@@ -95,6 +103,7 @@ enum AIPolicyCatalog {
             .init(id: "cn", title: "出口国家为中国大陆"),
             .init(id: "dns", title: "DNS 递归出口偏离"),
             .init(id: "webrtc", title: "WebRTC 公网候选偏离"),
+            .init(id: "session", title: "未能建立受管会话", fallback: "close"),
         ],
         actions: [.force, .close, .warn],
         defaultAction: "close",

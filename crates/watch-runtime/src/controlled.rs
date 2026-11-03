@@ -420,10 +420,9 @@ impl Controller {
     /// Configured action for a confirmed risk code, resolved in the policy
     /// family of the service being supervised. Which service that is comes
     /// from the launch target, so one engine answers for every family the
-    /// configuration declares. Codes without a config key keep the historical
-    /// normal-exit path; a load failure falls back to the same historical
-    /// mapping clamped to what the family can perform, so an unreadable
-    /// policy neither widens nor narrows the forced set.
+    /// configuration declares. A load failure resolves to the table's own
+    /// default for that criterion — never to a hardcoded close — so a policy
+    /// the user set to a notice can never be escalated by a read error.
     fn close_action(&self, code: &str, provider: Provider) -> String {
         ConfigStore {
             storage: self.storage.clone(),
@@ -431,16 +430,29 @@ impl Controller {
         .load()
         .map(|config| config.close_action(code, provider))
         .unwrap_or_else(|_| {
-            let historical = match code {
-                "egress_ip_changed" | "egress_country_cn" => "force",
-                _ => "close",
-            };
+            let action = PolicyCatalog::criterion_for(code)
+                .and_then(|criterion| criterion.default_action)
+                .unwrap_or("warn");
             match PolicyCatalog::family_for(provider) {
-                Some(family) if family.performable(historical) => historical.to_string(),
+                Some(family) if family.performable(action) => action.to_string(),
                 Some(family) => family.fallback().to_string(),
                 None => "warn".to_string(),
             }
         })
+    }
+    /// Strictest configured action across the two confirmed-egress criteria.
+    /// Used by the persistence-failure path, which has no key of its own and
+    /// is a consequence of one of these drifts.
+    fn egress_drift_action(&self, provider: Provider) -> String {
+        let ip = self.close_action("egress_ip_changed", provider);
+        let cn = self.close_action("egress_country_cn", provider);
+        if ip == "force" || cn == "force" {
+            "force".to_string()
+        } else if ip == "close" || cn == "close" {
+            "close".to_string()
+        } else {
+            "warn".to_string()
+        }
     }
     fn timed_guard_quit<S: DesktopSystem>(
         &self,
@@ -449,24 +461,50 @@ impl Controller {
     ) -> Result<()> {
         let started = std::time::Instant::now();
         receipt["stop_started_at"] = json!(system.now());
-        let code = receipt["session_guard"]["reason"]["code"]
+        let reported = receipt["session_guard"]["reason"]["code"]
             .as_str()
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
+        // A mainland exit is a confirmed drift even when it is also the reason
+        // no session exists, so it must be judged by its own criterion here
+        // too. Without this the stop step would re-read the coarse
+        // "no session" code and downgrade an explicit force to a notice.
+        let code = if reported == "session_missing"
+            && session::Egress::fresh(
+                &system.egress(),
+                system.now(),
+                session::GUARD_EGRESS_TTL,
+            )
+            .is_some_and(|exit| exit.country == "CN")
+        {
+            "egress_country_cn".to_string()
+        } else {
+            reported
+        };
         // The supervised service decides what may be done: only a family that
         // declares `force` ever reaches the bounded force path, whatever the
         // risk code is.
         let provider = system.launch_target().provider();
         let can_force =
             PolicyCatalog::family_for(provider).is_some_and(|family| family.performable("force"));
-        // A persistence failure means session state can no longer be tracked,
-        // so a force-capable service applies the bounded force fallback
-        // regardless of configuration; one that cannot force still closes the
-        // ordinary way.
-        let confirmed_ip = can_force && code == "egress_risk_persist_failed" || {
-            let action = self.close_action(code, provider);
-            receipt["stop_action"] = json!(action);
-            action == "force"
+        // A persistence failure has no key of its own: it means a confirmed
+        // egress drift could not be recorded. It is therefore judged by the
+        // drift criteria that produced it, and inherits their strictest
+        // configured action instead of forcing a close the user never chose.
+        let action = if code == "egress_risk_persist_failed" {
+            self.egress_drift_action(provider)
+        } else {
+            self.close_action(&code, provider)
         };
+        receipt["stop_action"] = json!(action);
+        // Last fuse before any process is touched: a warn action never closes,
+        // whichever branch reached this function.
+        if action == "warn" {
+            receipt["stop_state"] = json!("skipped_warn_only");
+            receipt["action"] = json!("observe");
+            return Ok(());
+        }
+        let confirmed_ip = can_force && action == "force";
         let result = if confirmed_ip {
             let mut forced = None;
             let result = system.quit_for_confirmed_ip_risk(&mut forced);
@@ -703,6 +741,20 @@ impl Controller {
                                 CoreError::new("guard_encoding_failed", "保护状态无法编码")
                             })?;
                         if matches!(outcome.state.as_str(), "risk" | "locked") {
+                            // A warn-only criterion reports without closing, in
+                            // this branch too: the related processes outliving a
+                            // exited main is the same class of finding the probe
+                            // criteria govern, so the configured action decides.
+                            if self.close_action(code, system.launch_target().provider()) == "warn" {
+                                receipt["session_notice"] = json!({
+                                    "code": code,
+                                    "detail": outcome.reason.as_ref().map(|r| r.detail.clone()),
+                                    "action": "warn",
+                                });
+                                receipt["action"] = json!("observe");
+                                receipt["stop_state"] = json!("skipped_warn_only");
+                                return Ok(());
+                            }
                             match sessions.close_if_current(
                                 Some(&ended.session_id),
                                 system.now(),
@@ -758,6 +810,17 @@ impl Controller {
                     receipt["session_guard"] = serde_json::to_value(&outcome)
                         .map_err(|_| CoreError::new("guard_encoding_failed", "保护状态无法编码"))?;
                     if matches!(outcome.state.as_str(), "risk" | "locked") {
+                        let found = code.unwrap_or("session_identity_unconfirmed");
+                        if self.close_action(found, system.launch_target().provider()) == "warn" {
+                            receipt["session_notice"] = json!({
+                                "code": found,
+                                "detail": outcome.reason.as_ref().map(|r| r.detail.clone()),
+                                "action": "warn",
+                            });
+                            receipt["action"] = json!("observe");
+                            receipt["stop_state"] = json!("skipped_warn_only");
+                            return Ok(());
+                        }
                         match sessions.close_if_current(
                             Some(&ended.session_id),
                             system.now(),
@@ -1064,6 +1127,24 @@ impl Controller {
                     .as_ref()
                     .map(|r| r.code.clone())
                     .unwrap_or_default();
+                // "No session" is the absence of supervision, not a diagnosis:
+                // it must not mask a drift that is confirmed independently of
+                // any session. A mainland exit is confirmed by the same
+                // measurement that would have refused to adopt the process, so
+                // it keeps the action its own criterion declares instead of
+                // inheriting the mild default of the unconfirmed row.
+                let code = if code == "session_missing"
+                    && session::Egress::fresh(
+                        &system.egress(),
+                        system.now(),
+                        session::GUARD_EGRESS_TTL,
+                    )
+                    .is_some_and(|exit| exit.country == "CN")
+                {
+                    "egress_country_cn".to_string()
+                } else {
+                    code
+                };
                 // A warn-configured criterion reports but never closes: the
                 // session stays active and the next round re-evaluates. The
                 // risk round latches the session to Locked, so later rounds
@@ -1169,6 +1250,21 @@ impl Controller {
         {
             receipt["status"] = json!("protection_triggered");
             receipt["session_guard"] = session::status(value, system.now(), Some(true));
+            let found = value
+                .reason
+                .as_ref()
+                .map(|reason| reason.code.clone())
+                .unwrap_or_default();
+            if self.close_action(&found, system.launch_target().provider()) == "warn" {
+                receipt["session_notice"] = json!({
+                    "code": found,
+                    "detail": value.reason.as_ref().map(|reason| reason.detail.clone()),
+                    "action": "warn",
+                });
+                receipt["action"] = json!("observe");
+                receipt["stop_state"] = json!("skipped_warn_only");
+                return Ok(());
+            }
             match sessions.close_if_current(id.as_deref(), system.now(), || {
                 self.timed_guard_quit(system, receipt)
             }) {
@@ -1195,6 +1291,21 @@ impl Controller {
                 receipt["session_guard"] = serde_json::to_value(&outcome)
                     .map_err(|_| CoreError::new("guard_encoding_failed", "保护状态无法编码"))?;
                 if matches!(outcome.state.as_str(), "risk" | "locked") {
+                    let found = outcome
+                        .reason
+                        .as_ref()
+                        .map(|reason| reason.code.clone())
+                        .unwrap_or_else(|| "guard_sampling_failed".into());
+                    if self.close_action(&found, system.launch_target().provider()) == "warn" {
+                        receipt["session_notice"] = json!({
+                            "code": found,
+                            "detail": outcome.reason.as_ref().map(|reason| reason.detail.clone()),
+                            "action": "warn",
+                        });
+                        receipt["action"] = json!("observe");
+                        receipt["stop_state"] = json!("skipped_warn_only");
+                        return Ok(());
+                    }
                     match sessions.close_if_current(id.as_deref(), system.now(), || {
                         self.timed_guard_quit(system, receipt)
                     }) {
