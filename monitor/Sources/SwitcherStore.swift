@@ -695,9 +695,17 @@ final class SwitcherStore: ObservableObject {
     var sessionDisplay: SessionProtectionPresentation {
         sessionDisplayEvidence?.presentation(at: loginClock.timeIntervalSince1970) ?? .loading
     }
+    /// First-run path: only raises the system consent prompt. It must NOT open
+    /// System Settings, otherwise the Settings window covers the prompt and the
+    /// user sees the "Device Control and Data Access" sheet get skipped in
+    /// favour of the pane jumping in front of it.
+    func requestAccessibilityConsent() {
+        guard !isFixture else { return }
+        AccessibilityPermission.request()
+    }
     func openClaudeWatchAccessibilitySettings() {
         guard !isFixture else { return }
-        guard AccessibilityPermission.requestAndOpenSettings() else {
+        guard AccessibilityPermission.openSettings() else {
             message = "系统设置未能自动打开，请手动前往 系统设置 › 隐私与安全性 › 辅助功能，并允许 Claude Watch。"
             return
         }

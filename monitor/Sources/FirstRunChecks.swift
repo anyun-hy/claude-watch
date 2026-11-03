@@ -43,7 +43,7 @@ final class FirstRunChecks: InitializationChecking {
             }
         }
         self.accessibilityTrusted = accessibilityTrusted ?? { AccessibilityPermission.trusted }
-        self.requestAccessibility = requestAccessibility ?? { store.switcher.openClaudeWatchAccessibilitySettings() }
+        self.requestAccessibility = requestAccessibility ?? { store.switcher.requestAccessibilityConsent() }
     }
     func begin() { store.beginInitialization(startSnapshotPolling: startSnapshotPolling) }
     func check(_ step: InitializationStep) async -> InitializationResult {

@@ -37,37 +37,31 @@ enum AccessibilityPermission {
         #endif
     }
 
+    /// Only triggers the system consent prompt. It never opens System
+    /// Settings: that would cover the prompt the user is meant to answer, so
+    /// the "Device Control and Data Access" sheet would be skipped and the
+    /// Settings window would appear to jump in front of it. The prompt itself
+    /// carries an "Open System Settings" button, so opening the pane is the
+    /// user's action, not ours.
     @MainActor static func request() {
         #if !UI_REVIEW
-        // macOS adds this running app to its permission list; approval remains a system action.
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
         #endif
     }
 
-    /// Registers this build in Privacy & Security and opens that pane.
-    ///
-    /// Only the switch in System Settings can grant the permission, so this
-    /// step is never skipped: without the pane the user has nowhere to act and
-    /// the round can only end in "not authorized". Returns whether the pane
-    /// was handed to the system, so the caller can say so when it was not.
-    @MainActor @discardableResult static func requestAndOpenSettings() -> Bool {
+    /// Explicitly opens the Accessibility pane, for the cases where the user
+    /// has already dismissed the prompt and needs to reach the switch again.
+    /// This is the "重新请求授权" path only; it must not run on the same turn
+    /// as `request()` or it would hide the consent prompt.
+    @MainActor @discardableResult static func openSettings() -> Bool {
         #if UI_REVIEW
         return true
         #else
-        request()
-        if openPane() { return true }
-        // The system prompt is presented by macOS in the same run loop turn
-        // and can swallow the first open attempt; retry once after it settles.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { _ = openPane() }
-        return false
-        #endif
-    }
-
-    @MainActor private static func openPane() -> Bool {
         for pane in settingsPanes {
             if let url = URL(string: pane), NSWorkspace.shared.open(url) { return true }
         }
         return false
+        #endif
     }
 }
