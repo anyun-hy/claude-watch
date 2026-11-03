@@ -16,12 +16,23 @@ enum GraphLaunchTarget: Equatable {
                 : ["chatgpt-desktop-main", "openai-desktop-main"].contains(process.kind)
         }
     }
-    @MainActor func blockReason(store: SwitcherStore, at now: Date) -> String? {
+    /// A launch is only impossible when the backend cannot represent the target
+    /// at all. This never depends on the (per-page) environment check, so it can
+    /// gate the button without making it look stuck.
+    @MainActor func capabilityBlockReason(store: SwitcherStore) -> String? {
         if self == .chatgpt && !store.isFixture {
             guard case .rustCandidate? = BundledBackendVariant.current() else {
                 return "当前后台不支持从此处启动 ChatGPT。"
             }
         }
+        return nil
+    }
+    /// The full pre-launch verification. This runs when the user actually taps
+    /// launch (and is re-checked inside `launch`), so the environment/session
+    /// prerequisites never gray out the button on a page that cannot satisfy
+    /// them — they only surface as a clear result on the launch attempt.
+    @MainActor func blockReason(store: SwitcherStore, at now: Date) -> String? {
+        if let reason = capabilityBlockReason(store: store) { return reason }
         if let reason = store.graphLaunchBlockReason(for: self == .claude ? .claude : .openAI, at: now) { return reason }
         if self == .claude {
             guard let evidence = store.sessionDisplayEvidence,
@@ -51,7 +62,7 @@ struct GraphLaunchButton: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
             let target = GraphLaunchTarget(product: product)
-            let reason = blockReason(for: target, at: context.date)
+            let reason = buttonBlockReason(for: target, at: context.date)
             Button {
                 pending = target
                 confirming = true
@@ -82,9 +93,9 @@ struct GraphLaunchButton: View {
     }
 
     @MainActor
-    private func blockReason(for target: GraphLaunchTarget, at now: Date) -> String? {
+    private func buttonBlockReason(for target: GraphLaunchTarget, at now: Date) -> String? {
         if processControl.busy { return "正在核对或关闭进程，请稍后再启动。" }
-        if let reason = target.blockReason(store: switcher, at: now) { return reason }
+        if let reason = target.capabilityBlockReason(store: switcher) { return reason }
         // Fast lane first: the 2s desktop-presence poll answers immediately for
         // the common "already running" case without waiting for a full backend
         // snapshot. When the backend is absent or stale (e.g. during first-run),
@@ -99,6 +110,15 @@ struct GraphLaunchButton: View {
            target.hasRunningDesktop(in: snapshot.processes) {
             return "\(target.title) 已在运行。"
         }
+        return nil
+    }
+
+    @MainActor
+    private func blockReason(for target: GraphLaunchTarget, at now: Date) -> String? {
+        if let reason = buttonBlockReason(for: target, at: now) { return reason }
+        // The environment/session prerequisites are only evaluated on the actual
+        // launch attempt, never to gray out the button.
+        if let reason = target.blockReason(store: switcher, at: now) { return reason }
         return nil
     }
 
