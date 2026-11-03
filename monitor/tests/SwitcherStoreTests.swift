@@ -485,14 +485,14 @@ struct SwitcherStoreTests {
         expect(claude?.actions.count == 3 && claude?.criteria.allSatisfy { policy in
             claude?.setting(policy).fallback == "force"
         } == true, "the supervised session keeps the full action set")
-        expect(openAI?.actions.map(\.id) == ["close", "warn"]
+        expect(openAI?.actions.map(\.id) == ["force", "close", "warn"]
                    && openAI?.criteria.allSatisfy { policy in
                        openAI?.setting(policy).fallback == "close"
                    } == true,
-               "the service closed the ordinary way offers close and warn, and assumes close")
-        expect(openAI?.actions.contains(.force) == false,
-               "force stays exclusive to the end-to-end supervised session")
-        expect(openAI?.note?.isEmpty == false, "the reduced action set is explained where it is shown")
+               "the OpenAI service offers the full action set and assumes close")
+        expect(openAI?.actions.contains(.force) == true,
+               "force is available for every supervised family")
+        expect(openAI?.note == nil, "no reduced action set means no explanation note")
         // Service differences are declared, not compared against an id string.
         expect(BackgroundServiceCatalog.descriptor("guard").toggle == Setting.guardEnabled
                    && BackgroundServiceCatalog.descriptor("watchdog").toggle == Setting.timezoneWatchdog,

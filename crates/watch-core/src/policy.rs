@@ -54,13 +54,10 @@ pub const CRITERIA: &[PolicyCriterion] = &[
 
 /// One AI service's disposition policy.
 ///
-/// The services are not the same shape and the difference is declared here:
-/// the Claude session is supervised end to end, so it can be forced to exit;
-/// ChatGPT / Codex is closed the ordinary way — the application is asked to
-/// quit and its CLI is sent SIGTERM — so it offers `close` and `warn` but
-/// never `force`. Everything that renders, validates or resolves a policy
-/// reads `actions`, so no caller can offer an action the service cannot
-/// perform.
+/// Each service declares the actions it can perform; the default is what it
+/// assumes when a key is absent. Everything that renders, validates or
+/// resolves a policy reads `actions`, so no caller can offer an action the
+/// service cannot perform.
 pub struct PolicyFamily {
     /// Logical family, matching the panel that edits it.
     pub id: &'static str,
@@ -109,9 +106,11 @@ const OPENAI: PolicyFamily = PolicyFamily {
     id: "openai",
     key_prefix: "gpt",
     providers: &[Provider::Codex, Provider::Chatgpt, Provider::Openai],
-    // Normal exit only: `force` stays Claude-only because the helper refuses
-    // to send SIGKILL to an OpenAI process tree.
-    actions: &["close", "warn"],
+    // Force is available for every supervised family. The helper issues
+    // SIGKILL to the process tree it has already identity-verified, so the
+    // same bounded force path serves Claude and ChatGPT / Codex alike; the
+    // per-product rule lives only in the policy table.
+    actions: &["force", "close", "warn"],
     default_action: "close",
 };
 pub const FAMILIES: &[PolicyFamily] = &[CLAUDE, OPENAI];

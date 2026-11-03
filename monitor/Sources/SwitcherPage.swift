@@ -512,13 +512,22 @@ struct SwitcherPage: View {
     }
     private func policyCard(_ policy: AIServicePolicy) -> some View {
         Surface(p) {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
                 Label(policy.title, systemImage: "shield.lefthalf.filled.badge.checkmark")
                     .font(WatchTypography.section)
                 Text(policy.subtitle)
-                    .font(WatchTypography.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
-                ForEach(policy.criteria) { criterion in
-                    policyRow(criterion, in: policy)
+                    .font(WatchTypography.small).foregroundStyle(p.secondary)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                // Two columns of compact rows keep the two policy tables short:
+                // each criterion is a caption over its picker instead of a full
+                // body-height row, so the pair of tables no longer dominates
+                // the protection page.
+                LazyVGrid(columns: [GridItem(.flexible(minimum: 220), spacing: 12, alignment: .leading),
+                                    GridItem(.flexible(minimum: 220), spacing: 12, alignment: .leading)],
+                          alignment: .leading, spacing: 10) {
+                    ForEach(policy.criteria) { criterion in
+                        policyCell(criterion, in: policy)
+                    }
                 }
                 if let note = policy.note {
                     InlineNotice(title: "可配置动作少于 Claude", detail: note,
@@ -527,15 +536,16 @@ struct SwitcherPage: View {
             }
         }
     }
-    private func policyRow(_ criterion: PolicyCriterion, in policy: AIServicePolicy) -> some View {
-        HStack {
-            Text(criterion.title).font(WatchTypography.body)
-            Spacer()
+    private func policyCell(_ criterion: PolicyCriterion, in policy: AIServicePolicy) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(criterion.title)
+                .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                .lineLimit(1)
             Picker(criterion.title, selection: store.choice(policy.setting(criterion))) {
                 ForEach(policy.actions) { Text($0.title).tag($0.id) }
             }
             .labelsHidden()
-            .frame(width: 128)
+            .frame(maxWidth: .infinity)
             .disabled(policy.actions.count < 2)
             .help(policy.actions.count < 2 ? "该服务当前只能配置为提示" : "选择偏离时的处置动作")
         }

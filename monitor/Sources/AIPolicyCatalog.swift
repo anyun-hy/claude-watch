@@ -19,10 +19,8 @@ struct PolicyCriterion: Identifiable {
 
 /// Disposition policy for one AI service.
 ///
-/// The services are deliberately not the same shape. Claude's session is
-/// supervised end to end, so it can be forced to exit; ChatGPT / Codex is only
-/// ever asked to quit normally, so it offers close and warn but never force.
-/// That difference lives here as data: what the UI offers, what it writes and
+/// Every supervised service declares its own action set; the default is what
+/// it assumes when a key is absent. What the UI offers, what it writes and
 /// what the backend accepts all read the same declaration, so no caller can
 /// offer an action the service cannot perform.
 ///
@@ -77,8 +75,8 @@ enum AIPolicyCatalog {
             .init(id: "dns", title: "DNS 递归出口偏离"),
             .init(id: "webrtc", title: "WebRTC 公网候选偏离"),
         ],
-        actions: [.close, .warn],
+        actions: [.force, .close, .warn],
         defaultAction: "close",
-        note: "该服务支持正常关闭：桌面应用被请求退出、独立 CLI 收到 SIGTERM，默认动作即正常关闭。不提供强制结束——强制结束只用于端到端受管的 Claude 会话。"
+        note: nil
     )
 }

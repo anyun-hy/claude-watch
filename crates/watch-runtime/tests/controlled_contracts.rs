@@ -1481,7 +1481,7 @@ fn observed_desktop_uses_shared_fresh_gate_and_only_creates_identity_leases() {
         // The observation target belongs to a supervised family, so the guard
         // accepts it. The leftover unparseable session file is read as state
         // corruption: protection refuses to run unverified, and the family's
-        // own action applies — a normal close, never the Claude force tier.
+        // own default action applies — a normal close.
         let guard_receipt = controller.guard_tick(&mut system).unwrap();
         assert_eq!(
             guard_receipt["session_guard"]["reason"]["code"],

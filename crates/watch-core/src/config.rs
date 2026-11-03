@@ -435,8 +435,8 @@ mod protection_tests {
         assert!(!config.require_dns && !config.require_stun);
         for criterion in ["ip", "cn", "dns", "webrtc"] {
             assert_eq!(config.action("claude", criterion), "force");
-            // ChatGPT / Codex closes the ordinary way: the family offers
-            // close and warn, never the Claude force tier.
+            // ChatGPT / Codex assumes a normal close when no key is set; it
+            // may still be configured to force.
             assert_eq!(config.action("openai", criterion), "close");
         }
     }
@@ -486,22 +486,27 @@ mod protection_tests {
             strict.close_action("dns_and_webrtc_egress_changed", Provider::Claude),
             "close"
         );
-        // Forcing an OpenAI process tree is not a capability of this service,
-        // so a stored value must never claim to perform one.
+        // Force is available to every supervised family, so an OpenAI key may
+        // be configured to force, and only values outside the three documented
+        // actions are rejected.
+        let forced =
+            Config::from_value(json!({"gpt_close_cn":"force","gpt_close_ip":"close"})).unwrap();
+        assert_eq!(forced.close_action("egress_country_cn", Provider::Codex), "force");
+        assert_eq!(forced.close_action("egress_ip_changed", Provider::Chatgpt), "close");
         for bad in [
             json!({"gpt_close_ip":"kill"}),
             json!({"gpt_close_cn":true}),
-            json!({"gpt_close_cn":"force"}),
+            json!({"gpt_close_cn":"FORCE"}),
         ] {
             assert_eq!(Config::from_value(bad).unwrap_err().code, "invalid_config");
         }
-        // A value written by an older build, before the exit path existed,
-        // degrades to the notice action instead of being performed as stored.
+        // A stored force value is now performable, so it resolves to force
+        // instead of degrading.
         let mut stale = Config::default();
         stale
             .policy_actions
             .insert("gpt_close_webrtc".into(), "force".into());
-        assert_eq!(stale.close_action("webrtc_egress_changed", Provider::Codex), "warn");
+        assert_eq!(stale.close_action("webrtc_egress_changed", Provider::Codex), "force");
         assert_eq!(stale.close_action("webrtc_egress_changed", Provider::Claude), "force");
     }
     #[test]
