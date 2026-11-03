@@ -85,6 +85,13 @@ struct GraphLaunchButton: View {
     private func blockReason(for target: GraphLaunchTarget, at now: Date) -> String? {
         if processControl.busy { return "正在核对或关闭进程，请稍后再启动。" }
         if let reason = target.blockReason(store: switcher, at: now) { return reason }
+        // Fast lane first: the 2s desktop-presence poll answers immediately for
+        // the common "already running" case without waiting for a full backend
+        // snapshot. When the backend is absent or stale (e.g. during first-run),
+        // fall back to the snapshot's desktop-main processes.
+        if monitor.desktopRunning[target == .claude ? .claude : .openAI] == true {
+            return "\(target.title) 已在运行。"
+        }
         let sampleTime = switcher.isFixture ? monitor.now.timeIntervalSince1970 : now.timeIntervalSince1970
         if monitor.error == nil, let snapshot = monitor.snapshot,
            snapshot.health.state == "running",

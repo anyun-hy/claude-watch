@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import UserNotifications
+import AppKit
 
 enum ReadOutcome: Sendable {
     case success(MonitorSnapshot)
@@ -153,6 +154,12 @@ final class MonitorStore: ObservableObject {
     @Published var refreshing = false
     @Published var automatic = true
     @Published private(set) var notificationAccess = WatchNotificationAccess.unknown
+    /// Live desktop-app presence, read every fast tick straight from AppKit
+    /// (`NSRunningApplication`) with no backend round-trip. This is the cheap
+    /// "fast lane" that keeps the launch/quit buttons accurate within ~2s even
+    /// though the full backend snapshot (CLI/daemon/connections) still arrives
+    /// on the relaxed ~20s cadence.
+    @Published private(set) var desktopRunning: [MonitoredProduct: Bool] = [:]
     @Published var page: Page = .environment
     @Published var now = Date()
     @Published var networkSelection = NetworkGraphSelection()
@@ -161,6 +168,7 @@ final class MonitorStore: ObservableObject {
     private var referenceQueryRunning = false
     private var referenceQueriesEnabled = false
     private var timer: Timer?
+    private var workspaceObserver: WorkspaceAppObserver?
     private var lastFull: Date = .distantPast
     private var lastBackgroundRead: Date = .distantPast
     private var backgroundReadRunning = false
@@ -217,6 +225,17 @@ final class MonitorStore: ObservableObject {
         if !initializing { refreshBackgroundIfNeeded(at: Date()) }
         referenceQueriesEnabled = !initializing
         refresh(full: true)
+        // Desktop app launches/terminations are now event-driven: the moment
+        // macOS posts a launch/quit notification for a supervised app, the
+        // snapshot re-reads immediately (no polling lag). The timer below is
+        // only the coarse fallback for CLI processes and health freshness.
+        if workspaceObserver == nil {
+            workspaceObserver = WorkspaceAppObserver { [weak self] in
+                guard let self else { return }
+                self.refresh(full: true, manual: true)
+            }
+            workspaceObserver?.start()
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
@@ -248,6 +267,10 @@ final class MonitorStore: ObservableObject {
         now = date
         leakChecks.now = date
         aiChecks.now = date
+        // The cheap desktop-presence fast lane runs every tick regardless of
+        // automatic detection state, so launch/quit buttons stay accurate even
+        // when background network detection is paused.
+        refreshDesktopState()
         // Login freshness is a display fact and must age even while automatic
         // network/environment detection is paused.
         switcher.advanceLoginClock(date)
@@ -262,7 +285,7 @@ final class MonitorStore: ObservableObject {
             // the main view; otherwise a healthy service always appears stale
             // 30 seconds after the final check.
             refreshBackgroundIfNeeded(at: date)
-            refresh(full: date.timeIntervalSince(lastFull) >= 15)
+            refresh(full: date.timeIntervalSince(lastFull) >= 20)
             return
         }
         refreshBackgroundIfNeeded(at: date)
@@ -270,7 +293,32 @@ final class MonitorStore: ObservableObject {
         Task { @MainActor [weak switcher] in
             await switcher?.refreshCurrentLogin()
         }
-        refresh(full: date.timeIntervalSince(lastFull) >= 15)
+        // Desktop app changes arrive via WorkspaceAppObserver; this interval is
+        // the coarse fallback for CLI processes (no .app launch event) and for
+        // general health freshness, so it can stay relaxed.
+        refresh(full: date.timeIntervalSince(lastFull) >= 20)
+    }
+    /// Reads the supervised desktop apps' presence straight from AppKit. This is
+    /// the fast lane: `NSRunningApplication` answers in microseconds and never
+    /// touches the Rust backend, so it can run on the 2s tick while the full
+    /// snapshot (which also resolves CLI/daemon/connections) stays at ~20s.
+    /// The bundle-id → product mapping mirrors `WorkspaceAppObserver` and the
+    /// desktop attribution in `AIProcessInventory.read()`.
+    private func refreshDesktopState() {
+        let claudeBundles = Set(["com.anthropic.claudefordesktop"])
+        let openAIBundles = Set(["com.openai.codex", "com.openai.chat"])
+        let running = NSWorkspace.shared.runningApplications
+        let claudeRunning = running.contains { app in
+            app.bundleIdentifier.map(claudeBundles.contains) ?? false
+        }
+        let openAIRunning = running.contains { app in
+            app.bundleIdentifier.map(openAIBundles.contains) ?? false
+        }
+        let next: [MonitoredProduct: Bool] = [
+            .claude: claudeRunning,
+            .openAI: openAIRunning,
+        ]
+        if next != desktopRunning { desktopRunning = next }
     }
     func refresh(full: Bool, manual: Bool = false) {
         if manual { refreshBackgroundIfNeeded(at: Date(), force: true) }
@@ -321,7 +369,7 @@ final class MonitorStore: ObservableObject {
     }
     private func refreshBackgroundIfNeeded(at date: Date, force: Bool = false) {
         guard !backgroundReadRunning, !switcher.busy,
-              force || date.timeIntervalSince(lastBackgroundRead) >= 15 else { return }
+              force || date.timeIntervalSince(lastBackgroundRead) >= 5 else { return }
         backgroundReadRunning = true
         lastBackgroundRead = date
         Task { @MainActor in
