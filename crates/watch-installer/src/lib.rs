@@ -12,7 +12,7 @@ pub mod layout;
 pub mod plist;
 pub mod runner;
 
-pub use flow::{app_identity, perform, LayoutPlan};
+pub use flow::{app_identity, perform, LayoutPlan, Outcome};
 pub use layout::Layout;
 pub use runner::{Output, RunMode, Runner, SystemRunner};
 

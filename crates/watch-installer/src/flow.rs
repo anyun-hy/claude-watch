@@ -9,7 +9,7 @@ use claude_watch_core::error::Result;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -806,6 +806,15 @@ fn verify_signature(runner: &dyn Runner, app: &Path) -> Result<bool> {
     Ok(output.success())
 }
 
+/// What the flow actually did. A cancelled run is not a successful install,
+/// and the caller must be able to say so instead of reporting success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Installed,
+    DryRun,
+    Cancelled,
+}
+
 /// Runs the full flow. `sleep` is injected so contract tests never wait.
 pub fn perform(
     layout: &Layout,
@@ -817,7 +826,7 @@ pub fn perform(
     uid: u32,
     cargo: &Path,
     sleep: &dyn Fn(Duration),
-) -> Result<()> {
+) -> Result<Outcome> {
     validate_arguments(version, build)?;
     check_build_inputs(layout, runner, cargo)?;
     let stamp = tag(runner)?;
@@ -830,18 +839,36 @@ pub fn perform(
     if [&app_out, &dmg, &sha].iter().any(|path| exists(path)) {
         return Err(blocked("本次输出路径已存在，未覆盖。"));
     }
-    let plan = preflight(layout, runner, uid)?;
+    // The plan is printed before preflight on purpose: a preflight that stops
+    // the flow must never look like "nothing happened, no idea what this
+    // command does". Target and phases are known before any check runs.
+    println!("Watch 重装：目标 {version} / build {build}（arm64 Rust 候选版）");
+    println!("流程：卸载已安装应用 → 清理 Watch 专属数据 → 打包 DMG → 校验 → 安装");
+    let _ = std::io::stdout().flush();
+    let plan = preflight(layout, runner, uid).map_err(|error| {
+        println!(
+            "预检未通过：{}；没有卸载、删除、打包或安装。",
+            error.message
+        );
+        let _ = std::io::stdout().flush();
+        error
+    })?;
     let old = plan
         .old_identity
         .as_ref()
         .map(|(version, build)| format!("{version} / build {build}"))
         .unwrap_or_else(|| "当前未安装".into());
-    println!("当前：{old}；目标：{version} / build {build}（arm64 Rust 候选版）。");
+    println!("已安装：{old}");
     println!("将永久删除 Claude Watch 的设置、日志、A/B 快照及其自有后台；保留 Claude 登录、TAG 配置和独立原版工具。");
     println!("流程先卸载再打包；如果打包失败，旧应用已卸载，请保留输出并检查当前状态。");
+    // The confirmation prompt writes to stderr; without flushing stdout the
+    // preview can stay in the pipe buffer and the prompt looks like it came
+    // out of nowhere (or, when the output is captured, from nowhere at all).
+    let _ = std::io::stdout().flush();
     if dry_run {
         println!("预演通过：没有卸载、删除、打包或安装。");
-        return Ok(());
+        let _ = std::io::stdout().flush();
+        return Ok(Outcome::DryRun);
     }
     if confirm("输入 y/N 重置并安装继续，其他输入取消：")?
         .trim()
@@ -849,7 +876,8 @@ pub fn perform(
         != "y"
     {
         println!("已取消，没有执行重置。");
-        return Ok(());
+        let _ = std::io::stdout().flush();
+        return Ok(Outcome::Cancelled);
     }
     let _lock = acquire_lock(layout, uid)?;
     let current = preflight(layout, runner, uid)?;
@@ -858,6 +886,8 @@ pub fn perform(
     }
     let mut trashed: Option<PathBuf> = None;
     if plan.old_identity.is_some() {
+        println!("[1/4] 卸载已安装应用（移入废纸篓，可恢复）。");
+        let _ = std::io::stdout().flush();
         let engine = layout.app.join("Contents/Resources/watch-engine");
         let result = json_command(
             runner,
@@ -1009,5 +1039,5 @@ pub fn perform(
     require(opened.success(), "应用已安装，但未能自动打开。")?;
     println!("已安装 {version} / build {build}；安装包：{}", dmg.display());
     println!("请按 macOS 提示授权；实际后台和保护功能仍需打开应用后核验。");
-    Ok(())
+    Ok(Outcome::Installed)
 }

@@ -455,7 +455,7 @@ impl Harness {
         let fake = Fake::new(&root);
         Self { root, fake }
     }
-    fn perform(&self, version: &str, build: &str, dry: bool, answer: &str) -> Result<()> {
+    fn perform(&self, version: &str, build: &str, dry: bool, answer: &str) -> Result<flow::Outcome> {
         let mut confirm = |_: &str| Ok(answer.to_string());
         flow::perform(
             &self.fake.layout,
@@ -469,7 +469,7 @@ impl Harness {
             &|_: Duration| {},
         )
     }
-    fn perform_with<F>(&self, confirm: &mut F) -> Result<()>
+    fn perform_with<F>(&self, confirm: &mut F) -> Result<flow::Outcome>
     where
         F: FnMut(&str) -> Result<String>,
     {
@@ -516,7 +516,7 @@ impl Harness {
             "keep trash"
         );
     }
-    fn blocked(&self, outcome: Result<()>, needle: &str) {
+    fn blocked<T: std::fmt::Debug>(&self, outcome: Result<T>, needle: &str) {
         let error = outcome.expect_err("flow must stop");
         assert!(
             error.message.contains(needle),
@@ -582,8 +582,16 @@ fn full_workflow_removes_only_watch_data_and_installs_requested_build() {
 #[test]
 fn preview_and_cancel_are_read_only() {
     let h = Harness::new();
-    h.perform("3.0.0", "314", true, "y").expect("dry run");
-    h.perform("3.0.0", "314", false, "取消").expect("cancel");
+    assert_eq!(
+        h.perform("3.0.0", "314", true, "y").expect("dry run"),
+        flow::Outcome::DryRun,
+        "a preview never reports an install"
+    );
+    assert_eq!(
+        h.perform("3.0.0", "314", false, "取消").expect("cancel"),
+        flow::Outcome::Cancelled,
+        "declining the prompt is a cancel, not an install"
+    );
     assert!(h.fake.layout.app.exists());
     assert!(h.fake.layout.base().exists());
     let forbidden = h.fake.calls().into_iter().any(|call| {

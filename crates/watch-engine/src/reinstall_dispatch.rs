@@ -4,9 +4,9 @@ use claude_watch_core::{
     cli::Request,
     error::{CoreError, Result},
 };
-use claude_watch_installer::{Layout, SystemRunner};
+use claude_watch_installer::{Layout, Outcome, SystemRunner};
 use serde_json::{json, Value};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -38,26 +38,60 @@ pub fn dispatch(request: &Request, uid: u32) -> Result<Option<Value>> {
     if !project.is_absolute() {
         return Err(CoreError::new("invalid_arguments", "--project 必须是绝对路径"));
     }
+    let dry_run = request.flag("dry-run");
+    // The flow removes the installed app, so it is only ever allowed to run
+    // with a human at the keyboard. Reading stdin from a pipe or /dev/null
+    // returns end-of-file, which would silently look like "cancelled" and
+    // leave the caller (and the user) unsure whether anything happened.
+    if !dry_run && !std::io::stdin().is_terminal() {
+        return Err(CoreError::new(
+            "confirmation_unavailable",
+            "重装需要交互确认，请在终端里直接运行 monitor/reinstall.sh；只想看预演请加 --dry-run。",
+        ));
+    }
     let layout = Layout::for_current_user(project, uid);
     let cargo = std::env::var_os("CW_CARGO_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| layout.home.join(".cargo/bin/cargo"));
-    claude_watch_installer::perform(
+    let outcome = claude_watch_installer::perform(
         &layout,
         &SystemRunner,
         &version,
         &build,
-        request.flag("dry-run"),
+        dry_run,
         &mut prompt_confirm,
         uid,
         &cargo,
         &|duration: Duration| std::thread::sleep(duration),
     )?;
-    Ok(Some(json!({
-        "status": "ok",
-        "action": "reinstall",
-        "engine": "rust",
-        "version": version,
-        "build": build,
-    })))
+    let _ = std::io::stdout().flush();
+    let value = match outcome {
+        Outcome::Installed => json!({
+            "status": "ok",
+            "action": "reinstall",
+            "engine": "rust",
+            "installed": true,
+            "version": version,
+            "build": build,
+        }),
+        Outcome::DryRun => json!({
+            "status": "preview",
+            "action": "reinstall",
+            "engine": "rust",
+            "installed": false,
+            "version": version,
+            "build": build,
+            "message": "预演通过；没有卸载、删除、打包或安装。",
+        }),
+        Outcome::Cancelled => json!({
+            "status": "cancelled",
+            "action": "reinstall",
+            "engine": "rust",
+            "installed": false,
+            "version": version,
+            "build": build,
+            "message": "已取消；没有卸载、删除、打包或安装。",
+        }),
+    };
+    Ok(Some(value))
 }

@@ -34,7 +34,11 @@ impl Layout {
         }
     }
     /// The real layout for the logged-in user, given the project root.
-    pub fn for_current_user(project: PathBuf, uid: u32) -> Self {
+    ///
+    /// `uid` is the human running the flow. The system helper is not theirs:
+    /// it lives under `/Library` and is owned by root, so ownership checks
+    /// must compare against root, never against the caller.
+    pub fn for_current_user(project: PathBuf, _uid: u32) -> Self {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/".into()));
         Self::new(
             home,
@@ -43,7 +47,7 @@ impl Layout {
             PathBuf::from("/Library/LaunchDaemons/io.local.claudewatch.timezone.plist"),
             project,
             PathBuf::from("/private/tmp"),
-            uid,
+            0,
         )
     }
     pub fn base(&self) -> PathBuf {
@@ -87,5 +91,23 @@ impl Layout {
     }
     pub fn helper_label(&self) -> String {
         "system/io.local.claudewatch.timezone".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_system_helper_belongs_to_root_not_to_the_caller() {
+        let layout = Layout::for_current_user(PathBuf::from("/tmp/project"), 501);
+        assert_eq!(
+            layout.system_uid, 0,
+            "the helper under /Library is root-owned; comparing it with the login uid blocks every reinstall"
+        );
+        assert_eq!(
+            layout.helper(),
+            PathBuf::from("/Library/Application Support/ClaudeWatch/claude-watch-admin.sh")
+        );
     }
 }
