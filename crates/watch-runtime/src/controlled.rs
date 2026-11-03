@@ -12,6 +12,11 @@ use claude_watch_core::{
 use serde_json::{json, Value};
 use std::{fs, time::Duration};
 
+mod disposition;
+use disposition::{confirmed_egress_code, PendingRisk, StopOutcome};
+#[cfg(test)]
+mod guard_regressions;
+
 pub trait DesktopSystem {
     fn prepare_cli(&mut self) -> Result<()> {
         Err(CoreError::new(
@@ -89,7 +94,7 @@ pub struct CliOutcome {
 pub struct Controller {
     pub storage: StateStore,
     failed_persistence_session:
-        std::sync::Mutex<std::collections::HashMap<&'static str, Option<String>>>,
+        std::sync::Mutex<std::collections::HashMap<&'static str, PendingRisk>>,
 }
 impl Controller {
     pub fn new(storage: StateStore) -> Self {
@@ -177,7 +182,8 @@ impl Controller {
         let _launch = self.storage.lock("launch", None)?;
         if !system.launch_target().protected() {
             return self.launch_observation(system);
-        }        if !system.desktops()?.is_empty() {
+        }
+        if !system.desktops()?.is_empty() {
             return Err(CoreError::new(
                 "claude_already_running",
                 "Claude 已在运行，不能补建受控启动会话",
@@ -427,107 +433,6 @@ impl Controller {
             diagnostic,
         })
     }
-    /// Configured action for a confirmed risk code, resolved in the policy
-    /// family of the service being supervised. Which service that is comes
-    /// from the launch target, so one engine answers for every family the
-    /// configuration declares. A load failure resolves to the table's own
-    /// default for that criterion — never to a hardcoded close — so a policy
-    /// the user set to a notice can never be escalated by a read error.
-    fn close_action(&self, code: &str, provider: Provider) -> String {
-        ConfigStore {
-            storage: self.storage.clone(),
-        }
-        .load()
-        .map(|config| config.close_action(code, provider))
-        .unwrap_or_else(|_| {
-            let action = PolicyCatalog::criterion_for(code)
-                .and_then(|criterion| criterion.default_action)
-                .unwrap_or("warn");
-            match PolicyCatalog::family_for(provider) {
-                Some(family) if family.performable(action) => action.to_string(),
-                Some(family) => family.fallback().to_string(),
-                None => "warn".to_string(),
-            }
-        })
-    }
-    /// Strictest configured action across the two confirmed-egress criteria.
-    /// Used by the persistence-failure path, which has no key of its own and
-    /// is a consequence of one of these drifts.
-    fn egress_drift_action(&self, provider: Provider) -> String {
-        let ip = self.close_action("egress_ip_changed", provider);
-        let cn = self.close_action("egress_country_cn", provider);
-        if ip == "force" || cn == "force" {
-            "force".to_string()
-        } else if ip == "close" || cn == "close" {
-            "close".to_string()
-        } else {
-            "warn".to_string()
-        }
-    }
-    fn timed_guard_quit<S: DesktopSystem>(
-        &self,
-        system: &mut S,
-        receipt: &mut Value,
-    ) -> Result<()> {
-        let started = std::time::Instant::now();
-        receipt["stop_started_at"] = json!(system.now());
-        let reported = receipt["session_guard"]["reason"]["code"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        // A mainland exit is a confirmed drift even when it is also the reason
-        // no session exists, so it must be judged by its own criterion here
-        // too. Without this the stop step would re-read the coarse
-        // "no session" code and downgrade an explicit force to a notice.
-        let code = if reported == "session_missing"
-            && session::Egress::fresh(
-                &system.egress(),
-                system.now(),
-                session::GUARD_EGRESS_TTL,
-            )
-            .is_some_and(|exit| exit.country == "CN")
-        {
-            "egress_country_cn".to_string()
-        } else {
-            reported
-        };
-        // The supervised service decides what may be done: only a family that
-        // declares `force` ever reaches the bounded force path, whatever the
-        // risk code is.
-        let provider = system.launch_target().provider();
-        let can_force =
-            PolicyCatalog::family_for(provider).is_some_and(|family| family.performable("force"));
-        // A persistence failure has no key of its own: it means a confirmed
-        // egress drift could not be recorded. It is therefore judged by the
-        // drift criteria that produced it, and inherits their strictest
-        // configured action instead of forcing a close the user never chose.
-        let action = if code == "egress_risk_persist_failed" {
-            self.egress_drift_action(provider)
-        } else {
-            self.close_action(&code, provider)
-        };
-        receipt["stop_action"] = json!(action);
-        // Last fuse before any process is touched: a warn action never closes,
-        // whichever branch reached this function.
-        if action == "warn" {
-            receipt["stop_state"] = json!("skipped_warn_only");
-            receipt["action"] = json!("observe");
-            return Ok(());
-        }
-        let confirmed_ip = can_force && action == "force";
-        let result = if confirmed_ip {
-            let mut forced = None;
-            let result = system.quit_for_confirmed_ip_risk(&mut forced);
-            receipt["stop_force_requested"] = json!(forced);
-            receipt["stop_force_reported"] = json!(forced.is_some());
-            result
-        } else {
-            system.quit_desktop()
-        };
-        receipt["stop_completed_at"] = json!(system.now());
-        receipt["stop_elapsed_seconds"] = json!(started.elapsed().as_secs_f64());
-        result
-    }
     pub fn guard_tick<S: DesktopSystem>(&self, system: &mut S) -> Result<Value> {
         // Which services the guard supervises is declared by the policy table,
         // not by the caller: one engine answers for every family the table
@@ -645,7 +550,7 @@ impl Controller {
                                         )
                                     })?
                                     .get(family)
-                                    .and_then(|v| v.as_ref())
+                                    .map(|risk| &risk.session_id)
                                     == Some(&previous.session_id);
                             if risk_latched && tree_running {
                                 // A confirmed risk stays latched until the
@@ -770,7 +675,8 @@ impl Controller {
                                 system.now(),
                                 || self.timed_guard_quit(system, &mut receipt),
                             ) {
-                                Ok(Some(())) => {
+                                Ok(Some(StopOutcome::SkippedWarn)) => {}
+                                Ok(Some(StopOutcome::Confirmed)) => {
                                     receipt["action"] = json!("close-desktop");
                                     receipt["stop_state"] = json!("confirmed");
                                     self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"), &json!({"stopped_at":system.now(),"session_id":ended.session_id,"reason":outcome.reason,"force_requested":receipt["stop_force_requested"],"force_reported":receipt["stop_force_reported"]}))?;
@@ -836,7 +742,8 @@ impl Controller {
                             system.now(),
                             || self.timed_guard_quit(system, &mut receipt),
                         ) {
-                            Ok(Some(())) => {
+                            Ok(Some(StopOutcome::SkippedWarn)) => {}
+                            Ok(Some(StopOutcome::Confirmed)) => {
                                 receipt["action"] = json!("close-desktop");
                                 receipt["stop_state"] = json!("confirmed");
                                 self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"), &json!({"stopped_at":system.now(),"session_id":ended.session_id,"reason":outcome.reason,"force_requested":receipt["stop_force_requested"],"force_reported":receipt["stop_force_reported"]}))?;
@@ -904,16 +811,9 @@ impl Controller {
             }
             let now = system.now();
             let id = current.as_ref().map(|s| s.session_id.clone());
-            let latched = {
-                let mut remembered = self.failed_persistence_session.lock().map_err(|_| {
-                    CoreError::new("guard_memory_unavailable", "保护内存状态不可用")
-                })?;
-                if remembered.get(family).and_then(|v| v.as_ref()) != id.as_ref() {
-                    remembered.insert(family, None);
-                }
-                remembered.get(family).is_some_and(|v| v.is_some())
-            };
-            if latched {
+            let latched = self.pending_risk(family, id.as_deref())?;
+            if let Some(risk) = latched {
+                receipt["persistence_risk_code"] = json!(risk.code);
                 receipt["persistence_error"] = json!("state_io_failed");
                 receipt["status"] = json!("protection_triggered");
                 receipt["session_id"] = json!(id);
@@ -924,7 +824,8 @@ impl Controller {
                     match sessions.close_if_current(id.as_deref(), system.now(), || {
                         self.timed_guard_quit(system, &mut receipt)
                     }) {
-                        Ok(Some(())) => {
+                        Ok(Some(StopOutcome::SkippedWarn)) => {}
+                        Ok(Some(StopOutcome::Confirmed)) => {
                             receipt["action"] = json!("close-desktop");
                             receipt["stop_state"] = json!("confirmed");
                         }
@@ -947,9 +848,9 @@ impl Controller {
                 receipt["session_guard"] =
                     session::status(current.as_ref().unwrap(), system.now(), Some(true));
                 // A warn-configured criterion keeps notifying without closing,
-                // including every round after the session latched to Locked.
-                // Codes without a warn tier (notably persistence failures)
-                // keep the configured close/force behavior below.
+                // including later Locked rounds. Before reporting the old
+                // notice, recheck independent confirmed risks against their
+                // own actions; a notice is not a global supervision pause.
                 let code = current
                     .as_ref()
                     .and_then(|s| s.reason.as_ref())
@@ -960,6 +861,9 @@ impl Controller {
                     // has cleared, resume normal supervision instead of
                     // latching the notice until the session ends.
                     let session = current.as_ref().unwrap();
+                    if self.recheck_warning(system, &sessions, family, session, &mut receipt)? {
+                        return Ok(());
+                    }
                     let resolved = match code.as_str() {
                         "egress_ip_changed" | "egress_country_cn" => {
                             let egress = system.egress();
@@ -998,7 +902,8 @@ impl Controller {
                 match sessions.close_if_current(id.as_deref(), system.now(), || {
                     self.timed_guard_quit(system, &mut receipt)
                 }) {
-                    Ok(Some(())) => {
+                    Ok(Some(StopOutcome::SkippedWarn)) => {}
+                    Ok(Some(StopOutcome::Confirmed)) => {
                         receipt["action"] = json!("close-desktop");
                         receipt["stop_state"] = json!("confirmed");
                         self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"), &json!({"stopped_at":system.now(),"session_id":id,"reason":current.as_ref().and_then(|value| value.reason.as_ref()),"force_requested":receipt["stop_force_requested"],"force_reported":receipt["stop_force_reported"]}))?;
@@ -1052,21 +957,8 @@ impl Controller {
                     };
                 let egress = system.egress();
                 let checked_at = system.now();
-                let confirmed_exit = current
-                    .as_ref()
-                    .and_then(|s| {
-                        session::Egress::fresh(&egress, checked_at, session::GUARD_EGRESS_TTL).map(
-                            |e| {
-                                (s.state != session::Phase::Rechecking
-                                    || e.observed_at >= s.created_at)
-                                    && (e.country == "CN"
-                                        || (s.extra.get("recheck_baseline_pending")
-                                            != Some(&json!(true))
-                                            && e.ip != s.baseline.ip))
-                            },
-                        )
-                    })
-                    .unwrap_or(false);
+                let confirmed_exit = current.as_ref()
+                    .and_then(|session| confirmed_egress_code(session, &egress, checked_at));
                 let local_unknown = local["proxy"] != "ok" || local["tun"] != "ok";
                 match sessions.check_verified_local(
                     &receipts,
@@ -1078,37 +970,29 @@ impl Controller {
                     local_unknown,
                 ) {
                     Ok(outcome) => outcome,
-                    Err(error) if confirmed_exit && error.code == "state_io_failed" => {
+                    Err(error) if confirmed_exit.is_some() && error.code == "state_io_failed" => {
+                        let risk_code = confirmed_exit.ok_or_else(|| {
+                            CoreError::new("egress_unconfirmed", "未确认出口风险，未授权处置")
+                        })?;
+                        receipt["persistence_risk_code"] = json!(risk_code);
                         receipt["status"] = json!("degraded");
                         receipt["session_id"] = json!(id);
                         receipt["session_guard"] = json!({"state":"risk", "reason":{"code":"egress_risk_persist_failed", "detail":"出口风险已确认，会话记录写入失败"}});
                         receipt["persistence_error"] = json!(error.code);
-                        self.failed_persistence_session
-                            .lock()
-                            .map_err(|_| {
-                                CoreError::new("guard_memory_unavailable", "保护内存状态不可用")
-                            })?
-                            .insert(family, id.clone());
+                        self.remember_risk(family, id.as_deref(), risk_code)?;
                         match sessions.close_if_current_before(
                             id.as_deref(),
                             system.now(),
                             checked_at,
                             || self.timed_guard_quit(system, &mut receipt),
                         ) {
-                            Ok(Some(())) => {
+                            Ok(Some(StopOutcome::SkippedWarn)) => {}
+                            Ok(Some(StopOutcome::Confirmed)) => {
                                 receipt["action"] = json!("close-desktop");
                                 receipt["stop_state"] = json!("confirmed");
                             }
                             Ok(None) => {
-                                self.failed_persistence_session
-                                    .lock()
-                                    .map_err(|_| {
-                                        CoreError::new(
-                                            "guard_memory_unavailable",
-                                            "保护内存状态不可用",
-                                        )
-                                    })?
-                                    .insert(family, None);
+                                self.forget_risk(family, id.as_deref())?;
                                 receipt["stop_state"] = json!("session_changed");
                             }
                             Err(stop_error) => {
@@ -1174,7 +1058,8 @@ impl Controller {
                 match sessions.close_if_current(expected, system.now(), || {
                     self.timed_guard_quit(system, &mut receipt)
                 }) {
-                    Ok(Some(())) => {
+                    Ok(Some(StopOutcome::SkippedWarn)) => {}
+                    Ok(Some(StopOutcome::Confirmed)) => {
                         receipt["action"] = json!("close-desktop");
                         receipt["stop_state"] = json!("confirmed");
                         self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"), &json!({"stopped_at":system.now(),"session_id":expected,"reason":outcome.reason,"force_requested":receipt["stop_force_requested"],"force_reported":receipt["stop_force_reported"]}))?;
@@ -1214,7 +1099,8 @@ impl Controller {
                 match sessions
                     .close_if_unreadable(system.now(), || self.timed_guard_quit(system, receipt))
                 {
-                    Ok(Some(_)) => {
+                    Ok(Some(StopOutcome::SkippedWarn)) => {}
+                    Ok(Some(StopOutcome::Confirmed)) => {
                         receipt["action"] = json!("close-desktop");
                         receipt["stop_state"] = json!("confirmed");
                     }
@@ -1229,20 +1115,17 @@ impl Controller {
         };
         let id = current.as_ref().map(|s| s.session_id.clone());
         receipt["session_id"] = json!(id);
-        let latched = self
-            .failed_persistence_session
-            .lock()
-            .map_err(|_| CoreError::new("guard_memory_unavailable", "保护内存状态不可用"))?
-            .get(family)
-            .is_some_and(|v| v.as_ref() == id.as_ref());
-        if latched {
+        let latched = self.pending_risk(family, id.as_deref())?;
+        if let Some(risk) = latched {
+            receipt["persistence_risk_code"] = json!(risk.code);
             receipt["status"] = json!("protection_triggered");
             receipt["persistence_error"] = json!("state_io_failed");
             receipt["session_guard"] = json!({"state":"locked", "phase":"locked", "reason":{"code":"egress_risk_persist_failed", "detail":"出口风险已确认，会话记录写入失败"}});
             match sessions.close_if_current(id.as_deref(), system.now(), || {
                 self.timed_guard_quit(system, receipt)
             }) {
-                Ok(Some(())) => {
+                Ok(Some(StopOutcome::SkippedWarn)) => {}
+                Ok(Some(StopOutcome::Confirmed)) => {
                     receipt["action"] = json!("close-desktop");
                     receipt["stop_state"] = json!("confirmed");
                 }
@@ -1266,6 +1149,13 @@ impl Controller {
                 .map(|reason| reason.code.clone())
                 .unwrap_or_default();
             if self.close_action(&found, system.launch_target().provider()) == "warn" {
+                // A failure in another sampler cannot hide a fresh HTTP exit.
+                // Failure to recheck is still unknown, never invented risk.
+                match self.recheck_warning(system, &sessions, family, value, receipt) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {},
+                    Err(error) => receipt["warning_recheck_error"] = json!(error.code),
+                }
                 receipt["session_notice"] = json!({
                     "code": found,
                     "detail": value.reason.as_ref().map(|reason| reason.detail.clone()),
@@ -1278,7 +1168,8 @@ impl Controller {
             match sessions.close_if_current(id.as_deref(), system.now(), || {
                 self.timed_guard_quit(system, receipt)
             }) {
-                Ok(Some(())) => {
+                Ok(Some(StopOutcome::SkippedWarn)) => {}
+                Ok(Some(StopOutcome::Confirmed)) => {
                     receipt["action"] = json!("close-desktop");
                     receipt["stop_state"] = json!("confirmed");
                 }
@@ -1319,7 +1210,8 @@ impl Controller {
                     match sessions.close_if_current(id.as_deref(), system.now(), || {
                         self.timed_guard_quit(system, receipt)
                     }) {
-                        Ok(Some(_)) => {
+                        Ok(Some(StopOutcome::SkippedWarn)) => {}
+                        Ok(Some(StopOutcome::Confirmed)) => {
                             receipt["action"] = json!("close-desktop");
                             receipt["stop_state"] = json!("confirmed");
                         }
