@@ -1,6 +1,7 @@
 use crate::storage::StateStore;
 use claude_watch_core::error::{CoreError, Result};
-use claude_watch_core::processes::Provider;
+use claude_watch_core::policy::PolicyCatalog;
+use claude_watch_core::processes::{LaunchTarget, Provider};
 use claude_watch_core::session::{self, CheckInput, Desktop, Launcher, Outcome, Phase, Session};
 use serde_json::json;
 use serde_json::Value;
@@ -56,6 +57,7 @@ impl SessionStore {
     /// Low-level compatibility seam for in-crate transition tests. Production
     /// dispatchers must call `begin_verified`, which reconstructs risk from
     /// private receipts rather than accepting a caller-selected state.
+    #[cfg(test)]
     fn begin(&self, audit: &Value, current: &Value, risk: &Value, now: f64) -> Result<Session> {
         let _lock = self.storage.lock(&self.lock_name(), None)?;
         let value = session::begin(audit, current, risk, &Uuid::new_v4().to_string(), now)?;
@@ -87,22 +89,7 @@ impl SessionStore {
                 "展示结果不能授予启动许可，必须重新执行完整预检",
             ));
         }
-        // The audit names the service it authorises, and this store writes one
-        // family's session record. A store must never accept another family's
-        // audit: doing so would either fail the launch gate against the wrong
-        // target or overwrite a different service's session file. Deriving the
-        // family from the audit — instead of a fixed one — is what lets the
-        // OpenAI family establish a session at all.
-        let audit_family = claude_watch_core::policy::PolicyCatalog::family_for(
-            claude_watch_core::session::audit_target(audit).provider(),
-        )
-        .map(|family| family.id);
-        if audit_family.is_some_and(|family| family != self.family) {
-            return Err(CoreError::new(
-                "launch_target_mismatch",
-                "启动审计与目标或授权范围不一致",
-            ));
-        }
+        self.require_audit_family(audit, None)?;
         let context = audit
             .get("context_id")
             .and_then(Value::as_str)
@@ -110,21 +97,44 @@ impl SessionStore {
             .ok_or_else(|| CoreError::new("egress_unconfirmed", "审计回执缺少当前网络上下文"))?;
         let current_ip = current.get("ip").and_then(Value::as_str);
         let risk = receipts.session_risk(context, current_ip, now);
-        let mut session = self.begin(audit, current, &risk, now)?;
-        // Anchor the probe baseline to this session: later drift comparison
-        // judges change relative to what this session actually started with,
-        // not relative to an absolute verdict.
-        let (dns, webrtc) = receipts.probe_receipts();
-        let (dns_countries, rtc_addresses) =
-            claude_watch_core::risk::probe_fingerprint(&dns, &webrtc);
-        session
-            .extra
-            .insert("baseline_dns_countries".into(), json!(dns_countries));
-        session
-            .extra
-            .insert("baseline_webrtc_addresses".into(), json!(rtc_addresses));
+        // Publish the pending session and its baseline once, under the same
+        // lock. A second unlocked save could restore Pending over a concurrent
+        // bind/lock/replacement made after the first save.
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
+        let mut session = session::begin(audit, current, &risk, &Uuid::new_v4().to_string(), now)?;
+        Self::anchor_probe_baseline(&mut session, receipts, now);
         self.save(&session)?;
         Ok(session)
+    }
+    fn require_audit_family(&self, audit: &Value, provider: Option<Provider>) -> Result<()> {
+        let mismatch = || CoreError::new("launch_target_mismatch", "启动审计、会话服务与授权范围不一致");
+        // Only a genuinely absent target has the legacy Claude meaning.
+        // Invalid, unknown or CLI targets cannot create a desktop session.
+        let target = match audit.get("launch_target") {
+            None => LaunchTarget::ClaudeDesktop,
+            Some(value) => value.as_str().and_then(LaunchTarget::parse).ok_or_else(mismatch)?,
+        };
+        if target.cli()
+            || PolicyCatalog::family_for(target.provider()).map(|f| f.id) != Some(self.family)
+            || provider.is_some_and(|p| PolicyCatalog::family_for(p).map(|f| f.id) != Some(self.family))
+        {
+            return Err(mismatch());
+        }
+        Ok(())
+    }
+    fn anchor_probe_baseline(session: &mut Session, receipts: &crate::receipt_store::ReceiptStore, now: f64) {
+        let (mut dns, mut webrtc) = receipts.probe_receipts();
+        let usable = |value: &Value, context_key: &str, time_key: &str| {
+            value["status"] == "complete"
+                && value[context_key].as_str() == Some(session.context_id.as_str())
+                && value[time_key].as_f64().is_some_and(|at| at.is_finite()
+                    && (0.0..=session::RISK_EVIDENCE_TTL).contains(&(now - at)))
+        };
+        if !usable(&dns, "context", "finished_at") { dns = Value::Null; }
+        if !usable(&webrtc, "context_id", "sampled_at") { webrtc = Value::Null; }
+        let (countries, addresses) = claude_watch_core::risk::probe_fingerprint(&dns, &webrtc);
+        session.extra.insert("baseline_dns_countries".into(), json!(countries));
+        session.extra.insert("baseline_webrtc_addresses".into(), json!(addresses));
     }
     pub fn bind_launcher(&self, id: &str, launcher: Launcher, now: f64) -> Result<Session> {
         if launcher.pid <= 1 || launcher.start.is_empty() || launcher.start.len() > 80 {
@@ -319,6 +329,9 @@ impl SessionStore {
         now: f64,
         provider: Provider,
     ) -> Result<Option<Session>> {
+        // Apply the same family boundary as initial creation, before either
+        // a session record or an observation lease can be changed.
+        self.require_audit_family(audit, Some(provider))?;
         // Policy writes use this lock. Keep it short and outside network work;
         // the fast guard does not acquire it.
         let _operation = self.storage.lock("operation", None)?;
@@ -380,10 +393,8 @@ impl SessionStore {
             ));
         }
         let context = audit["context_id"].as_str().unwrap_or("");
-        let risk = crate::receipt_store::ReceiptStore {
-            storage: self.storage.clone(),
-        }
-        .session_risk(context, Some(&measured.ip), now);
+        let receipts = crate::receipt_store::ReceiptStore { storage: self.storage.clone() };
+        let risk = receipts.session_risk(context, Some(&measured.ip), now);
         if ["dns", "webrtc"].iter().any(|kind| {
             risk["sources"][*kind]["observed_at"]
                 .as_f64()
@@ -398,6 +409,7 @@ impl SessionStore {
         verified.state = Phase::Active;
         verified.desktop = Some(desktop.clone());
         verified.bound_at = Some(now);
+        Self::anchor_probe_baseline(&mut verified, &receipts, now);
         let lease_path = self
             .storage
             .paths

@@ -3,6 +3,7 @@
 use claude_watch_core::{
     config::Config,
     error::{CoreError, Result},
+    policy::PolicyCatalog,
     processes::Provider,
     session::Desktop,
 };
@@ -39,6 +40,25 @@ fn next_interval(failures: &mut u32, incomplete: bool) -> Duration {
     } else {
         *failures = 0;
         Duration::from_secs(5)
+    }
+}
+fn evidence_error_code(code: &str) -> &str {
+    match code {
+        "evidence_worker_missing"
+        | "evidence_runtime_invalid"
+        | "evidence_context_changed"
+        | "evidence_context_unconfirmed"
+        | "evidence_session_changed"
+        | "evidence_policy_changed"
+        | "revalidation_timeout"
+        | "revalidation_context_changed"
+        | "revalidation_lease_rollback_failed"
+        | "revalidation_unavailable"
+        | "preflight_blocked"
+        | "egress_changed"
+        | "risk_evidence_unavailable"
+        | "desktop_inventory_incomplete" => code,
+        _ => "evidence_refresh_failed",
     }
 }
 impl EvidenceSystem for NativeEvidence {
@@ -92,6 +112,12 @@ impl EvidenceSystem for NativeEvidence {
     fn supervised_provider(&self) -> Provider {
         self.desktop.provider()
     }
+    fn set_family(&mut self, family: &str) -> Result<()> {
+        let target = PolicyCatalog::family(family).and_then(PolicyCatalog::guard_target)
+            .ok_or_else(|| CoreError::new("evidence_family_unavailable", "策略未声明该证据服务"))?;
+        self.desktop.set_guard_target(target);
+        Ok(())
+    }
 }
 pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<thread::JoinHandle<()>> {
     let store = StateStore::new(paths.clone());
@@ -118,32 +144,17 @@ pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<thread::JoinHandle<(
             let mut failures = 0;
             while !stop.load(Ordering::Acquire) {
                 let started = Instant::now();
-                let outcome = background_evidence::refresh_active_session(&store, &mut system);
+                let outcome = background_evidence::refresh_supervised_sessions(&store, &mut system);
                 let (status, code, count) = match &outcome {
                     Ok(v) => (
                         v["status"].as_str().unwrap_or("incomplete"),
-                        None,
+                        v["families"].as_array().and_then(|rows| rows.iter()
+                            .find_map(|row| row["code"].as_str())).map(evidence_error_code),
                         v["count"].as_u64().unwrap_or(0) as u32,
                     ),
                     Err(e) => (
                         "incomplete",
-                        Some(match e.code.as_str() {
-                            "evidence_worker_missing"
-                            | "evidence_runtime_invalid"
-                            | "evidence_context_changed"
-                            | "evidence_context_unconfirmed"
-                            | "evidence_session_changed"
-                            | "evidence_policy_changed"
-                            | "revalidation_timeout"
-                            | "revalidation_context_changed"
-                            | "revalidation_lease_rollback_failed"
-                            | "revalidation_unavailable"
-                            | "preflight_blocked"
-                            | "egress_changed"
-                            | "risk_evidence_unavailable"
-                            | "desktop_inventory_incomplete" => e.code.as_str(),
-                            _ => "evidence_refresh_failed",
-                        }),
+                        Some(evidence_error_code(&e.code)),
                         0,
                     ),
                 };

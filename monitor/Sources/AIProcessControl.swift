@@ -1,7 +1,9 @@
+import Foundation
+#if !PROCESS_POLICY_TESTS
 import AppKit
 import Combine
 import Darwin
-import Foundation
+#endif
 
 struct AIProcessIdentity: Equatable, Sendable {
     let pid, parent: Int32
@@ -21,6 +23,17 @@ struct AIProcessClosePlan: Sendable {
     let targets: [AIProcessIdentity]
     let protected: Set<Int32>
 }
+/// A failed identity read is not proof that a process exited.
+enum AIProcessPresence {
+    case live(AIProcessIdentity)
+    case gone
+    case unavailable
+}
+struct AIProcessExitEvidence {
+    let remaining: [AIProcessIdentity]
+    let unconfirmed: Int
+    var complete: Bool { remaining.isEmpty && unconfirmed == 0 }
+}
 enum AIProcessClosePolicy {
     static func plan(_ product: MonitoredProduct, inventory: [AIProcessIdentity], uid: UInt32,
                      protected: Set<Int32>) -> AIProcessClosePlan {
@@ -32,6 +45,31 @@ enum AIProcessClosePolicy {
         }
         return .init(product: product, uid: uid,
                      targets: owned.filter { ids.contains($0.pid) }.sorted { $0.pid < $1.pid }, protected: protected)
+    }
+    /// Read-only completion evidence; this never creates new signal authority.
+    /// Retain the original identities even after reparenting, and include newly
+    /// observed family members only in the report, not in forceRemaining().
+    static func exitEvidence(_ original: AIProcessClosePlan, inventory: [AIProcessIdentity],
+                             lookup: (Int32) -> AIProcessPresence) -> AIProcessExitEvidence {
+        let fresh = plan(original.product, inventory: inventory, uid: original.uid,
+                         protected: original.protected)
+        var samples: [Int32: AIProcessPresence] = [:]
+        var live: [Int32: AIProcessIdentity] = [:]
+        var unknown = Set<Int32>()
+        for expected in original.targets + fresh.targets {
+            guard expected.pid > 1, expected.uid == original.uid,
+                  !original.protected.contains(expected.pid) else { continue }
+            let sample: AIProcessPresence
+            if let cached = samples[expected.pid] { sample = cached }
+            else { sample = lookup(expected.pid); samples[expected.pid] = sample }
+            switch sample {
+            case .live(let actual):
+                if expected.sameProcess(as: actual) { live[actual.pid] = actual }
+            case .gone: break
+            case .unavailable: unknown.insert(expected.pid)
+            }
+        }
+        return .init(remaining: live.values.sorted { $0.pid < $1.pid }, unconfirmed: unknown.count)
     }
     static func execute(_ plan: AIProcessClosePlan, lookup: (Int32) -> AIProcessIdentity?,
                         quitApplication: (Int32) -> Bool, terminate: (Int32) -> Bool) -> (requested: Int, skipped: Int, failed: Int) {
@@ -61,6 +99,7 @@ enum AIProcessClosePolicy {
     }
 }
 
+#if !PROCESS_POLICY_TESTS
 enum AIProcessInventory {
     static func identity(_ pid: Int32) -> AIProcessIdentity? {
         guard pid > 1 else { return nil }
@@ -73,6 +112,13 @@ enum AIProcessInventory {
         return .init(pid: pid, parent: Int32(info.pbi_ppid), uid: info.pbi_uid,
                      startSeconds: info.pbi_start_tvsec, startMicroseconds: info.pbi_start_tvusec,
                      executable: String(cString: path))
+    }
+    static func presence(_ pid: Int32) -> AIProcessPresence {
+        if let live = identity(pid) { return .live(live) }
+        // Signal 0 checks existence only; no signal is delivered. Permission
+        // and metadata failures stay unknown rather than becoming a false exit.
+        if pid > 1, Darwin.kill(pid, 0) == -1, errno == ESRCH { return .gone }
+        return .unavailable
     }
     static func read() throws -> [AIProcessIdentity] {
         let output = try command(["-axo", "pid="])
@@ -195,14 +241,16 @@ final class AIProcessControl: ObservableObject {
         }.value
         try? await Task.sleep(nanoseconds: 1_200_000_000)
         do {
-            let remaining = try await Task.detached {
-                AIProcessClosePolicy.plan(plan.product, inventory: try AIProcessInventory.read(), uid: plan.uid,
-                                          protected: plan.protected).targets.count
+            let evidence = try await Task.detached {
+                AIProcessClosePolicy.exitEvidence(plan, inventory: try AIProcessInventory.read(),
+                                                  lookup: AIProcessInventory.presence)
             }.value
-            return remaining == 0
+            return evidence.complete
                 ? "当前未检测到 \(plan.product.title) 相关进程。退出请求 \(outcome.requested) 项，身份变化跳过 \(outcome.skipped) 项。"
-                : "仍有 \(remaining) 个 \(plan.product.title) 进程。退出请求 \(outcome.requested) 项，失败 \(outcome.failed) 项；部分进程可能拒绝退出或重新启动。"
+                : "仍有 \(evidence.remaining.count) 个 \(plan.product.title) 进程，另有 \(evidence.unconfirmed) 项身份无法复核。退出请求 \(outcome.requested) 项，失败 \(outcome.failed) 项；未确认全部退出。"
         } catch { return "已发送 \(outcome.requested) 项退出请求，但无法复核是否全部退出。" }
     }
 }
 #endif
+
+#endif // !PROCESS_POLICY_TESTS

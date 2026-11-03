@@ -76,45 +76,48 @@ struct WatchProcessHelper {
         let outcome = AIProcessClosePolicy.execute(selected, lookup: AIProcessInventory.identity,
             quitApplication: { NSRunningApplication(processIdentifier: $0)?.terminate() ?? false },
             terminate: { Darwin.kill($0, SIGTERM) == 0 })
-        var remaining = selected.targets
         var forced = (requested: 0, skipped: 0, failed: 0)
         if allowForce {
-            let original = selected
-            func originalStillRunning() -> Bool {
-                original.targets.contains { target in
-                    guard let live = AIProcessInventory.identity(target.pid) else { return false }
-                    return target.sameProcess(as: live)
+            func originalNotConfirmedGone() -> Bool {
+                selected.targets.contains { target in
+                    switch AIProcessInventory.presence(target.pid) {
+                    case .live(let actual): return target.sameProcess(as: actual)
+                    case .gone: return false
+                    case .unavailable: return true
+                    }
                 }
             }
             let graceDeadline = ProcessInfo.processInfo.systemUptime + 2
-            while originalStillRunning() && ProcessInfo.processInfo.systemUptime < graceDeadline {
+            while originalNotConfirmedGone() && ProcessInfo.processInfo.systemUptime < graceDeadline {
                 Thread.sleep(forTimeInterval: 0.1)
             }
-            if originalStillRunning() {
-                forced = AIProcessClosePolicy.forceRemaining(original, lookup: AIProcessInventory.identity,
+            if originalNotConfirmedGone() {
+                // Never extend force authority to a new/restarted process.
+                forced = AIProcessClosePolicy.forceRemaining(selected, lookup: AIProcessInventory.identity,
                     force: { Darwin.kill($0, SIGKILL) == 0 })
             }
-            let forceDeadline = ProcessInfo.processInfo.systemUptime + 5
-            while originalStillRunning() && ProcessInfo.processInfo.systemUptime < forceDeadline {
-                Thread.sleep(forTimeInterval: 0.1)
-            }
-            // Re-scan the tree for processes started during exit; only the
-            // original verified plan was eligible for force.
-            remaining = plan(product, inventory: try inventory(for: product)).targets
-        } else {
-            let until = ProcessInfo.processInfo.systemUptime + 15
-            repeat {
-                remaining = plan(product, inventory: try inventory(for: product)).targets
-                if remaining.isEmpty { break }
-                Thread.sleep(forTimeInterval: 0.2)
-            } while ProcessInfo.processInfo.systemUptime < until
         }
-        return ["status": remaining.isEmpty ? "ok" : "error",
-                "code": remaining.isEmpty ? "" : "target_still_running",
-                "message": remaining.isEmpty ? "\(label) 已退出" : "\(label) 未完全退出",
-                "requested": outcome.requested, "remaining": remaining.count,
+        // A root disappearing must not erase an original, now-orphaned child.
+        // New roots are reported, not force-signalled by this invocation.
+        let until = ProcessInfo.processInfo.systemUptime + (allowForce ? 5 : 15)
+        var evidence: AIProcessExitEvidence
+        repeat {
+            evidence = AIProcessClosePolicy.exitEvidence(selected, inventory: try inventory(for: product),
+                                                         lookup: AIProcessInventory.presence)
+            if evidence.complete { break }
+            if ProcessInfo.processInfo.systemUptime >= until { break }
+            Thread.sleep(forTimeInterval: 0.2)
+        } while true
+        let code = evidence.complete ? "" : (evidence.unconfirmed > 0
+            ? "process_identity_unavailable" : "target_still_running")
+        return ["schema": 1, "product": product == .claude ? "claude" : "openai",
+                "status": evidence.complete ? "ok" : "error", "code": code,
+                "message": evidence.complete ? "\(label) 已退出" : "\(label) 未确认完全退出",
+                "planned": selected.targets.count, "requested": outcome.requested, "skipped": outcome.skipped, "failed": outcome.failed,
+                "remaining": evidence.remaining.count, "identity_unconfirmed": evidence.unconfirmed,
                 "force_requested": forced.requested, "force_skipped": forced.skipped, "force_failed": forced.failed]
     }
+
     /// The helper command names the supervised product the same way the
     /// policy table does: one Claude family, one ChatGPT / Codex family.
     static func product(_ name: String) -> MonitoredProduct? {

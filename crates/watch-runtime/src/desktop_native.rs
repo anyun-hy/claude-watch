@@ -31,6 +31,8 @@ use std::{
 use subprocess::unix::JobExt;
 use subprocess::{Exec, Job, Redirection};
 
+mod close_receipt;
+
 fn execute_output(program: &Path, args: &[&str], timeout: Duration) -> Result<Vec<u8>> {
     let started = Instant::now();
     let mut job = Exec::cmd(program)
@@ -785,56 +787,27 @@ impl<R: ReadRunner> NativeDesktop<R> {
         Ok(())
     }
     pub fn quit(&self) -> Result<()> {
-        self.require_quit_authority()?;
-        // The helper's plan is per product and only Claude may be forced, so
-        // the family the target belongs to selects the tree and the action.
-        let product = PolicyCatalog::family_for(self.target.provider())
-            .map(|family| family.id)
-            .ok_or_else(|| {
-                CoreError::new(
-                    "protected_scope_mismatch",
-                    "观察目标不属于受监督的服务，不能通过退出入口关闭",
-                )
-            })?;
-        let request = execute(&self.helper, &["close-desktop", product], Duration::from_secs(20));
-        if !self.desktop_tree_running()? {
-            return Ok(());
-        }
-        request?;
-        Err(CoreError::new("target_still_running", "受监督的应用尚未完全退出"))
+        self.request_quit(false, &mut None)
     }
-    /// Only the confirmed IP-risk path requests the bounded force fallback.
-    /// The actual process tree decides success even if another guard closed it.
+    /// Force remains an explicit upstream decision. Completion covers the
+    /// helper's original identities and newly observed family members.
     pub fn quit_for_confirmed_ip_risk(&self, forced: &mut Option<u32>) -> Result<()> {
+        self.request_quit(true, forced)
+    }
+    fn request_quit(&self, allow_force: bool, forced: &mut Option<u32>) -> Result<()> {
         *forced = None;
         self.require_quit_authority()?;
-        let product = PolicyCatalog::family_for(self.target.provider())
-            .map(|family| family.id)
-            .ok_or_else(|| {
-                CoreError::new(
-                    "protected_scope_mismatch",
-                    "观察目标不属于受监督的服务，不能通过退出入口关闭",
-                )
-            })?;
-        let request = execute_output(
-            &self.helper,
-            &["guard-close-desktop", product],
-            Duration::from_secs(20),
-        );
-        *forced = request
-            .as_ref()
-            .ok()
-            .and_then(|bytes| crate::storage::strict_json(bytes).ok())
-            .filter(|value| matches!(value["status"].as_str(), Some("ok" | "error")))
-            .and_then(|value| value.get("force_requested").and_then(Value::as_u64))
-            .and_then(|count| u32::try_from(count).ok())
-            .filter(|count| *count <= 4096);
-        if self.desktop_tree_running()? {
-            request?;
-            return Err(CoreError::new("target_still_running", "受监督的应用尚未完全退出"));
+        let family = PolicyCatalog::family_for(self.target.provider()).ok_or_else(|| {
+            CoreError::new("protected_scope_mismatch", "观察目标不属于受监督的服务，不能通过退出入口关闭")
+        })?;
+        if allow_force && !family.performable("force") {
+            return Err(CoreError::new("protected_scope_mismatch", "该服务未声明强制退出能力"));
         }
-        Ok(())
+        let command = if allow_force { "guard-close-desktop" } else { "close-desktop" };
+        let request = execute_output(&self.helper, &[command, family.id], Duration::from_secs(20));
+        close_receipt::finish(request, family.id, allow_force, forced, || self.desktop_tree_running())
     }
+
 }
 pub struct DesktopRuntime<'a, R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> {
     pub desktop: &'a mut NativeDesktop<R>,

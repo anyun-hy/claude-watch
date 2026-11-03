@@ -11,8 +11,9 @@ use crate::{
 use claude_watch_core::{
     config::Config,
     error::{CoreError, Result},
+    policy::PolicyCatalog,
     processes::Provider,
-    session::{Desktop, Phase},
+    session::{Desktop, Phase, Session},
 };
 use serde_json::{json, Value};
 use std::{
@@ -108,6 +109,14 @@ pub trait EvidenceSystem {
     fn supervised_provider(&self) -> Provider {
         Provider::Claude
     }
+    /// Fixed-target test/CLI adapters cannot silently collect another family.
+    fn set_family(&mut self, family: &str) -> Result<()> {
+        if PolicyCatalog::family_for(self.supervised_provider()).map(|f| f.id) == Some(family) {
+            Ok(())
+        } else {
+            Err(err("evidence_family_unavailable", "证据适配器不能切换到该服务"))
+        }
+    }
 }
 fn err(code: &str, detail: &str) -> CoreError {
     CoreError::new(code, detail)
@@ -152,6 +161,51 @@ fn fresh(store: &StateStore, kind: ProbeKind, ctx: &str, now: f64, since: Option
         })
 }
 
+/// A notice does not stop supervision. Only warn-only locks may refresh;
+/// mandatory close/force locks stay latched and are never resumed here.
+fn refreshable(session: &Session, config: &Config, provider: Provider) -> bool {
+    match session.state {
+        Phase::Active | Phase::Rechecking => true,
+        Phase::Locked => session.reason.as_ref()
+            .is_some_and(|reason| config.close_action(&reason.code, provider) == "warn"),
+        Phase::Pending | Phase::Ended => false,
+    }
+}
+
+/// One worker services all declared families. Receipts may be reused only
+/// when their verified context and freshness match; sessions and locks never
+/// cross families. A failure in one family must not starve the next one.
+pub fn refresh_supervised_sessions<S: EvidenceSystem>(store: &StateStore, system: &mut S) -> Result<Value> {
+    let mut reports = Vec::new();
+    for family in PolicyCatalog::families() {
+        if system.cancelled() { break; }
+        if PolicyCatalog::guard_target(family).is_none() { continue; }
+        let result = system.set_family(family.id).and_then(|()| {
+            if PolicyCatalog::family_for(system.supervised_provider()).map(|f| f.id) != Some(family.id) {
+                return Err(err("evidence_family_mismatch", "证据适配器与会话服务不一致"));
+            }
+            refresh_active_session(store, system)
+        });
+        let mut report = match result {
+            Ok(value) => value,
+            Err(error) => json!({"status":"incomplete","count":0,"code":error.code}),
+        };
+        report["family"] = json!(family.id);
+        reports.push(report);
+    }
+    let has = |status: &str| reports.iter().any(|v| v["status"] == status);
+    let status = if has("risk") { "risk" } else if has("incomplete") { "incomplete" }
+        else if has("ok") { "ok" } else { "idle" };
+    let count: u64 = reports.iter().filter_map(|v| v["count"].as_u64()).sum();
+    let probes = |key: &str| -> Vec<&str> {
+        ["dns", "webrtc"].into_iter().filter(|kind| reports.iter().any(|v| {
+            v[key].as_array().is_some_and(|names| names.iter().any(|name| name.as_str() == Some(*kind)))
+        })).collect()
+    };
+    Ok(json!({"status":status,"count":count,"failed_probes":probes("failed_probes"),
+        "risk_probes":probes("risk_probes"),"families":reports}))
+}
+
 /// Called by one independent worker on a bounded cadence. GUI-produced fresh
 /// receipts are reused, so opening the window does not double probe frequency.
 pub fn refresh_active_session<S: EvidenceSystem>(
@@ -165,17 +219,20 @@ pub fn refresh_active_session<S: EvidenceSystem>(
     if !config.enabled || !config.guard_enabled || system.cancelled() {
         return Ok(json!({"status":"idle","count":0}));
     }
-    let sessions = SessionStore::new(store.clone());
+    let provider = system.supervised_provider();
+    let family = PolicyCatalog::family_for(provider)
+        .ok_or_else(|| err("evidence_family_unavailable", "证据服务未声明会话策略"))?;
+    let sessions = SessionStore::for_family(store.clone(), family.id);
     let Some(session) = sessions
         .load(system.now())?
-        .filter(|s| matches!(s.state, Phase::Active | Phase::Rechecking))
+        .filter(|s| refreshable(s, &config, provider))
     else {
         return Ok(json!({"status":"idle","count":0}));
     };
     let Some(desktop) = session.desktop.as_ref() else {
         return Err(err("evidence_identity_unknown", "受控会话缺少主进程身份"));
     };
-    if session.state == Phase::Active
+    if session.state != Phase::Rechecking
         && [ProbeKind::Dns, ProbeKind::WebRtc]
             .iter()
             .all(|kind| fresh(store, *kind, &session.context_id, system.now(), None))
@@ -238,7 +295,8 @@ pub fn refresh_active_session<S: EvidenceSystem>(
         }
         let active = sessions.load(system.now())?;
         if !active.as_ref().is_some_and(|s| {
-            matches!(s.state, Phase::Active | Phase::Rechecking)
+            refreshable(s, &current, provider)
+                && s.context_id == evidence_context
                 && s.session_id == session.session_id
                 && s.desktop.as_ref() == Some(desktop)
         }) || !system.desktop_matches(desktop)?
@@ -256,36 +314,26 @@ pub fn refresh_active_session<S: EvidenceSystem>(
             ));
         }
         let result = collected.and_then(|probe| {
-            // Serialise the final session check with replacement/locking of a
-            // session. The network observations above remain outside this lock.
-            let _session_lock = store.lock("session-guard", None)?;
-            if !sessions.load(system.now())?.as_ref().is_some_and(|s| {
-                matches!(s.state, Phase::Active | Phase::Rechecking)
-                    && s.session_id == session.session_id
-                    && s.desktop.as_ref() == Some(desktop)
-            }) {
-                return Err(err("evidence_session_changed", "采集期间受控会话已变化"));
-            }
-            if guard_policy_digest(
-                &ConfigStore {
-                    storage: store.clone(),
+            // Use exactly the selected family's session lock. No network work
+            // is performed inside it, and a newer lock/replacement wins.
+            sessions.close_if_current(Some(&session.session_id), system.now(), || {
+                let latest = ConfigStore { storage: store.clone() }.load()?;
+                if !latest.enabled || !latest.guard_enabled || guard_policy_digest(&latest)? != policy {
+                    return Err(err("evidence_policy_changed", "采集期间保护策略已变化"));
                 }
-                .load()?,
-            )? != policy
-            {
-                return Err(err("evidence_policy_changed", "采集期间保护策略已变化"));
-            }
-            let receipts = ReceiptStore {
-                storage: store.clone(),
-            };
-            match kind {
-                // The two verified local observations bind this background
-                // collection; no UI token or cached context is trusted here.
-                ProbeKind::Dns => receipts.record_dns(&probe, &after, None, system.now()),
-                ProbeKind::WebRtc => {
-                    receipts.record_webrtc(&probe, &after, Some(&evidence_context), system.now())
+                if !sessions.load(system.now())?.as_ref().is_some_and(|s| {
+                    refreshable(s, &latest, provider)
+                        && s.context_id == evidence_context
+                        && s.desktop.as_ref() == Some(desktop)
+                }) {
+                    return Err(err("evidence_session_changed", "采集期间受控会话已变化"));
                 }
-            }
+                let receipts = ReceiptStore { storage: store.clone() };
+                match kind {
+                    ProbeKind::Dns => receipts.record_dns(&probe, &after, None, system.now()),
+                    ProbeKind::WebRtc => receipts.record_webrtc(&probe, &after, Some(&evidence_context), system.now()),
+                }
+            })?.ok_or_else(|| err("evidence_session_changed", "采集期间受控会话已变化"))
         });
         match result {
             Ok(receipt) => {
