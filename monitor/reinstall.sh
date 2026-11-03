@@ -15,6 +15,11 @@ export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 cd "$PROJECT"
 # The flow replaces the installed app, so it must run the engine built from
 # this tree, never the copy inside the app it is about to remove.
-cargo build --release -p claude-watch-engine >/dev/null
-exec "$PROJECT/target/release/claude-watch-engine" reinstall \
+#
+# Build into the explicit `aarch64-apple-darwin` target. The packaging step
+# (tools/build-rust-components.sh) compiles the same packages into that same
+# directory, so a single cache serves both phases instead of compiling the
+# whole tree twice (once as the host target, once as the explicit target).
+cargo build --release --target aarch64-apple-darwin -p claude-watch-engine >/dev/null
+exec "$PROJECT/target/aarch64-apple-darwin/release/claude-watch-engine" reinstall \
   --version "$version" --build "$build" --project "$PROJECT" "$@"
