@@ -133,6 +133,18 @@ impl PolicyCatalog {
             .iter()
             .find(|family| family.providers.contains(&provider))
     }
+    /// The representative desktop target a family supervises. The guard's
+    /// process scope is derived from `provider()`, not from the specific
+    /// desktop kind, so one target per family is enough: `family_desktop_scopes`
+    /// expands it to every bundle the family covers. CLI families have no
+    /// desktop representative and return `None`.
+    pub fn guard_target(family: &PolicyFamily) -> Option<crate::processes::LaunchTarget> {
+        match family.id {
+            "claude" => Some(crate::processes::LaunchTarget::ClaudeDesktop),
+            "openai" => Some(crate::processes::LaunchTarget::CodexDesktop),
+            _ => None,
+        }
+    }
     /// The criteria that own a config key. Combined codes own none.
     pub fn keyed_criteria() -> impl Iterator<Item = &'static PolicyCriterion> {
         CRITERIA.iter().filter(|criterion| criterion.combines.is_empty())

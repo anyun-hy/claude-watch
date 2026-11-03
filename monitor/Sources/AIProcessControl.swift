@@ -109,6 +109,12 @@ enum AIProcessInventory {
         if path.hasPrefix(home + "/.local/share/claude/versions/") { return .claude }
         if path.contains("/Caskroom/codex/"), path.hasSuffix("/bin/codex") { return .openAI }
         if path.contains("/node_modules/@openai/codex/"), path.hasSuffix("/codex") { return .openAI }
+        // The self-started app-server daemon OpenAI ships (see process_roots::
+        // managed_codex_app_server) lives under ~/.codex/packages/app-server-daemon/.
+        // It is launched by launchd (parent PID 1), so it is not a descendant of
+        // any desktop/CLI root and would otherwise survive "退出 ChatGPT / Codex".
+        // Attribute it to OpenAI so the close plan collects it too.
+        if path.hasPrefix(home + "/.codex/packages/app-server-daemon/"), path.hasSuffix("/bin/codex") { return .openAI }
         return nil
     }
     static func nodeEntry(_ command: String) -> String? {

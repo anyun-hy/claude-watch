@@ -154,7 +154,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
     } else {
         let guard_diagnostics = diagnostic_queue.clone();
         let mut host = super::runtime::host(paths.clone(), Authority::ExplicitPermit)?;
-        let desktop = NativeDesktop::new(
+        let mut desktop = NativeDesktop::new(
             host.runner.clone(),
             super::runtime::process_component()?,
             Authority::ExplicitPermit,
@@ -169,7 +169,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                     let controller = Controller::new(store.clone());
                     let network = host.network.clone();
                     let mut runtime = DesktopRuntime {
-                        desktop: &desktop,
+                        desktop: &mut desktop,
                         system: &mut host,
                         network,
                         storage: store,

@@ -62,6 +62,16 @@ impl Paths {
     pub fn session(&self) -> PathBuf {
         self.base().join("session-guard.json")
     }
+    /// Per-family session record. The guard supervises each policy family as
+    /// its own supervised service, so their session state must not overwrite
+    /// each other. The legacy `session-guard.json` name is the Claude family's
+    /// file, kept so an existing install upgrades in place.
+    pub fn session_for(&self, family: &str) -> PathBuf {
+        if family == "claude" {
+            return self.session();
+        }
+        self.base().join(format!("session-guard-{family}.json"))
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -75,7 +75,7 @@ impl EvidenceSystem for NativeEvidence {
         let network = self.host.network.clone();
         let storage = self.host.storage.clone();
         let mut runtime = DesktopRuntime {
-            desktop: &self.desktop,
+            desktop: &mut self.desktop,
             system: &mut self.host,
             network,
             storage,

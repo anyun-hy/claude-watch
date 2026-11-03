@@ -31,6 +31,16 @@ pub trait DesktopSystem {
     fn launch_target(&self) -> LaunchTarget {
         LaunchTarget::ClaudeDesktop
     }
+    /// Point the guard at one policy family before its next tick. The guard
+    /// supervises every family the policy table declares, one at a time; this
+    /// is how a single engine answers for each of them. Adapters that cannot
+    /// change target (a fixed CLI entry) leave the default error.
+    fn set_family(&mut self, _family_id: &str) -> Result<()> {
+        Err(CoreError::new(
+            "target_adapter_unavailable",
+            "目标进程适配尚不可用",
+        ))
+    }
     /// Native-verified, current-user main processes for the selected target.
     fn observation_roots(&mut self) -> Result<Vec<Target>> {
         Err(CoreError::new(
@@ -78,13 +88,14 @@ pub struct CliOutcome {
 }
 pub struct Controller {
     pub storage: StateStore,
-    failed_persistence_session: std::sync::Mutex<Option<String>>,
+    failed_persistence_session:
+        std::sync::Mutex<std::collections::HashMap<&'static str, Option<String>>>,
 }
 impl Controller {
     pub fn new(storage: StateStore) -> Self {
         Self {
             storage,
-            failed_persistence_session: std::sync::Mutex::new(None),
+            failed_persistence_session: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
     fn record_launch(&self, target: LaunchTarget, pid: u32, now: f64) -> Option<Value> {
@@ -159,6 +170,10 @@ impl Controller {
                 "CLI必须使用带生命周期的共享入口",
             ));
         }
+        // The caller has already bound the supervised target via `select_target`
+        // (see runtime.rs) before entering here. A launch must honor that target
+        // instead of re-binding to Claude: ChatGPT/Codex route through the
+        // observation path below, Claude through the protected session path.
         let _launch = self.storage.lock("launch", None)?;
         if !system.launch_target().protected() {
             return self.launch_observation(system);
@@ -466,9 +481,56 @@ impl Controller {
         result
     }
     pub fn guard_tick<S: DesktopSystem>(&self, system: &mut S) -> Result<Value> {
-        // Which services the guard supervises is declared by the policy
-        // table, and supervision is a desktop matter: a CLI target has its
-        // own shared lifecycle entry.
+        // Which services the guard supervises is declared by the policy table,
+        // not by the caller: one engine answers for every family the table
+        // declares. Each family runs its own tick against its own session
+        // record, then the receipts are folded into one heartbeat. Adding a
+        // service later is one row in the policy table — nothing here changes.
+        let mut families = Vec::new();
+        for family in PolicyCatalog::families() {
+            if PolicyCatalog::guard_target(family).is_none() {
+                continue;
+            }
+            families.push(family);
+        }
+        if families.is_empty() {
+            return Ok(json!({"status":"disabled","action":"observe"}));
+        }
+        let mut receipts = Vec::with_capacity(families.len());
+        for family in families {
+            // One family's failure must not stop the others: record it as an
+            // unknown round for that family and keep supervising the rest of
+            // the table.
+            let receipt = match system
+                .set_family(family.id)
+                .and_then(|()| self.guard_tick_family(system, family.id))
+            {
+                Ok(receipt) => receipt,
+                Err(error) => json!({
+                    "family": family.id,
+                    "status": "unknown",
+                    "action": "observe",
+                    "time": system.now(),
+                    "code": error.code,
+                    "message": error.message,
+                }),
+            };
+            receipts.push(receipt);
+        }
+        let heartbeat = fold_guard_receipts(receipts);
+        self.storage.atomic_json(
+            &self.storage.paths.base().join("guard-heartbeat.json"),
+            &heartbeat,
+        )?;
+        Ok(heartbeat)
+    }
+    fn guard_tick_family<S: DesktopSystem>(
+        &self,
+        system: &mut S,
+        family: &'static str,
+    ) -> Result<Value> {
+        // Supervision is a desktop matter: a CLI target has its own shared
+        // lifecycle entry and never enters this automatic-exit path.
         let target = system.launch_target();
         if target.cli() || PolicyCatalog::family_for(target.provider()).is_none() {
             return Err(CoreError::new(
@@ -485,23 +547,19 @@ impl Controller {
             Err(error) => {
                 let mut receipt =
                     json!({"status":"unknown","action":"observe","time":system.now()});
-                self.sampling_failure(system, &mut receipt, error)?;
-                self.storage.atomic_json(
-                    &self.storage.paths.base().join("guard-heartbeat.json"),
-                    &receipt,
-                )?;
+                self.sampling_failure(system, family, &mut receipt, error)?;
                 return Ok(receipt);
             }
         };
         if !config.enabled || !config.guard_enabled {
-            return Ok(json!({"status":"disabled","action":"observe"}));
+            return Ok(json!({"status":"disabled","action":"observe","family":family}));
         }
-        let sessions = SessionStore::new(self.storage.clone());
+        let sessions = SessionStore::for_family(self.storage.clone(), family);
         let receipts = ReceiptStore {
             storage: self.storage.clone(),
         };
         let now = system.now();
-        let mut receipt = json!({"status":"unknown","action":"observe","time":now,"policy":crate::config_store::policy_digest(&config.value()?)?,"guard_policy_v1":crate::config_store::guard_policy_digest(&config)?});
+        let mut receipt = json!({"status":"unknown","action":"observe","family":family,"time":now,"policy":crate::config_store::policy_digest(&config.value()?)?,"guard_policy_v1":crate::config_store::guard_policy_digest(&config)?});
         let result: Result<()> = (|| {
             let mut desktops = system.desktops()?;
             let mut current = sessions.load(system.now())?;
@@ -538,7 +596,8 @@ impl Controller {
                                             "保护内存状态不可用",
                                         )
                                     })?
-                                    .as_ref()
+                                    .get(family)
+                                    .and_then(|v| v.as_ref())
                                     == Some(&previous.session_id);
                             if risk_latched && tree_running {
                                 // A confirmed risk stays latched until the
@@ -776,10 +835,10 @@ impl Controller {
                 let mut remembered = self.failed_persistence_session.lock().map_err(|_| {
                     CoreError::new("guard_memory_unavailable", "保护内存状态不可用")
                 })?;
-                if remembered.as_ref() != id.as_ref() {
-                    *remembered = None;
+                if remembered.get(family).and_then(|v| v.as_ref()) != id.as_ref() {
+                    remembered.insert(family, None);
                 }
-                remembered.is_some()
+                remembered.get(family).is_some_and(|v| v.is_some())
             };
             if latched {
                 receipt["persistence_error"] = json!("state_io_failed");
@@ -951,9 +1010,12 @@ impl Controller {
                         receipt["session_id"] = json!(id);
                         receipt["session_guard"] = json!({"state":"risk", "reason":{"code":"egress_risk_persist_failed", "detail":"出口风险已确认，会话记录写入失败"}});
                         receipt["persistence_error"] = json!(error.code);
-                        *self.failed_persistence_session.lock().map_err(|_| {
-                            CoreError::new("guard_memory_unavailable", "保护内存状态不可用")
-                        })? = id.clone();
+                        self.failed_persistence_session
+                            .lock()
+                            .map_err(|_| {
+                                CoreError::new("guard_memory_unavailable", "保护内存状态不可用")
+                            })?
+                            .insert(family, id.clone());
                         match sessions.close_if_current_before(
                             id.as_deref(),
                             system.now(),
@@ -965,9 +1027,15 @@ impl Controller {
                                 receipt["stop_state"] = json!("confirmed");
                             }
                             Ok(None) => {
-                                *self.failed_persistence_session.lock().map_err(|_| {
-                                    CoreError::new("guard_memory_unavailable", "保护内存状态不可用")
-                                })? = None;
+                                self.failed_persistence_session
+                                    .lock()
+                                    .map_err(|_| {
+                                        CoreError::new(
+                                            "guard_memory_unavailable",
+                                            "保护内存状态不可用",
+                                        )
+                                    })?
+                                    .insert(family, None);
                                 receipt["stop_state"] = json!("session_changed");
                             }
                             Err(stop_error) => {
@@ -1030,17 +1098,14 @@ impl Controller {
             Ok(())
         })();
         if let Err(error) = result {
-            self.sampling_failure(system, &mut receipt, error)?;
+            self.sampling_failure(system, family, &mut receipt, error)?;
         }
-        self.storage.atomic_json(
-            &self.storage.paths.base().join("guard-heartbeat.json"),
-            &receipt,
-        )?;
         Ok(receipt)
     }
     fn sampling_failure<S: DesktopSystem>(
         &self,
         system: &mut S,
+        family: &'static str,
         receipt: &mut Value,
         error: CoreError,
     ) -> Result<()> {
@@ -1050,7 +1115,7 @@ impl Controller {
         if !system.desktops().is_ok_and(|d| !d.is_empty()) {
             return Ok(());
         }
-        let sessions = SessionStore::new(self.storage.clone());
+        let sessions = SessionStore::for_family(self.storage.clone(), family);
         let current = match sessions.load(system.now()) {
             Ok(value) => value,
             Err(_) => {
@@ -1077,8 +1142,8 @@ impl Controller {
             .failed_persistence_session
             .lock()
             .map_err(|_| CoreError::new("guard_memory_unavailable", "保护内存状态不可用"))?
-            .as_ref()
-            .is_some_and(|v| Some(v) == id.as_ref());
+            .get(family)
+            .is_some_and(|v| v.as_ref() == id.as_ref());
         if latched {
             receipt["status"] = json!("protection_triggered");
             receipt["persistence_error"] = json!("state_io_failed");
@@ -1149,4 +1214,42 @@ impl Controller {
         }
         Ok(())
     }
+}
+
+/// Fold one receipt per supervised family into a single heartbeat. The top
+/// level carries the most severe family's receipt verbatim so the existing UI
+/// and diagnostics keep reading the fields they know (`status`, `action`,
+/// `stop_state`, `session_guard`, `session_id`), while the `families` array
+/// keeps every family's full receipt. Adding a service is a new entry in the
+/// policy table; nothing here needs to know about it.
+fn fold_guard_receipts(receipts: Vec<Value>) -> Value {
+    let severity = |status: &str| -> u8 {
+        match status {
+            "protection_triggered" => 5,
+            "unknown" => 4,
+            "degraded" => 3,
+            "ok" => 2,
+            "disabled" => 1,
+            _ => 0,
+        }
+    };
+    let rank = |receipt: &Value| -> (u8, u8) {
+        // A family that actually closed outranks one that only reported.
+        let acted = u8::from(receipt["action"].as_str() == Some("close-desktop"));
+        (severity(receipt["status"].as_str().unwrap_or("")), acted)
+    };
+    let mut primary: Option<Value> = None;
+    for receipt in &receipts {
+        let take = primary
+            .as_ref()
+            .is_none_or(|current| rank(receipt) > rank(current));
+        if take {
+            primary = Some(receipt.clone());
+        }
+    }
+    let mut folded = primary.unwrap_or_else(|| {
+        serde_json::json!({"status":"disabled","action":"observe"})
+    });
+    folded["families"] = serde_json::json!(receipts);
+    folded
 }

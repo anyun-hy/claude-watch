@@ -555,7 +555,7 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
         )));
     }
     let mut desktop_runtime = DesktopRuntime {
-        desktop: &desktop,
+        desktop: &mut desktop,
         network: host.network.clone(),
         system: &mut host,
         storage: storage.clone(),

@@ -22,7 +22,7 @@ pub struct AccountRuntimeHost<R: ReadRunner, T: Transport, S: AuditSystem + Serv
 impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> AccountRuntimeHost<R, T, S> {
     fn runtime(&mut self) -> DesktopRuntime<'_, R, T, S> {
         DesktopRuntime {
-            desktop: &self.desktop,
+            desktop: &mut self.desktop,
             system: &mut self.system,
             network: self.network.clone(),
             storage: self.storage.clone(),

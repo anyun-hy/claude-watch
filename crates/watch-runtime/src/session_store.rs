@@ -8,15 +8,36 @@ use uuid::Uuid;
 
 pub struct SessionStore {
     pub storage: StateStore,
+    family: &'static str,
 }
 impl SessionStore {
     pub fn new(storage: StateStore) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            family: "claude",
+        }
+    }
+    /// Bind the store to one policy family so its session record and lock are
+    /// kept apart from the other families the guard supervises. The default
+    /// `new` remains the Claude family for backward compatibility with callers
+    /// that manage a single supervised service (monitor snapshots, evidence).
+    pub fn for_family(storage: StateStore, family: &'static str) -> Self {
+        Self { storage, family }
+    }
+    fn session_path(&self) -> std::path::PathBuf {
+        self.storage.paths.session_for(self.family)
+    }
+    fn lock_name(&self) -> String {
+        if self.family == "claude" {
+            "session-guard".to_string()
+        } else {
+            format!("session-guard-{}", self.family)
+        }
     }
     pub fn load(&self, now: f64) -> Result<Option<Session>> {
         let value = self
             .storage
-            .read_json(&self.storage.paths.session(), Value::Null)?;
+            .read_json(&self.session_path(), Value::Null)?;
         if value.is_null() {
             return Ok(None);
         }
@@ -27,7 +48,7 @@ impl SessionStore {
     }
     fn save(&self, value: &Session) -> Result<()> {
         self.storage.atomic_json(
-            &self.storage.paths.session(),
+            &self.session_path(),
             &serde_json::to_value(value)
                 .map_err(|_| CoreError::new("invalid_session", "受控会话无法序列化"))?,
         )
@@ -36,7 +57,7 @@ impl SessionStore {
     /// dispatchers must call `begin_verified`, which reconstructs risk from
     /// private receipts rather than accepting a caller-selected state.
     fn begin(&self, audit: &Value, current: &Value, risk: &Value, now: f64) -> Result<Session> {
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         let value = session::begin(audit, current, risk, &Uuid::new_v4().to_string(), now)?;
         self.save(&value)?;
         Ok(value)
@@ -96,7 +117,7 @@ impl SessionStore {
                 "启动器身份未能确认",
             ));
         }
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         let mut value = self.pending(id, now)?;
         value.launcher = Some(launcher);
         self.save(&value)?;
@@ -114,7 +135,7 @@ impl SessionStore {
                 "主进程启动身份不完整",
             ));
         }
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         let mut value = self.pending(id, now)?;
         value.state = Phase::Active;
         value.bound_at = Some(now);
@@ -126,7 +147,7 @@ impl SessionStore {
     /// later diagnostics and the UI can tell it apart from a controlled
     /// launch without weakening any check.
     pub fn mark_adopted(&self, id: &str, now: f64) -> Result<Session> {
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         let mut value = self
             .load(now)?
             .filter(|v| v.session_id == id)
@@ -147,7 +168,7 @@ impl SessionStore {
         now: f64,
         tree_pending: bool,
     ) -> Result<bool> {
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         let Some(mut value) = self.load(now)? else {
             return Ok(false);
         };
@@ -175,7 +196,7 @@ impl SessionStore {
     }
 
     pub fn clear_ended_tree(&self, id: &str, now: f64) -> Result<bool> {
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         let Some(mut value) = self.load(now)? else {
             return Ok(false);
         };
@@ -198,7 +219,7 @@ impl SessionStore {
                 "新进程身份不完整",
             ));
         }
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         let Some(mut value) = self.load(now)? else {
             return Ok(None);
         };
@@ -253,7 +274,7 @@ impl SessionStore {
                 "新进程网络上下文无效",
             ));
         }
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         let Some(mut current) = self.load(now)? else {
             return Ok(false);
         };
@@ -285,7 +306,7 @@ impl SessionStore {
         // Policy writes use this lock. Keep it short and outside network work;
         // the fast guard does not acquire it.
         let _operation = self.storage.lock("operation", None)?;
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         let Some(current) = self.load(now)? else {
             return Ok(None);
         };
@@ -392,7 +413,7 @@ impl SessionStore {
         if !input.now.is_finite() || input.now <= 0.0 {
             return Err(CoreError::new("clock_unavailable", "无法核对检测时间"));
         }
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         self.apply_check_locked(id, input, false)
     }
     fn apply_check_locked(
@@ -468,7 +489,7 @@ impl SessionStore {
         if !now.is_finite() || now <= 0.0 {
             return Err(CoreError::new("clock_unavailable", "无法核对检测时间"));
         }
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         let current = self
             .load(now)?
             .filter(|v| Some(v.session_id.as_str()) == id);
@@ -515,7 +536,7 @@ impl SessionStore {
         now: f64,
         closer: impl FnOnce() -> Result<T>,
     ) -> Result<Option<T>> {
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         if self.load(now)?.as_ref().map(|v| v.session_id.as_str()) != id {
             return Ok(None);
         }
@@ -529,7 +550,7 @@ impl SessionStore {
         checked_at: f64,
         closer: impl FnOnce() -> Result<T>,
     ) -> Result<Option<T>> {
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         let current = self.load(now)?;
         if current.as_ref().map(|v| v.session_id.as_str()) != id
             || current.as_ref().is_some_and(|v| {
@@ -550,7 +571,7 @@ impl SessionStore {
         now: f64,
         closer: impl FnOnce() -> Result<T>,
     ) -> Result<Option<T>> {
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         if self.load(now).is_ok() {
             return Ok(None);
         }
@@ -561,7 +582,7 @@ impl SessionStore {
     /// stale reason is dropped. Only a still-current locked session can be
     /// resumed, and the drift baseline stays untouched.
     pub fn resume_if_current(&self, id: Option<&str>, now: f64) -> Result<bool> {
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         let Some(mut value) = self.load(now)? else {
             return Ok(false);
         };
@@ -588,7 +609,7 @@ impl SessionStore {
         detail: &str,
         confirmed: bool,
     ) -> Result<Outcome> {
-        let _lock = self.storage.lock("session-guard", None)?;
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
         let current = self.load(now)?;
         if current.as_ref().map(|v| v.session_id.as_str()) != id {
             return Ok(Outcome::changed(now));

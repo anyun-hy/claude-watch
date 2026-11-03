@@ -26,7 +26,11 @@ struct WatchedProcess: Decodable, Identifiable, Sendable {
     }
 
     var sourceRole: ProcessSourceRole {
-        if runtimeRole == "codex_managed" && roleEvidence == "managed_app_server" { return .managed }
+        // The Codex app-server daemon (codex_managed) is OpenAI's self-started
+        // background server, not an independently supervised source. It is folded
+        // into the desktop source instead of surfacing as a separate "托管后台"
+        // node, so closing Codex/ChatGPT leaves no orphan backend card behind.
+        if runtimeRole == "codex_managed" && roleEvidence == "managed_app_server" { return .desktop }
         if runtimeRole == "codex_managed_unconfirmed" && roleEvidence == "managed_path_only" { return .child }
         if kind == "code" || kind == "codex-cli" { return .cli }
         if kind.contains("desktop-") { return .desktop }

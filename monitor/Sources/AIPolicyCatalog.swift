@@ -49,6 +49,27 @@ struct AIServicePolicy: Identifiable {
 
 enum AIPolicyCatalog {
     static let services: [AIServicePolicy] = [claude, openAI]
+
+    /// The policy a monitored product maps to. Claude and ChatGPT / Codex are
+    /// separate families, so a product never reads another service's keys.
+    static func service(for product: MonitoredProduct) -> AIServicePolicy {
+        services.first { $0.id == (product == .claude ? "claude" : "openai") } ?? claude
+    }
+
+    /// A one-line summary of the service's four disposition actions, read from
+    /// the same settings the policy page edits. Used by the close button so the
+    /// action the user is about to take visibly matches the configured policy.
+    static func summary(for product: MonitoredProduct, settings: [String: Any]) -> String {
+        let policy = service(for: product)
+        let parts = policy.criteria.map { criterion in
+            let key = policy.setting(criterion).key
+            let stored = settings[key] as? String
+            let actionID = stored ?? policy.defaultAction
+            let title = policy.actionTitle(actionID)
+            return "\(criterion.title)→\(title)"
+        }
+        return parts.joined(separator: " · ")
+    }
     private static let claude = AIServicePolicy(
         id: "claude",
         title: "Claude 会话处置策略",

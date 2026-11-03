@@ -257,6 +257,15 @@ impl<R: ReadRunner> NativeDesktop<R> {
         self.target = target;
         Ok(())
     }
+    /// Point the guard's supervised family at a target without resolving or
+    /// binding an application. The guard's observation and exit paths derive
+    /// their bundle scope from `target.provider()` alone; they never read the
+    /// launch-time `selected` binding, so a family may be supervised before
+    /// (or without) its app being installed. Launch-time binding still goes
+    /// through `select_target`, which verifies the app exists.
+    pub fn set_guard_target(&mut self, target: LaunchTarget) {
+        self.target = target;
+    }
     pub fn select_cli(&mut self, target: LaunchTarget, home: &Path) -> Result<()> {
         let mut env = std::collections::BTreeMap::new();
         for key in ["PATH", "CLAUDE_CODE_BIN", "CODEX_CLI_BIN"] {
@@ -828,7 +837,7 @@ impl<R: ReadRunner> NativeDesktop<R> {
     }
 }
 pub struct DesktopRuntime<'a, R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> {
-    pub desktop: &'a NativeDesktop<R>,
+    pub desktop: &'a mut NativeDesktop<R>,
     pub system: &'a mut S,
     pub network: NetworkClient<T>,
     pub storage: StateStore,
@@ -903,6 +912,17 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
     }
     fn launch_target(&self) -> LaunchTarget {
         self.desktop.target()
+    }
+    fn set_family(&mut self, family_id: &str) -> Result<()> {
+        let target = claude_watch_core::policy::PolicyCatalog::family(family_id)
+            .and_then(claude_watch_core::policy::PolicyCatalog::guard_target)
+            .ok_or_else(|| CoreError::new("unknown_family", "策略表未声明该监督对象"))?;
+        // Supervision scope is derived from the target's provider, not from a
+        // resolved app bundle, so pointing the guard at a family never fails
+        // when its app is not yet installed. Launch-time binding still goes
+        // through `select_target`.
+        self.desktop.set_guard_target(target);
+        Ok(())
     }
     fn observation_roots(&mut self) -> Result<Vec<Target>> {
         self.desktop.observation_roots()

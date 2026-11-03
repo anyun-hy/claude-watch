@@ -632,17 +632,24 @@ mod tests {
         use claude_watch_runtime::controlled::{Controller, DesktopSystem};
         struct Fake {
             running: bool,
+            family: &'static str,
         }
         impl DesktopSystem for Fake {
             fn now(&self) -> f64 {
                 1001.0
+            }
+            fn set_family(&mut self, family_id: &str) -> Result<()> {
+                // The fixture supervises one Claude-shaped target; the OpenAI
+                // family has no processes, so its tick stays idle.
+                self.family = if family_id == "claude" { "claude" } else { "openai" };
+                Ok(())
             }
             fn monotonic(&self) -> Duration {
                 Duration::from_secs(1001)
             }
             fn wait(&mut self, _: Duration) {}
             fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
-                Ok(if self.running {
+                Ok(if self.running && self.family == "claude" {
                     vec![(
                         Desktop {
                             pid: 77,
@@ -672,7 +679,12 @@ mod tests {
                 panic!("locked session must not probe")
             }
             fn local_guard(&mut self) -> Result<Value> {
-                panic!("locked session must not sample")
+                // The Claude-shaped target has a locked session and must not
+                // sample; the OpenAI family has no process and reports idle.
+                if self.family == "claude" {
+                    panic!("locked session must not sample")
+                }
+                Ok(json!({"proxy":"ok","tun":"ok","guard_backend_healthy":true}))
             }
             fn backend_healthy(&mut self) -> Result<bool> {
                 Ok(true)
@@ -726,7 +738,7 @@ mod tests {
             failed: Arc::new(AtomicU64::new(0)),
         };
         queue.send("sampling-state", EventFields::default(), 1000.0);
-        let mut fake = Fake { running: true };
+        let mut fake = Fake { running: true, family: "claude" };
         let receipt = controller.guard_tick(&mut fake).unwrap();
         assert!(!fake.running);
         assert_eq!(receipt["stop_state"], "confirmed");

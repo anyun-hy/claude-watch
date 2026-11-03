@@ -90,6 +90,11 @@ struct Fake {
     interrupt_code: Option<i32>,
     spawn_test_process: bool,
     test_child: Option<TestChild>,
+    family: &'static str,
+    /// When true, the OpenAI family also reports a running desktop so a test
+    /// can drive its automatic disposition. Defaults false so the existing
+    /// Claude-only contracts keep the OpenAI tick idle.
+    supervise_openai: bool,
 }
 impl Default for Fake {
     fn default() -> Self {
@@ -131,6 +136,8 @@ impl Default for Fake {
             interrupt_code: None,
             spawn_test_process: false,
             test_child: None,
+            family: "claude",
+            supervise_openai: false,
         }
     }
 }
@@ -218,6 +225,13 @@ impl DesktopSystem for Fake {
     fn launch_target(&self) -> claude_watch_core::processes::LaunchTarget {
         self.target
     }
+    fn set_family(&mut self, family_id: &str) -> Result<()> {
+        // Every contract in this file supervises the Claude-shaped fixture;
+        // the OpenAI family has no process and its tick stays idle. The launch
+        // target is separate and stays ClaudeDesktop.
+        self.family = if family_id == "claude" { "claude" } else { "openai" };
+        Ok(())
+    }
     fn observation_owner(&mut self) -> Result<claude_watch_core::processes::Identity> {
         Ok(claude_watch_core::processes::Identity {
             pid: 88,
@@ -231,7 +245,12 @@ impl DesktopSystem for Fake {
     }
     fn observation_roots(&mut self) -> Result<Vec<claude_watch_core::processes::Target>> {
         use claude_watch_core::processes::{Identity, Kind, LaunchTarget, Target};
-        if !self.running || self.no_main {
+        let present = if self.supervise_openai {
+            self.family == "openai"
+        } else {
+            self.family == "claude"
+        };
+        if !self.running || self.no_main || !present {
             return Ok(vec![]);
         }
         self.root_reads += 1;
@@ -270,7 +289,16 @@ impl DesktopSystem for Fake {
         self.now += d.as_secs_f64()
     }
     fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
-        Ok(if self.running {
+        // `supervise_openai` repurposes `running` as the OpenAI family's
+        // process state and leaves the Claude family empty, so a test can
+        // drive the OpenAI disposition in isolation. The default (false)
+        // keeps the original Claude-only fixture semantics.
+        let present = if self.supervise_openai {
+            self.running && self.family == "openai"
+        } else {
+            self.running && self.family == "claude"
+        };
+        Ok(if present {
             vec![(
                 Desktop {
                     pid: self
@@ -309,7 +337,12 @@ impl DesktopSystem for Fake {
             .any(|(desktop, main, _)| *main && desktop == expected))
     }
     fn desktop_tree_running(&mut self) -> Result<bool> {
-        Ok(self.tree_running_override.unwrap_or(self.running))
+        let present = if self.supervise_openai {
+            self.family == "openai"
+        } else {
+            self.family == "claude"
+        };
+        Ok(self.tree_running_override.unwrap_or(self.running && present))
     }
     fn launcher(&mut self) -> Result<Launcher> {
         Ok(Launcher {
@@ -579,6 +612,10 @@ fn isolated_process_protection_handles_retry_recovery_and_confirmed_ip_change() 
     );
     system.ip = "1.1.1.1";
     system.now += 1.0;
+    // A controlled launch is single-target: the runtime binds the Claude
+    // target before entering `launch` (guard_tick above left the family on
+    // the last supervised one, which must not leak into this launch).
+    system.set_family("claude").unwrap();
     fixture.receipts(system.now);
     assert_eq!(controller.launch(&mut system).unwrap()["status"], "ok");
     assert!(system
@@ -1784,6 +1821,10 @@ fn failed_write_and_failed_stop_latch_same_session_until_retry() {
         .unwrap()
         .success());
     system.now += 1.0;
+    // A controlled launch is single-target: the runtime binds the Claude
+    // target before entering `launch` (guard_tick above left the family on
+    // the last supervised one, which must not leak into this launch).
+    system.set_family("claude").unwrap();
     fixture.receipts(system.now);
     controller.launch(&mut system).unwrap();
     system.now += 1.0;
@@ -2065,4 +2106,73 @@ fn combined_probe_drift_applies_the_stricter_of_the_two_policies() {
     assert_eq!(receipt["stop_action"], "force");
     assert_eq!(system.ip_force_calls, 1);
     assert!(!system.running);
+}
+
+#[test]
+fn the_openai_family_is_supervised_and_closed_on_confirmed_drift() {
+    // Regression: the guard supervised only the Claude target, so a ChatGPT /
+    // Codex disposition was configurable but never enforced. The guard now
+    // walks every family the policy table declares, so an OpenAI drift closes
+    // the OpenAI desktop by its own policy.
+    let fixture = Fixture::new();
+    let mut system = Fake {
+        running: true,
+        supervise_openai: true,
+        ..Default::default()
+    };
+    let controller = Controller::new(fixture.storage.clone());
+    // First round adopts the running OpenAI desktop into supervision. The
+    // per-family receipt lives in the heartbeat's `families` array.
+    let adopted = controller.guard_tick(&mut system).unwrap();
+    let openai = |receipt: &Value| -> Value {
+        receipt["families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["family"] == "openai")
+            .cloned()
+            .unwrap()
+    };
+    let adopted_openai = openai(&adopted);
+    assert_eq!(adopted_openai["action"], "observe");
+    assert_eq!(
+        adopted_openai["session_guard"]["reason"]["code"],
+        "session_adopted"
+    );
+    // A changed exit is a confirmed drift under the OpenAI family's policy.
+    system.ip = "8.8.8.8";
+    system.now += 2.0;
+    let risk = controller.guard_tick(&mut system).unwrap();
+    let risk_openai = openai(&risk);
+    assert_eq!(risk_openai["action"], "close-desktop");
+    assert!(!system.running);
+    assert_eq!(system.closes, 1);
+}
+
+#[test]
+fn each_supervised_family_keeps_its_own_session_record() {
+    // The per-family session file keeps Claude and OpenAI supervision from
+    // overwriting each other, and the heartbeat lists every family the policy
+    // table declares.
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake::default();
+    controller.guard_tick(&mut system).unwrap();
+    let heartbeat = fixture
+        .storage
+        .read_json(&fixture.storage.paths.base().join("guard-heartbeat.json"), json!(null))
+        .unwrap();
+    let families: Vec<&str> = heartbeat["families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["family"].as_str().unwrap())
+        .collect();
+    assert!(families.contains(&"claude"));
+    assert!(families.contains(&"openai"));
+    // The OpenAI session path exists and is distinct from the Claude record.
+    assert_ne!(
+        fixture.storage.paths.session_for("claude"),
+        fixture.storage.paths.session_for("openai")
+    );
 }

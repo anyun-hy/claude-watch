@@ -503,31 +503,27 @@ struct SwitcherPage: View {
     /// Each AI service declares its own policy, so the panel renders the
     /// catalog instead of one shape copied per service.
     private var protectionPolicyPanel: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("以下两张表决定运行中的会话被怎么处置：会话建立时记录基线，任一项偏离即按所选动作处理。它不决定启动是否放行——启动门槛在页面底部的「启动要求与高级维护」。")
-                .font(WatchTypography.caption).foregroundStyle(p.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+        // The two policy cards sit side by side, one column per AI service, so
+        // both tables share a single row height instead of stacking full-width.
+        // Each card keeps its own four criteria as a single column of
+        // label-over-picker rows; a narrow column reads better as four short
+        // rows than as a cramped 2x2 grid.
+        LazyVGrid(columns: [GridItem(.flexible(minimum: 240), spacing: 12, alignment: .top),
+                            GridItem(.flexible(minimum: 240), spacing: 12, alignment: .top)],
+                  alignment: .leading, spacing: 12) {
             ForEach(AIPolicyCatalog.services) { policy in policyCard(policy) }
         }
     }
     private func policyCard(_ policy: AIServicePolicy) -> some View {
-        Surface(p) {
-            VStack(alignment: .leading, spacing: 10) {
+        Surface(p, padding: 14) {
+            VStack(alignment: .leading, spacing: 8) {
                 Label(policy.title, systemImage: "shield.lefthalf.filled.badge.checkmark")
                     .font(WatchTypography.section)
                 Text(policy.subtitle)
                     .font(WatchTypography.small).foregroundStyle(p.secondary)
                     .lineLimit(2).fixedSize(horizontal: false, vertical: true)
-                // Two columns of compact rows keep the two policy tables short:
-                // each criterion is a caption over its picker instead of a full
-                // body-height row, so the pair of tables no longer dominates
-                // the protection page.
-                LazyVGrid(columns: [GridItem(.flexible(minimum: 220), spacing: 12, alignment: .leading),
-                                    GridItem(.flexible(minimum: 220), spacing: 12, alignment: .leading)],
-                          alignment: .leading, spacing: 10) {
-                    ForEach(policy.criteria) { criterion in
-                        policyCell(criterion, in: policy)
-                    }
+                ForEach(policy.criteria) { criterion in
+                    policyCell(criterion, in: policy)
                 }
                 if let note = policy.note {
                     InlineNotice(title: "可配置动作少于 Claude", detail: note,
@@ -574,6 +570,7 @@ struct SwitcherPage: View {
             Text("会话保护在明确 IP 变化、中国出口、DNS/WebRTC 风险或会话缺失时请求退出 Claude；它是进程级策略，存在采样窗口，不是防火墙，也不保证账号状态。")
                 .font(WatchTypography.caption).foregroundStyle(p.secondary)
             protectionPolicyPanel
+            draftActions
             recoveryPanel
             Surface(p) {
                 DisclosureGroup("启动要求与高级维护", isExpanded: $showSettings) { settingsPanel.padding(.top, 14) }
@@ -694,7 +691,6 @@ struct SwitcherPage: View {
                     }
                 }.font(WatchTypography.caption).padding(.top, 12)
             }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
-            draftActions
         }.disabled(store.busy || !store.loaded)
     }
     private var draftActions: some View {

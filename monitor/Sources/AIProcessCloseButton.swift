@@ -10,6 +10,19 @@ struct AIProcessCloseButton: View {
     @State private var confirming = false
     @State private var message = ""
     @State private var showingMessage = false
+
+    /// The confirmation message names the policy the close action will follow,
+    /// so the manual quit visibly matches the configured disposition instead of
+    /// being a hard-coded sentence that can drift from the policy page.
+    private var confirmationMessage: String {
+        if control.isFixture { return "当前为隔离预览，只模拟关闭，不影响实际应用。" }
+        let summary = AIPolicyCatalog.summary(for: product, settings: switcher.settings)
+        let scope = product == .openAI
+            ? "将按当前策略结束 ChatGPT / Codex 桌面应用与独立 CLI，当前 Codex 对话和运行任务可能中断。"
+            : "将按当前策略结束 Claude Desktop、Claude Code 及已核实的关联进程，正在运行的会话可能中断。"
+        return "当前处置策略：\(summary)。\n\n\(scope)"
+    }
+
     var body: some View {
         Button {
             Task {
@@ -40,9 +53,7 @@ struct AIProcessCloseButton: View {
             }
             Button("取消", role: .cancel) { pending = nil }
         } message: {
-            Text(control.isFixture ? "当前为隔离预览，只模拟关闭，不影响实际应用。"
-                 : product == .openAI ? "将结束 ChatGPT / Codex 桌面应用与独立 CLI，当前 Codex 对话和运行任务可能中断。"
-                 : "将结束 Claude Desktop、Claude Code 及已核实的关联进程，正在运行的会话可能中断。")
+            Text(confirmationMessage)
         }
         .alert(control.isFixture ? "进程关闭 · 模拟结果" : "进程关闭结果", isPresented: $showingMessage) {
             Button("知道了", role: .cancel) {}
