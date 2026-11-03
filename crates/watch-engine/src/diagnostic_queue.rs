@@ -283,6 +283,10 @@ impl GuardHistory {
         let reason = guard["reason"]["code"]
             .as_str()
             .or_else(|| receipt["code"].as_str());
+        // Every code a guard tick can actually report. A code that reaches the
+        // receipt but is missing here used to collapse to "other", which hid
+        // the one fact the event exists to record — including the most common
+        // one, `session_missing`.
         let code = match reason {
             None => "none",
             Some(
@@ -302,15 +306,41 @@ impl GuardHistory {
                 | "session_pending"
                 | "session_rechecking"
                 | "session_ended"
+                | "session_missing"
+                | "session_changed"
+                | "session_state_invalid"
+                | "revalidation_context_changed"
                 | "revalidation_timeout"
                 | "risk_evidence_unavailable"
                 | "risk_evidence_missing"
+                | "risk_evidence_invalid"
                 | "invalid_config"
                 | "invalid_session"
                 | "invalid_native_observation"
                 | "native_observation_unavailable"
                 | "desktop_inventory_incomplete"
+                | "desktop_identity_unavailable"
                 | "process_metadata_unavailable"
+                | "target_identity_changed"
+                | "target_identity_mismatch"
+                | "target_already_running"
+                | "target_start_unconfirmed"
+                | "launcher_identity_unavailable"
+                | "launcher_context_changed"
+                | "evidence_context_unconfirmed"
+                | "superseded_check"
+                | "protected_scope_mismatch"
+                | "display_receipt_not_authority"
+                | "claude_already_running"
+                | "pending_cleanup_failed"
+                | "revalidation_lease_rollback_failed"
+                | "backend_unhealthy"
+                | "guard_memory_unavailable"
+                | "guard_encoding_failed"
+                | "egress_changed"
+                | "dns_egress_changed"
+                | "webrtc_egress_changed"
+                | "dns_and_webrtc_egress_changed"
                 | "state_io_failed"
                 | "unsafe_path"
                 | "home_owner_mismatch"

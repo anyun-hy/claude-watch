@@ -383,12 +383,21 @@ enum SwitcherCommandRunner {
         env.removeValue(forKey: "CLAUDE_WATCH_DNS_REFRESH_TOKEN")
         env.removeValue(forKey: "CW_SETUP_PROGRESS")
         if let dnsRefreshToken { env["CLAUDE_WATCH_DNS_REFRESH_TOKEN"] = dnsRefreshToken }
-        let observesSetup: Bool
-        if case .rustCandidate = variant { observesSetup = args.starts(with: ["setup", "apply"]) && setupProgress != nil }
-        else { observesSetup = false }
-        if observesSetup { env["CW_SETUP_PROGRESS"] = "1" }
+        // Any command whose slow stage the user has to sit through streams its
+        // stage announcements. A launch or a launch requirements preview used to
+        // run with no progress at all, which read as a frozen button.
+        let streamsProgress: Bool
+        if case .rustCandidate = variant {
+            streamsProgress = setupProgress != nil && (
+                args.starts(with: ["setup", "apply"])
+                || args.first == "launch"
+                || args.first == "checkdetail"
+                || (args.starts(with: ["account", "switch"]) && args.contains("--apply"))
+            )
+        } else { streamsProgress = false }
+        if streamsProgress { env["CW_SETUP_PROGRESS"] = "1" }
         task.environment = env
-        return try execute(task, input: input, cancellation: cancellation, setupProgress: observesSetup ? setupProgress : nil)
+        return try execute(task, input: input, cancellation: cancellation, setupProgress: streamsProgress ? setupProgress : nil)
     }
     static func execute(_ task: Process, input: Data? = nil, cancellation: SwitcherReadCancellation? = nil,
                         setupProgress: SetupProgressReader? = nil) throws -> Data {
@@ -495,6 +504,10 @@ final class SwitcherStore: ObservableObject {
     private(set) var initializationDNSReceipt: (context: String, state: String, sampled: Double)?
     private(set) var initializationWebRTCReceipt: (context: String, state: String, sampled: Double)?
     @Published private(set) var activity = ""
+    /// Which stage of the pre-launch check is running, when the backend
+    /// announces one. `nil` outside a launch-grade command, so the launch row
+    /// can show a determinate progress indicator instead of a frozen button.
+    @Published private(set) var activityStage: Int?
     @Published private(set) var operationLog = ""
     @Published var setupApplyEnvironment = true { didSet { setupPlan = nil } }
     @Published var setupEnablePolicy = true { didSet { setupPlan = nil } }
@@ -864,14 +877,27 @@ final class SwitcherStore: ObservableObject {
     private func beginActivity(_ text: String) -> Int {
         activityGeneration += 1
         activity = text
+        activityStage = nil
         return activityGeneration
     }
     private func updateActivity(_ text: String, token: Int) {
         if token == activityGeneration { activity = text }
     }
     private func endActivity(_ token: Int) {
-        if token == activityGeneration { activity = "" }
+        if token == activityGeneration { activity = ""; activityStage = nil }
     }
+    /// True for the commands whose slow stage the user has to sit through. They
+    /// stream stage announcements so the UI can say what is being checked.
+    private static func streamsPhases(_ args: [String]) -> Bool {
+        args.starts(with: ["setup", "apply"])
+            || args.first == "launch"
+            || args.first == "checkdetail"
+            || (args.starts(with: ["account", "switch"]) && args.contains("--apply"))
+    }
+    #if UI_REVIEW
+    /// Test seam for the streaming rule above.
+    static func streamsPhasesForTest(_ args: [String]) -> Bool { streamsPhases(args) }
+    #endif
     static func acceptsDisplayPolicy(_ preview: EnvironmentPolicyEvaluation, for environment: CurrentEnvironmentReceipt,
                                      hasUnsavedSettings: Bool) -> Bool {
         guard let observationID = environment.observation_id, !observationID.isEmpty,
@@ -1333,7 +1359,20 @@ final class SwitcherStore: ObservableObject {
                 if args.starts(with: ["account", "switch"]) && args.contains("--apply") {
                     data = try await runAccountSwitchWithDNSRefresh(args, input: input)
                 } else {
-                    let channel = setupProgress.map { observer in
+                    // A launch-grade command streams its stages whether or not
+                    // the caller supplied an observer, so the activity line and
+                    // the launch row both move while the check runs.
+                    let channel: SetupProgressReader?
+                    if Self.streamsPhases(args) {
+                        channel = SetupProgressReader { [weak self] phase, stream in
+                            Task { @MainActor in
+                                guard let self, stream.isActive, self.busy, self.activityGeneration == activityToken else { return }
+                                self.updateActivity(phase.detail, token: activityToken)
+                                if let stage = phase.launchStage { self.activityStage = stage }
+                                setupProgress?(phase)
+                            }
+                        }
+                    } else { channel = setupProgress.map { observer in
                         SetupProgressReader { [weak self] phase, stream in
                             Task { @MainActor in
                                 guard let self, stream.isActive, self.busy, self.activityGeneration == activityToken else { return }
@@ -1341,7 +1380,7 @@ final class SwitcherStore: ObservableObject {
                                 observer(phase)
                             }
                         }
-                    }
+                    } }
                     data = try await Task.detached { try SwitcherCommandRunner.run(args, input: input, setupProgress: channel) }.value
                 }
                 let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]

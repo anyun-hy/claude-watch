@@ -355,7 +355,7 @@ fn unknown_samples_require_a_sustained_fifteen_second_streak_without_claiming_ip
     let out = store
         .apply_check(Some(&value.session_id), &unavailable)
         .unwrap();
-    assert_eq!(out.reason.unwrap().detail, "Claude 主进程身份连续未能复核");
+    assert_eq!(out.reason.unwrap().detail, "主进程身份连续未能复核");
 }
 
 #[test]

@@ -177,13 +177,17 @@ impl Controller {
         let _launch = self.storage.lock("launch", None)?;
         if !system.launch_target().protected() {
             return self.launch_observation(system);
-        }
-        if !system.desktops()?.is_empty() {
+        }        if !system.desktops()?.is_empty() {
             return Err(CoreError::new(
                 "claude_already_running",
                 "Claude 已在运行，不能补建受控启动会话",
             ));
         }
+        // The audit is the slow stage: it measures the exit, DNS, WebRTC and
+        // the service endpoints. Announce it before it starts so the user sees
+        // which part of the pre-launch check is running instead of a button
+        // that stops answering.
+        crate::setup_progress::emit(crate::setup_progress::Phase::CollectEvidence);
         let audit = system.full_audit()?;
         let current = system.egress();
         if !system.desktops()?.is_empty() {
@@ -196,6 +200,7 @@ impl Controller {
         let receipts = ReceiptStore {
             storage: self.storage.clone(),
         };
+        crate::setup_progress::emit(crate::setup_progress::Phase::VerifyLaunchConditions);
         let pending = sessions.begin_verified(&receipts, &audit, &current, system.now())?;
         let id = pending.session_id.clone();
         let result: Result<Value> = (|| {
@@ -212,7 +217,9 @@ impl Controller {
                 .as_bytes(),
                 0o600,
             )?;
+            crate::setup_progress::emit(crate::setup_progress::Phase::BindSession);
             system.open_desktop()?;
+            crate::setup_progress::emit(crate::setup_progress::Phase::OpenApplication);
             let deadline = system.monotonic() + Duration::from_secs(10);
             while system.monotonic() < deadline {
                 let processes = system.desktops()?;
@@ -295,6 +302,7 @@ impl Controller {
                 "目标已在运行，不能补登记观察会话",
             ));
         }
+        crate::setup_progress::emit(crate::setup_progress::Phase::CollectEvidence);
         let audit = self.observation_audit(system, &owner)?;
         if !system.observation_roots()?.is_empty() {
             return Err(CoreError::new(
@@ -302,7 +310,9 @@ impl Controller {
                 "预检期间目标已由其他入口启动，未补登记观察会话",
             ));
         }
+        crate::setup_progress::emit(crate::setup_progress::Phase::VerifyLaunchConditions);
         system.open_desktop()?;
+        crate::setup_progress::emit(crate::setup_progress::Phase::OpenApplication);
         let deadline = system.monotonic() + Duration::from_secs(10);
         while system.monotonic() < deadline {
             let roots = system.observation_roots()?;

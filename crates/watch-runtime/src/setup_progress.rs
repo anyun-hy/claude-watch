@@ -8,6 +8,10 @@ pub enum Phase {
     VerifySettings,
     SaveBaseline,
     RestoreSettings,
+    CollectEvidence,
+    VerifyLaunchConditions,
+    BindSession,
+    OpenApplication,
 }
 impl Phase {
     pub fn code(self) -> &'static str {
@@ -18,6 +22,10 @@ impl Phase {
             Self::VerifySettings => "verify_settings",
             Self::SaveBaseline => "save_baseline",
             Self::RestoreSettings => "restore_settings",
+            Self::CollectEvidence => "collect_evidence",
+            Self::VerifyLaunchConditions => "verify_launch_conditions",
+            Self::BindSession => "bind_session",
+            Self::OpenApplication => "open_application",
         }
     }
 }

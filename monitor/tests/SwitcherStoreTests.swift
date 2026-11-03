@@ -505,6 +505,36 @@ struct SwitcherStoreTests {
                "a service with no switch of its own has no key to write")
         expect(BackgroundServiceCatalog.descriptor("unknown").toggle == nil,
                "an unknown service gets no switch instead of a guessed key")
+        // The pre-launch check must stream its stages: a launch or a launch
+        // requirements preview that reports nothing read as a frozen button.
+        expect(SwitcherStore.streamsPhasesForTest(["launch", "--apply"]), "a launch streams its stages")
+        expect(SwitcherStore.streamsPhasesForTest(["launch", "--target", "chatgpt-desktop", "--apply"]),
+               "a ChatGPT launch streams its stages")
+        expect(SwitcherStore.streamsPhasesForTest(["checkdetail", "--online"]),
+               "a launch requirements preview streams its stages")
+        expect(SwitcherStore.streamsPhasesForTest(["setup", "apply", "--apply"]),
+               "the setup transaction keeps streaming")
+        expect(!SwitcherStore.streamsPhasesForTest(["logs"]),
+               "an instant command streams nothing")
+        expect(!SwitcherStore.streamsPhasesForTest(["account", "import"]),
+               "a read-only account command streams nothing")
+        expect(SwitcherStore.streamsPhasesForTest(["account", "switch", "A", "--apply"]),
+               "an applying account switch streams its stages")
+        // Each announced stage maps to exactly one determinate step, so the
+        // launch row can show 1/3, 2/3, 3/3 instead of an endless spinner.
+        expect(SetupProgressPhase.collectEvidence.launchStage == 1
+                   && SetupProgressPhase.verifyLaunchConditions.launchStage == 2
+                   && SetupProgressPhase.bindSession.launchStage == 3
+                   && SetupProgressPhase.openApplication.launchStage == 3,
+               "every launch stage maps to one determinate step")
+        expect(SetupProgressPhase.applySettings.launchStage == nil,
+               "a setup phase is not a launch step")
+        expect(SetupProgressPhase.launchStageCount == 3, "the launch check has three stages")
+        expect(SetupProgressPhase(rawValue: "collect_evidence") == .collectEvidence
+                   && SetupProgressPhase(rawValue: "verify_launch_conditions") == .verifyLaunchConditions
+                   && SetupProgressPhase(rawValue: "bind_session") == .bindSession
+                   && SetupProgressPhase(rawValue: "open_application") == .openApplication,
+               "the interface decodes the stage codes the backend emits")
         print("SwitcherStore: \(checks) isolated assertions passed")
     }
 }

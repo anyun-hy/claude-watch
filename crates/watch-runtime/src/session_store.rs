@@ -87,6 +87,22 @@ impl SessionStore {
                 "展示结果不能授予启动许可，必须重新执行完整预检",
             ));
         }
+        // The audit names the service it authorises, and this store writes one
+        // family's session record. A store must never accept another family's
+        // audit: doing so would either fail the launch gate against the wrong
+        // target or overwrite a different service's session file. Deriving the
+        // family from the audit — instead of a fixed one — is what lets the
+        // OpenAI family establish a session at all.
+        let audit_family = claude_watch_core::policy::PolicyCatalog::family_for(
+            claude_watch_core::session::audit_target(audit).provider(),
+        )
+        .map(|family| family.id);
+        if audit_family.is_some_and(|family| family != self.family) {
+            return Err(CoreError::new(
+                "launch_target_mismatch",
+                "启动审计与目标或授权范围不一致",
+            ));
+        }
         let context = audit
             .get("context_id")
             .and_then(Value::as_str)

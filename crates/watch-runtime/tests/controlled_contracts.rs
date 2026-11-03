@@ -226,10 +226,17 @@ impl DesktopSystem for Fake {
         self.target
     }
     fn set_family(&mut self, family_id: &str) -> Result<()> {
-        // Every contract in this file supervises the Claude-shaped fixture;
-        // the OpenAI family has no process and its tick stays idle. The launch
-        // target is separate and stays ClaudeDesktop.
+        // Mirror the real system: a family's tick runs against that family's
+        // own guard target, and the audit it collects declares that target.
+        // Keeping the target on ClaudeDesktop here is what let a test pass
+        // while production rejected the same audit with
+        // `launch_target_mismatch`.
         self.family = if family_id == "claude" { "claude" } else { "openai" };
+        if self.supervise_openai {
+            self.target = claude_watch_core::policy::PolicyCatalog::family(family_id)
+                .and_then(claude_watch_core::policy::PolicyCatalog::guard_target)
+                .unwrap_or(self.target);
+        }
         Ok(())
     }
     fn observation_owner(&mut self) -> Result<claude_watch_core::processes::Identity> {
@@ -2191,6 +2198,15 @@ fn the_openai_family_is_supervised_and_closed_on_confirmed_drift() {
     };
     let adopted_openai = openai(&adopted);
     assert_eq!(adopted_openai["action"], "observe");
+    // The audit declares this family's own target, so the session layer must
+    // accept it. Resolving the target from the audit used to be a fixed
+    // ClaudeDesktop, which made every OpenAI adoption fail with
+    // `launch_target_mismatch` in production while this test passed.
+    assert!(
+        adopted_openai.get("adopt_error").is_none(),
+        "adopt_error: {}",
+        adopted_openai["adopt_error"]
+    );
     assert_eq!(
         adopted_openai["session_guard"]["reason"]["code"],
         "session_adopted"

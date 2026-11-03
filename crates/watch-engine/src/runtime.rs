@@ -353,6 +353,14 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
                 persist,
                 launch: false,
             };
+            // The same stage announcements the launch path uses, so a launch
+            // requirements preview shows which part of the check is running
+            // rather than sitting still until the whole audit finishes.
+            if !environment && scope == AuditScope::Full {
+                claude_watch_runtime::setup_progress::emit(
+                    claude_watch_runtime::setup_progress::Phase::CollectEvidence,
+                );
+            }
             let (mut audit, guard_diagnostics) = if environment {
                 store.collect_environment(&mut host, &zones, request.launch_target(), options)?
             } else if scope == AuditScope::Full {
@@ -366,6 +374,11 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
                     None,
                 )
             };
+            if !environment && scope == AuditScope::Full {
+                claude_watch_runtime::setup_progress::emit(
+                    claude_watch_runtime::setup_progress::Phase::VerifyLaunchConditions,
+                );
+            }
             audit["grants_launch_permission"] = json!(false);
             if !environment && scope == AuditScope::Full {
                 audit["purpose"] = json!("launch_requirements_preview");

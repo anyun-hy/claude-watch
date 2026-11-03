@@ -76,6 +76,9 @@ struct GraphLaunchButton: View {
             .disabled(reason != nil)
             .help(reason ?? "环境预览已通过；启动时会重新执行完整检查。")
             .accessibilityHint(reason ?? "启动前将重新检查当前环境。")
+            if switcher.busy {
+                launchProgress
+            }
         }
         .confirmationDialog("检查并启动 \(pending?.title ?? "应用")？", isPresented: $confirming, titleVisibility: .visible) {
             if let target = pending {
@@ -92,9 +95,31 @@ struct GraphLaunchButton: View {
         } message: { Text(resultMessage) }
     }
 
+    /// The live pre-launch check row. The backend announces which stage is
+    /// running; before the first announcement (and for commands with no
+    /// stages) this still shows an indeterminate spinner with the generic
+    /// activity text, so the button never looks frozen.
+    private var launchProgress: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text(switcher.activity.isEmpty ? "正在检查启动条件…" : switcher.activity)
+                    .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let stage = switcher.activityStage {
+                ProgressView(value: Double(stage), total: Double(SetupProgressPhase.launchStageCount))
+                    .controlSize(.small)
+                Text("第 \(stage) / \(SetupProgressPhase.launchStageCount) 步：实测取样 → 核对策略 → 建立会话")
+                    .font(WatchTypography.small).foregroundStyle(p.secondary)
+            }
+        }
+        .padding(.top, 8)
+        .accessibilityLabel("启动检查进度")
+    }
+
     @MainActor
-    private func buttonBlockReason(for target: GraphLaunchTarget, at now: Date) -> String? {
-        if processControl.busy { return "正在核对或关闭进程，请稍后再启动。" }
+    private func buttonBlockReason(for target: GraphLaunchTarget, at now: Date) -> String? {        if processControl.busy { return "正在核对或关闭进程，请稍后再启动。" }
         if let reason = target.capabilityBlockReason(store: switcher) { return reason }
         // Fast lane first: the 2s desktop-presence poll answers immediately for
         // the common "already running" case without waiting for a full backend

@@ -314,6 +314,18 @@ pub fn verify_launch(
     Ok((current, initial_risk))
 }
 
+/// Which service the launch audit authorises. The audit carries the target it
+/// was evaluated against, so a session established for one family is verified
+/// against that family instead of a fixed one. A protected target writes no
+/// target at all — that is the Claude desktop, and the default stands.
+pub fn audit_target(audit: &Value) -> crate::processes::LaunchTarget {
+    audit
+        .get("launch_target")
+        .and_then(Value::as_str)
+        .and_then(crate::processes::LaunchTarget::parse)
+        .unwrap_or(crate::processes::LaunchTarget::ClaudeDesktop)
+}
+
 pub fn begin(
     audit: &Value,
     current: &Value,
@@ -321,13 +333,7 @@ pub fn begin(
     id: &str,
     now: f64,
 ) -> Result<Session> {
-    let (current, initial_risk) = verify_launch(
-        audit,
-        current,
-        initial_risk,
-        now,
-        crate::processes::LaunchTarget::ClaudeDesktop,
-    )?;
+    let (current, initial_risk) = verify_launch(audit, current, initial_risk, now, audit_target(audit))?;
     let context = audit["context_id"].as_str().unwrap_or("");
     if id.is_empty() || id.len() > 256 {
         return Err(CoreError::new("invalid_session", "会话编号无效"));
@@ -415,7 +421,7 @@ impl Outcome {
             state: "risk".into(),
             reason: Some(Reason::new(
                 "session_missing",
-                "Claude 未绑定受控启动会话",
+                "未绑定受控启动会话",
                 now,
             )),
             baseline: None,
@@ -575,8 +581,8 @@ pub fn check(session: &Session, input: &CheckInput) -> Outcome {
         return uncertain_with_terminal(
             session,
             "session_identity_unconfirmed",
-            "Claude 主进程身份暂未能复核",
-            "Claude 主进程身份连续未能复核",
+            "主进程身份暂未能复核",
+            "主进程身份连续未能复核",
             now,
         );
     }
