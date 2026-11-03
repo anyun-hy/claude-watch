@@ -16,6 +16,7 @@ struct Fake {
     fail_retire: bool,
     retired: bool,
     fail_stop_agent: bool,
+    fail_rollback: bool,
 }
 impl LifecycleOs for Fake {
     fn validate_bundle(&mut self, _: &Path) -> Result<AppIdentity> {
@@ -62,6 +63,9 @@ impl LifecycleOs for Fake {
     }
     fn rollback_agent_install(&mut self) -> Result<()> {
         self.rollbacks += 1;
+        if self.fail_rollback {
+            return Err(CoreError::new("rollback_failed", "fixture"));
+        }
         Ok(())
     }
     fn resume_agent(&mut self, _: &Path) -> Result<()> {
@@ -202,6 +206,98 @@ fn failing_to_stop_the_agent_leaves_no_staging_bundle_behind() {
     );
     assert!(app.exists());
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_failed_rollback_still_removes_the_staged_copy() {
+    let root = std::env::temp_dir().join(format!("cw-life-rb-{}", Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let app = bundle(&root, "old.app");
+    let source = bundle(&root, "source.app");
+    let mut lifecycle = AppLifecycle {
+        paths: LifecyclePaths {
+            installed: app.clone(),
+            trash: root.join("trash"),
+            protected_data: root.join("data"),
+        },
+        os: Fake {
+            fail_stop: true,
+            fail_rollback: true,
+            agent: true,
+            ..Default::default()
+        },
+    };
+    assert_eq!(
+        lifecycle.apply(&source).unwrap_err().code,
+        "app_stop_failed"
+    );
+    assert_eq!(lifecycle.os.rollbacks, 1);
+    assert!(staged_copies(&root).is_empty(), "staged copy leaked past a failed rollback");
+    assert_eq!(fs::read_to_string(app.join("Contents/Info.plist")).unwrap(), "fixture");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_staging_copy_left_by_a_killed_install_is_swept_by_the_next_one() {
+    let root = std::env::temp_dir().join(format!("cw-life-sweep-{}", Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let app = bundle(&root, "old.app");
+    let source = bundle(&root, "source.app");
+    let stale = bundle(&root, &format!(".ClaudeWatch-{}.app", "a".repeat(32)));
+    // Neither of these is a name this module generates.
+    let foreign = bundle(&root, &format!(".ClaudeWatch-{}.app", "z".repeat(32)));
+    let short = bundle(&root, &format!(".ClaudeWatch-{}.app", "b".repeat(31)));
+    let mut lifecycle = AppLifecycle {
+        paths: LifecyclePaths {
+            installed: app.clone(),
+            trash: root.join("trash"),
+            protected_data: root.join("data"),
+        },
+        os: Fake::default(),
+    };
+    lifecycle.apply(&source).unwrap();
+    assert!(!stale.exists(), "the interrupted install's copy survived the next install");
+    assert!(foreign.exists());
+    assert!(short.exists());
+    assert!(staged_copies(&root).is_empty());
+    assert!(app.join("Contents/Info.plist").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn uninstall_sweeps_stale_staging_copies_even_without_an_installed_app() {
+    let root = std::env::temp_dir().join(format!("cw-life-sweep-rm-{}", Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let stale = bundle(&root, &format!(".ClaudeWatch-{}.app", "c".repeat(32)));
+    let mut lifecycle = AppLifecycle {
+        paths: LifecyclePaths {
+            installed: root.join(APP_NAME),
+            trash: root.join("trash"),
+            protected_data: root.join("data"),
+        },
+        os: Fake::default(),
+    };
+    assert_eq!(lifecycle.uninstall().unwrap_err().code, "app_missing");
+    assert!(!stale.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn staged_copies(root: &Path) -> Vec<String> {
+    fs::read_dir(root)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            name.strip_prefix(".ClaudeWatch-")
+                .and_then(|rest| rest.strip_suffix(".app"))
+                .is_some_and(|id| {
+                    id.len() == 32
+                        && id
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+        })
+        .collect()
 }
 
 #[test]

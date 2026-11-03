@@ -8,6 +8,10 @@ use std::{
 use uuid::Uuid;
 pub const APP_NAME: &str = "Claude Watch Monitor.app";
 pub const BUNDLE_ID: &str = "io.local.watchpanel";
+/// Staging copies live next to the install target and carry the product's
+/// bundle identifier. They are transport only: a copy that survives the call
+/// that created it becomes a second registration of the same product.
+const STAGE_PREFIX: &str = ".ClaudeWatch-";
 fn err(c: &str, m: &str) -> CoreError {
     CoreError::new(c, m)
 }
@@ -99,7 +103,14 @@ impl<O: LifecycleOs> AppLifecycle<O> {
             .parent()
             .ok_or_else(|| err("invalid_app_path", "安装目标缺少父目录"))?;
         fs::create_dir_all(parent).map_err(io)?;
-        let stage = parent.join(format!(".ClaudeWatch-{}.app", Uuid::new_v4().simple()));
+        // An install that was killed between staging and the swap cannot run
+        // its own cleanup, so every later run sweeps first. Otherwise the
+        // leftover bundle is a second app with our identifier: LaunchServices
+        // may resolve consent prompts to that copy instead of the installed
+        // one, and the privacy pane keeps listing it.
+        sweep_staging(parent)?;
+        let stage = parent.join(format!("{STAGE_PREFIX}{}.app", Uuid::new_v4().simple()));
+        let _staged = StagedCopy(stage.clone());
         let old = self
             .paths
             .trash
@@ -110,14 +121,13 @@ impl<O: LifecycleOs> AppLifecycle<O> {
         // /Applications whenever an early step fails.
         if let Err(error) = copy_dir(source, &stage).and_then(|()| self.verify(&stage).map(|_| ()))
         {
-            let _ = fs::remove_dir_all(&stage);
             return Err(error);
         }
         let mut had_agent = false;
         let mut new_installed = false;
         let mut old_moved = false;
         let mut accessibility_reset_attempted = false;
-        let result = (|| {
+        let result: Result<AppIdentity> = (|| {
             had_agent = self.os.stop_agent()?;
             self.os.stop_app(&plan.installed)?;
             if plan.installed.exists() {
@@ -144,9 +154,16 @@ impl<O: LifecycleOs> AppLifecycle<O> {
                 error
             };
             let _ = self.os.stop_agent();
-            self.os
-                .rollback_agent_install()
-                .map_err(explain_permission)?;
+            // A failed rollback must not replace the reason the install
+            // stopped: the operator needs the original failure to retry, with
+            // the rollback problem attached. The staged copy is removed by
+            // its guard on the way out.
+            if let Err(rollback) = self.os.rollback_agent_install() {
+                return Err(explain_permission(CoreError::new(
+                    &e.code,
+                    &format!("{}；后台回滚未完成：{}", e.message, rollback.message),
+                )));
+            }
             if new_installed && plan.installed.exists() {
                 let failed = self
                     .paths
@@ -163,12 +180,14 @@ impl<O: LifecycleOs> AppLifecycle<O> {
                     .resume_agent(&plan.installed)
                     .map_err(explain_permission)?;
             }
-            let _ = fs::remove_dir_all(&stage);
             return Err(explain_permission(e));
         }
         Ok(incoming)
     }
     pub fn uninstall(&mut self) -> Result<PathBuf> {
+        if let Some(parent) = self.paths.installed.parent() {
+            sweep_staging(parent)?;
+        }
         if !self.paths.installed.exists() {
             return Err(err("app_missing", "未找到本产品，未清理其他程序或权限"));
         }
@@ -248,6 +267,51 @@ fn same_path(a: &Path, b: &Path) -> Result<bool> {
         return Ok(false);
     }
     Ok(fs::canonicalize(a).map_err(io)? == fs::canonicalize(b).map_err(io)?)
+}
+/// Removes the staging bundle on every exit path, including the early `?`
+/// returns taken while explaining a rollback failure. A copy that outlives the
+/// call is not inert: it is a second bundle with the product's identifier.
+struct StagedCopy(PathBuf);
+impl Drop for StagedCopy {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+/// Only the exact names this module generates are swept: a `.app` with an
+/// unrelated or malformed suffix is somebody else's directory and stays put.
+fn is_staging_name(name: &str) -> bool {
+    name.strip_prefix(STAGE_PREFIX)
+        .and_then(|rest| rest.strip_suffix(".app"))
+        .is_some_and(|id| {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+fn sweep_staging(parent: &Path) -> Result<()> {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(io)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_staging_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        // symlink_metadata never follows the link: a symlink that happens to
+        // use this name is not a copy we made and is left untouched.
+        match fs::symlink_metadata(&path).map(|m| m.file_type()) {
+            Ok(kind) if kind.is_dir() => fs::remove_dir_all(&path).map_err(io)?,
+            Ok(kind) if kind.is_file() => fs::remove_file(&path).map_err(io)?,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 fn copy_dir(s: &Path, t: &Path) -> Result<()> {
     if t.exists() {
