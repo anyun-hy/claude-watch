@@ -24,6 +24,8 @@ enum SnapshotRunner {
                 return .failure("本次读取未完成，将在下次刷新时重试。")
             case .outputTooLarge:
                 return .failure("本次快照超出安全大小限制，未采纳该结果。")
+            case .timedOut:
+                return .failure("本次读取超时，已停止并丢弃该结果，将在下次刷新时重试。")
             case .success(let data):
                 do { return .success(try JSONDecoder().decode(MonitorSnapshot.self, from: data)) }
                 catch { return .failure("检测数据暂时无法解析，将在下次刷新时重试。") }
