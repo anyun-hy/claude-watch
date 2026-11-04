@@ -13,13 +13,16 @@ command -v python3 >/dev/null || { echo 'python3 required' >&2; exit 1; }
 python3 -m unittest -v \
   tools/tests/test_build_pipeline_contract.py \
   tools/tests/test_policy_catalog_generation.py \
-  tools/tests/test_guard_stop_consolidation.py
+  tools/tests/test_guard_stop_consolidation.py \
+  tools/tests/test_platform_contract.py
 python3 tools/generate-ai-policy-swift.py --check
 bash -n monitor/build.sh monitor/package-dmg.sh tools/build-rust-components.sh
 
 echo '===== RUST COMPILE AND SAFE REGRESSIONS ====='
 command -v cargo >/dev/null || { echo 'cargo required' >&2; exit 1; }
 cargo check --locked -p claude-watch-core -p claude-watch-runtime -p claude-watch-engine -p claude-watch-installer
+# Exact no-signal adapter test: does not start a real application or child.
+cargo test --locked -p claude-watch-runtime --test controlled_contracts fake_family_switches_target_even_without_a_running_member -- --exact
 bash tools/test-force-migration-regressions.sh
 bash tools/test-storage-regressions.sh
 

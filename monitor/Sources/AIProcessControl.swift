@@ -77,14 +77,19 @@ enum AIProcessClosePolicy {
         // Roots are asked to quit normally. No SIGKILL or privileged helper is used.
         for target in plan.targets.sorted(by: { $0.desktopMain && !$1.desktopMain }) {
             guard target.uid == plan.uid, !plan.protected.contains(target.pid), target.pid > 1,
-                  let live = lookup(target.pid), target.sameProcess(as: live) else { skipped += 1; continue }
+                  let live = lookup(target.pid), target.sameProcess(as: live),
+                  // A second immediate read narrows the PID-reuse interval
+                  // between plan validation and the side effect. It cannot
+                  // make a PID-only Darwin signal an atomic identity operation.
+                  let latest = lookup(target.pid), target.sameProcess(as: latest) else { skipped += 1; continue }
             let accepted = target.desktopMain ? quitApplication(target.pid) : terminate(target.pid)
             if accepted { requested += 1 } else { failed += 1 }
         }
         return (requested, skipped, failed)
     }
     /// Only the exact identities from the original, verified plan are eligible.
-    /// A recycled PID or a process started after that plan is never signalled.
+    /// Observed PID reuse and new processes are skipped; the final identity
+    /// read narrows but cannot eliminate the non-atomic Darwin signal window.
     /// Whether force is allowed at all is decided upstream by the policy
     /// table; this routine only verifies identity, for any product.
     static func forceRemaining(_ plan: AIProcessClosePlan, lookup: (Int32) -> AIProcessIdentity?,
@@ -92,7 +97,8 @@ enum AIProcessClosePolicy {
         var requested = 0, skipped = 0, failed = 0
         for target in plan.targets {
             guard target.uid == plan.uid, !plan.protected.contains(target.pid), target.pid > 1,
-                  let live = lookup(target.pid), target.sameProcess(as: live) else { skipped += 1; continue }
+                  let live = lookup(target.pid), target.sameProcess(as: live),
+                  let latest = lookup(target.pid), target.sameProcess(as: latest) else { skipped += 1; continue }
             if force(target.pid) { requested += 1 } else { failed += 1 }
         }
         return (requested, skipped, failed)

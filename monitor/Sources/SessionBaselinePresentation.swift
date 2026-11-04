@@ -32,6 +32,15 @@ struct SessionBaselinePresentation {
             return .init(title: display.title, detail: [saved, display.detail].filter { !$0.isEmpty }.joined(separator: "。"),
                          symbol: "shield.slash", tone: "danger")
         }
+        // A failed current read is a warning even when an older baseline
+        // remains visible. Keep locked risk above this branch: a failed read
+        // must not downgrade a previously latched danger.
+        if !evidence.readError.isEmpty {
+            let display = evidence.presentation(at: now)
+            return .init(title: display.title,
+                         detail: [saved, display.detail].filter { !$0.isEmpty }.joined(separator: "。"),
+                         symbol: display.symbol, tone: display.tone)
+        }
         guard !evidence.isStale(at: now) else {
             return .init(title: baseline.isEmpty ? "会话基准读取未完成" : "上次会话基准",
                          detail: [saved, evidence.readError.isEmpty ? "当前保护状态等待更新；历史记录不用于启动放行。" : evidence.readError].filter { !$0.isEmpty }.joined(separator: "。"),

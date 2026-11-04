@@ -87,6 +87,44 @@ struct AIProcessExitEvidenceTests {
             if pid == 10 { return root }; if pid == 12 { return newChild }; return nil
         }, force: { forceCalls.append($0); return true })
         expect(forceCalls == [10], "new descendant is never forced by the old plan")
+        // A PID may be recycled after the first observation but before the
+        // side effect. A second identity read must then skip the signal.
+        // This narrows the race; PID-only signalling is not atomic.
+        let single = AIProcessClosePlan(product: .openAI, uid: 501, targets: [root], protected: [])
+        var signalReads = 0
+        var signals = 0
+        let recycledBeforeTerm = AIProcessClosePolicy.execute(single, lookup: { _ in
+            signalReads += 1
+            return signalReads == 1 ? root : replacement
+        }, quitApplication: { _ in signals += 1; return true },
+           terminate: { _ in signals += 1; return true })
+        expect(signalReads == 2 && signals == 0 && recycledBeforeTerm.skipped == 1,
+               "a PID recycled between identity reads never receives TERM")
+
+        var forceReads = 0
+        let recycledBeforeForce = AIProcessClosePolicy.forceRemaining(single, lookup: { _ in
+            forceReads += 1
+            return forceReads == 1 ? root : replacement
+        }, force: { _ in signals += 1; return true })
+        expect(forceReads == 2 && signals == 0 && recycledBeforeForce.skipped == 1,
+               "a PID recycled between identity reads never receives Force")
+
+        var stableReads = 0
+        let stable = AIProcessClosePolicy.execute(single, lookup: { _ in
+            stableReads += 1
+            return root
+        }, quitApplication: { _ in signals += 1; return true },
+           terminate: { _ in signals += 1; return true })
+        expect(stableReads == 2 && stable.requested == 1 && signals == 1,
+               "stable matching identity still permits one explicit normal-exit request")
+        var unavailableReads = 0
+        let vanishedBeforeForce = AIProcessClosePolicy.forceRemaining(single, lookup: { _ in
+            unavailableReads += 1
+            return unavailableReads == 1 ? root : nil
+        }, force: { _ in signals += 1; return true })
+        expect(vanishedBeforeForce.skipped == 1 && signals == 1,
+               "missing second identity check never authorizes Force")
+
         let anotherProduct = row(30, product: .claude)
         let unrelated = AIProcessClosePolicy.exitEvidence(original, inventory: [anotherProduct]) { _ in .gone }
         expect(unrelated.complete, "another family is not silently added to close scope")

@@ -35,7 +35,7 @@ APP_VERSION=3.0.0 BUILD_NUMBER=367 CW_BUILD_ARCH=arm64 bash monitor/package-dmg.
 
 ## 离线验证
 
-Python 测试入口见项目首页。Swift 状态测试使用当前 macOS SDK，编译目标与 `macos-minimum.txt` 一致（当前最低 macOS 13）：
+Python 测试入口见项目首页。Swift 状态测试使用当前 macOS SDK，编译目标由 `macos-minimum.txt` 决定（当前为 macOS 26.0；不要与历史 macOS 13 声明混淆）：
 
 ```sh
 mkdir -p /private/tmp/claude-watch-tests/module-cache

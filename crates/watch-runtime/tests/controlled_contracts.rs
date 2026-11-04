@@ -231,12 +231,15 @@ impl DesktopSystem for Fake {
         // Keeping the target on ClaudeDesktop here is what let a test pass
         // while production rejected the same audit with
         // `launch_target_mismatch`.
-        self.family = if family_id == "claude" { "claude" } else { "openai" };
-        if self.supervise_openai {
-            self.target = claude_watch_core::policy::PolicyCatalog::family(family_id)
-                .and_then(claude_watch_core::policy::PolicyCatalog::guard_target)
-                .unwrap_or(self.target);
-        }
+        // Even if this fixture has no running members in the selected family,
+        // its target must switch exactly as the production adapter does. The
+        // process-presence toggle affects inventory only, never audit target.
+        let family = claude_watch_core::policy::PolicyCatalog::family(family_id)
+            .ok_or_else(|| CoreError::new("target_adapter_unavailable", "测试目标家族不存在"))?;
+        let target = claude_watch_core::policy::PolicyCatalog::guard_target(family)
+            .ok_or_else(|| CoreError::new("target_adapter_unavailable", "测试目标不可监管"))?;
+        self.family = family.id;
+        self.target = target;
         Ok(())
     }
     fn observation_owner(&mut self) -> Result<claude_watch_core::processes::Identity> {
@@ -1954,6 +1957,34 @@ fn adoption_refuses_a_stale_exit() {
         .load(system.now)
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn fake_family_switches_target_even_without_a_running_member() {
+    use claude_watch_core::processes::LaunchTarget;
+    // The absence of an OpenAI process does not exempt the adapter from
+    // reporting the actual OpenAI target during its guard tick.
+    let mut fake = Fake::default();
+    assert!(!fake.supervise_openai);
+    DesktopSystem::set_family(&mut fake, "openai").unwrap();
+    assert_eq!(DesktopSystem::launch_target(&fake), LaunchTarget::CodexDesktop);
+    let audit = DesktopSystem::full_audit(&mut fake).unwrap();
+    assert_eq!(audit["launch_target"], "codex-desktop");
+    assert_eq!(audit["authorization_scope"], "observation");
+    assert!(DesktopSystem::desktops(&mut fake).unwrap().is_empty());
+
+    DesktopSystem::set_family(&mut fake, "claude").unwrap();
+    assert_eq!(DesktopSystem::launch_target(&fake), LaunchTarget::ClaudeDesktop);
+    let claude_audit = DesktopSystem::full_audit(&mut fake).unwrap();
+    assert!(claude_audit.get("launch_target").is_none());
+    assert!(claude_audit.get("authorization_scope").is_none());
+
+    let before = DesktopSystem::launch_target(&fake);
+    assert_eq!(
+        DesktopSystem::set_family(&mut fake, "unregistered").unwrap_err().code,
+        "target_adapter_unavailable"
+    );
+    assert_eq!(DesktopSystem::launch_target(&fake), before);
 }
 
 fn policy_config(fixture: &Fixture, dns: &str, webrtc: &str) {

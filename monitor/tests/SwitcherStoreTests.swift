@@ -47,7 +47,18 @@ struct SwitcherStoreTests {
         expect(SessionBaselinePresentation.make(service, now: 1005).tone == "success", "automatic session baseline drives overview without legacy file")
         expect(SessionBaselinePresentation.make(service, now: 1036).title == "上次会话基准", "old receipt cannot present current safety")
         expect(SessionBaselinePresentation.make(service, now: 1011).tone != "success", "active safety expires at guard deadline")
-        expect(SessionBaselinePresentation.make(service, error: "read failed", now: 1005).tone != "success", "read failure preserves history without green safety")
+        expect(SessionBaselinePresentation.make(service, error: "read failed", now: 1005).tone == "warning" &&
+               SessionBaselinePresentation.make(service, error: "read failed", now: 1005).title == "保护状态读取失败",
+               "retained live baseline plus read error matches guard warning instead of stale info")
+        expect(SessionBaselinePresentation.make(service, error: "read failed", now: 1100).tone == "warning",
+               "stale baseline cannot downgrade an explicit read error to a neutral update")
+        let lockedReadError = SessionProtectionEvidence(
+            session: .init(state: "locked", phase: "locked",
+                           reason: .init(code: "dns_risk", detail: "保留的 DNS 风险")),
+            observedAt: 1000, backendReady: false, readError: "read failed")
+        expect(lockedReadError.presentation(at: 1100).tone == "danger" &&
+               SessionBaselinePresentation.make(evidence: lockedReadError, now: 1100).tone == "danger",
+               "a latched danger remains danger even when the next background read fails")
         expect(SessionProtectionPresentation.unavailable(error: "read failed").tone == "warning" &&
                SessionBaselinePresentation.make(nil, error: "read failed", now: 1005).tone == "warning",
                "no session receipt plus a read failure agrees across the guard and baseline panels")
