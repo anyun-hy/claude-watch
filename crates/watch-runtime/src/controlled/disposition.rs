@@ -37,23 +37,20 @@ pub(super) fn confirmed_egress_code(
 }
 
 impl Controller {
-    /// Resolve the current policy without introducing a new forced fallback.
-    pub(super) fn close_action(&self, code: &str, provider: Provider) -> String {
-        ConfigStore {
-            storage: self.storage.clone(),
-        }
-        .load()
-        .map(|config| config.close_action(code, provider))
-        .unwrap_or_else(|_| {
-            let action = PolicyCatalog::criterion_for(code)
-                .and_then(|criterion| criterion.default_action)
-                .unwrap_or("warn");
-            match PolicyCatalog::family_for(provider) {
-                Some(family) if family.performable(action) => action.to_string(),
-                Some(family) => family.fallback().to_string(),
-                None => "warn".to_string(),
-            }
+    /// An absent criterion can use its declared default inside a valid config.
+    /// A failed config read is different: it grants no process-stop authority.
+    /// Do not cache a force policy across an unreadable/disabled configuration.
+    fn resolve_close_action(&self, code: &str, provider: Provider) -> Result<String> {
+        let config = ConfigStore { storage: self.storage.clone() }.load()?;
+        Ok(if config.enabled && config.guard_enabled {
+            config.close_action(code, provider)
+        } else {
+            "warn".to_string()
         })
+    }
+
+    pub(super) fn close_action(&self, code: &str, provider: Provider) -> String {
+        self.resolve_close_action(code, provider).unwrap_or_else(|_| "warn".to_string())
     }
 
     pub(super) fn pending_risk(
@@ -117,7 +114,16 @@ impl Controller {
         };
         let provider = system.launch_target().provider();
         let family = PolicyCatalog::family_for(provider);
-        let action = self.close_action(&code, provider);
+        let resolved = self.resolve_close_action(&code, provider);
+        let policy_available = resolved.is_ok();
+        let action = match resolved {
+            Ok(action) => action,
+            Err(error) => {
+                receipt["policy_state"] = json!("unavailable");
+                receipt["policy_error"] = json!(error.code);
+                "warn".to_string()
+            }
+        };
         receipt["stop_action"] = json!(action);
         receipt["stop_reason_code"] = json!(code);
         let result = if action == "warn" {
@@ -125,7 +131,9 @@ impl Controller {
             receipt["action"] = json!("observe");
             // A notice is not a latched stop. Keep evaluating fresh risks on
             // the next round, even if this round could not persist its state.
-            if reported == "egress_risk_persist_failed" {
+            // An unreadable policy is NOT a user-selected notice: preserve its
+            // pending risk for re-evaluation after configuration is readable.
+            if policy_available && reported == "egress_risk_persist_failed" {
                 if let Some(family) = family {
                     self.forget_risk(family.id, receipt["session_id"].as_str())?;
                 }

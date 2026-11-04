@@ -1383,27 +1383,29 @@ fn corrupt_session_fails_closed_without_overwriting_the_damaged_evidence() {
 }
 
 #[test]
-fn invalid_configuration_is_sampling_failure_not_a_guard_disable_or_an_ip_change() {
+fn invalid_configuration_reports_without_authorising_a_stop() {
     let fixture = Fixture::new();
     let controller = Controller::new(fixture.storage.clone());
     let mut system = Fake::default();
     controller.launch(&mut system).unwrap();
-    system.now += 1.0;
+    let before = fs::read(fixture.storage.paths.session()).unwrap();
     fs::write(fixture.storage.paths.config(), b"{invalid-config").unwrap();
-    let first = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(first["action"], "observe");
-    assert_eq!(system.closes, 0);
-    system.now += 1.0;
-    let second = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(second["action"], "observe");
-    system.now += 14.0;
-    let third = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(third["action"], "close-desktop");
-    assert_eq!(
-        third["session_guard"]["reason"]["code"],
-        "guard_sampling_failed"
-    );
-    assert_eq!(system.closes, 1);
+    // A missing policy is not a configured close, even after the normal
+    // sampling grace. Keep the fault visible without mutating the session.
+    for advance in [1.0, 1.0, 14.0] {
+        system.now += advance;
+        let result = controller.guard_tick(&mut system).unwrap();
+        assert_eq!(result["status"], "unknown");
+        assert_eq!(result["action"], "observe");
+        assert_eq!(result["policy_state"], "unavailable");
+        assert_eq!(result["stop_action"], "warn");
+        assert_eq!(result["stop_state"], "skipped_warn_only");
+        assert!(result["code"].is_string());
+        assert_eq!((system.closes, system.ip_force_calls), (0, 0));
+        assert!(system.running);
+        assert_eq!(fs::read(fixture.storage.paths.session()).unwrap(), before);
+    }
+    assert!(!fixture.storage.paths.base().join("last-guard-stop.json").exists());
 }
 #[test]
 fn display_preview_cannot_be_reused_as_launch_authority() {
@@ -2217,6 +2219,8 @@ fn the_openai_family_is_supervised_and_closed_on_confirmed_drift() {
     let risk = controller.guard_tick(&mut system).unwrap();
     let risk_openai = openai(&risk);
     assert_eq!(risk_openai["action"], "close-desktop");
+    assert_eq!(risk_openai["stop_action"], "close");
+    assert_eq!(system.ip_force_calls, 0, "OpenAI's default close is not force");
     assert!(!system.running);
     assert_eq!(system.closes, 1);
 }

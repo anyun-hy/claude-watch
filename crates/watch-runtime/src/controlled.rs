@@ -13,6 +13,9 @@ use serde_json::{json, Value};
 use std::{fs, time::Duration};
 
 mod disposition;
+mod warning_recovery;
+#[cfg(test)]
+mod warning_regressions;
 use disposition::{confirmed_egress_code, PendingRisk, StopOutcome};
 #[cfg(test)]
 mod guard_regressions;
@@ -498,10 +501,10 @@ impl Controller {
         {
             Ok(value) => value,
             Err(error) => {
-                let mut receipt =
-                    json!({"status":"unknown","action":"observe","time":system.now()});
-                self.sampling_failure(system, family, &mut receipt, error)?;
-                return Ok(receipt);
+                return Ok(json!({"status":"unknown","action":"observe","family":family,
+                    "time":system.now(),"code":error.code,"message":error.message,
+                    "stop_action":"warn","stop_state":"skipped_warn_only",
+                    "policy_state":"unavailable"}));
             }
         };
         if !config.enabled || !config.guard_enabled {
@@ -864,30 +867,7 @@ impl Controller {
                     if self.recheck_warning(system, &sessions, family, session, &mut receipt)? {
                         return Ok(());
                     }
-                    let resolved = match code.as_str() {
-                        "egress_ip_changed" | "egress_country_cn" => {
-                            let egress = system.egress();
-                            session::Egress::fresh(&egress, system.now(), session::GUARD_EGRESS_TTL)
-                                .is_some_and(|e| e.country != "CN" && e.ip == session.baseline.ip)
-                        }
-                        _ => {
-                            let extra = serde_json::to_value(&session.extra)
-                                .unwrap_or_else(|_| serde_json::json!({}));
-                            receipts.probe_drift_risk(&extra, system.now())["state"] == "safe"
-                        }
-                    };
-                    if resolved && sessions.resume_if_current(id.as_deref(), system.now())? {
-                        receipt["session_guard"] = json!({
-                            "state": "active", "phase": "active",
-                            "reason": {"code": "session_resumed", "detail": "仅提示判据的漂移已恢复，继续正常监管"}
-                        });
-                        receipt["session_notice"] = json!({
-                            "code": "session_resumed",
-                            "detail": "漂移已恢复，回到仅观察状态",
-                            "action": "resume",
-                        });
-                        receipt["action"] = json!("observe");
-                        receipt["stop_state"] = json!("recovered");
+                    if self.resume_warning(system, &sessions, family, session, &mut receipt)? {
                         return Ok(());
                     }
                     receipt["session_notice"] = json!({

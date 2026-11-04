@@ -265,16 +265,29 @@ pub fn probe_fingerprint(
 }
 
 fn probe_fresh(receipt: &Value, time_key: &str, now: f64) -> bool {
-    receipt
-        .get(time_key)
-        .and_then(Value::as_f64)
-        .is_some_and(|v| v.is_finite() && (0.0..=300.0).contains(&(now - v)))
+    now.is_finite() && now > 0.0
+        && receipt
+            .get(time_key)
+            .and_then(Value::as_f64)
+            .is_some_and(|v| v.is_finite() && v > 0.0 && (0.0..=300.0).contains(&(now - v)))
 }
 
-/// Compare the running probe receipts against the session baseline. Returns
-/// the drift code only when both sides are usable: an absent baseline, a
-/// missing sample or a stale one is reported as unknown and must never close
-/// a session by itself.
+/// Each source needs its own fresh observation AND baseline. An unavailable
+/// source is unknown, not safe, and cannot suppress another confirmed drift.
+fn probe_state(fresh: bool, baseline: &[String], current: &[String]) -> &'static str {
+    if !fresh || baseline.is_empty() || current.is_empty() {
+        "unknown"
+    } else if baseline == current {
+        "safe"
+    } else {
+        "risk"
+    }
+}
+
+/// Compare each probe independently. Only confirmed changed sources contribute
+/// to the returned risk code, so an unknown source cannot lend its stricter
+/// configured action to the source that actually drifted. Overall safety still
+/// requires both sources to be usable and unchanged.
 pub fn probe_drift(
     baseline_dns: &[String],
     baseline_webrtc: &[String],
@@ -285,51 +298,54 @@ pub fn probe_drift(
     let dns_ready = probe_fresh(dns_receipt, "finished_at", now);
     let rtc_ready = probe_fresh(webrtc_receipt, "sampled_at", now);
     let (current_dns, current_rtc) = probe_fingerprint(dns_receipt, webrtc_receipt);
+    let dns_state = probe_state(dns_ready, baseline_dns, &current_dns);
+    let rtc_state = probe_state(rtc_ready, baseline_webrtc, &current_rtc);
     let sources = json!({
-        "dns": {"observed": dns_ready, "countries": current_dns},
-        "webrtc": {"observed": rtc_ready, "addresses": current_rtc},
+        "dns": {"observed": dns_ready, "state": dns_state, "countries": current_dns,
+            "observed_at": if dns_ready { dns_receipt["finished_at"].clone() } else { Value::Null }},
+        "webrtc": {"observed": rtc_ready, "state": rtc_state, "addresses": current_rtc,
+            "observed_at": if rtc_ready { webrtc_receipt["sampled_at"].clone() } else { Value::Null }},
     });
-    if !dns_ready || !rtc_ready {
-        return json!({"state":"unknown","observed_at":now,"sources":sources,"reason":Reason::new(
-            "risk_evidence_unavailable",
-            "DNS/WebRTC 探针样本缺失或已过期，暂不比较会话基线",
-            now,
-        )});
-    }
-    // A fresh sample with zero usable observations proves nothing either way:
-    // it cannot confirm the baseline, and it cannot confirm drift.
-    if current_dns.is_empty() || current_rtc.is_empty() {
-        return json!({"state":"unknown","observed_at":now,"sources":sources,"reason":Reason::new(
-            "probe_sample_empty",
-            "本轮探针未取得可用观测，暂不比较会话基线",
-            now,
-        )});
-    }
-    if baseline_dns.is_empty() || baseline_webrtc.is_empty() {
-        return json!({"state":"unknown","observed_at":now,"sources":sources,"reason":Reason::new(
-            "risk_baseline_missing",
-            "会话建立时缺少探针基线，无法比较漂移",
-            now,
-        )});
-    }
-    let dns_changed = baseline_dns != current_dns.as_slice();
-    let rtc_changed = baseline_webrtc != current_rtc.as_slice();
-    let (code, detail) = match (dns_changed, rtc_changed) {
-        (true, true) => (
+    let cause = match (dns_state == "risk", rtc_state == "risk") {
+        (true, true) => Some((
             "dns_and_webrtc_egress_changed",
             "运行中 DNS 递归出口与 WebRTC 公网候选均偏离会话基线",
-        ),
-        (true, false) => (
+        )),
+        (true, false) => Some((
             "dns_egress_changed",
             "运行中 DNS 递归出口国家集合偏离会话基线",
-        ),
-        (false, true) => (
+        )),
+        (false, true) => Some((
             "webrtc_egress_changed",
             "运行中 WebRTC 公网候选偏离会话基线",
-        ),
-        (false, false) => {
-            return json!({"state":"safe","observed_at":now,"sources":sources});
-        }
+        )),
+        (false, false) => None,
     };
-    json!({"state":"risk","observed_at":now,"reason":Reason::new(code, detail, now),"sources":sources})
+    if let Some((code, detail)) = cause {
+        // Retain the actual oldest contributing sample time, not the time a
+        // cached receipt happened to be read by this guard round.
+        let observed = [(dns_state, &dns_receipt["finished_at"]),
+                        (rtc_state, &webrtc_receipt["sampled_at"])]
+            .into_iter()
+            .filter(|(state, _)| *state == "risk")
+            .filter_map(|(_, at)| at.as_f64())
+            .min_by(f64::total_cmp)
+            .unwrap_or(now);
+        return json!({"state":"risk","observed_at":observed,
+            "reason":Reason::new(code, detail, observed),"sources":sources});
+    }
+    if dns_state == "safe" && rtc_state == "safe" {
+        let observed = dns_receipt["finished_at"].as_f64().unwrap_or(now)
+            .min(webrtc_receipt["sampled_at"].as_f64().unwrap_or(now));
+        return json!({"state":"safe","observed_at":observed,"sources":sources});
+    }
+    let (code, detail) = if !dns_ready || !rtc_ready {
+        ("risk_evidence_unavailable", "部分 DNS/WebRTC 探针样本缺失或已过期，未确认整体安全")
+    } else if current_dns.is_empty() || current_rtc.is_empty() {
+        ("probe_sample_empty", "部分探针未取得可用观测，未确认整体安全")
+    } else {
+        ("risk_baseline_missing", "部分探针缺少会话基线，无法确认整体漂移状态")
+    };
+    json!({"state":"unknown","observed_at":Value::Null,
+        "reason":Reason::new(code, detail, now),"sources":sources})
 }
