@@ -7,6 +7,8 @@ use serde_json::json;
 use serde_json::Value;
 use uuid::Uuid;
 
+pub mod desktop_groups;
+
 pub struct SessionStore {
     pub storage: StateStore,
     family: &'static str,
@@ -45,6 +47,10 @@ impl SessionStore {
         let mut session: Session = serde_json::from_value(value)
             .map_err(|_| CoreError::new("invalid_session", "受控会话记录格式无效"))?;
         session.validate(now)?;
+        desktop_groups::desktop_members(&session)?;
+        if desktop_groups::has_desktop_group(&session) && self.family != "openai" {
+            return Err(CoreError::new("invalid_session", "多桌面集合不属于此策略服务"));
+        }
         Ok(Some(session))
     }
     fn save(&self, value: &Session) -> Result<()> {
@@ -251,6 +257,7 @@ impl SessionStore {
         };
         if value.session_id != id
             || value.state != Phase::Ended
+            || desktop_groups::has_desktop_group(&value)
             || value.desktop.as_ref() == Some(&desktop)
         {
             return Ok(None);
@@ -304,8 +311,14 @@ impl SessionStore {
         let Some(mut current) = self.load(now)? else {
             return Ok(false);
         };
+        let group_warning = if desktop_groups::group_rechecking(&current) && current.state == Phase::Locked {
+            let config = crate::config_store::ConfigStore { storage: self.storage.clone() }.load()?;
+            config.enabled && config.guard_enabled && current.reason.as_ref().is_some_and(|r| {
+                config.close_action(&r.code, Provider::Codex) == "warn"
+            })
+        } else { false };
         if current.session_id != id
-            || current.state != Phase::Rechecking
+            || !(current.state == Phase::Rechecking || group_warning)
             || current.desktop.as_ref() != Some(desktop)
         {
             return Ok(false);
@@ -341,6 +354,7 @@ impl SessionStore {
         };
         if current.session_id != id
             || current.state != Phase::Rechecking
+            || desktop_groups::has_desktop_group(&current)
             || current.desktop.as_ref() != Some(desktop)
         {
             return Ok(None);
@@ -614,7 +628,9 @@ impl SessionStore {
         let Some(mut value) = self.load(now)? else {
             return Ok(false);
         };
-        if value.session_id.as_str() != id.unwrap_or_default() || value.state != Phase::Locked {
+        if value.session_id.as_str() != id.unwrap_or_default() || value.state != Phase::Locked
+            || desktop_groups::group_rechecking(&value)
+        {
             return Ok(false);
         }
         value.state = Phase::Active;

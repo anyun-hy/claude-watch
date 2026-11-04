@@ -13,6 +13,8 @@ use serde_json::{json, Value};
 use std::{fs, time::Duration};
 
 mod disposition;
+mod desktop_groups;
+use desktop_groups::GroupRound;
 mod warning_recovery;
 #[cfg(test)]
 mod warning_regressions;
@@ -521,8 +523,14 @@ impl Controller {
             let mut current = sessions.load(system.now())?;
             let mut identity_unconfirmed = false;
             let mut exit_pending = false;
+            let group_round = self.prepare_desktop_group(
+                system, &sessions, &receipts, family, &config,
+                &mut desktops, &mut current, &mut identity_unconfirmed,
+                &mut exit_pending, &mut receipt,
+            )?;
+            if group_round == GroupRound::Handled { return Ok(()); }
             if let Some(previous) = current.as_ref().filter(|s| {
-                matches!(
+                group_round == GroupRound::Legacy && matches!(
                     s.state,
                     session::Phase::Active | session::Phase::Rechecking | session::Phase::Locked
                 )
@@ -927,7 +935,13 @@ impl Controller {
                     .unwrap_or(false);
                 let identity =
                     if let Some(expected) = current.as_ref().and_then(|s| s.desktop.as_ref()) {
-                        if desktops.iter().any(|(d, main, _)| *main && d == expected) {
+                        let group_matches = current.as_ref()
+                            .filter(|s| crate::session_store::desktop_groups::has_desktop_group(s))
+                            .map(|s| crate::session_store::desktop_groups::desktop_set_matches(s, &desktops))
+                            .transpose()?.unwrap_or(true);
+                        if !identity_unconfirmed && group_matches
+                            && desktops.iter().any(|(d, main, _)| *main && d == expected)
+                        {
                             Identity::Matches
                         } else {
                             Identity::Unavailable

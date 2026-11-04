@@ -26,10 +26,8 @@ fn baseline(session: &Session, key: &str) -> Vec<String> {
         .filter_map(Value::as_str).map(str::to_owned).collect()
 }
 fn current_main<S: DesktopSystem>(system: &mut S, expected: &Session) -> Result<bool> {
-    let Some(desktop) = expected.desktop.as_ref() else { return Ok(false) };
-    let rows = system.desktops()?;
-    let mut mains = rows.iter().filter(|(_, main, _)| *main);
-    Ok(mains.next().is_some_and(|(actual, _, _)| actual == desktop) && mains.next().is_none())
+    if crate::session_store::desktop_groups::group_rechecking(expected) { return Ok(false); }
+    crate::session_store::desktop_groups::desktop_set_matches(expected, &system.desktops()?)
 }
 fn same_exit(value: &Value, expected: &Session, now: f64, since: f64) -> bool {
     Egress::fresh(value, now, session::GUARD_EGRESS_TTL).is_some_and(|e| {

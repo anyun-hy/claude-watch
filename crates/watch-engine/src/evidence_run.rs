@@ -83,6 +83,11 @@ impl EvidenceSystem for NativeEvidence {
             .filter(|(actual, _, _)| actual == expected && mains.next().is_none())
             .map(|(_, _, stamp)| stamp.clone()))
     }
+    fn desktop_group_stamps(&mut self, expected: &[Desktop]) -> Result<Option<Vec<(Desktop, String)>>> {
+        claude_watch_runtime::session_store::desktop_groups::group_stamps(
+            expected, &self.desktop.desktops()?,
+        )
+    }
     fn collect(&mut self, kind: ProbeKind) -> Result<Value> {
         background_evidence::collect_native(
             &self.host.storage,

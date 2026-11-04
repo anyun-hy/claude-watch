@@ -15,6 +15,7 @@ use claude_watch_core::{
     processes::Provider,
     session::{Desktop, Phase, Session},
 };
+use crate::session_store::desktop_groups::{desktop_members, group_rechecking, has_desktop_group};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -95,6 +96,14 @@ pub trait EvidenceSystem {
     fn local(&mut self, config: &Config) -> Result<Value>;
     fn desktop_matches(&mut self, desktop: &Desktop) -> Result<bool>;
     fn desktop_unique_stamp(&mut self, desktop: &Desktop) -> Result<Option<String>>;
+    /// Complete native membership, not just the representative PID. Adapters
+    /// which cannot enumerate a group must explicitly decline it.
+    fn desktop_group_stamps(&mut self, members: &[Desktop]) -> Result<Option<Vec<(Desktop, String)>>> {
+        if members.len() != 1 {
+            return Err(err("evidence_identity_unknown", "证据适配器不能核对完整桌面集合"));
+        }
+        Ok(self.desktop_unique_stamp(&members[0])?.map(|stamp| vec![(members[0].clone(), stamp)]))
+    }
     fn collect(&mut self, kind: ProbeKind) -> Result<Value>;
     /// The full launch-grade audit runs here, never on the fast guard thread.
     fn revalidate(&mut self) -> Result<(Value, Value)> {
@@ -172,6 +181,22 @@ fn refreshable(session: &Session, config: &Config, provider: Provider) -> bool {
     }
 }
 
+fn matching_desktops<S: EvidenceSystem>(system: &mut S, session: &Session) -> Result<bool> {
+    if has_desktop_group(session) {
+        let members = desktop_members(session)?;
+        let Some(bindings) = system.desktop_group_stamps(&members)? else { return Ok(false) };
+        let actual = crate::session_store::desktop_groups::canonical_desktops(
+            bindings.iter().map(|(d, _)| d.clone()).collect(),
+        )?;
+        Ok(actual == members)
+    } else {
+        match session.desktop.as_ref() {
+            Some(desktop) => system.desktop_matches(desktop),
+            None => Ok(false),
+        }
+    }
+}
+
 /// One worker services all declared families. Receipts may be reused only
 /// when their verified context and freshness match; sessions and locks never
 /// cross families. A failure in one family must not starve the next one.
@@ -232,18 +257,23 @@ pub fn refresh_active_session<S: EvidenceSystem>(
     let Some(desktop) = session.desktop.as_ref() else {
         return Err(err("evidence_identity_unknown", "受控会话缺少主进程身份"));
     };
-    if session.state != Phase::Rechecking
+    let grouped = has_desktop_group(&session);
+    let rechecking = session.state == Phase::Rechecking || group_rechecking(&session);
+    if grouped && !matching_desktops(system, &session)? {
+        return Ok(json!({"status":"idle","count":0}));
+    }
+    if !rechecking
         && [ProbeKind::Dns, ProbeKind::WebRtc]
             .iter()
             .all(|kind| fresh(store, *kind, &session.context_id, system.now(), None))
     {
         return Ok(json!({"status":"ok","count":0,"failed_probes":[]}));
     }
-    if !system.desktop_matches(desktop)? {
+    if !matching_desktops(system, &session)? {
         return Ok(json!({"status":"idle","count":0}));
     }
     let policy = guard_policy_digest(&config)?;
-    let evidence_context = if session.state == Phase::Rechecking {
+    let evidence_context = if rechecking {
         let local = system.local(&config)?;
         let current_context = context(&local)
             .ok_or_else(|| err("evidence_context_unconfirmed", "新进程网络上下文未确认"))?
@@ -267,7 +297,7 @@ pub fn refresh_active_session<S: EvidenceSystem>(
         if system.cancelled() {
             break;
         }
-        let since = (session.state == Phase::Rechecking).then_some(session.created_at);
+        let since = rechecking.then_some(session.created_at);
         if fresh(store, kind, &evidence_context, system.now(), since) {
             continue;
         }
@@ -299,7 +329,8 @@ pub fn refresh_active_session<S: EvidenceSystem>(
                 && s.context_id == evidence_context
                 && s.session_id == session.session_id
                 && s.desktop.as_ref() == Some(desktop)
-        }) || !system.desktop_matches(desktop)?
+                && s.extra.get("desktop_group_v1") == session.extra.get("desktop_group_v1")
+        }) || !matching_desktops(system, &session)?
         {
             return Err(err(
                 "evidence_session_changed",
@@ -325,6 +356,7 @@ pub fn refresh_active_session<S: EvidenceSystem>(
                     refreshable(s, &latest, provider)
                         && s.context_id == evidence_context
                         && s.desktop.as_ref() == Some(desktop)
+                        && s.extra.get("desktop_group_v1") == session.extra.get("desktop_group_v1")
                 }) {
                     return Err(err("evidence_session_changed", "采集期间受控会话已变化"));
                 }
@@ -361,30 +393,28 @@ pub fn refresh_active_session<S: EvidenceSystem>(
             Err(_) => errors.push(kind.label()),
         }
     }
-    if session.state == Phase::Rechecking
+    if rechecking
         && errors.is_empty()
         && risks.is_empty()
         && !system.cancelled()
     {
         let (audit, egress) = system.revalidate()?;
-        let Some(stamp) = system.desktop_unique_stamp(desktop)? else {
-            return Err(err("evidence_session_changed", "重新校验期间进程已变化"));
+        let completed = if grouped {
+            let Some(bindings) = system.desktop_group_stamps(&desktop_members(&session)?)? else {
+                return Err(err("evidence_session_changed", "重新校验期间桌面集合已变化"));
+            };
+            if system.cancelled() { return Err(err("evidence_session_changed", "重新校验已取消")); }
+            sessions.complete_group_recheck(&session, &bindings, &audit, &egress,
+                system.now(), system.supervised_provider())?
+        } else {
+            let Some(stamp) = system.desktop_unique_stamp(desktop)? else {
+                return Err(err("evidence_session_changed", "重新校验期间进程已变化"));
+            };
+            if system.cancelled() { return Err(err("evidence_session_changed", "重新校验已取消")); }
+            sessions.complete_recheck(&session.session_id, desktop, &stamp, &audit, &egress,
+                system.now(), system.supervised_provider())?
         };
-        if system.cancelled() {
-            return Err(err("evidence_session_changed", "重新校验期间进程已变化"));
-        }
-        if sessions
-            .complete_recheck(
-                &session.session_id,
-                desktop,
-                &stamp,
-                &audit,
-                &egress,
-                system.now(),
-                system.supervised_provider(),
-            )?
-            .is_none()
-        {
+        if completed.is_none() {
             return Err(err("evidence_session_changed", "重新校验结果已过期"));
         }
     }
