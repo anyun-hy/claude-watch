@@ -35,6 +35,9 @@ if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   printf 'APP_VERSION must be semantic version (for example 2.2.0): %s\n' "$APP_VERSION" >&2
   exit 1
 fi
+# The UI policy rows are generated from Rust. A stale checked-in table
+# must fail before we compile or sign an app with mismatched action defaults.
+python3 "$REPOSITORY_ROOT/tools/generate-ai-policy-swift.py" --check
 # The engine's own manifest carries the version and digest of each component.
 RUST_COMPONENTS_DIR="$ROOT/build/rust-components"
 "$REPOSITORY_ROOT/tools/build-rust-components.sh" --output "$RUST_COMPONENTS_DIR"

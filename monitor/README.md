@@ -29,6 +29,8 @@ APP_VERSION=3.0.0 BUILD_NUMBER=367 CW_BUILD_ARCH=arm64 bash monitor/build.sh
 APP_VERSION=3.0.0 BUILD_NUMBER=367 CW_BUILD_ARCH=arm64 bash monitor/package-dmg.sh
 ```
 
+策略目录仅在 `crates/watch-core/src/policy.rs` 定义。修改 Rust 策略项、动作或默认值后运行 `python3 tools/generate-ai-policy-swift.py --write` 更新生成文件；构建前会强制执行 `--check`，防止 Swift UI 与 Rust 授权规则不一致。UI 源文件只维护中文展示文字。
+
 本地构建使用临时签名，未提供 Developer ID 公证。`build/` 和 `dist/` 均为生成目录，可以清理；清理不影响 `/Applications` 中已安装的应用。需要另设输出目录时可使用 `CW_APP_OUTPUT`。
 
 ## 离线验证
