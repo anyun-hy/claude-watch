@@ -1262,7 +1262,7 @@ final class SwitcherStore: ObservableObject {
             try? await Task.sleep(nanoseconds: 150_000_000)
         }
     }
-    private func runAccountSwitchWithDNSRefresh(_ args: [String], input: Data?) async throws -> Data {
+    private func runAccountSwitchWithDNSRefresh(_ args: [String], input: Data?, setupProgress: SetupProgressReader?) async throws -> Data {
         let bridge = try DNSRefreshBridge(root: dnsRefreshRoot)
         let poller = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -1274,7 +1274,7 @@ final class SwitcherStore: ObservableObject {
         }
         let token = bridge.token
         return try await Task.detached {
-            try SwitcherCommandRunner.run(args, input: input, dnsRefreshToken: token)
+            try SwitcherCommandRunner.run(args, input: input, dnsRefreshToken: token, setupProgress: setupProgress)
         }.value
     }
     func perform(_ args: [String], input: Data? = nil, refresh: Bool = true, setupProgress: SetupProgressObserver? = nil) async {
@@ -1355,32 +1355,32 @@ final class SwitcherStore: ObservableObject {
                 if args.first != "checkdetail" { message = "隔离预览：未访问真实账号、未联网、未执行系统或进程操作。" }
                 failure = false
             } else {
+                // Build the same bounded progress channel before selecting the
+                // DNS-rendezvous account path or the ordinary command path.
+                let channel: SetupProgressReader?
+                if Self.streamsPhases(args) {
+                    channel = SetupProgressReader { [weak self] phase, stream in
+                        Task { @MainActor in
+                            guard let self, stream.isActive, self.busy, self.activityGeneration == activityToken else { return }
+                            self.updateActivity(phase.detail, token: activityToken)
+                            if let stage = phase.launchStage { self.activityStage = stage }
+                            setupProgress?(phase)
+                        }
+                    }
+                } else { channel = setupProgress.map { observer in
+                    SetupProgressReader { [weak self] phase, stream in
+                        Task { @MainActor in
+                            guard let self, stream.isActive, self.busy, self.activityGeneration == activityToken else { return }
+                            self.updateActivity(phase.detail, token: activityToken)
+                            observer(phase)
+                        }
+                    }
+                } }
+                defer { channel?.finish() }
                 let data: Data
                 if args.starts(with: ["account", "switch"]) && args.contains("--apply") {
-                    data = try await runAccountSwitchWithDNSRefresh(args, input: input)
+                    data = try await runAccountSwitchWithDNSRefresh(args, input: input, setupProgress: channel)
                 } else {
-                    // A launch-grade command streams its stages whether or not
-                    // the caller supplied an observer, so the activity line and
-                    // the launch row both move while the check runs.
-                    let channel: SetupProgressReader?
-                    if Self.streamsPhases(args) {
-                        channel = SetupProgressReader { [weak self] phase, stream in
-                            Task { @MainActor in
-                                guard let self, stream.isActive, self.busy, self.activityGeneration == activityToken else { return }
-                                self.updateActivity(phase.detail, token: activityToken)
-                                if let stage = phase.launchStage { self.activityStage = stage }
-                                setupProgress?(phase)
-                            }
-                        }
-                    } else { channel = setupProgress.map { observer in
-                        SetupProgressReader { [weak self] phase, stream in
-                            Task { @MainActor in
-                                guard let self, stream.isActive, self.busy, self.activityGeneration == activityToken else { return }
-                                self.updateActivity(phase.detail, token: activityToken)
-                                observer(phase)
-                            }
-                        }
-                    } }
                     data = try await Task.detached { try SwitcherCommandRunner.run(args, input: input, setupProgress: channel) }.value
                 }
                 let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
