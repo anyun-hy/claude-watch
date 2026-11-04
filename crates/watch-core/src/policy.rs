@@ -72,6 +72,10 @@ pub const CRITERIA: &[PolicyCriterion] = &[
     PolicyCriterion {
         id: "session",
         codes: &[
+            // These codes select an action only after the controller receives
+            // a risk/locked outcome. Healthy Pending rounds keep observing.
+            "session_pending",
+            "launch_failed",
             "session_missing",
             "session_identity_unconfirmed",
             "session_identity_changed",
