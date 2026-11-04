@@ -1,6 +1,7 @@
 #!/bin/bash
 # Source, mocked guard, transaction and macOS Swift typecheck acceptance.
-# No real launch, installed configuration write, native signal or app install.
+# No supervised app launch, installed configuration write or app install.
+# A synthetic, owned /bin/sh child verifies snapshot output handling.
 # The full Cargo test workspace is intentionally excluded: some legacy
 # integration fixtures signal owned child processes.
 set -euo pipefail
@@ -15,7 +16,8 @@ python3 -m unittest -v \
   tools/tests/test_policy_catalog_generation.py \
   tools/tests/test_guard_stop_consolidation.py \
   tools/tests/test_platform_contract.py \
-  tools/tests/test_architecture_boundaries.py
+  tools/tests/test_architecture_boundaries.py \
+  tools/tests/test_snapshot_transport_contract.py
 python3 tools/generate-ai-policy-swift.py --check
 bash -n monitor/build.sh monitor/package-dmg.sh tools/build-rust-components.sh
 
@@ -57,6 +59,15 @@ if [[ "$(uname -s)" == Darwin ]]; then
     monitor/Sources/*.swift monitor/tests/SwitcherStoreTests.swift \
     -o "$BUILD/switcher-fixture-tests"
   "$BUILD/switcher-fixture-tests"
+  echo '===== SNAPSHOT STDERR AND OUTPUT-BOUND REGRESSIONS ====='
+  # Foundation-only test; launches an owned synthetic shell child, never a
+  # supervised application or its installed helper.
+  "$SWIFTC" -swift-version 5 -Onone -parse-as-library \
+    -target "$ARCH-apple-macosx$MIN" -sdk "$SDK" \
+    -module-cache-path "$BUILD/module-cache" \
+    monitor/Sources/SnapshotProcessTransport.swift monitor/tests/SnapshotProcessTransportTests.swift \
+    -o "$BUILD/snapshot-transport-tests"
+  "$BUILD/snapshot-transport-tests"
 else
   echo 'SKIP: macOS production Swift typecheck (not running on macOS)'
 fi
