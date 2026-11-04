@@ -1,21 +1,21 @@
 # 原生应用开发说明
 
-应用版本 **2.9.5 / build 297**，后台 **2.8.4**。日常使用与安装说明见 [项目首页](../README.md)。
+源码构建版本与 build 号由调用者显式指定；不能用仓库文档推断当前安装版本。日常使用与安装说明见 [项目首页](../README.md)。
 
 ## 源码入口
 
 | 文件或目录 | 职责 |
 | --- | --- |
 | `Sources/MonitorApp.swift` | 导航、工具栏、概览 |
-| `Sources/MonitorStore.swift` | 采集刷新、页面共享状态 |
+| `Sources/MonitorStore.swift` | 采集刷新与协调；连接连续性、刷新门控由独立类型负责 |
 | `Sources/SessionProtectionPresentation.swift` | 会话状态与最新只读证据的统一展示 |
 | `Sources/SessionBaselinePresentation.swift` | 自动会话基准及历史记录展示 |
 | `Sources/SwitcherStore.swift`、`SwitcherPage.swift` | 环境、启动与账号、后台保护页面 |
 | `Sources/ConnectionGraphModel.swift`、`GraphDisplayState.swift` | 连接投影、当前／历史路径状态 |
 | `Sources/ConnectionInventory.swift` | 按应用、平台、MCP、本地和组件用途归类 |
 | `Sources/ClaudeLoginProbe.swift`、`AccessibilityPermission.swift` | 只读账号界面识别与系统授权请求 |
-| `Resources/snapshot.sh`、`snapshot.py` | 只读后台数据适配 |
-| `Resources/watch_switcher/` | 账号、环境、会话保护、更新和恢复引擎 |
+| `Sources/BundledBackendVariant.swift` | 运行时仅使用 Rust 引擎，不依赖已退役 Python 后台 |
+| `../crates/watch-runtime/`、`../crates/watch-engine/` | 账号、会话保护、更新与恢复的 Rust 运行时和命令入口 |
 | `Packaging/` | 应用替换、后台安装、卸载与权限生命周期 |
 
 ## 构建
@@ -23,20 +23,22 @@
 从项目根目录执行：
 
 ```sh
-CW_BUILD_ARCH=arm64 bash monitor/build.sh
-CW_BUILD_ARCH=arm64 bash monitor/package-dmg.sh
+# 仅构建 App（值仅为示例）
+APP_VERSION=3.0.0 BUILD_NUMBER=367 CW_BUILD_ARCH=arm64 bash monitor/build.sh
+# 打包 DMG 时会自动执行构建，避免再单独运行上一命令：
+APP_VERSION=3.0.0 BUILD_NUMBER=367 CW_BUILD_ARCH=arm64 bash monitor/package-dmg.sh
 ```
 
 本地构建使用临时签名，未提供 Developer ID 公证。`build/` 和 `dist/` 均为生成目录，可以清理；清理不影响 `/Applications` 中已安装的应用。需要另设输出目录时可使用 `CW_APP_OUTPUT`。
 
 ## 离线验证
 
-Python 测试入口见项目首页。Swift 状态测试需要 macOS 14 以上的本机工具链环境：
+Python 测试入口见项目首页。Swift 状态测试使用当前 macOS SDK，编译目标与 `macos-minimum.txt` 一致（当前最低 macOS 13）：
 
 ```sh
 mkdir -p /private/tmp/claude-watch-tests/module-cache
 xcrun swiftc -swift-version 5 -Onone -parse-as-library -D UI_REVIEW \
-  -target arm64-apple-macosx26.0 \
+  -target arm64-apple-macosx$(cat monitor/macos-minimum.txt) \
   -module-cache-path /private/tmp/claude-watch-tests/module-cache \
   -framework SwiftUI -framework AppKit -framework WebKit \
   monitor/Sources/*.swift monitor/tests/SwitcherStoreTests.swift \

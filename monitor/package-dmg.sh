@@ -8,7 +8,7 @@ ROOT=$(cd "$(dirname "$0")" && pwd -P)
 : "${APP_VERSION:?Set APP_VERSION (for example 3.0.0)}"
 : "${BUILD_NUMBER:?Set BUILD_NUMBER (for example 367)}"
 APP_NAME='Claude Watch Monitor.app'
-APP="${CW_APP_OUTPUT:-$ROOT/build/Claude Watch Monitor.app}"
+APP="${CW_APP_OUTPUT:-$ROOT/build/Claude Watch Monitor Rust Candidate.app}"
 DIST="$ROOT/dist"
 DMG_NAME="${DMG_NAME:-Claude-Watch-${APP_VERSION}-build${BUILD_NUMBER}-${CW_BUILD_ARCH:-arm64}.dmg}"
 DMG="$DIST/$DMG_NAME"

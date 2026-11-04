@@ -2,9 +2,9 @@
 
 macOS 上的 Claude 受控启动、账号 A/B 切换与环境保护工具，同时观察 Claude、ChatGPT / Codex 的进程和代理连接。
 
-当前源码版本：**应用 2.9.5 / build 297，后台 2.8.4**。当前发行目标为 **Apple Silicon（arm64）**。
+当前源码以 Git `main` 提交为准；**应用版本与构建号由构建时显式指定**，仓库不代表当前已安装版本。发行目标为 **Apple Silicon（arm64）**，部署最低版本以 `monitor/macos-minimum.txt` 为准。
 
-Rust 后台完整迁移在 `crates/` 持续实施。检测、状态、会话保护、账号事务及恢复等主体已接入原生接口，正在完成剩余入口和完整验收。命令共用 Rust 服务，不另设手工基线或独立预检。当前已安装程序保持不动；尚不能宣称完整迁移或真实界面验收完成。范围和验证证据见 [完整迁移清单](docs/RUST_MIGRATION_MATRIX.md)。
+运行组件采用 Rust `watch-engine`，界面为 SwiftUI。已登记功能缺陷完成对应源码修复与隔离回归，但**尚未完成同一提交上的完整构建、实际安装与持续运行验收**。源码状态与当前已安装版本分开核对。范围与历史验证证据见 [完整迁移清单](docs/RUST_MIGRATION_MATRIX.md)，Force 历史配置迁移见 [迁移说明](docs/OPENAI_FORCE_MIGRATION.md)。
 
 ## 日常使用
 
@@ -31,11 +31,19 @@ Claude 正常关闭后显示“后台保护待命，无需操作”。异常停�
 依赖本机已有的 Xcode / Swift 和 Python 3.9 以上版本；生产应用目标为 macOS 13 以上。构建不会自动安装或改变系统配置。
 
 ```sh
-CW_BUILD_ARCH=arm64 bash monitor/build.sh
-CW_BUILD_ARCH=arm64 bash monitor/package-dmg.sh
+# APP_VERSION 和 BUILD_NUMBER 均须显式指定；以下值仅示例，勿覆盖现有 DMG。
+APP_VERSION=3.0.0 BUILD_NUMBER=367 CW_BUILD_ARCH=arm64 bash monitor/package-dmg.sh
 ```
 
-第一条生成 `monitor/build/Claude Watch Monitor.app`，第二条生成带 SHA-256 校验文件的 DMG。打包脚本拒绝覆盖同名安装包。
+`package-dmg.sh` **内部会调用 `monitor/build.sh`**，只需执行一次打包命令，避免重复构建。它默认从 Rust 后台清单复制 `watch-process-control`，不再编译并覆盖同名 Swift helper。直接只构建 App 时可使用相同版本环境变量运行 `monitor/build.sh`。两个脚本的默认中间 App 路径统一为 `monitor/build/Claude Watch Monitor Rust Candidate.app`；也可用 `CW_APP_OUTPUT` 自行指定同一个输出路径，例如：
+
+```sh
+APP_VERSION=3.0.0 BUILD_NUMBER=367 CW_BUILD_ARCH=arm64 \
+CW_APP_OUTPUT="$PWD/monitor/build/Claude Watch Monitor Rust Candidate.app" \
+bash monitor/package-dmg.sh
+```
+
+打包完成会生成带 SHA-256 校验文件的 DMG；脚本拒绝覆盖同名安装包。**打包不会安装**；安装、删除数据或调整系统权限必须单独授权。
 
 离线 Python 回归测试：
 
@@ -52,12 +60,12 @@ Swift 测试、隔离界面与真实界面验收说明见 [原生应用开发说
 | --- | --- |
 | `claude-watch.sh` | 采集后台、只读诊断与受控入口 |
 | `monitor/Sources/` | SwiftUI 界面、状态模型、连接关联展示 |
-| `monitor/Resources/` | Python 保护与账号引擎、检测页面、图标资产 |
+| `monitor/Resources/` | WebView 检测页面、辅助脚本、图标资产（不携带已退役的 Python 后台） |
 | `monitor/Packaging/` | 完整安装、卸载与权限处理 |
 | `monitor/ThirdParty/` | 固定版本的上游源码、来源清单和许可证 |
 | `tests/`、`monitor/tests/` | 后台、原生界面和集成测试 |
 | `monitor/tools/` | 构建与维护辅助工具 |
-| `crates/`、`Cargo.toml` | Rust 纯判定核心、隔离运行时及对照程序；正式接入尚未完成 |
+| `crates/`、`Cargo.toml` | 已接入的 Rust 策略核心、运行时、原生引擎和安装组件 |
 | `tools/rust_shadow.py` | 新旧实现的同输入对照与回放验证 |
 | `monitor/build/`、`monitor/dist/` | 可重新生成的构建产物与安装包，不进入 Git |
 | `monitor/reports/` | 本机验收和观测记录，不进入 Git |

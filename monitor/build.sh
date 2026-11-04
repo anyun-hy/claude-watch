@@ -74,10 +74,8 @@ for CW_TARGET_ARCH in $CW_TARGETS; do
     -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
     -framework SwiftUI -framework AppKit -framework WebKit "$ROOT"/Sources/*.swift \
     -o "$ROOT/build/ClaudeWatchMonitor.$CW_TARGET_ARCH"
-  "$SWIFTC" -swift-version 5 -O -parse-as-library -D PROCESS_HELPER \
-    -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
-    -framework AppKit "$ROOT/Sources/AIProcessControl.swift" "$ROOT/tools/ProcessHelper.swift" \
-    -o "$ROOT/build/watch-process-control.$CW_TARGET_ARCH"
+  # The Rust component manifest supplies watch-process-control. Do not build
+  # the retired Swift helper: it was overwritten by the Rust staging copy.
   "$SWIFTC" -swift-version 5 -O -parse-as-library -D BACKGROUND_LEAK_WORKER \
     -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
     -framework AppKit -framework WebKit "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" \
@@ -85,7 +83,6 @@ for CW_TARGET_ARCH in $CW_TARGETS; do
     "$ROOT/tools/BackgroundLeakWorker.swift" -o "$ROOT/build/watch-leak-worker.$CW_TARGET_ARCH"
 done
 cp "$ROOT/build/ClaudeWatchMonitor.$CW_BUILD_ARCH" "$APP/Contents/MacOS/ClaudeWatchMonitor"
-cp "$ROOT/build/watch-process-control.$CW_BUILD_ARCH" "$APP/Contents/Resources/watch-process-control"
 cp "$ROOT/build/watch-leak-worker.$CW_BUILD_ARCH" "$APP/Contents/Resources/watch-leak-worker"
 cp "$ROOT/Resources/webrtc_probe.html" "$ROOT/Resources/webrtc_probe.js" "$APP/Contents/Resources/"
 cp "$ROOT/Resources/netcoffee_probe.html" "$ROOT/Resources/netcoffee_probe.js" "$ROOT/Resources/netcoffee_probe.css" "$ROOT/Resources/watch-admin.sh" "$APP/Contents/Resources/"
