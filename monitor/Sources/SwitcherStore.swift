@@ -452,6 +452,7 @@ final class SwitcherReadCancellation: @unchecked Sendable {
 @MainActor
 final class SwitcherStore: ObservableObject {
     @Published var settings: [String: Any] = [:]
+    @Published private(set) var legacyOpenAIForceReview: [String] = []
     @Published private(set) var audit: EnvironmentAuditReceipt?
     @Published private(set) var currentPolicyEvaluation: EnvironmentPolicyEvaluation?
     @Published private(set) var auditOperationMessage = ""
@@ -525,6 +526,9 @@ final class SwitcherStore: ObservableObject {
     @Published private(set) var diagnosticRunning = false
     let isFixture: Bool
     private var savedSettings: [String: Any] = [:]
+    /// Only a deliberate new OpenAI Force selection may request a per-key
+    /// authorization. A loaded legacy value never creates such a request.
+    private var pendingOpenAIForceKeys = Set<String>()
     private var protectionChanges: [String: Bool]?
     private var detectionCancellation: SwitcherReadCancellation?
     private var environmentGeneration = 0
@@ -773,7 +777,18 @@ final class SwitcherStore: ObservableObject {
     /// service is never read with another service's default.
     func choice(_ setting: ChoiceSetting) -> Binding<String> {
         Binding(get: { self.settings[setting.key] as? String ?? setting.fallback },
-                set: { self.settings[setting.key] = $0; self.markDraft() })
+                set: { selected in
+                    if setting.key.hasPrefix("gpt_close_") {
+                        let saved = self.savedSettings[setting.key] as? String ?? setting.fallback
+                        if selected == "force" && saved != "force" {
+                            self.pendingOpenAIForceKeys.insert(setting.key)
+                        } else {
+                            self.pendingOpenAIForceKeys.remove(setting.key)
+                        }
+                    }
+                    self.settings[setting.key] = selected
+                    self.markDraft()
+                })
     }
     func addresses(_ key: String) -> Binding<String> {
         Binding(get: { (self.settings[key] as? [String] ?? []).joined(separator: ", ") }, set: {
@@ -786,11 +801,18 @@ final class SwitcherStore: ObservableObject {
         hasUnsavedSettings = true; plan = nil; setupPlan = nil; audit = nil
         currentPolicyEvaluation = nil
     }
-    func discardChanges() { settings = savedSettings; hasUnsavedSettings = false; setupPlan = nil; plan = nil }
+    func discardChanges() {
+        settings = savedSettings
+        pendingOpenAIForceKeys.removeAll()
+        hasUnsavedSettings = false; setupPlan = nil; plan = nil
+    }
     func dismissMessage() { message = "" }
     var policyWarnings: [String] {
         var items: [String] = []
         if isOn(Setting.autoUpdate) && !updateSourceReady { items.append("保存的自动更新意愿为开启，但发布源与公钥尚未配置。实际状态见后台保护。") }
+        if !legacyOpenAIForceReview.isEmpty {
+            items.append("历史 ChatGPT/Codex 强制结束设置已暂按普通关闭执行。若仍需要 Force，请在策略中逐项重新选择并保存。")
+        }
         return items
     }
     func load(automaticCheck: Bool = false) async {
@@ -809,7 +831,13 @@ final class SwitcherStore: ObservableObject {
     }
     func save() async {
         guard let data = try? JSONSerialization.data(withJSONObject: settings, options: [.sortedKeys]) else { return }
-        await perform(["config", "set", "--apply"], input: data)
+        let approved = pendingOpenAIForceKeys.filter { settings[$0] as? String == "force" }.sorted()
+        var args = ["config", "set", "--apply"]
+        if !approved.isEmpty {
+            args += ["--confirm-force", approved.joined(separator: ",")]
+        }
+        await perform(args, input: data)
+        if !failure { pendingOpenAIForceKeys.removeAll() }
     }
     func detectCurrentEnvironment() async -> Bool {
         guard !busy && !readingEnvironment else { return false }
@@ -1458,8 +1486,12 @@ final class SwitcherStore: ObservableObject {
                           userInfo: [NSLocalizedDescriptionKey: raw["message"] as? String ?? "读取未完成"])
         }
         let incoming = raw["config"] as? [String: Any] ?? [:]
+        legacyOpenAIForceReview = raw["legacy_openai_force_review"] as? [String] ?? []
         savedSettings = incoming
-        if !hasUnsavedSettings { settings = incoming }
+        if !hasUnsavedSettings {
+            settings = incoming
+            pendingOpenAIForceKeys.removeAll()
+        }
         claudeVersion = raw["claude_version"] as? String ?? ""
         proxyGroups = raw["proxy_groups"] as? [String] ?? []
         updateRecoveryRequired = raw["update_recovery_required"] as? Bool ?? false

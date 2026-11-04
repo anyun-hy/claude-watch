@@ -308,10 +308,11 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
         }
         "service-status" => Ok(Some(background(&host)?)),
         "status" => {
-            let config = ConfigStore {
+            let config_store = ConfigStore {
                 storage: host.storage.clone(),
-            }
-            .load()?;
+            };
+            let config = config_store.load()?;
+            let legacy_openai_force_review = config_store.legacy_force_pending()?;
             let mut audit = host.storage.read_json(
                 &host.storage.paths.base().join("last-audit.json"),
                 Value::Null,
@@ -324,7 +325,7 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
                 .value();
             let env = host.environment().ok();
             Ok(Some(
-                json!({"status":"ok","config":config.value()?,"accounts":accounts,"audit":audit,"service_status":background(&host)?,"netcoffee_lookup":audit["netcoffee_lookup"],"source_notices":audit.get("source_notices").unwrap_or(&json!([])),
+                json!({"status":"ok","config":config.value()?,"legacy_openai_force_review":legacy_openai_force_review,"accounts":accounts,"audit":audit,"service_status":background(&host)?,"netcoffee_lookup":audit["netcoffee_lookup"],"source_notices":audit.get("source_notices").unwrap_or(&json!([])),
                 "repair":host.storage.read_json(&host.storage.paths.base().join("last-repair.json"),Value::Null)?,"guard":host.storage.read_json(&host.storage.paths.base().join("guard-heartbeat.json"),Value::Null)?,
                 "update_recovery_required":host.storage.paths.base().join("update-transaction.json").exists(),"setup_recovery_required":host.storage.paths.base().join("setup-transaction.json").exists()||host.storage.paths.base().join("service-transaction.json").exists()||host.storage.paths.watch().join("agent-install-transaction.json").exists(),"proxy_groups":[],
                 "claude_version":env.as_ref().and_then(|v|v.pointer("/claude_app/version")).and_then(Value::as_str).unwrap_or("")}),

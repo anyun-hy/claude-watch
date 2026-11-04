@@ -24,7 +24,12 @@ impl Fixture {
     fn sessions(&self) -> SessionStore { SessionStore::for_family(self.store.clone(), self.family) }
     fn policy(&self, criterion: &str, action: &str) {
         let mut config = ConfigStore { storage: self.store.clone() }.load().unwrap();
-        config.policy_actions.insert(PolicyCatalog::family(self.family).unwrap().key(criterion), action.into());
+        let key = PolicyCatalog::family(self.family).unwrap().key(criterion);
+        config.gpt_force_approved_v1.retain(|v| v != &key);
+        if self.family == "openai" && action == "force" {
+            config.gpt_force_approved_v1.push(key.clone());
+        }
+        config.policy_actions.insert(key, action.into());
         self.store.atomic_json(&self.store.paths.config(), &config.value().unwrap()).unwrap();
     }
     fn locked(&self, code: &str) -> Session {
@@ -283,7 +288,9 @@ fn changed_policy_or_receipt_during_recovery_cannot_unlock_the_old_snapshot() {
         system.on_egress=Some(Box::new(move || {
             if policy {
                 let mut config=ConfigStore{storage:store.clone()}.load().unwrap().value().unwrap();
-                config["gpt_close_dns"]=json!("force"); store.atomic_json(&store.paths.config(), &config).unwrap();
+                config["gpt_close_dns"]=json!("force");
+                config["gpt_force_approved_v1"]=json!(["gpt_close_dns"]);
+                store.atomic_json(&store.paths.config(), &config).unwrap();
             } else {
                 store.atomic_json(&store.paths.base().join("dns-leak-receipt.json"),
                     &json!({"finished_at":1003.,"context":"fixture","dns":{"countries":["US"]}})).unwrap();

@@ -93,7 +93,10 @@ fn local_command(request: &claude_watch_core::cli::Request, paths: Paths) -> Res
         )),
         ("config", Some("set")) => {
             request.require_apply()?;
-            let saved = config.save(bounded_input(request.input_limit())?)?;
+            let saved = config.save_with_force_confirmation(
+                bounded_input(request.input_limit())?,
+                request.value("confirm-force"),
+            )?;
             Ok(Some(json!({"status":"ok","config":saved.value()?})))
         }
         ("account", Some("status")) => Ok(Some(

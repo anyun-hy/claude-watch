@@ -47,6 +47,10 @@ pub struct Config {
     /// reachable.
     #[serde(flatten)]
     pub policy_actions: BTreeMap<String, String>,
+    /// The exact OpenAI policy keys explicitly re-approved for Force.
+    /// Absence means a pre-migration Force string cannot grant SIGKILL.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpt_force_approved_v1: Vec<String>,
     pub update_url: String,
     pub update_public_key: String,
     pub verified_claude_versions: Vec<String>,
@@ -78,6 +82,7 @@ impl Default for Config {
             expected_resolvers: Vec::new(),
             allow_ip_change: true,
             policy_actions: PolicyCatalog::default_actions(),
+            gpt_force_approved_v1: Vec::new(),
             update_url: String::new(),
             update_public_key: String::new(),
             verified_claude_versions: Vec::new(),
@@ -96,6 +101,9 @@ impl Config {
         let merged = defaults
             .as_object_mut()
             .ok_or_else(|| invalid("默认配置格式无效"))?;
+        // The approval field is intentionally omitted from the empty default
+        // document, keeping legacy policy digests stable.
+        merged.insert("gpt_force_approved_v1".into(), serde_json::json!([]));
         if incoming.keys().any(|k| !merged.contains_key(k)) {
             return Err(invalid("配置包含未知字段"));
         }
@@ -142,7 +150,7 @@ impl Config {
         }) {
             return Err(invalid("账号兼容性版本列表无效"));
         }
-        let result: Self =
+        let mut result: Self =
             serde_json::from_value(defaults).map_err(|_| invalid("配置字段类型无效"))?;
         if result.schema != 1
             || !matches!(
@@ -197,6 +205,34 @@ impl Config {
                 }
             }
         }
+        // Old schema-1 files could already contain gpt_close_*=force before
+        // this consent protocol existed. Those strings have no execution
+        // authority; normalize their effective values to ordinary close.
+        let openai = PolicyCatalog::family("openai")
+            .ok_or_else(|| invalid("OpenAI 策略目录不可用"))?;
+        let keys = PolicyCatalog::keyed_criteria()
+            .map(|criterion| openai.key(criterion.id))
+            .collect::<BTreeSet<_>>();
+        let mut seen = BTreeSet::new();
+        if result.gpt_force_approved_v1.len() > keys.len()
+            || result.gpt_force_approved_v1.iter().any(|key| {
+                !keys.contains(key) || !seen.insert(key.clone())
+            })
+        {
+            return Err(invalid("历史 Force 确认记录无效"));
+        }
+        result.gpt_force_approved_v1.retain(|key| {
+            result.policy_actions.get(key).is_some_and(|action| action == "force")
+        });
+        result.gpt_force_approved_v1.sort();
+        let approved = result.gpt_force_approved_v1.iter().cloned().collect::<BTreeSet<_>>();
+        for key in &keys {
+            if result.policy_actions.get(key).is_some_and(|value| value == "force")
+                && !approved.contains(key)
+            {
+                result.policy_actions.insert(key.clone(), "close".into());
+            }
+        }
         Ok(result)
     }
     /// Actions a service can be configured to take, from the family that
@@ -214,10 +250,19 @@ impl Config {
         let Some(family) = PolicyCatalog::family(family) else {
             return String::new();
         };
-        self.policy_actions
-            .get(&family.key(criterion))
+        let key = family.key(criterion);
+        let selected = self.policy_actions
+            .get(&key)
             .cloned()
-            .unwrap_or_else(|| PolicyCatalog::fallback_action(family, criterion).to_string())
+            .unwrap_or_else(|| PolicyCatalog::fallback_action(family, criterion).to_string());
+        // Also guard manually constructed Config values, which bypass parsing.
+        if family.id == "openai" && selected == "force"
+            && !self.gpt_force_approved_v1.contains(&key)
+        {
+            "close".to_string()
+        } else {
+            selected
+        }
     }
     /// Configured action for a confirmed risk code within one service's own
     /// policy family. Families are kept separate, so an action is always
@@ -491,11 +536,14 @@ mod protection_tests {
             strict.close_action("dns_and_webrtc_egress_changed", Provider::Claude),
             "close"
         );
-        // Force is available to every supervised family, so an OpenAI key may
-        // be configured to force, and only values outside the three documented
-        // actions are rejected.
-        let forced =
+        // A legacy OpenAI Force value is not new explicit consent.
+        let legacy =
             Config::from_value(json!({"gpt_close_cn":"force","gpt_close_ip":"close"})).unwrap();
+        assert_eq!(legacy.close_action("egress_country_cn", Provider::Codex), "close");
+        let forced = Config::from_value(json!({
+            "gpt_close_cn":"force","gpt_close_ip":"close",
+            "gpt_force_approved_v1":["gpt_close_cn"]
+        })).unwrap();
         assert_eq!(forced.close_action("egress_country_cn", Provider::Codex), "force");
         assert_eq!(forced.close_action("egress_ip_changed", Provider::Chatgpt), "close");
         for bad in [
@@ -505,13 +553,13 @@ mod protection_tests {
         ] {
             assert_eq!(Config::from_value(bad).unwrap_err().code, "invalid_config");
         }
-        // A stored force value is now performable, so it resolves to force
-        // instead of degrading.
+        // Even a manually constructed stale configuration has no OpenAI
+        // Force authority without its per-key grant.
         let mut stale = Config::default();
         stale
             .policy_actions
             .insert("gpt_close_webrtc".into(), "force".into());
-        assert_eq!(stale.close_action("webrtc_egress_changed", Provider::Codex), "force");
+        assert_eq!(stale.close_action("webrtc_egress_changed", Provider::Codex), "close");
         assert_eq!(stale.close_action("webrtc_egress_changed", Provider::Claude), "force");
     }
     #[test]
@@ -532,7 +580,10 @@ mod protection_tests {
                 for action in family.actions {
                     let key = family.key(criterion.id);
                     let stored = Config::from_value(json!({ key: action })).unwrap();
-                    assert_eq!(stored.action(family.id, criterion.id), *action);
+                    assert_eq!(
+                        stored.action(family.id, criterion.id),
+                        if family.id == "openai" && *action == "force" { "close" } else { *action }
+                    );
                 }
                 let rejected = family.key(criterion.id);
                 assert_eq!(

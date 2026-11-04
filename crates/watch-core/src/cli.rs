@@ -61,7 +61,7 @@ impl Request {
             "check" | "checkdetail" => {
                 (&[], &["online", "require-ready", "no-report"], &["target"])
             }
-            "config" => (&["show", "set", "enabled"], &["apply"], &[]),
+            "config" => (&["show", "set", "enabled"], &["apply"], &["confirm-force"]),
             "account" => (
                 &["status", "switch", "recover", "import"],
                 &["apply", "ack-unverified-version"],
@@ -204,6 +204,12 @@ impl Request {
             positionals.remove(0);
         }
         if !positionals.is_empty() {
+            return Err(invalid());
+        }
+        if command == "config"
+            && request.value("confirm-force").is_some()
+            && (request.action.as_deref() != Some("set") || !request.flag("apply"))
+        {
             return Err(invalid());
         }
         if command == "ai-probe" && !matches!(request.value("service"), Some("claude" | "gpt")) {

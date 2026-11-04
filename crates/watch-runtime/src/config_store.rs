@@ -4,6 +4,7 @@ use claude_watch_core::{
     error::{CoreError, Result},
 };
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 pub struct ConfigStore {
     pub storage: StateStore,
@@ -16,8 +17,107 @@ impl ConfigStore {
         )
     }
     pub fn save(&self, value: Value) -> Result<Config> {
-        let validated = Config::from_value(value)?;
+        self.save_with_force_confirmation(value, None)
+    }
+
+    /// Read-only migration disclosure for the UI. Loading never edits the
+    /// legacy document; the effective config is already downgraded to close.
+    pub fn legacy_force_pending(&self) -> Result<Vec<String>> {
+        let raw = self.storage.read_json(
+            &self.storage.paths.config(), serde_json::json!({}),
+        )?;
+        let config = Config::from_value(raw.clone())?;
+        let openai = claude_watch_core::policy::PolicyCatalog::family("openai")
+            .ok_or_else(|| CoreError::new("invalid_config", "OpenAI 策略目录不可用"))?;
+        Ok(claude_watch_core::policy::PolicyCatalog::keyed_criteria()
+            .filter_map(|criterion| {
+                let key = openai.key(criterion.id);
+                (raw.get(&key).and_then(Value::as_str) == Some("force")
+                    && config.action("openai", criterion.id) != "force")
+                    .then_some(key)
+            })
+            .collect())
+    }
+
+    /// A new OpenAI Force grant is a specific, explicit per-key transition.
+    /// The ordinary full-document save must never re-authorize a stale force
+    /// string, even if an older GUI echoes the raw value during another edit.
+    /// The grant and the effective policy are committed in one atomic JSON.
+    pub fn save_with_force_confirmation(
+        &self,
+        mut value: Value,
+        confirmation: Option<&str>,
+    ) -> Result<Config> {
         let _lock = self.storage.lock("operation", None)?;
+        let raw_before = self.storage.read_json(
+            &self.storage.paths.config(), serde_json::json!({}),
+        )?;
+        let previous = match Config::from_value(raw_before.clone()) {
+            Ok(config) => config,
+            Err(error) if confirmation.is_none() => {
+                // Keep the original ability to repair invalid stored config
+                // without allowing a new Force grant while authority is unknown.
+                let _ = error;
+                Config::default()
+            }
+            Err(error) => return Err(error),
+        };
+        let incoming = value.as_object_mut().ok_or_else(|| {
+            CoreError::new("invalid_config", "配置必须是对象")
+        })?;
+        if incoming.get("gpt_force_approved_v1")
+            .is_some_and(|v| v != &serde_json::json!(previous.gpt_force_approved_v1))
+        {
+            return Err(CoreError::new(
+                "force_confirmation_invalid", "Force 授权记录不能由配置请求直接修改",
+            ));
+        }
+        let openai = claude_watch_core::policy::PolicyCatalog::family("openai")
+            .ok_or_else(|| CoreError::new("invalid_config", "OpenAI 策略目录不可用"))?;
+        let allowed = claude_watch_core::policy::PolicyCatalog::keyed_criteria()
+            .map(|criterion| openai.key(criterion.id))
+            .collect::<BTreeSet<_>>();
+        let mut approved = previous.gpt_force_approved_v1.iter()
+            .cloned().collect::<BTreeSet<_>>();
+        if let Some(raw) = confirmation {
+            if raw.is_empty() || raw.len() > 512 {
+                return Err(CoreError::new("force_confirmation_invalid", "Force 确认参数无效"));
+            }
+            let mut selected = BTreeSet::new();
+            for key in raw.split(',') {
+                if !allowed.contains(key)
+                    || !selected.insert(key.to_string())
+                    || incoming.get(key).and_then(Value::as_str) != Some("force")
+                {
+                    return Err(CoreError::new(
+                        "force_confirmation_invalid", "Force 确认项与本次选择不一致",
+                    ));
+                }
+            }
+            approved.extend(selected);
+        }
+        // A newly requested Force without the explicit CLI confirmation is
+        // rejected rather than silently accepted or displayed as successful.
+        // A pre-migration, already-stored Force string is the sole exception:
+        // it is downgraded to ordinary close when the document is next saved.
+        for key in &allowed {
+            if incoming.get(key).and_then(Value::as_str) == Some("force")
+                && !approved.contains(key)
+                && raw_before.get(key).and_then(Value::as_str) != Some("force")
+            {
+                return Err(CoreError::new(
+                    "force_confirmation_required", "新选择的 Force 需要逐项明确确认",
+                ));
+            }
+        }
+        // An old, unconfirmed Force value is never inherited. A legitimate
+        // existing approval persists only while that exact key stays Force.
+        approved.retain(|key| incoming.get(key).and_then(Value::as_str) == Some("force"));
+        incoming.insert(
+            "gpt_force_approved_v1".into(),
+            serde_json::json!(approved.into_iter().collect::<Vec<_>>()),
+        );
+        let validated = Config::from_value(value)?;
         self.storage
             .atomic_json(&self.storage.paths.config(), &validated.value()?)?;
         Ok(validated)

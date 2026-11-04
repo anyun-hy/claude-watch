@@ -19,6 +19,9 @@ impl Fixture {
         let mut config = Config { guard_enabled: true, ..Default::default() };
         for (key, value) in actions {
             config.policy_actions.insert((*key).into(), (*value).into());
+            if key.starts_with("gpt_close_") && *value == "force" {
+                config.gpt_force_approved_v1.push((*key).into());
+            }
         }
         storage.atomic_json(&storage.paths.config(), &config.value().unwrap()).unwrap();
         Self { controller: Controller::new(storage.clone()), home, storage, family }

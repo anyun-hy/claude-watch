@@ -69,8 +69,10 @@ impl Fixture {
     fn session(&self, now: f64) -> Session { self.sessions().load(now).unwrap().unwrap() }
     fn config(&self, key: &str, value: Value) {
         let store = ConfigStore { storage: self.store.clone() };
-        let mut config = store.load().unwrap().value().unwrap(); config[key] = value;
-        store.save(config).unwrap();
+        let mut config = store.load().unwrap().value().unwrap();
+        let force = value.as_str() == Some("force") && key.starts_with("gpt_close_");
+        config[key] = value;
+        store.save_with_force_confirmation(config, force.then_some(key)).unwrap();
     }
     fn mock(&self, count: usize) -> Mock {
         Mock { store: self.store.clone(), family: "openai", now: 1001.,
