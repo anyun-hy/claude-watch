@@ -7,6 +7,7 @@ pub mod audit;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod guard_event;
 pub mod json_value;
 pub mod network;
 pub mod observation;
