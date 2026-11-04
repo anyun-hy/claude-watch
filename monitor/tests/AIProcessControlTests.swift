@@ -24,7 +24,10 @@ struct AIProcessControlTests {
             try await Task.sleep(nanoseconds: 200_000_000)
             guard child.isRunning else { fatalError("fixture did not ignore normal exit") }
             let forced = AIProcessClosePolicy.forceRemaining(plan, lookup: AIProcessInventory.identity,
-                force: { target in target == pid && Darwin.kill(target, SIGKILL) == 0 })
+                force: { target in target.pid == pid &&
+                    AIProcessClosePolicy.applyToMatchingIdentity(target, lookup: AIProcessInventory.identity) {
+                        Darwin.kill($0, SIGKILL) == 0
+                    } })
             guard forced.requested == 1 else { fatalError("verified child was not force-signalled") }
             child.waitUntilExit()
             guard !child.isRunning else { fatalError("owned child still running") }
@@ -42,7 +45,10 @@ struct AIProcessControlTests {
             let plan = AIProcessClosePlan(product: .claude, uid: getuid(), targets: [identity], protected: [getpid()])
             let outcome = AIProcessClosePolicy.execute(plan, lookup: AIProcessInventory.identity,
                 quitApplication: { _ in fatalError("not an application") },
-                terminate: { target in target == pid && Darwin.kill(target, SIGTERM) == 0 })
+                terminate: { target in target.pid == pid &&
+                    AIProcessClosePolicy.applyToMatchingIdentity(target, lookup: AIProcessInventory.identity) {
+                        Darwin.kill($0, SIGTERM) == 0
+                    } })
             guard outcome.requested == 1 else { fatalError("owned child was not signalled") }
             child.waitUntilExit()
             guard !child.isRunning else { fatalError("owned child still running") }
@@ -81,7 +87,7 @@ struct AIProcessControlTests {
         expect(empty.targets.isEmpty, "missing product never falls back to another product")
         var quit: [Int32] = [], signals: [Int32] = []
         let ok = AIProcessClosePolicy.execute(plan, lookup: { pid in rows.first { $0.pid == pid } },
-            quitApplication: { quit.append($0); return true }, terminate: { signals.append($0); return true })
+            quitApplication: { quit.append($0.pid); return true }, terminate: { signals.append($0.pid); return true })
         expect(quit == [10] && Set(signals) == [11, 12], "desktop gets normal quit; descendants get TERM")
         expect(ok.requested == 3 && ok.failed == 0 && ok.skipped == 0, "request accounting")
         for changed in [row(10, product: .claude, seconds: 101), row(10, product: .claude, micros: 2),
@@ -102,7 +108,7 @@ struct AIProcessControlTests {
             if pid == 10 { return row(10, product: .claude, seconds: 101, main: true) }
             if pid == 11 { return rows.first { $0.pid == pid } }
             return nil
-        }, force: { forced.append($0); return true })
+        }, force: { forced.append($0.pid); return true })
         expect(forced == [11] && onlySame.requested == 1 && onlySame.skipped == 2,
                "force fallback skips recycled or exited identities")
         for changed in [row(10, product: .claude, seconds: 101), row(10, product: .claude, micros: 2),
@@ -118,9 +124,23 @@ struct AIProcessControlTests {
         var otherForced: [Int32] = []
         let other = AIProcessClosePolicy.forceRemaining(otherPlan, lookup: { pid in
             pid == 20 ? rows.first { $0.pid == pid } : nil
-        }, force: { otherForced.append($0); return true })
+        }, force: { otherForced.append($0.pid); return true })
         expect(otherForced == [20] && other.requested == 1 && other.skipped == 0,
                "force follows the upstream policy decision and identity verification alone")
+        // The effect adapter independently checks the original full identity;
+        // a PID check alone cannot authorise an action after process reuse.
+        var effects = 0
+        let original = rows[0]
+        let fakeReused = row(original.pid, seconds: original.startSeconds + 1)
+        let effectSkipped = AIProcessClosePolicy.applyToMatchingIdentity(original,
+            lookup: { _ in fakeReused }, effect: { _ in effects += 1; return true })
+        expect(!effectSkipped && effects == 0, "effect-boundary identity change blocks a signal")
+        let effectAccepted = AIProcessClosePolicy.applyToMatchingIdentity(original,
+            lookup: { _ in original }, effect: { pid in
+                effects += 1
+                return pid == original.pid
+            })
+        expect(effectAccepted && effects == 1, "effect adapter receives the verified original PID")
         let forceFailed = AIProcessClosePolicy.forceRemaining(plan, lookup: { pid in rows.first { $0.pid == pid } }, force: { _ in false })
         expect(forceFailed.requested == 0 && forceFailed.failed == 3, "failed force requests are never reported as successful")
         expect(AIProcessInventory.nodeEntry("/usr/bin/node /x/node_modules/@anthropic-ai/claude-code/cli.js")?.hasSuffix("cli.js") == true, "executed node script recognized")

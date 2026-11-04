@@ -74,8 +74,16 @@ struct WatchProcessHelper {
         let label = product == .claude ? "Claude" : "ChatGPT / Codex"
         let selected = plan(product, inventory: try inventory(for: product))
         let outcome = AIProcessClosePolicy.execute(selected, lookup: AIProcessInventory.identity,
-            quitApplication: { NSRunningApplication(processIdentifier: $0)?.terminate() ?? false },
-            terminate: { Darwin.kill($0, SIGTERM) == 0 })
+            quitApplication: { expected in
+                AIProcessClosePolicy.applyToMatchingIdentity(expected, lookup: AIProcessInventory.identity) {
+                    NSRunningApplication(processIdentifier: $0)?.terminate() ?? false
+                }
+            },
+            terminate: { expected in
+                AIProcessClosePolicy.applyToMatchingIdentity(expected, lookup: AIProcessInventory.identity) {
+                    Darwin.kill($0, SIGTERM) == 0
+                }
+            })
         var forced = (requested: 0, skipped: 0, failed: 0)
         if allowForce {
             func originalNotConfirmedGone() -> Bool {
@@ -94,7 +102,11 @@ struct WatchProcessHelper {
             if originalNotConfirmedGone() {
                 // Never extend force authority to a new/restarted process.
                 forced = AIProcessClosePolicy.forceRemaining(selected, lookup: AIProcessInventory.identity,
-                    force: { Darwin.kill($0, SIGKILL) == 0 })
+                    force: { expected in
+                        AIProcessClosePolicy.applyToMatchingIdentity(expected, lookup: AIProcessInventory.identity) {
+                            Darwin.kill($0, SIGKILL) == 0
+                        }
+                    })
             }
         }
         // A root disappearing must not erase an original, now-orphaned child.

@@ -7,7 +7,11 @@
 | 文件或目录 | 职责 |
 | --- | --- |
 | `Sources/MonitorApp.swift` | 导航、工具栏、概览 |
-| `Sources/MonitorStore.swift` | 采集刷新与协调；连接连续性、刷新门控由独立类型负责 |
+| `Sources/MonitorStore.swift` | 观察协调、后台轮询、界面共享状态，不再负责快照子进程执行 |
+| `Sources/MonitorSnapshotReader.swift` | 独立快照命令执行与 JSON 解码，不包含用户会话授权 |
+| `Sources/DiagnosticContextTracker.swift`、`MonitorPage.swift` | 诊断上下文时效与页面定义 |
+| `../crates/watch-runtime/src/controlled/launch.rs` | 受控启动、观察租约与 CLI 生命周期 |
+| `../crates/watch-runtime/src/controlled/sampling_failure.rs` | Guard 采样失败后的独立恢复分支 |
 | `Sources/SessionProtectionPresentation.swift` | 会话状态与最新只读证据的统一展示 |
 | `Sources/SessionBaselinePresentation.swift` | 自动会话基准及历史记录展示 |
 | `Sources/SwitcherStore.swift`、`SwitcherPage.swift` | 环境、启动与账号、后台保护页面 |

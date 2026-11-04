@@ -14,7 +14,8 @@ python3 -m unittest -v \
   tools/tests/test_build_pipeline_contract.py \
   tools/tests/test_policy_catalog_generation.py \
   tools/tests/test_guard_stop_consolidation.py \
-  tools/tests/test_platform_contract.py
+  tools/tests/test_platform_contract.py \
+  tools/tests/test_architecture_boundaries.py
 python3 tools/generate-ai-policy-swift.py --check
 bash -n monitor/build.sh monitor/package-dmg.sh tools/build-rust-components.sh
 

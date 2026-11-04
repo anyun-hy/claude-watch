@@ -72,7 +72,7 @@ enum AIProcessClosePolicy {
         return .init(remaining: live.values.sorted { $0.pid < $1.pid }, unconfirmed: unknown.count)
     }
     static func execute(_ plan: AIProcessClosePlan, lookup: (Int32) -> AIProcessIdentity?,
-                        quitApplication: (Int32) -> Bool, terminate: (Int32) -> Bool) -> (requested: Int, skipped: Int, failed: Int) {
+                        quitApplication: (AIProcessIdentity) -> Bool, terminate: (AIProcessIdentity) -> Bool) -> (requested: Int, skipped: Int, failed: Int) {
         var requested = 0, skipped = 0, failed = 0
         // Roots are asked to quit normally. No SIGKILL or privileged helper is used.
         for target in plan.targets.sorted(by: { $0.desktopMain && !$1.desktopMain }) {
@@ -82,24 +82,36 @@ enum AIProcessClosePolicy {
                   // between plan validation and the side effect. It cannot
                   // make a PID-only Darwin signal an atomic identity operation.
                   let latest = lookup(target.pid), target.sameProcess(as: latest) else { skipped += 1; continue }
-            let accepted = target.desktopMain ? quitApplication(target.pid) : terminate(target.pid)
+            let accepted = target.desktopMain ? quitApplication(target) : terminate(target)
             if accepted { requested += 1 } else { failed += 1 }
         }
         return (requested, skipped, failed)
     }
+    /// The effect adapter is given the originally authorised identity, not
+    /// only its PID. Recheck at the actual side-effect boundary so a changed
+    /// process is never accepted merely because it passed an earlier poll.
+    /// No macOS PID-based signal is an atomic identity-conditional syscall.
+    static func applyToMatchingIdentity(_ expected: AIProcessIdentity,
+                                        lookup: (Int32) -> AIProcessIdentity?,
+                                        effect: (Int32) -> Bool) -> Bool {
+        guard expected.pid > 1, let current = lookup(expected.pid),
+              expected.sameProcess(as: current) else { return false }
+        return effect(expected.pid)
+    }
+
     /// Only the exact identities from the original, verified plan are eligible.
     /// Observed PID reuse and new processes are skipped; the final identity
     /// read narrows but cannot eliminate the non-atomic Darwin signal window.
     /// Whether force is allowed at all is decided upstream by the policy
     /// table; this routine only verifies identity, for any product.
     static func forceRemaining(_ plan: AIProcessClosePlan, lookup: (Int32) -> AIProcessIdentity?,
-                               force: (Int32) -> Bool) -> (requested: Int, skipped: Int, failed: Int) {
+                               force: (AIProcessIdentity) -> Bool) -> (requested: Int, skipped: Int, failed: Int) {
         var requested = 0, skipped = 0, failed = 0
         for target in plan.targets {
             guard target.uid == plan.uid, !plan.protected.contains(target.pid), target.pid > 1,
                   let live = lookup(target.pid), target.sameProcess(as: live),
                   let latest = lookup(target.pid), target.sameProcess(as: latest) else { skipped += 1; continue }
-            if force(target.pid) { requested += 1 } else { failed += 1 }
+            if force(target) { requested += 1 } else { failed += 1 }
         }
         return (requested, skipped, failed)
     }
@@ -242,8 +254,16 @@ final class AIProcessControl: ObservableObject {
         if isFixture { return "模拟关闭 \(plan.targets.count) 个 \(plan.product.title) 进程；未向任何系统进程发送退出请求。" }
         let outcome = await Task.detached(priority: .userInitiated) {
             AIProcessClosePolicy.execute(plan, lookup: AIProcessInventory.identity,
-                quitApplication: { NSRunningApplication(processIdentifier: $0)?.terminate() ?? false },
-                terminate: { Darwin.kill($0, SIGTERM) == 0 })
+                quitApplication: { expected in
+                    AIProcessClosePolicy.applyToMatchingIdentity(expected, lookup: AIProcessInventory.identity) {
+                        NSRunningApplication(processIdentifier: $0)?.terminate() ?? false
+                    }
+                },
+                terminate: { expected in
+                    AIProcessClosePolicy.applyToMatchingIdentity(expected, lookup: AIProcessInventory.identity) {
+                        Darwin.kill($0, SIGTERM) == 0
+                    }
+                })
         }.value
         try? await Task.sleep(nanoseconds: 1_200_000_000)
         do {

@@ -53,7 +53,7 @@ struct AIProcessExitEvidenceTests {
         var forceCalls: [Int32] = []
         let force = AIProcessClosePolicy.forceRemaining(original, lookup: { pid in
             pid == 20 ? newRoot : nil
-        }, force: { forceCalls.append($0); return true })
+        }, force: { forceCalls.append($0.pid); return true })
         expect(forceCalls.isEmpty && force.requested == 0, "new report member never inherits force authority")
         let still = [root, child]
         var calls: [Int32: Int] = [:]
@@ -85,7 +85,7 @@ struct AIProcessExitEvidenceTests {
         forceCalls.removeAll()
         _ = AIProcessClosePolicy.forceRemaining(original, lookup: { pid in
             if pid == 10 { return root }; if pid == 12 { return newChild }; return nil
-        }, force: { forceCalls.append($0); return true })
+        }, force: { forceCalls.append($0.pid); return true })
         expect(forceCalls == [10], "new descendant is never forced by the old plan")
         // A PID may be recycled after the first observation but before the
         // side effect. A second identity read must then skip the signal.
@@ -125,6 +125,16 @@ struct AIProcessExitEvidenceTests {
         expect(vanishedBeforeForce.skipped == 1 && signals == 1,
                "missing second identity check never authorizes Force")
 
+        var effectSignals = 0
+        let effectReuse = AIProcessClosePolicy.applyToMatchingIdentity(root,
+            lookup: { _ in replacement }, effect: { _ in effectSignals += 1; return true })
+        expect(!effectReuse && effectSignals == 0, "effect adapter refuses a recycled PID")
+        let effectUnavailable = AIProcessClosePolicy.applyToMatchingIdentity(root,
+            lookup: { _ in nil }, effect: { _ in effectSignals += 1; return true })
+        expect(!effectUnavailable && effectSignals == 0, "effect adapter refuses a missing identity")
+        let effectValid = AIProcessClosePolicy.applyToMatchingIdentity(root,
+            lookup: { _ in root }, effect: { pid in effectSignals += 1; return pid == root.pid })
+        expect(effectValid && effectSignals == 1, "effect adapter receives only the verified PID")
         let anotherProduct = row(30, product: .claude)
         let unrelated = AIProcessClosePolicy.exitEvidence(original, inventory: [anotherProduct]) { _ in .gone }
         expect(unrelated.complete, "another family is not silently added to close scope")
