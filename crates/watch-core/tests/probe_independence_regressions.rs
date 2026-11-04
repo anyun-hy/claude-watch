@@ -65,12 +65,17 @@ fn unavailable_criterion_cannot_lend_force_to_a_warning() {
     let mut config = Config::default();
     config.policy_actions.insert("gpt_close_dns".into(), "warn".into());
     config.policy_actions.insert("gpt_close_webrtc".into(), "force".into());
+    // Force is deliberately authorised for only this criterion. A stale
+    // pre-migration Force value resolves to ordinary close instead.
+    config.gpt_force_approved_v1 = vec!["gpt_close_webrtc".into()];
     let dns_only = verdict(&dns("US", NOW), &Value::Null);
     assert_eq!(config.close_action(dns_only["reason"]["code"].as_str().unwrap(), Provider::Codex), "warn");
     let both = verdict(&dns("US", NOW), &rtc("8.8.8.8", NOW));
     assert_eq!(config.close_action(both["reason"]["code"].as_str().unwrap(), Provider::Codex), "force");
     config.policy_actions.insert("gpt_close_dns".into(), "force".into());
     config.policy_actions.insert("gpt_close_webrtc".into(), "warn".into());
+    // Moving the explicit grant does not let the unavailable peer lend Force.
+    config.gpt_force_approved_v1 = vec!["gpt_close_dns".into()];
     let rtc_only = verdict(&Value::Null, &rtc("8.8.8.8", NOW));
     assert_eq!(config.close_action(rtc_only["reason"]["code"].as_str().unwrap(), Provider::Codex), "warn");
 }
