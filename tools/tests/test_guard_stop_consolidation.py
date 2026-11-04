@@ -20,7 +20,7 @@ class GuardStopConsolidation(unittest.TestCase):
         self.assertNotIn('last-guard-stop.json', CONTROLLED)
         self.assertEqual(DISPOSITION.count('last-guard-stop.json'), 1)
         confirmed = DISPOSITION.index("Ok(Some(StopOutcome::Confirmed))")
-        persisted = DISPOSITION.index('last-guard-stop.json')
+        persisted = DISPOSITION.index('self.persist_stop_record(system, expected_session, reason, receipt)?;')
         self.assertLess(confirmed, persisted)
         self.assertIn('Ok(None) => receipt["stop_state"] = json!("session_changed")', DISPOSITION)
         self.assertIn('receipt["stop_error"] = json!(error.code)', DISPOSITION)
