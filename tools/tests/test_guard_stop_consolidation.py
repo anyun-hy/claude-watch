@@ -4,6 +4,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTROLLED = (ROOT / "crates/watch-runtime/src/controlled.rs").read_text(encoding="utf-8")
+SAMPLING_FAILURE = (ROOT / "crates/watch-runtime/src/controlled/sampling_failure.rs").read_text(encoding="utf-8")
 DISPOSITION = (ROOT / "crates/watch-runtime/src/controlled/disposition.rs").read_text(encoding="utf-8")
 PROTECTION = (ROOT / "monitor/Sources/SessionProtectionPresentation.swift").read_text(encoding="utf-8")
 BASELINE = (ROOT / "monitor/Sources/SessionBaselinePresentation.swift").read_text(encoding="utf-8")
@@ -13,11 +14,18 @@ STORE = (ROOT / "monitor/Sources/SwitcherStore.swift").read_text(encoding="utf-8
 class GuardStopConsolidation(unittest.TestCase):
     def test_stop_result_is_handled_in_one_place(self):
         self.assertNotIn("match sessions.close_if_current(", CONTROLLED)
+        self.assertNotIn("match sessions.close_if_current(", SAMPLING_FAILURE)
         self.assertEqual(DISPOSITION.count("pub(super) fn finish_current_stop"), 1)
-        self.assertEqual(CONTROLLED.count("self.finish_current_stop("), 8)
+        # R04 moved three guarded-stop call sites into sampling_failure.rs.
+        # Count both modules so this test tracks the full decision path.
+        self.assertEqual(CONTROLLED.count("self.finish_current_stop("), 5)
+        self.assertEqual(SAMPLING_FAILURE.count("self.finish_current_stop("), 3)
+        self.assertEqual(sum(part.count("self.finish_current_stop(")
+                             for part in (CONTROLLED, SAMPLING_FAILURE)), 8)
 
     def test_last_guard_stop_is_persisted_only_on_confirmed_result(self):
         self.assertNotIn('last-guard-stop.json', CONTROLLED)
+        self.assertNotIn('last-guard-stop.json', SAMPLING_FAILURE)
         self.assertEqual(DISPOSITION.count('last-guard-stop.json'), 1)
         confirmed = DISPOSITION.index("Ok(Some(StopOutcome::Confirmed))")
         persisted = DISPOSITION.index('self.persist_stop_record(system, expected_session, reason, receipt)?;')
