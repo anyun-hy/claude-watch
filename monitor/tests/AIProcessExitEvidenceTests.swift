@@ -15,9 +15,10 @@ struct AIProcessExitEvidenceTests {
         }
         func row(_ pid: Int32, parent: Int32 = 1, uid: UInt32 = 501,
                  start: UInt64 = 100, product: MonitoredProduct? = nil,
-                 path: String = "/mock/process") -> AIProcessIdentity {
+                 path: String = "/mock/process",
+                 token: [UInt32]? = [501, 501, 20, 501, 20, 10, 1000, 1]) -> AIProcessIdentity {
             .init(pid: pid, parent: parent, uid: uid, startSeconds: start,
-                  startMicroseconds: 1, executable: path, rootProduct: product)
+                  startMicroseconds: 1, executable: path, auditToken: token, rootProduct: product)
         }
         let root = row(10, product: .openAI)
         let child = row(11, parent: 10)
@@ -135,6 +136,21 @@ struct AIProcessExitEvidenceTests {
         let effectValid = AIProcessClosePolicy.applyToMatchingIdentity(root,
             lookup: { _ in root }, effect: { pid in effectSignals += 1; return pid == root.pid })
         expect(effectValid && effectSignals == 1, "effect adapter receives only the verified PID")
+        // On XNU, execve preserves pbi_start_tvsec/usec; an updated audit token
+        // (pidversion) with identical PID, UID, start time and path must still
+        // be rejected at every decision and effect boundary.
+        let samePathExec = row(10, product: .openAI, token: [501, 501, 20, 501, 20, 10, 1000, 2])
+        expect(!root.sameProcess(as: samePathExec),
+               "in-place exec with identical start time and path is not the same process")
+        var execEffects = 0
+        let execBlocked = AIProcessClosePolicy.applyToMatchingIdentity(root,
+            lookup: { _ in samePathExec }, effect: { _ in execEffects += 1; return true })
+        expect(!execBlocked && execEffects == 0,
+               "effect adapter refuses an in-place exec with changed audit token")
+        let execForce = AIProcessClosePolicy.forceRemaining(single,
+            lookup: { _ in samePathExec }, force: { _ in execEffects += 1; return true })
+        expect(execForce.skipped == 1 && execEffects == 0,
+               "forceRemaining refuses an in-place exec with changed audit token")
         let anotherProduct = row(30, product: .claude)
         let unrelated = AIProcessClosePolicy.exitEvidence(original, inventory: [anotherProduct]) { _ in .gone }
         expect(unrelated.complete, "another family is not silently added to close scope")

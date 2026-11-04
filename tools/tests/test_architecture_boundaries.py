@@ -54,6 +54,10 @@ class ArchitectureBoundaries(unittest.TestCase):
         self.assertIn("Darwin.kill($0, SIGTERM)", HELPER)
         self.assertIn("Darwin.kill($0, SIGKILL)", HELPER)
         self.assertIn("No macOS PID-based signal is an atomic", PROCESS)
+        self.assertIn("TASK_AUDIT_TOKEN", PROCESS)
+        self.assertIn("proc_pidpath_audittoken(&token, &path, UInt32(path.count))", PROCESS)
+        self.assertIn("auditToken == other.auditToken", PROCESS)
+        self.assertIn("identities[index].sameProcess(as: verified)", PROCESS)
 
 
 if __name__ == "__main__":

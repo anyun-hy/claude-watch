@@ -4,6 +4,77 @@ import Darwin
 @main
 struct AIProcessControlTests {
     @MainActor static func main() async throws {
+        if CommandLine.arguments.contains("--owned-exec-identity") {
+            // Real macOS API verification without sending any signal or sleeping:
+            // pipe handshakes synchronize before and after an in-place exec to the
+            // same /bin/sh binary. XNU preserves pbi_start_tvsec/usec across execve,
+            // so only the kernel audit token (pidversion) distinguishes the two.
+            let child = Process()
+            let toChild = Pipe()
+            let fromChild = Pipe()
+            child.executableURL = URL(fileURLWithPath: "/bin/sh")
+            child.arguments = ["-c", "printf 1; IFS= read -r _; exec /bin/sh -c 'printf 2; IFS= read -r _'"]
+            child.standardInput = toChild
+            child.standardOutput = fromChild
+            child.standardError = FileHandle.nullDevice
+            try child.run()
+            defer {
+                try? toChild.fileHandleForWriting.close()
+                try? fromChild.fileHandleForReading.close()
+                child.waitUntilExit()
+            }
+            let pid = child.processIdentifier
+            guard let phase1 = try fromChild.fileHandleForReading.read(upToCount: 1),
+                  String(data: phase1, encoding: .utf8) == "1" else {
+                fatalError("owned pre-exec child did not reach phase 1")
+            }
+            guard let before = AIProcessInventory.identity(pid),
+                  before.uid == getuid(),
+                  before.auditToken != nil else {
+                fatalError("owned pre-exec child identity or audit token unavailable")
+            }
+            var stableEffects = 0
+            let acceptedBeforeExec = AIProcessClosePolicy.applyToMatchingIdentity(
+                before, lookup: AIProcessInventory.identity
+            ) { verified in
+                stableEffects += 1
+                return verified == pid
+            }
+            guard acceptedBeforeExec && stableEffects == 1 else {
+                fatalError("pre-exec identity failed verification")
+            }
+            try toChild.fileHandleForWriting.write(contentsOf: Data("\n".utf8))
+            guard let phase2 = try fromChild.fileHandleForReading.read(upToCount: 1),
+                  String(data: phase2, encoding: .utf8) == "2" else {
+                fatalError("owned post-exec child did not reach phase 2")
+            }
+            guard let after = AIProcessInventory.identity(pid),
+                  after.pid == before.pid,
+                  after.uid == before.uid,
+                  after.startSeconds == before.startSeconds,
+                  after.startMicroseconds == before.startMicroseconds,
+                  after.executable == before.executable else {
+                fatalError("owned post-exec child identity unavailable or unexpected attributes")
+            }
+            guard after.auditToken != nil, after.auditToken != before.auditToken,
+                  !before.sameProcess(as: after) else {
+                fatalError("in-place exec in the same PID did not change auditToken/sameProcess")
+            }
+            var postExecEffects = 0
+            let rejectedAfterExec = AIProcessClosePolicy.applyToMatchingIdentity(
+                before, lookup: AIProcessInventory.identity
+            ) { _ in
+                postExecEffects += 1
+                return true
+            }
+            guard !rejectedAfterExec && postExecEffects == 0 else {
+                fatalError("effect adapter accepted a post-exec incarnation of the same PID")
+            }
+            try toChild.fileHandleForWriting.close()
+            child.waitUntilExit()
+            print("PASS: real macOS audit token rejects in-place exec with identical PID, start time, and path")
+            return
+        }
         if CommandLine.arguments.contains("--owned-force-child") {
             let child = Process()
             child.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -69,9 +140,10 @@ struct AIProcessControlTests {
             guard value() else { fputs("FAIL: \(message)\n", stderr); exit(1) }; passed += 1
         }
         func row(_ pid: Int32, parent: Int32 = 1, product: MonitoredProduct? = nil,
-                 uid: UInt32 = 501, seconds: UInt64 = 100, micros: UInt64 = 1, path: String = "/mock/app", main: Bool = false) -> AIProcessIdentity {
+                 uid: UInt32 = 501, seconds: UInt64 = 100, micros: UInt64 = 1, path: String = "/mock/app",
+                 token: [UInt32]? = [501, 501, 20, 501, 20, 10, 1000, 1], main: Bool = false) -> AIProcessIdentity {
             .init(pid: pid, parent: parent, uid: uid, startSeconds: seconds, startMicroseconds: micros,
-                  executable: path, rootProduct: product, desktopMain: main)
+                  executable: path, auditToken: token, rootProduct: product, desktopMain: main)
         }
         let rows = [row(10, product: .claude, main: true), row(11, parent: 10), row(12, parent: 11),
                     row(20, product: .openAI, main: true), row(21, parent: 20),
@@ -91,7 +163,8 @@ struct AIProcessControlTests {
         expect(quit == [10] && Set(signals) == [11, 12], "desktop gets normal quit; descendants get TERM")
         expect(ok.requested == 3 && ok.failed == 0 && ok.skipped == 0, "request accounting")
         for changed in [row(10, product: .claude, seconds: 101), row(10, product: .claude, micros: 2),
-                        row(10, product: .claude, path: "/unrelated/app"), row(10, product: .claude, uid: 502)] {
+                        row(10, product: .claude, path: "/unrelated/app"), row(10, product: .claude, uid: 502),
+                        row(10, product: .claude, token: [501, 501, 20, 501, 20, 10, 1000, 2], main: true)] {
             let one = AIProcessClosePlan(product: .claude, uid: 501, targets: [rows[0]], protected: [])
             var called = false
             let result = AIProcessClosePolicy.execute(one, lookup: { _ in changed },
@@ -112,7 +185,8 @@ struct AIProcessControlTests {
         expect(forced == [11] && onlySame.requested == 1 && onlySame.skipped == 2,
                "force fallback skips recycled or exited identities")
         for changed in [row(10, product: .claude, seconds: 101), row(10, product: .claude, micros: 2),
-                        row(10, product: .claude, path: "/unrelated/app"), row(10, product: .claude, uid: 502)] {
+                        row(10, product: .claude, path: "/unrelated/app"), row(10, product: .claude, uid: 502),
+                        row(10, product: .claude, token: [501, 501, 20, 501, 20, 10, 1000, 2], main: true)] {
             let one = AIProcessClosePlan(product: .claude, uid: 501, targets: [rows[0]], protected: [])
             var called = false
             let result = AIProcessClosePolicy.forceRemaining(one, lookup: { _ in changed }, force: { _ in called = true; return true })

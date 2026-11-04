@@ -68,6 +68,15 @@ if [[ "$(uname -s)" == Darwin ]]; then
     monitor/Sources/SnapshotProcessTransport.swift monitor/tests/SnapshotProcessTransportTests.swift \
     -o "$BUILD/snapshot-transport-tests"
   "$BUILD/snapshot-transport-tests"
+  echo '===== PROCESS IDENTITY AND AUDIT-TOKEN REGRESSIONS (NO SIGNAL) ====='
+  "$SWIFTC" -swift-version 5 -Onone -parse-as-library \
+    -target "$ARCH-apple-macosx$MIN" -sdk "$SDK" \
+    -module-cache-path "$BUILD/module-cache" \
+    -framework AppKit \
+    monitor/Sources/MonitorModels.swift monitor/Sources/AIProcessControl.swift monitor/tests/AIProcessControlTests.swift \
+    -o "$BUILD/process-control-tests"
+  "$BUILD/process-control-tests"
+  "$BUILD/process-control-tests" --owned-exec-identity
 else
   echo 'SKIP: macOS production Swift typecheck (not running on macOS)'
 fi

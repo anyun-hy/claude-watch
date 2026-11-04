@@ -10,11 +10,17 @@ struct AIProcessIdentity: Equatable, Sendable {
     let uid: UInt32
     let startSeconds, startMicroseconds: UInt64
     let executable: String
+    /// Kernel audit token words (including monotonically increasing pidversion)
+    /// when obtainable via the public Mach task-name port API. Distinguishes
+    /// in-place exec replacements that keep the same PID, start timestamp, and
+    /// executable path on XNU.
+    var auditToken: [UInt32]? = nil
     var rootProduct: MonitoredProduct? = nil
     var desktopMain = false
     func sameProcess(as other: Self) -> Bool {
         pid == other.pid && uid == other.uid && startSeconds == other.startSeconds
             && startMicroseconds == other.startMicroseconds && executable == other.executable
+            && auditToken == other.auditToken
     }
 }
 struct AIProcessClosePlan: Sendable {
@@ -119,17 +125,49 @@ enum AIProcessClosePolicy {
 
 #if !PROCESS_POLICY_TESTS
 enum AIProcessInventory {
+    private static func rawAuditToken(_ pid: Int32) -> audit_token_t? {
+        guard pid > 1 else { return nil }
+        var name: mach_port_name_t = 0
+        guard task_name_for_pid(mach_task_self_, pid, &name) == KERN_SUCCESS else { return nil }
+        defer { mach_port_deallocate(mach_task_self_, name) }
+        var token = audit_token_t()
+        var count = mach_msg_type_number_t(MemoryLayout<audit_token_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &token) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(name, task_flavor_t(TASK_AUDIT_TOKEN), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return nil }
+        return token
+    }
+    private static func tokenWords(_ token: audit_token_t) -> [UInt32] {
+        let v = token.val
+        return [v.0, v.1, v.2, v.3, v.4, v.5, v.6, v.7]
+    }
     static func identity(_ pid: Int32) -> AIProcessIdentity? {
         guard pid > 1 else { return nil }
         var info = proc_bsdinfo()
         let expected = Int32(MemoryLayout<proc_bsdinfo>.size)
         guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, expected) == expected else { return nil }
+        let beforeToken = rawAuditToken(pid)
         // PROC_PIDPATHINFO_MAXSIZE is a C expression macro unavailable in Swift.
         var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
-        guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return nil }
-        return .init(pid: pid, parent: Int32(info.pbi_ppid), uid: info.pbi_uid,
-                     startSeconds: info.pbi_start_tvsec, startMicroseconds: info.pbi_start_tvusec,
-                     executable: String(cString: path))
+        if var token = beforeToken {
+            guard proc_pidpath_audittoken(&token, &path, UInt32(path.count)) > 0 else { return nil }
+        } else {
+            guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return nil }
+        }
+        var confirm = proc_bsdinfo()
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &confirm, expected) == expected,
+              info.pbi_uid == confirm.pbi_uid,
+              info.pbi_start_tvsec == confirm.pbi_start_tvsec,
+              info.pbi_start_tvusec == confirm.pbi_start_tvusec else { return nil }
+        let beforeWords = beforeToken.map(tokenWords)
+        let afterWords = rawAuditToken(pid).map(tokenWords)
+        guard beforeWords == afterWords else { return nil }
+        return .init(pid: pid, parent: Int32(confirm.pbi_ppid), uid: confirm.pbi_uid,
+                     startSeconds: confirm.pbi_start_tvsec, startMicroseconds: confirm.pbi_start_tvusec,
+                     executable: String(cString: path), auditToken: beforeWords)
     }
     static func presence(_ pid: Int32) -> AIProcessPresence {
         if let live = identity(pid) { return .live(live) }
@@ -153,6 +191,8 @@ enum AIProcessInventory {
             } else if let product = nativeCLI(path) { identities[index].rootProduct = product }
             else if ["node", "nodejs", "bun"].contains(URL(fileURLWithPath: path).lastPathComponent),
                     let args = try? command(["-ww", "-p", String(identities[index].pid), "-o", "args="]),
+                    let verified = identity(identities[index].pid),
+                    identities[index].sameProcess(as: verified),
                     let script = nodeEntry(args) {
                 if script.hasSuffix("/node_modules/@anthropic-ai/claude-code/cli.js") { identities[index].rootProduct = .claude }
                 if script.hasSuffix("/node_modules/@openai/codex/bin/codex.js") { identities[index].rootProduct = .openAI }
