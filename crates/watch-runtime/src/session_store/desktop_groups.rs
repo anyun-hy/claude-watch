@@ -290,7 +290,7 @@ impl SessionStore {
             for (path, old) in previous {
                 let restored = match old {
                     Some(bytes) => self.storage.atomic_bytes(&path, &bytes, 0o600),
-                    None => self.storage.guarded(&path).and_then(|()| {
+                    None => self.storage.guarded(&path).and_then(|path| {
                         match std::fs::remove_file(&path) {
                             Ok(()) => Ok(()),
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
