@@ -16,6 +16,8 @@ use std::{
 };
 use uuid::Uuid;
 
+mod commit_recovery;
+
 const TRANSIENT: &[&str] = &["SingletonLock", "SingletonCookie", "SingletonSocket"];
 const MANIFEST_LIMIT: usize = 2_000_000;
 fn err(code: &str, message: &str) -> CoreError {
@@ -336,10 +338,14 @@ impl<O: AccountOs> AccountStore<O> {
                     .atomic_json(&self.storage.paths.journal(), &j)?;
                 self.os.checkpoint("archived")?;
             }
+            j["commit_backups_v1"] = self.commit_backup_evidence(&work)?;
+            self.storage.atomic_json(&self.storage.paths.journal(), &j)?;
+            self.os.checkpoint("commit_prepared")?;
             if !self.state_matches(current.as_deref(), state_existed)? {
                 return Err(err("external_change", "启动期间账号标记被外部修改"));
             }
             self.save_state(Some(target), Some(&token))?;
+            self.os.checkpoint("state_saved")?;
             j["phase"] = json!("committed");
             self.storage
                 .atomic_json(&self.storage.paths.journal(), &j)?;
@@ -425,20 +431,8 @@ impl<O: AccountOs> AccountStore<O> {
             .get("state_existed")
             .and_then(Value::as_bool)
             .ok_or_else(|| err("invalid_journal", "恢复状态记录不完整"))?;
-        if j.get("phase").and_then(Value::as_str) == Some("committed") {
-            if self
-                .storage
-                .read_json(&self.state_path(), json!({}))?
-                .get("transaction_id")
-                .and_then(Value::as_str)
-                != Some(token)
-            {
-                return Err(err("recovery_conflict", "已提交账号标记发生外部变化"));
-            }
-            if work.exists() {
-                fs::remove_dir_all(work).map_err(io)?;
-            }
-            return fs::remove_file(p).map_err(io);
+        if self.recover_published_marker(&j, token, &work, &p)? {
+            return Ok(());
         }
         if !self.state_matches(previous, state_existed)? {
             return Err(err("recovery_conflict", "账号标记发生外部变化，未覆盖"));

@@ -9,10 +9,12 @@ use std::{
     collections::BTreeSet,
     fs,
     io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
 };
 use zip::ZipArchive;
+
+mod permissions;
 pub const MAX_ARCHIVE: u64 = 1024 * 1024 * 1024;
 pub const MAX_EXPANDED: u64 = 2 * MAX_ARCHIVE;
 const MAX_FILES: usize = 100_000;
@@ -186,6 +188,7 @@ pub fn verify_extract(archive: &Path, destination: &Path, release: &Release) -> 
         if seen.len() > MAX_FILES {
             return Err(err("oversize_release", "更新包文件数过多"));
         }
+        permissions::validate_entry(f.is_dir(), f.unix_mode())?;
         if f.is_dir() {
             continue;
         }
@@ -198,13 +201,14 @@ pub fn verify_extract(archive: &Path, destination: &Path, release: &Release) -> 
         if expanded > MAX_EXPANDED {
             return Err(err("oversize_release", "更新包展开后过大"));
         }
-        let target = destination.join(&name);
-        fs::create_dir_all(target.parent().unwrap()).map_err(io)?;
+        let target = permissions::prepare_parent(destination, &name)?;
         let mut out = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&target)
             .map_err(io)?;
+        out.set_permissions(fs::Permissions::from_mode(0o600)).map_err(io)?;
         let mut h = Sha256::new();
         let mut b = [0u8; 65536];
         loop {
@@ -258,12 +262,14 @@ pub fn verify_extract(archive: &Path, destination: &Path, release: &Release) -> 
             ));
         }
     }
-    Ok(())
+    // No execution bits until the complete listed payload and matching
+    // bundled/runtime components have passed content validation.
+    permissions::apply(destination, release)
 }
 pub fn archive_hash(archive: &Path) -> Result<String> {
     let mut f = fs::File::open(archive).map_err(io)?;
     let mut h = Sha256::new();
-    let mut b = [0; 65536];
+    let mut b = [0u8; 65536];
     loop {
         let n = f.read(&mut b).map_err(io)?;
         if n == 0 {
@@ -308,6 +314,7 @@ fn safe_member(n: &str) -> Result<String> {
         || n.contains('\\')
         || n.contains('\0')
         || p.is_absolute()
+        || n.strip_suffix('/').unwrap_or(n).split('/').any(|part| matches!(part, "" | "." | ".."))
         || p.components().any(|x| matches!(x, Component::ParentDir))
         || !matches!(p.components().next(),Some(Component::Normal(x)) if x=="app"||x=="runtime")
         || n.ends_with(".py")
@@ -337,7 +344,7 @@ pub struct UreqTransport;
 impl Transport for UreqTransport {
     fn get(&mut self, url: &str, limit: u64) -> Result<Vec<u8>> {
         if !safe_https(url) {
-            return Err(err("unsafe_update_url", "更新地址必须为 HTTPS"));
+            return Err(err("unsafe_update_url", "更新地址必须是 HTTPS"));
         }
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .proxy(None)
