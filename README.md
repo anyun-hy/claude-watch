@@ -52,6 +52,14 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s monitor/tests -v
 ```
 
+完整源码修复收尾使用以下**无真实进程信号、无账号操作、无安装**的回归入口；它覆盖 Rust 会话/账号/更新隔离测试、Python 构建及策略目录契约、Swift 进程策略用例、生产 SwiftUI 类型检查与 UI_REVIEW 模拟断言：
+
+```sh
+bash tools/test-final-no-signal.sh
+```
+
+此脚本特意**不执行未经挑选的 `cargo test --workspace`**，因为项目部分历史集成夹具会向自行创建的子进程发送信号；这不属于本轮无信号验收范围。测试全部通过不等同于安装、真实后台保护或真实界面验收。
+
 Swift 测试、隔离界面与真实界面验收说明见 [原生应用开发说明](monitor/README.md)。
 
 ## 目录

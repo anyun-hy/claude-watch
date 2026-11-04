@@ -153,6 +153,60 @@ impl Controller {
         result
     }
 
+    /// One stop-record serializer for both the normal guard and warning
+    /// recovery. Caller decides whether a log write error is propagated or
+    /// recorded as a secondary diagnostic after an already completed stop.
+    pub(super) fn persist_stop_record<S: DesktopSystem>(
+        &self,
+        system: &S,
+        session_id: Option<&str>,
+        reason: Value,
+        receipt: &Value,
+    ) -> Result<()> {
+        self.storage.atomic_json(
+            &self.storage.paths.base().join("last-guard-stop.json"),
+            &json!({
+                "stopped_at": system.now(),
+                "session_id": session_id,
+                "reason": reason,
+                "force_requested": receipt["stop_force_requested"],
+                "force_reported": receipt["stop_force_reported"],
+            }),
+        )
+    }
+
+    /// Centralize the outcome of one identity-checked, transaction-guarded
+    /// stop. Callers decide which risk is actionable; this function never
+    /// widens stop authority or changes the process scope.
+    pub(super) fn finish_current_stop<S: DesktopSystem>(
+        &self,
+        sessions: &SessionStore,
+        system: &mut S,
+        expected_session: Option<&str>,
+        receipt: &mut Value,
+        persist_reason: Option<Value>,
+    ) -> Result<()> {
+        let result = sessions.close_if_current(expected_session, system.now(), || {
+            self.timed_guard_quit(system, receipt)
+        });
+        match result {
+            Ok(Some(StopOutcome::SkippedWarn)) => {}
+            Ok(Some(StopOutcome::Confirmed)) => {
+                receipt["action"] = json!("close-desktop");
+                receipt["stop_state"] = json!("confirmed");
+                if let Some(reason) = persist_reason {
+                    self.persist_stop_record(system, expected_session, reason, receipt)?;
+                }
+            }
+            Ok(None) => receipt["stop_state"] = json!("session_changed"),
+            Err(error) => {
+                receipt["stop_state"] = json!("failed");
+                receipt["stop_error"] = json!(error.code);
+            }
+        }
+        Ok(())
+    }
+
     /// Recheck independent confirmed risks while the previous finding only
     /// warns. The fast HTTP exit is checked before any slower local sampling.
     /// Returns true when this round handled a new actionable risk (or a race).
@@ -262,13 +316,12 @@ impl Controller {
             Ok(Some(Some(StopOutcome::Confirmed))) => {
                 receipt["action"] = json!("close-desktop");
                 receipt["stop_state"] = json!("confirmed");
-                if let Err(error) = self.storage.atomic_json(
-                    &self.storage.paths.base().join("last-guard-stop.json"),
-                    &json!({"stopped_at":system.now(),"session_id":expected.session_id,
-                        "reason":receipt["session_guard"]["reason"],
-                        "force_requested":receipt["stop_force_requested"],
-                        "force_reported":receipt["stop_force_reported"]}))
-                {
+                if let Err(error) = self.persist_stop_record(
+                    system,
+                    Some(expected.session_id.as_str()),
+                    receipt["session_guard"]["reason"].clone(),
+                    receipt,
+                ) {
                     receipt["stop_log_error"] = json!(error.code);
                 }
             }

@@ -48,6 +48,12 @@ struct SwitcherStoreTests {
         expect(SessionBaselinePresentation.make(service, now: 1036).title == "上次会话基准", "old receipt cannot present current safety")
         expect(SessionBaselinePresentation.make(service, now: 1011).tone != "success", "active safety expires at guard deadline")
         expect(SessionBaselinePresentation.make(service, error: "read failed", now: 1005).tone != "success", "read failure preserves history without green safety")
+        expect(SessionProtectionPresentation.unavailable(error: "read failed").tone == "warning" &&
+               SessionBaselinePresentation.make(nil, error: "read failed", now: 1005).tone == "warning",
+               "no session receipt plus a read failure agrees across the guard and baseline panels")
+        expect(SessionProtectionPresentation.unavailable(error: "").tone == "info" &&
+               SessionBaselinePresentation.make(nil, now: 1005).tone == "info",
+               "missing receipt without a known read error is still a pending observation")
         service.session_guard = .init(state: "idle", phase: "active", baseline: reference, current: reference)
         expect(SessionBaselinePresentation.make(service, now: 1005).title == "后台保护待命", "closed app displays standby with session history")
         let idle = SessionProtectionEvidence(session: service.session_guard!, observedAt: 1000, backendReady: true)

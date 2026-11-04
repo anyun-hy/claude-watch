@@ -681,23 +681,7 @@ impl Controller {
                                 receipt["stop_state"] = json!("skipped_warn_only");
                                 return Ok(());
                             }
-                            match sessions.close_if_current(
-                                Some(&ended.session_id),
-                                system.now(),
-                                || self.timed_guard_quit(system, &mut receipt),
-                            ) {
-                                Ok(Some(StopOutcome::SkippedWarn)) => {}
-                                Ok(Some(StopOutcome::Confirmed)) => {
-                                    receipt["action"] = json!("close-desktop");
-                                    receipt["stop_state"] = json!("confirmed");
-                                    self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"), &json!({"stopped_at":system.now(),"session_id":ended.session_id,"reason":outcome.reason,"force_requested":receipt["stop_force_requested"],"force_reported":receipt["stop_force_reported"]}))?;
-                                }
-                                Ok(None) => receipt["stop_state"] = json!("session_changed"),
-                                Err(error) => {
-                                    receipt["stop_state"] = json!("failed");
-                                    receipt["stop_error"] = json!(error.code);
-                                }
-                            }
+                            self.finish_current_stop(&sessions, system, Some(ended.session_id.as_str()), &mut receipt, Some(json!(&outcome.reason)))?;
                         }
                     } else {
                         receipt["status"] = json!("unknown");
@@ -748,23 +732,7 @@ impl Controller {
                             receipt["stop_state"] = json!("skipped_warn_only");
                             return Ok(());
                         }
-                        match sessions.close_if_current(
-                            Some(&ended.session_id),
-                            system.now(),
-                            || self.timed_guard_quit(system, &mut receipt),
-                        ) {
-                            Ok(Some(StopOutcome::SkippedWarn)) => {}
-                            Ok(Some(StopOutcome::Confirmed)) => {
-                                receipt["action"] = json!("close-desktop");
-                                receipt["stop_state"] = json!("confirmed");
-                                self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"), &json!({"stopped_at":system.now(),"session_id":ended.session_id,"reason":outcome.reason,"force_requested":receipt["stop_force_requested"],"force_reported":receipt["stop_force_reported"]}))?;
-                            }
-                            Ok(None) => receipt["stop_state"] = json!("session_changed"),
-                            Err(error) => {
-                                receipt["stop_state"] = json!("failed");
-                                receipt["stop_error"] = json!(error.code);
-                            }
-                        }
+                        self.finish_current_stop(&sessions, system, Some(ended.session_id.as_str()), &mut receipt, Some(json!(&outcome.reason)))?;
                     }
                     return Ok(());
                 }
@@ -832,20 +800,7 @@ impl Controller {
                 if desktops.is_empty() && !identity_unconfirmed && !exit_pending {
                     receipt["stop_state"] = json!("confirmed");
                 } else {
-                    match sessions.close_if_current(id.as_deref(), system.now(), || {
-                        self.timed_guard_quit(system, &mut receipt)
-                    }) {
-                        Ok(Some(StopOutcome::SkippedWarn)) => {}
-                        Ok(Some(StopOutcome::Confirmed)) => {
-                            receipt["action"] = json!("close-desktop");
-                            receipt["stop_state"] = json!("confirmed");
-                        }
-                        Ok(None) => receipt["stop_state"] = json!("session_changed"),
-                        Err(error) => {
-                            receipt["stop_state"] = json!("failed");
-                            receipt["stop_error"] = json!(error.code);
-                        }
-                    }
+                    self.finish_current_stop(&sessions, system, id.as_deref(), &mut receipt, None)?;
                 }
                 return Ok(());
             }
@@ -887,21 +842,8 @@ impl Controller {
                     receipt["stop_state"] = json!("skipped_warn_only");
                     return Ok(());
                 }
-                match sessions.close_if_current(id.as_deref(), system.now(), || {
-                    self.timed_guard_quit(system, &mut receipt)
-                }) {
-                    Ok(Some(StopOutcome::SkippedWarn)) => {}
-                    Ok(Some(StopOutcome::Confirmed)) => {
-                        receipt["action"] = json!("close-desktop");
-                        receipt["stop_state"] = json!("confirmed");
-                        self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"), &json!({"stopped_at":system.now(),"session_id":id,"reason":current.as_ref().and_then(|value| value.reason.as_ref()),"force_requested":receipt["stop_force_requested"],"force_reported":receipt["stop_force_reported"]}))?;
-                    }
-                    Ok(None) => receipt["stop_state"] = json!("session_changed"),
-                    Err(error) => {
-                        receipt["stop_state"] = json!("failed");
-                        receipt["stop_error"] = json!(error.code);
-                    }
-                }
+                self.finish_current_stop(&sessions, system, id.as_deref(), &mut receipt,
+                                    Some(json!(current.as_ref().and_then(|value| value.reason.as_ref()))))?;
                 return Ok(());
             }
             let local = system.local_guard()?;
@@ -1049,21 +991,7 @@ impl Controller {
                     return Ok(());
                 }
                 let expected = outcome.session.as_ref().map(|s| s.session_id.as_str());
-                match sessions.close_if_current(expected, system.now(), || {
-                    self.timed_guard_quit(system, &mut receipt)
-                }) {
-                    Ok(Some(StopOutcome::SkippedWarn)) => {}
-                    Ok(Some(StopOutcome::Confirmed)) => {
-                        receipt["action"] = json!("close-desktop");
-                        receipt["stop_state"] = json!("confirmed");
-                        self.storage.atomic_json(&self.storage.paths.base().join("last-guard-stop.json"), &json!({"stopped_at":system.now(),"session_id":expected,"reason":outcome.reason,"force_requested":receipt["stop_force_requested"],"force_reported":receipt["stop_force_reported"]}))?;
-                    }
-                    Ok(None) => receipt["stop_state"] = json!("session_changed"),
-                    Err(error) => {
-                        receipt["stop_state"] = json!("failed");
-                        receipt["stop_error"] = json!(error.code);
-                    }
-                }
+                self.finish_current_stop(&sessions, system, expected, &mut receipt, Some(json!(&outcome.reason)))?;
             }
             Ok(())
         })();
@@ -1115,20 +1043,7 @@ impl Controller {
             receipt["status"] = json!("protection_triggered");
             receipt["persistence_error"] = json!("state_io_failed");
             receipt["session_guard"] = json!({"state":"locked", "phase":"locked", "reason":{"code":"egress_risk_persist_failed", "detail":"出口风险已确认，会话记录写入失败"}});
-            match sessions.close_if_current(id.as_deref(), system.now(), || {
-                self.timed_guard_quit(system, receipt)
-            }) {
-                Ok(Some(StopOutcome::SkippedWarn)) => {}
-                Ok(Some(StopOutcome::Confirmed)) => {
-                    receipt["action"] = json!("close-desktop");
-                    receipt["stop_state"] = json!("confirmed");
-                }
-                Ok(None) => receipt["stop_state"] = json!("session_changed"),
-                Err(error) => {
-                    receipt["stop_error"] = json!(error.code);
-                    receipt["stop_state"] = json!("failed");
-                }
-            }
+            self.finish_current_stop(&sessions, system, id.as_deref(), receipt, None)?;
             return Ok(());
         }
         if let Some(value) = current
@@ -1159,20 +1074,7 @@ impl Controller {
                 receipt["stop_state"] = json!("skipped_warn_only");
                 return Ok(());
             }
-            match sessions.close_if_current(id.as_deref(), system.now(), || {
-                self.timed_guard_quit(system, receipt)
-            }) {
-                Ok(Some(StopOutcome::SkippedWarn)) => {}
-                Ok(Some(StopOutcome::Confirmed)) => {
-                    receipt["action"] = json!("close-desktop");
-                    receipt["stop_state"] = json!("confirmed");
-                }
-                Ok(None) => receipt["stop_state"] = json!("session_changed"),
-                Err(error) => {
-                    receipt["stop_error"] = json!(error.code);
-                    receipt["stop_state"] = json!("failed");
-                }
-            }
+            self.finish_current_stop(&sessions, system, id.as_deref(), receipt, None)?;
             return Ok(());
         }
         match sessions.mark_failure(
@@ -1201,20 +1103,7 @@ impl Controller {
                         receipt["stop_state"] = json!("skipped_warn_only");
                         return Ok(());
                     }
-                    match sessions.close_if_current(id.as_deref(), system.now(), || {
-                        self.timed_guard_quit(system, receipt)
-                    }) {
-                        Ok(Some(StopOutcome::SkippedWarn)) => {}
-                        Ok(Some(StopOutcome::Confirmed)) => {
-                            receipt["action"] = json!("close-desktop");
-                            receipt["stop_state"] = json!("confirmed");
-                        }
-                        Err(error) => {
-                            receipt["stop_error"] = json!(error.code);
-                            receipt["stop_state"] = json!("failed");
-                        }
-                        _ => {}
-                    }
+                    self.finish_current_stop(&sessions, system, id.as_deref(), receipt, None)?;
                 }
             }
             Err(error) => receipt["sampling_error"] = json!(error.code),

@@ -32,6 +32,13 @@ struct SessionProtectionPresentation {
     static let idleTitle = "后台保护待命"
     static let idleDetail = "后台保护待命，无需操作。Claude 已关闭；下次使用时通过“检查并启动 Claude”执行完整校验。"
     static let loading = Self(title: "正在读取保护状态", detail: "正在读取后台检测结果。", symbol: "clock", tone: "info")
+    /// A failed read with no receipt is not a pending/safe observation.
+    /// The baseline and guard panels use this same neutral failure verdict.
+    static func unavailable(error: String) -> Self {
+        guard !error.isEmpty else { return loading }
+        return .init(title: "保护状态读取失败", detail: error,
+                     symbol: "exclamationmark.triangle", tone: "warning")
+    }
 
     static func make(_ session: SessionGuardStatus, stale: Bool = false, backendReady: Bool = true) -> Self {
         if session.state == "risk" || session.state == "locked" || session.phase == "locked" {

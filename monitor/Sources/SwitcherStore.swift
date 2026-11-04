@@ -712,7 +712,7 @@ final class SwitcherStore: ObservableObject {
         return SessionProtectionEvidence.fromBackground(value, error: backgroundError)
     }
     var sessionDisplay: SessionProtectionPresentation {
-        sessionDisplayEvidence?.presentation(at: loginClock.timeIntervalSince1970) ?? .loading
+        sessionDisplayEvidence?.presentation(at: loginClock.timeIntervalSince1970) ?? .unavailable(error: backgroundError)
     }
     /// First-run path: only raises the system consent prompt. It must NOT open
     /// System Settings, otherwise the Settings window covers the prompt and the

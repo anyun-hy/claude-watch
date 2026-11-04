@@ -8,7 +8,12 @@ struct SessionBaselinePresentation {
 
     static func make(_ receipt: BackgroundServiceReceipt?, error: String = "", now: Double) -> Self {
         guard let receipt, let evidence = SessionProtectionEvidence.fromBackground(receipt, error: error) else {
-            return .init(title: "正在读取会话基准", detail: error.isEmpty ? "正在读取自动保护的会话记录。" : error,
+            if !error.isEmpty {
+                let display = SessionProtectionPresentation.unavailable(error: error)
+                return .init(title: display.title, detail: display.detail,
+                             symbol: display.symbol, tone: display.tone)
+            }
+            return .init(title: "正在读取会话基准", detail: "正在读取自动保护的会话记录。",
                          symbol: "clock", tone: "info")
         }
         return make(evidence: evidence, now: now)
