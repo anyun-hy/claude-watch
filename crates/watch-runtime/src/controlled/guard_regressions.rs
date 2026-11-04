@@ -3,7 +3,7 @@
 use super::*;
 use claude_watch_core::{config::Config, session::{Phase, Session}};
 use crate::storage::Paths;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 struct Fixture {
     home: PathBuf,
