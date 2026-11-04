@@ -258,12 +258,7 @@ impl GuardHistory {
         {
             "disabled".to_owned()
         } else {
-            state(
-                &guard["state"],
-                &[
-                    "idle", "safe", "risk", "locked", "unknown", "missing", "pending",
-                ],
-            )
+            claude_watch_core::guard_event::state(guard["state"].as_str()).to_owned()
         };
         if let Some(ended) = uuid(&receipt["ended_session_id"]) {
             if session.as_deref() != Some(ended.as_str()) || current != "idle" {
@@ -283,72 +278,7 @@ impl GuardHistory {
         let reason = guard["reason"]["code"]
             .as_str()
             .or_else(|| receipt["code"].as_str());
-        // Every code a guard tick can actually report. A code that reaches the
-        // receipt but is missing here used to collapse to "other", which hid
-        // the one fact the event exists to record — including the most common
-        // one, `session_missing`.
-        let code = match reason {
-            None => "none",
-            Some(
-                code @ ("egress_ip_changed"
-                | "egress_country_cn"
-                | "session_identity_changed"
-                | "proxy_or_tun_failed"
-                | "egress_risk_persist_failed"
-                | "evidence_expired"
-                | "dns_risk"
-                | "webrtc_risk"
-                | "network_leak_risk"
-                | "egress_unconfirmed"
-                | "proxy_or_tun_unconfirmed"
-                | "guard_sampling_failed"
-                | "session_identity_unconfirmed"
-                | "session_pending"
-                | "session_rechecking"
-                | "session_ended"
-                | "session_missing"
-                | "session_changed"
-                | "session_state_invalid"
-                | "revalidation_context_changed"
-                | "revalidation_timeout"
-                | "risk_evidence_unavailable"
-                | "risk_evidence_missing"
-                | "risk_evidence_invalid"
-                | "invalid_config"
-                | "invalid_session"
-                | "invalid_native_observation"
-                | "native_observation_unavailable"
-                | "desktop_inventory_incomplete"
-                | "desktop_identity_unavailable"
-                | "process_metadata_unavailable"
-                | "target_identity_changed"
-                | "target_identity_mismatch"
-                | "target_already_running"
-                | "target_start_unconfirmed"
-                | "launcher_identity_unavailable"
-                | "launcher_context_changed"
-                | "evidence_context_unconfirmed"
-                | "superseded_check"
-                | "protected_scope_mismatch"
-                | "display_receipt_not_authority"
-                | "claude_already_running"
-                | "pending_cleanup_failed"
-                | "revalidation_lease_rollback_failed"
-                | "backend_unhealthy"
-                | "guard_memory_unavailable"
-                | "guard_encoding_failed"
-                | "egress_changed"
-                | "dns_egress_changed"
-                | "webrtc_egress_changed"
-                | "dns_and_webrtc_egress_changed"
-                | "state_io_failed"
-                | "unsafe_path"
-                | "home_owner_mismatch"
-                | "clock_unavailable"
-                | "sampling_failed"),
-            ) => code,
-            _ => "other",
-        };
+        let code = claude_watch_core::guard_event::reason(reason);
         let changed = self
             .last
             .as_ref()
