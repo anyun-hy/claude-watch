@@ -109,6 +109,7 @@ pub struct AsyncAuditRequest {
     pub request_id: u64,
     pub family: String,
     pub session_id: Option<String>,
+    pub context_id: Option<String>,
     pub policy_version: PolicyVersion,
     pub requested_at: f64,
     pub timeout_seconds: f64,
@@ -120,6 +121,7 @@ impl PartialEq for AsyncAuditRequest {
         self.request_id == other.request_id
             && self.family == other.family
             && self.session_id == other.session_id
+            && self.context_id == other.context_id
             && self.policy_version == other.policy_version
             && self.requested_at == other.requested_at
             && self.timeout_seconds == other.timeout_seconds
@@ -408,9 +410,9 @@ impl ChannelSupervisor {
                         Err(mpsc::RecvTimeoutError::Disconnected) => {}
                     }
                 }
-                for (cancel, handle) in detached_runners {
+                for (cancel, _handle) in detached_runners {
                     cancel.store(true, Ordering::Release);
-                    let _ = handle.join();
+                    let _ = thread::yield_now();
                 }
             })
             .map_err(|_| CoreError::new("async_audit_worker_failed", "异步审计工作线程无法启动"))?;
@@ -433,6 +435,20 @@ impl ChannelSupervisor {
             saved_policy_version: self.saved_policy_version.clone(),
             families,
         }
+    }
+
+    pub fn authoritative_state_for_family(
+        &self,
+        family: &str,
+    ) -> Option<(PolicyVersion, u64, u64, Option<ChannelPermitState>)> {
+        self.tracks.get(family).map(|t| {
+            (
+                self.saved_policy_version.clone(),
+                t.command_seq,
+                t.permit_generation,
+                t.current_permit.as_ref().map(|p| p.state),
+            )
+        })
     }
 
     pub fn handle_event(&mut self, event: SupervisionEvent) -> Result<ChannelMonitorSnapshot> {
@@ -658,6 +674,16 @@ impl ChannelSupervisor {
             ).err(),
             Err(_) => Some("evidence_not_from_controlled_path"),
         };
+        let audit_context_id = session
+            .as_ref()
+            .map(|s| s.context_id.clone())
+            .or_else(|| {
+                self.latest_egress
+                    .get("context_id")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string())
+            });
+
         let had_active_or_permitted = session
             .as_ref()
             .is_some_and(|s| s.state == Phase::Active)
@@ -729,7 +755,7 @@ impl ChannelSupervisor {
                 }
                 if evidence_expired_or_missing {
                     let sid = session.as_ref().map(|s| s.session_id.clone());
-                    self.request_async_audit_if_needed(family, sid, now);
+                    self.request_async_audit_if_needed(family, sid, audit_context_id.clone(), now);
                 }
                 (ChannelPermitState::Revoked, code)
             }
@@ -745,13 +771,13 @@ impl ChannelSupervisor {
                     .and_then(|t| t.current_permit.as_ref())
                     .is_some_and(|p| p.state == ChannelPermitState::Revoked);
                 if was_revoked {
-                    self.request_async_audit_if_needed(family, Some(s.session_id.clone()), now);
+                    self.request_async_audit_if_needed(family, Some(s.session_id.clone()), audit_context_id.clone(), now);
                     (
                         ChannelPermitState::Revoked,
                         "awaiting_recovery_verification".into(),
                     )
                 } else if !local_guard_ok || !evidence_valid || path_matches_err.is_some() {
-                    self.request_async_audit_if_needed(family, Some(s.session_id.clone()), now);
+                    self.request_async_audit_if_needed(family, Some(s.session_id.clone()), audit_context_id.clone(), now);
                     let err_code = path_matches_err.unwrap_or("egress_evidence_expired");
                     (
                         ChannelPermitState::Revoked,
@@ -773,11 +799,11 @@ impl ChannelSupervisor {
                 {
                     (ChannelPermitState::Permitted, code)
                 } else {
-                    self.request_async_audit_if_needed(family, Some(s.session_id.clone()), now);
+                    self.request_async_audit_if_needed(family, Some(s.session_id.clone()), audit_context_id.clone(), now);
                     (ChannelPermitState::Revoked, code)
                 }
             } else {
-                self.request_async_audit_if_needed(family, Some(s.session_id.clone()), now);
+                self.request_async_audit_if_needed(family, Some(s.session_id.clone()), audit_context_id.clone(), now);
                 if self
                     .tracks
                     .get(family)
@@ -797,7 +823,7 @@ impl ChannelSupervisor {
         } else {
             // Running desktop without a verified session: hold channel in
             // PendingVerification and schedule async full_audit() in background!
-            self.request_async_audit_if_needed(family, None, now);
+            self.request_async_audit_if_needed(family, None, audit_context_id.clone(), now);
             if self
                 .tracks
                 .get(family)
@@ -822,6 +848,7 @@ impl ChannelSupervisor {
         &mut self,
         family: &str,
         session_id: Option<String>,
+        context_id: Option<String>,
         now: f64,
     ) {
         let Some(track) = self.tracks.get_mut(family) else {
@@ -829,6 +856,7 @@ impl ChannelSupervisor {
         };
         if let Some(in_flight) = track.audit_in_flight.clone() {
             if in_flight.session_id != session_id
+                || in_flight.context_id != context_id
                 || in_flight.policy_version != self.saved_policy_version
             {
                 track.audit_in_flight = None;
@@ -865,6 +893,7 @@ impl ChannelSupervisor {
             request_id: self.next_audit_request_id,
             family: family.into(),
             session_id,
+            context_id,
             policy_version: self.saved_policy_version.clone(),
             requested_at: now,
             timeout_seconds: DEFAULT_ASYNC_AUDIT_TIMEOUT_SECONDS,

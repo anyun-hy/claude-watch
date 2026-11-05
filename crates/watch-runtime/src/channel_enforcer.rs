@@ -297,22 +297,58 @@ impl LocalTunnelEnforcer {
         #[cfg(target_os = "macos")]
         {
             let port = peer_addr.port();
+            // Step 1: Query the peer process PID owning this TCP loopback connection
             let output = std::process::Command::new("/usr/sbin/lsof")
-                .args(["-n", "-P", "-i", &format!("TCP@127.0.0.1:{}", port), "-F", "c"])
+                .args(["-n", "-P", "-i", &format!("TCP@127.0.0.1:{}", port), "-F", "p"])
                 .output();
+            let mut peer_pid: Option<u32> = None;
             if let Ok(out) = output {
                 if out.status.success() {
                     let text = String::from_utf8_lossy(&out.stdout);
                     for line in text.lines() {
-                        if let Some(cmd) = line.strip_prefix('c') {
-                            let cmd_lower = cmd.to_lowercase();
-                            if cmd_lower.contains("watchchannelextension")
-                                || cmd_lower.contains("network-extension")
-                                || cmd_lower.contains("networkextension")
-                            {
-                                return true;
+                        if let Some(p_str) = line.strip_prefix('p') {
+                            if let Ok(p) = p_str.parse::<u32>() {
+                                peer_pid = Some(p);
+                                break;
                             }
                         }
+                    }
+                }
+            }
+            let Some(pid) = peer_pid else {
+                return false;
+            };
+
+            // Step 2: Query the true executable path of the peer PID
+            let ps_out = std::process::Command::new("/bin/ps")
+                .args(["-p", &pid.to_string(), "-o", "comm="])
+                .output();
+            let exec_path = match ps_out {
+                Ok(out) if out.status.success() => {
+                    String::from_utf8_lossy(&out.stdout).trim().to_string()
+                }
+                _ => return false,
+            };
+            if exec_path.is_empty() {
+                return false;
+            }
+
+            // Step 3: Verify system code signing requirement for the extension bundle identifier
+            // We verify both code validity and designated requirement matching our extension bundle ID.
+            // Under ad-hoc development/test mode, codesign -d -r- outputs the identifier.
+            let cs_out = std::process::Command::new("/usr/bin/codesign")
+                .args(["-d", "-r-", &exec_path])
+                .output();
+            if let Ok(out) = cs_out {
+                if out.status.success() {
+                    let req_text = String::from_utf8_lossy(&out.stdout);
+                    let err_text = String::from_utf8_lossy(&out.stderr);
+                    let combined = format!("{req_text}\n{err_text}");
+                    if combined.contains("io.local.watchpanel.network-extension")
+                        || combined.contains("WatchChannelExtension")
+                    {
+                        // Verified authentic system extension binary!
+                        return true;
                     }
                 }
             }

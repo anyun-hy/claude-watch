@@ -138,37 +138,62 @@ impl ProductionChannelStack {
         self.drain_background_events()?;
         let now = system.now();
 
-        // Sync system extension activation status from host manager with strict freshness check
-        let ext_status_path = self
+        // Sync system extension status: prioritize independent extension liveness heartbeat over host UI status
+        let heartbeat_path = self
             .supervisor
             .storage
             .paths
             .watch()
-            .join("state/system-extension-status.json");
-        if ext_status_path.exists() {
-            if let Ok(ext_val) = self
-                .supervisor
-                .storage
-                .read_json(&ext_status_path, Value::Null)
-            {
-                let updated_at = ext_val.get("updated_at").and_then(Value::as_f64).unwrap_or(0.0);
-                let is_fresh = updated_at > 0.0 && (now - updated_at).abs() <= 30.0;
-                if is_fresh {
-                    if let Some(active) = ext_val.get("is_tunnel_active").and_then(Value::as_bool) {
-                        let detail = ext_val.get("detail").and_then(Value::as_str);
-                        let _ = self.enforcer.set_system_extension_active(active, detail, now);
-                    }
-                } else {
+            .join("state/system-extension-heartbeat.json");
+        let mut heartbeat_active = false;
+        if heartbeat_path.exists() {
+            if let Ok(hb_val) = self.supervisor.storage.read_json(&heartbeat_path, Value::Null) {
+                let hb_at = hb_val.get("heartbeat_at").and_then(Value::as_f64).unwrap_or(0.0);
+                let is_interception_active = hb_val.get("interception_active").and_then(Value::as_bool).unwrap_or(false);
+                // 8-second freshness window for heartbeat emitted every 2 seconds by WatchChannelExtension
+                if hb_at > 0.0 && (now - hb_at).abs() <= 8.0 && is_interception_active {
+                    heartbeat_active = true;
                     let _ = self.enforcer.set_system_extension_active(
-                        false,
-                        Some("扩展状态文件过期（可能宿主或扩展已停止）"),
+                        true,
+                        Some("扩展独立心跳在线"),
                         now,
                     );
                 }
             }
         }
 
-        // Validate authoritative system extension receipt
+        if !heartbeat_active {
+            let ext_status_path = self
+                .supervisor
+                .storage
+                .paths
+                .watch()
+                .join("state/system-extension-status.json");
+            if ext_status_path.exists() {
+                if let Ok(ext_val) = self
+                    .supervisor
+                    .storage
+                    .read_json(&ext_status_path, Value::Null)
+                {
+                    let updated_at = ext_val.get("updated_at").and_then(Value::as_f64).unwrap_or(0.0);
+                    let is_fresh = updated_at > 0.0 && (now - updated_at).abs() <= 30.0;
+                    if is_fresh {
+                        if let Some(active) = ext_val.get("is_tunnel_active").and_then(Value::as_bool) {
+                            let detail = ext_val.get("detail").and_then(Value::as_str);
+                            let _ = self.enforcer.set_system_extension_active(active, detail, now);
+                        }
+                    } else {
+                        let _ = self.enforcer.set_system_extension_active(
+                            false,
+                            Some("扩展心跳超时且宿主失联"),
+                            now,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Validate authoritative system extension receipt against current supervision state
         let receipt_path = self
             .supervisor
             .storage
@@ -182,12 +207,41 @@ impl ProductionChannelStack {
                 .read_json(&receipt_path, Value::Null)
             {
                 if let Ok(receipt) = serde_json::from_value::<SystemExtensionReceipt>(receipt_val) {
-                    if !receipt.is_fresh(now, 30.0) {
-                        let _ = self.enforcer.set_system_extension_active(
-                            false,
-                            Some("系统扩展回执已过期，当前策略可能未在内核层生效"),
-                            now,
-                        );
+                    if let Some((policy_ver, cmd_seq, permit_gen, desired_state)) =
+                        self.supervisor.authoritative_state_for_family("claude")
+                    {
+                        match desired_state {
+                            Some(claude_watch_core::channel::ChannelPermitState::Permitted) => {
+                                let matches = receipt.matches_supervision(
+                                    &policy_ver.policy_digest,
+                                    cmd_seq,
+                                    permit_gen,
+                                );
+                                if !matches {
+                                    let _ = self.enforcer.set_system_extension_active(
+                                        false,
+                                        Some("扩展执行回执与当前权威策略不匹配（待同步或被拒绝）"),
+                                        now,
+                                    );
+                                }
+                            }
+                            Some(claude_watch_core::channel::ChannelPermitState::Revoked) => {
+                                if receipt.is_disconnecting() {
+                                    let _ = self.enforcer.set_system_extension_active(
+                                        true,
+                                        Some("扩展正在断流排空中（disconnecting）"),
+                                        now,
+                                    );
+                                } else if !receipt.is_confirmed_revoked(cmd_seq, permit_gen) {
+                                    let _ = self.enforcer.set_system_extension_active(
+                                        false,
+                                        Some("扩展撤销回执缺失或未确认排空"),
+                                        now,
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -514,16 +568,25 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                                 },
                             )?;
                             if req.is_cancelled() {
-                                return Err(CoreError::new("audit_cancelled", "慢审计已超时取消"));
+                                return Err(CoreError::new("audit_cancelled", "慢审计已超时取消，立即释放资源"));
                             }
+                            let probe_context = match req.context_id.as_deref().filter(|s| !s.trim().is_empty()) {
+                                Some(ctx) => ctx,
+                                None => {
+                                    return Err(CoreError::new("missing_context_id", "慢审计缺少环境上下文标识，保持待验证"));
+                                }
+                            };
                             let enforcer = claude_watch_runtime::channel_enforcer::registered_production_enforcer(
                                 &audit_paths.watch(),
                             );
                             let now_ts = native::now();
                             let egress = if let Some(ref enf) = enforcer {
+                                if req.is_cancelled() {
+                                    return Err(CoreError::new("audit_cancelled", "慢审计已超时取消，立即释放资源"));
+                                }
                                 let probe_res = enf.probe_via_controlled_diagnostic_channel(
                                     &req.family,
-                                    &req.session_id.clone().unwrap_or_else(|| "diag-ctx".into()),
+                                    probe_context,
                                     now_ts,
                                     |proxy_endpoint| {
                                         let receipt = audit_host.network.fast_egress_via(Some(proxy_endpoint));
@@ -533,6 +596,9 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                                         })
                                     },
                                 );
+                                if req.is_cancelled() {
+                                    return Err(CoreError::new("audit_cancelled", "慢审计已超时取消，迟到探测结果废弃"));
+                                }
                                 match probe_res {
                                     Ok((mut data, evidence)) => {
                                         data["via_controlled_path"] = serde_json::json!(true);

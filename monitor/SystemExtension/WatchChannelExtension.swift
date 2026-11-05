@@ -54,7 +54,48 @@ open class WatchChannelExtension: NETransparentProxyProvider {
     private var leaseWatchdogTimer: DispatchSourceTimer?
     private var commandPollTimer: DispatchSourceTimer?
     private var drainCheckTimer: DispatchSourceTimer?
+    private var heartbeatTimer: DispatchSourceTimer?
     private var lastCommandFileMtime: Date = .distantPast
+
+    /// Resolves the unified state directory shared between the Rust daemon and this system extension.
+    /// Does NOT rely on `FileManager.default.homeDirectoryForCurrentUser` which returns a sandbox container path in system extensions!
+    private func resolveSharedStateDir() -> URL {
+        let sharedDir = URL(fileURLWithPath: "/Users/Shared/ClaudeWatch/state")
+        if FileManager.default.fileExists(atPath: sharedDir.path) {
+            return sharedDir
+        }
+        if let consoleUser = getConsoleUserName(), !consoleUser.isEmpty {
+            let userDir = URL(fileURLWithPath: "/Users/\(consoleUser)/Library/Application Support/ClaudeWatch/state")
+            if FileManager.default.fileExists(atPath: userDir.path) {
+                return userDir
+            }
+        }
+        try? FileManager.default.createDirectory(at: sharedDir, withIntermediateDirectories: true, attributes: [
+            .posixPermissions: 0o700
+        ])
+        return sharedDir
+    }
+
+    private func getConsoleUserName() -> String? {
+        var statBuf = stat()
+        if stat("/dev/console", &statBuf) == 0 {
+            if let pw = getpwuid(statBuf.st_uid) {
+                return String(cString: pw.pointee.pw_name)
+            }
+        }
+        return nil
+    }
+
+    private func atomicWrite(data: Data, to targetUrl: URL) {
+        let tmpUrl = targetUrl.appendingPathExtension("tmp.\(UUID().uuidString)")
+        do {
+            try data.write(to: tmpUrl, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmpUrl.path)
+            _ = rename(tmpUrl.path, targetUrl.path)
+        } catch {
+            logger.error("Failed atomic write to \(targetUrl.path): \(error.localizedDescription)")
+        }
+    }
 
     /// Well-known domain suffixes for AI API endpoints that must NEVER be bypassed to direct public network.
     private static let managedAiDomainKeywords: [String] = [
@@ -99,8 +140,8 @@ open class WatchChannelExtension: NETransparentProxyProvider {
                 extensionSecret = secret
             }
         }
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let secretFile = home.appendingPathComponent("Library/Application Support/ClaudeWatch/state/.extension-secret")
+        let stateDir = resolveSharedStateDir()
+        let secretFile = stateDir.appendingPathComponent(".extension-secret")
         if let secretData = try? Data(contentsOf: secretFile),
            let secretStr = String(data: secretData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
            !secretStr.isEmpty {
@@ -129,6 +170,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             self.logger.info("WatchChannelExtension transparent proxy network settings active")
             self.startLeaseWatchdog()
             self.startCommandFilePolling()
+            self.startHeartbeatTimer()
             completionHandler(nil)
         }
     }
@@ -146,6 +188,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         stopLeaseWatchdog()
         stopCommandFilePolling()
         stopDrainCheck()
+        stopHeartbeatTimer()
         completionHandler()
     }
 
@@ -232,6 +275,50 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         drainCheckTimer = timer
     }
 
+    private func startHeartbeatTimer() {
+        stopHeartbeatTimer()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 1.0, repeating: 2.0)
+        timer.setEventHandler { [weak self] in
+            self?.emitLivenessHeartbeat()
+        }
+        timer.resume()
+        heartbeatTimer = timer
+    }
+
+    private func stopHeartbeatTimer() {
+        heartbeatTimer?.cancel()
+        heartbeatTimer = nil
+    }
+
+    private func emitLivenessHeartbeat() {
+        stateLock.lock()
+        let active = isInterceptionActive
+        let permitted = isPermitted
+        let policyVer = currentPolicyVersion
+        let cmdSeq = currentCommandSeq
+        let permitGen = currentPermitGeneration
+        let flowsCount = activeFlows.count
+        stateLock.unlock()
+
+        let stateDir = resolveSharedStateDir()
+        let heartbeatFile = stateDir.appendingPathComponent("system-extension-heartbeat.json")
+        let dict: [String: Any] = [
+            "heartbeat_at": Date().timeIntervalSince1970,
+            "interception_active": active,
+            "direct_fallback_blocked": true,
+            "is_permitted": permitted,
+            "policy_version": policyVer,
+            "command_seq": cmdSeq,
+            "permit_generation": permitGen,
+            "active_flows_count": flowsCount,
+            "status": "online"
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
+            atomicWrite(data: data, to: heartbeatFile)
+        }
+    }
+
     private func startCommandFilePolling() {
         stopCommandFilePolling()
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
@@ -250,8 +337,8 @@ open class WatchChannelExtension: NETransparentProxyProvider {
 
     /// Polls independent command file directly written by Rust daemon (works even when UI is closed).
     private func pollCommandFile() {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let cmdFile = home.appendingPathComponent("Library/Application Support/ClaudeWatch/state/system-extension-command.json")
+        let stateDir = resolveSharedStateDir()
+        let cmdFile = stateDir.appendingPathComponent("system-extension-command.json")
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: cmdFile.path),
               let mtime = attrs[.modificationDate] as? Date,
               mtime > lastCommandFileMtime else {
@@ -403,10 +490,8 @@ open class WatchChannelExtension: NETransparentProxyProvider {
     }
 
     private func writeSystemExtensionReceiptLocked(status: String, reason: String?) {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let receiptFile = home.appendingPathComponent("Library/Application Support/ClaudeWatch/state/system-extension-receipt.json")
-        let dir = receiptFile.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stateDir = resolveSharedStateDir()
+        let receiptFile = stateDir.appendingPathComponent("system-extension-receipt.json")
 
         let activeCount = activeFlows.count
         let effectivePermitState: String
@@ -433,7 +518,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             dict["reason"] = reason
         }
         if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
-            try? data.write(to: receiptFile, options: .atomic)
+            atomicWrite(data: data, to: receiptFile)
         }
     }
 
