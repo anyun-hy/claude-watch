@@ -112,13 +112,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
     /// Helper to enforce strict monotonic progression for permit generations and command sequences.
     /// Rejects stale, out-of-order, or replayed commands from overwriting current revocation/permit states.
     private func isCommandNewerLocked(permitGen: UInt64, cmdSeq: UInt64) -> Bool {
-        if permitGen > currentPermitGeneration {
-            return true
-        }
-        if permitGen == currentPermitGeneration {
-            return cmdSeq > currentCommandSeq
-        }
-        return false
+        return cmdSeq > currentCommandSeq && permitGen >= currentPermitGeneration
     }
 
     open override func startProxy(options: [String: Any]? = nil, completionHandler: @escaping (Error?) -> Void) {
@@ -182,8 +176,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         isPermitted = false
         activeLeaseDeadlineEpochSeconds = 0
         terminateAllActiveFlowsLocked(reason: "stop_proxy_\(reason.rawValue)")
-        activeFlows.removeAll()
-        writeSystemExtensionReceiptLocked(status: "revoked", reason: "stop_proxy")
+        writeSystemExtensionReceiptLocked(status: "stopped_unverified", reason: "stop_proxy")
         stateLock.unlock()
         stopLeaseWatchdog()
         stopCommandFilePolling()
@@ -248,7 +241,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             self.stateLock.lock()
             var drainedKeys: [UUID] = []
             for (id, record) in self.activeFlows {
-                if record.connection.state == .cancelled || record.connection.state == .disconnected || checks >= 30 {
+                if record.connection.state == .cancelled || record.connection.state == .disconnected {
                     drainedKeys.append(id)
                 }
             }
@@ -261,11 +254,10 @@ open class WatchChannelExtension: NETransparentProxyProvider {
                 self.stateLock.unlock()
                 self.logger.notice("Drain check: all active flows confirmed terminated and drained (reason=\(reason))")
                 timer.cancel()
-            } else if checks >= 30 { // 1.5s timeout forced purge
-                self.activeFlows.removeAll()
-                self.writeSystemExtensionReceiptLocked(status: "revoked", reason: "drain_timeout_forced")
+            } else if checks >= 30 {
+                self.writeSystemExtensionReceiptLocked(status: "drain_timeout_unconfirmed", reason: reason)
                 self.stateLock.unlock()
-                self.logger.warning("Drain check: timed out waiting for flows, forced purge.")
+                self.logger.error("Drain timed out; active flows are not confirmed closed.")
                 timer.cancel()
             } else {
                 self.stateLock.unlock()
@@ -430,7 +422,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             let incomingSeq = (json["command_seq"] as? UInt64) ?? 0
 
             // Check if revocation command is older than current command
-            if incomingGen < self.currentPermitGeneration || (incomingGen == self.currentPermitGeneration && incomingSeq < self.currentCommandSeq) {
+            if !isCommandNewerLocked(permitGen: incomingGen, cmdSeq: incomingSeq) {
                 logger.warning("Rejecting stale revoke_channel: incoming gen=\(incomingGen), seq=\(incomingSeq) < current gen=\(self.currentPermitGeneration), seq=\(self.currentCommandSeq)")
                 stateLock.unlock()
                 let resp: [String: Any] = ["status": "rejected_stale"]
@@ -835,8 +827,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         activeLeaseDeadlineEpochSeconds = 0
         isPermitted = false
         terminateAllActiveFlowsLocked(reason: "system_sleep")
-        activeFlows.removeAll()
-        writeSystemExtensionReceiptLocked(status: "revoked", reason: "system_sleep")
+        writeSystemExtensionReceiptLocked(status: "suspended_unverified", reason: "system_sleep")
         stateLock.unlock()
         stopDrainCheck()
         completionHandler()
@@ -847,7 +838,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         stateLock.lock()
         activeLeaseDeadlineEpochSeconds = 0
         isPermitted = false
-        writeSystemExtensionReceiptLocked(status: "revoked", reason: "system_wake")
+        writeSystemExtensionReceiptLocked(status: "wake_unverified", reason: "system_wake")
         stateLock.unlock()
     }
 }
