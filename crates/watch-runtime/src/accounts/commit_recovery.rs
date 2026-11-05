@@ -34,8 +34,35 @@ impl<O: AccountOs> AccountStore<O> {
             if committed { return Err(err("recovery_conflict", "已提交账号标记发生外部变化")); }
             return Ok(false);
         }
-        let expected = json!({"schema":1,"current":journal["target"],"transaction_id":token});
-        if state != expected {
+        let state_matches_marker = |s: &Value| {
+            let obj = match s.as_object() {
+                Some(o) => o,
+                None => return false,
+            };
+            if s.get("schema") != Some(&json!(1))
+                || s.get("current") != journal.get("target")
+                || s.get("transaction_id").and_then(Value::as_str) != Some(token)
+            {
+                return false;
+            }
+            for k in obj.keys() {
+                if !matches!(
+                    k.as_str(),
+                    "schema"
+                        | "current"
+                        | "transaction_id"
+                        | "ownership_epoch"
+                        | "active_dir_ino"
+                        | "legacy_current_observed"
+                        | "legacy_current_mtime_ns"
+                        | "legacy_current_ino"
+                ) {
+                    return false;
+                }
+            }
+            true
+        };
+        if !state_matches_marker(&state) {
             return Err(err("recovery_conflict", "事务标识相同但账号标记不一致，未清理资料"));
         }
         if !committed {
@@ -99,7 +126,7 @@ impl<O: AccountOs> AccountStore<O> {
             if self.os.claude_running()? {
                 return Err(err("claude_still_running", "恢复期间应用重新启动，未清理备份"));
             }
-            if self.storage.read_json(&self.state_path(), Value::Null)? != expected
+            if !state_matches_marker(&self.storage.read_json(&self.state_path(), Value::Null)?)
                 || self.storage.read_json(journal_path, Value::Null)? != *journal
             { return Err(err("recovery_conflict", "恢复期间账号标记或事务记录发生变化")); }
             let mut completed = journal.clone();
@@ -109,7 +136,7 @@ impl<O: AccountOs> AccountStore<O> {
             self.storage.atomic_json(journal_path, &completed)?;
             self.os.checkpoint("recovery_committed")?;
         }
-        if self.storage.read_json(&self.state_path(), Value::Null)? != expected {
+        if !state_matches_marker(&self.storage.read_json(&self.state_path(), Value::Null)?) {
             return Err(err("recovery_conflict", "清理前账号标记发生外部变化"));
         }
         self.storage.guarded(work)?;

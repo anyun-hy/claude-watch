@@ -198,6 +198,7 @@ fn background(host: &Host) -> Result<Value> {
     let mut value = services::service_status(host, &config)?;
     let at = value["observed_at"].clone();
     for row in value["services"].as_array_mut().into_iter().flatten() {
+        let verified = row["execution_verified"] == true;
         let detail = match (
             row["id"].as_str().unwrap_or(""),
             row["state"].as_str().unwrap_or(""),
@@ -205,6 +206,9 @@ fn background(host: &Host) -> Result<Value> {
             ("guard", "running") => "保护心跳与后台身份已确认",
             (_, "inactive") => "该后台任务已停用",
             ("updater", "unavailable") => "尚未配置本项目发布源或固定公钥",
+            ("original", "scheduled") => "已在 launchd 注册（原版任务无执行回执，仅确认注册态）",
+            ("watchdog", "scheduled") if verified => "任务已注册，且已确认最近时区巡检回执",
+            ("watchdog", "scheduled") => "任务已注册，等待或尚未确认最近执行回执",
             (_, "scheduled") => "任务已注册并按计划运行",
             (_, "mismatch") => "实际后台状态与已保存意愿不同",
             (_, "error") => "实际后台健康未通过核对",
@@ -653,6 +657,49 @@ mod session_heartbeat_projection_tests {
         assert_eq!(
             ended["state"], "idle",
             "a stale failure cannot resurrect an ended session"
+        );
+    }
+
+    #[test]
+    fn service_detail_mapping_is_truthful_and_distinguishes_receipt() {
+        let rows = vec![
+            json!({"id": "guard", "state": "running", "execution_verified": true}),
+            json!({"id": "original", "state": "scheduled", "execution_verified": false}),
+            json!({"id": "watchdog", "state": "scheduled", "execution_verified": true}),
+            json!({"id": "watchdog", "state": "scheduled", "execution_verified": false}),
+            json!({"id": "other", "state": "inactive", "execution_verified": false}),
+        ];
+        let details: Vec<&str> = rows
+            .iter()
+            .map(|row| {
+                let verified = row["execution_verified"] == true;
+                match (
+                    row["id"].as_str().unwrap_or(""),
+                    row["state"].as_str().unwrap_or(""),
+                ) {
+                    ("guard", "running") => "保护心跳与后台身份已确认",
+                    (_, "inactive") => "该后台任务已停用",
+                    ("updater", "unavailable") => "尚未配置本项目发布源或固定公钥",
+                    ("original", "scheduled") => "已在 launchd 注册（原版任务无执行回执，仅确认注册态）",
+                    ("watchdog", "scheduled") if verified => "任务已注册，且已确认最近时区巡检回执",
+                    ("watchdog", "scheduled") => "任务已注册，等待或尚未确认最近执行回执",
+                    (_, "scheduled") => "任务已注册并按计划运行",
+                    (_, "mismatch") => "实际后台状态与已保存意愿不同",
+                    (_, "error") => "实际后台健康未通过核对",
+                    _ => "尚未取得完整后台运行证据",
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            details,
+            vec![
+                "保护心跳与后台身份已确认",
+                "已在 launchd 注册（原版任务无执行回执，仅确认注册态）",
+                "任务已注册，且已确认最近时区巡检回执",
+                "任务已注册，等待或尚未确认最近执行回执",
+                "该后台任务已停用",
+            ]
         );
     }
 }

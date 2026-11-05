@@ -74,7 +74,10 @@ PLIST
       /usr/sbin/systemsetup -settimezone "$desired"
     fi
     [[ ! -L "$ROOT/timezone.last-success" ]] || exit 1
+    umask 022
     date +%s > "$ROOT/timezone.last-success"
+    /usr/sbin/chown root:wheel "$ROOT/timezone.last-success"
+    /bin/chmod 644 "$ROOT/timezone.last-success"
     ;;
   legacy-stop)
     [[ $# == 1 ]] || exit 2

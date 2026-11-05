@@ -220,3 +220,101 @@ impl PolicyCatalog {
         actions
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AuthorityConflict {
+    pub code: String,
+    pub title: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AuthorityArbitration {
+    pub legacy_bodyguard_active: bool,
+    pub legacy_tz_active: bool,
+    pub effective_proxy_loss_enforcement: String,
+    pub conflicts: Vec<AuthorityConflict>,
+}
+
+/// Arbitrates authority between Claude Watch policy configuration and legacy background services.
+/// Pure policy evaluation: no I/O, no clocks, no process execution.
+pub fn arbitrate_legacy_services(
+    config: &crate::config::Config,
+    legacy_bodyguard_active: bool,
+    legacy_tz_active: bool,
+) -> AuthorityArbitration {
+    let mut conflicts = Vec::new();
+    let configured_session_action = config.action("claude", "session");
+    let effective_proxy_loss_enforcement = if legacy_bodyguard_active {
+        "legacy_root_kill".to_string()
+    } else {
+        configured_session_action.to_string()
+    };
+
+    if legacy_bodyguard_active {
+        let has_warn_action = ["ip", "cn", "dns", "webrtc", "session"]
+            .iter()
+            .any(|crit| config.action("claude", crit) == "warn");
+
+        if config.guard_enabled || has_warn_action {
+            conflicts.push(AuthorityConflict {
+                code: "legacy_bodyguard_overrides_policy".to_string(),
+                title: "原版保镖覆盖策略".to_string(),
+                detail: "原版 local.claude-bodyguard 正在运行，在代理或 TUN 异常时会直接终止 Claude，覆盖 Claude Watch 的策略配置。".to_string(),
+            });
+        }
+    }
+
+    if legacy_tz_active && config.timezone_watchdog {
+        conflicts.push(AuthorityConflict {
+            code: "dual_timezone_writer_conflict".to_string(),
+            title: "时区守护双写冲突".to_string(),
+            detail: "原版 local.tz-watchdog 与 Claude Watch 时区守护同时启用，两者可能竞争修改系统时区。".to_string(),
+        });
+    }
+
+    AuthorityArbitration {
+        legacy_bodyguard_active,
+        legacy_tz_active,
+        effective_proxy_loss_enforcement,
+        conflicts,
+    }
+}
+
+#[cfg(test)]
+mod legacy_arbitration_tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn clean_state_produces_no_conflicts() {
+        let config = Config::default();
+        let arb = arbitrate_legacy_services(&config, false, false);
+        assert!(!arb.legacy_bodyguard_active);
+        assert!(!arb.legacy_tz_active);
+        assert_eq!(arb.effective_proxy_loss_enforcement, "close");
+        assert!(arb.conflicts.is_empty());
+    }
+
+    #[test]
+    fn legacy_bodyguard_warn_conflict_detected() {
+        let mut config = Config::default();
+        config.guard_enabled = false;
+        config.policy_actions.insert("claude_close_session".into(), "warn".into());
+        let arb = arbitrate_legacy_services(&config, true, false);
+        assert!(arb.legacy_bodyguard_active);
+        assert_eq!(arb.effective_proxy_loss_enforcement, "legacy_root_kill");
+        assert_eq!(arb.conflicts.len(), 1);
+        assert_eq!(arb.conflicts[0].code, "legacy_bodyguard_overrides_policy");
+    }
+
+    #[test]
+    fn dual_timezone_writer_detected() {
+        let mut config = Config::default();
+        config.timezone_watchdog = true;
+        let arb = arbitrate_legacy_services(&config, false, true);
+        assert!(arb.legacy_tz_active);
+        assert_eq!(arb.conflicts.len(), 1);
+        assert_eq!(arb.conflicts[0].code, "dual_timezone_writer_conflict");
+    }
+}

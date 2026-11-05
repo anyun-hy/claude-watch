@@ -29,6 +29,10 @@ fn fixed(store: &StateStore, name: &str) -> Option<(PathBuf, &'static str)> {
                 .join("Library/LaunchAgents/io.local.claudewatch.update.plist"),
             "io.local.claudewatch.update",
         )),
+        "legacy_watchdog" => Some((
+            "/Library/LaunchDaemons/local.tz-watchdog.plist".into(),
+            "local.tz-watchdog",
+        )),
         _ => None,
     }
 }
@@ -64,6 +68,12 @@ fn valid_arguments(store: &StateStore, name: &str, value: &Value) -> bool {
                 "--apply"
             ]) && value["StartInterval"] == 43200
                 && value["RunAtLoad"] == false
+        }
+        "legacy_watchdog" => {
+            args == &json!([
+                "/bin/bash",
+                "/Library/Application Support/claude-switcher/tz-watchdog.sh"
+            ])
         }
         _ => false,
     }
@@ -148,4 +158,46 @@ pub fn read_job_definition<R: ReadRunner>(
     Ok(
         json!({"trusted":trusted,"definition":sha256(&bytes),"definition_present":true,"label":label,"interval":value["StartInterval"].as_u64().filter(|v|*v>0)}),
     )
+}
+
+/// Reads a bounded timestamp receipt file using `O_NOFOLLOW`, owner/mode validation,
+/// and before/after metadata sandwiching.
+pub fn read_receipt_timestamp(path: &std::path::Path, expected_uid: u32) -> Option<f64> {
+    #[cfg(target_os = "macos")]
+    const NOFOLLOW: i32 = 0x100;
+    #[cfg(not(target_os = "macos"))]
+    const NOFOLLOW: i32 = 0x20000;
+
+    let before = fs::symlink_metadata(path).ok()?;
+    if !before.is_file()
+        || before.file_type().is_symlink()
+        || before.uid() != expected_uid
+        || before.mode() & 0o022 != 0
+        || before.len() == 0
+        || before.len() > 64
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW)
+        .open(path)
+        .and_then(|file| file.take(65).read_to_end(&mut bytes))
+        .ok()?;
+    if bytes.is_empty() || bytes.len() > 64 {
+        return None;
+    }
+    let after = fs::symlink_metadata(path).ok()?;
+    if !after.is_file()
+        || after.file_type().is_symlink()
+        || after.dev() != before.dev()
+        || after.ino() != before.ino()
+        || after.uid() != expected_uid
+        || after.mode() & 0o022 != 0
+    {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes).ok()?.trim();
+    text.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
 }

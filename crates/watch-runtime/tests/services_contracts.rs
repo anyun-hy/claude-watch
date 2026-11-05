@@ -379,3 +379,125 @@ fn failed_service_write_rolls_back_and_does_not_leave_an_unreachable_confirmatio
     assert!(!store.paths.base().join("service-transaction.json").exists());
     fs::remove_dir_all(home).unwrap();
 }
+
+#[test]
+fn legacy_bodyguard_conflict_is_projected_in_service_status_and_policy_issues() {
+    let (home, store) = store();
+    let mut system = fake();
+    system.jobs["original"]["registered"] = json!(true);
+
+    let mut config = Config::default();
+    config.guard_enabled = false;
+    config.policy_actions.insert("claude_close_session".into(), "warn".into());
+    store.atomic_json(&store.paths.config(), &config.value().unwrap()).unwrap();
+
+    let status = services::service_status(&system, &config).unwrap();
+    let arb = &status["authority_arbitration"];
+    assert_eq!(arb["legacy_bodyguard_active"], true);
+    assert_eq!(arb["effective_proxy_loss_enforcement"], "legacy_root_kill");
+
+    let issues = status["policy_issues"].as_array().unwrap();
+    assert!(issues.iter().any(|i| i["id"] == "legacy_bodyguard_overrides_policy"));
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn dual_timezone_writer_conflict_is_projected() {
+    let (home, store) = store();
+    let mut system = fake();
+    system.jobs.as_object_mut().unwrap().insert(
+        "legacy_watchdog".into(),
+        json!({"registered":true,"trusted":true}),
+    );
+
+    let mut config = Config::default();
+    config.timezone_watchdog = true;
+    store.atomic_json(&store.paths.config(), &config.value().unwrap()).unwrap();
+
+    let status = services::service_status(&system, &config).unwrap();
+    let arb = &status["authority_arbitration"];
+    assert_eq!(arb["legacy_tz_active"], true);
+
+    let issues = status["policy_issues"].as_array().unwrap();
+    assert!(issues.iter().any(|i| i["id"] == "dual_timezone_writer_conflict"));
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn execution_receipt_and_health_basis_are_projected_truthfully() {
+    let (home, _store) = store();
+    let mut system = fake();
+    let mut config = Config::default();
+    config.timezone_watchdog = true;
+    config.timezone = "Asia/Tokyo".into();
+    system.jobs["watchdog"]["registered"] = json!(true);
+    system.jobs["original"]["registered"] = json!(true);
+
+    // 1. Fresh execution receipt (now = 1000., last_success = 900., delta = 100s <= 7200s)
+    system.now = 1000.0;
+    system.watchdog = json!({
+        "registered": true,
+        "target": "Asia/Tokyo",
+        "last_success_at": 900.0,
+    });
+    let status = services::service_status(&system, &config).unwrap();
+    let rows = status["services"].as_array().unwrap();
+
+    let watchdog_row = rows.iter().find(|r| r["id"] == "watchdog").unwrap();
+    assert_eq!(watchdog_row["state"], "scheduled");
+    assert_eq!(watchdog_row["execution_verified"], true);
+    assert_eq!(watchdog_row["health_basis"], "root_execution_receipt");
+
+    let original_row = rows.iter().find(|r| r["id"] == "original").unwrap();
+    assert_eq!(original_row["state"], "scheduled");
+    assert_eq!(original_row["execution_verified"], false);
+    assert_eq!(original_row["health_basis"], "launchd_registration_only");
+
+    // 2. Expired execution receipt (now = 10000., last_success = 900., delta = 9100s > 7200s)
+    system.now = 10000.0;
+    let status_expired = services::service_status(&system, &config).unwrap();
+    let rows_expired = status_expired["services"].as_array().unwrap();
+    let watchdog_expired = rows_expired.iter().find(|r| r["id"] == "watchdog").unwrap();
+    assert_eq!(watchdog_expired["execution_verified"], false);
+    assert_eq!(watchdog_expired["health_basis"], "launchd_registration_only");
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn receipt_timestamp_reader_rejects_missing_wrong_owner_writable_and_symlink() {
+    use claude_watch_runtime::service_native::read_receipt_timestamp;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+    let (home, _store) = store();
+    let uid = fs::metadata(&home).unwrap().uid();
+    let missing = home.join("missing.last-success");
+    assert_eq!(read_receipt_timestamp(&missing, uid), None);
+
+    let receipt = home.join("timezone.last-success");
+    fs::write(&receipt, "1700000000\n").unwrap();
+    fs::set_permissions(&receipt, fs::Permissions::from_mode(0o644)).unwrap();
+
+    // 1. Valid owner and mode 0644 succeeds
+    assert_eq!(read_receipt_timestamp(&receipt, uid), Some(1_700_000_000.0));
+
+    // 2. Non-matching owner (e.g. expecting root uid 0 on a user-owned file) is rejected
+    if uid != 0 {
+        assert_eq!(read_receipt_timestamp(&receipt, 0), None);
+    }
+    assert_eq!(read_receipt_timestamp(&receipt, uid.wrapping_add(1)), None);
+
+    // 3. Group/world-writable mode is rejected
+    fs::set_permissions(&receipt, fs::Permissions::from_mode(0o666)).unwrap();
+    assert_eq!(read_receipt_timestamp(&receipt, uid), None);
+    fs::set_permissions(&receipt, fs::Permissions::from_mode(0o644)).unwrap();
+
+    // 4. Symlink is rejected via symlink_metadata + O_NOFOLLOW
+    let link = home.join("symlink.last-success");
+    symlink(&receipt, &link).unwrap();
+    assert_eq!(read_receipt_timestamp(&link, uid), None);
+
+    let _ = fs::remove_dir_all(home);
+}

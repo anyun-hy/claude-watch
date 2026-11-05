@@ -967,6 +967,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> ServiceSystem for Macos<R, T, M> {
         let mut observation = match name {
             "watchdog" => self.job(ServiceLabel::Timezone),
             "original" => self.job(ServiceLabel::LegacyBodyguard),
+            "legacy_watchdog" => self.job(ServiceLabel::LegacyTimezone),
             "updater" => self.gui_updater(),
             _ => json!({"registered":null,"trusted":false}),
         };
@@ -1004,8 +1005,11 @@ impl<R: ReadRunner, T: Transport, M: Mutator> ServiceSystem for Macos<R, T, M> {
             })
             .and_then(|_| fs::read_to_string(target).ok())
             .map(|v| v.trim().to_owned());
+        let last_success =
+            std::path::Path::new("/Library/Application Support/ClaudeWatch/timezone.last-success");
+        let last_success_at = crate::service_native::read_receipt_timestamp(last_success, 0);
         Ok(
-            json!({"registered":job["registered"],"target":value,"trusted":job["trusted"],"source":"root timezone target and fixed launchd definition"}),
+            json!({"registered":job["registered"],"target":value,"last_success_at":last_success_at,"trusted":job["trusted"],"source":"root timezone target and fixed launchd definition"}),
         )
     }
     fn admin_helper_status(&self) -> Result<Value> {

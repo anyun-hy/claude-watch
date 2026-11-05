@@ -2,6 +2,10 @@
 //! concrete process implementation: callers must inject application control.
 use crate::storage::StateStore;
 use claude_watch_core::{
+    account::{
+        evaluate_account_ownership, AccountOwnershipObservation, AccountOwnershipState,
+        LegacySwitcherAnchor,
+    },
     config::Config,
     error::{CoreError, Result},
 };
@@ -52,6 +56,7 @@ pub struct Status {
     pub current: Option<String>,
     pub recovery_required: bool,
     pub accounts: Vec<AccountStatus>,
+    pub legacy_conflict: Option<Value>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CopyMetrics {
@@ -67,7 +72,7 @@ pub struct SwitchResult {
 }
 impl Status {
     pub fn value(&self) -> Value {
-        json!({"schema":1,"current":self.current,"recovery_required":self.recovery_required,"accounts":self.accounts.iter().map(|x|json!({"id":x.id,"stored":x.stored,"current":x.current})).collect::<Vec<_>>(),"login_verified":false,"detail":"账号槽位表示本地资料目录，不证明远端账号身份或钥匙串隔离"})
+        json!({"schema":1,"current":self.current,"recovery_required":self.recovery_required,"accounts":self.accounts.iter().map(|x|json!({"id":x.id,"stored":x.stored,"current":x.current})).collect::<Vec<_>>(),"legacy_conflict":self.legacy_conflict,"login_verified":false,"detail":"账号槽位表示本地资料目录，不证明远端账号身份或钥匙串隔离"})
     }
 }
 impl SwitchResult {
@@ -116,15 +121,186 @@ impl<O: AccountOs> AccountStore<O> {
             Ok(c)
         }
     }
-    fn save_state(&self, current: Option<&str>, token: Option<&str>) -> Result<()> {
-        let mut v = json!({"schema":1,"current":current});
+    fn active_directory_ino(&self) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(self.storage.paths.active())
+            .ok()
+            .filter(|m| m.is_dir() && !m.file_type().is_symlink())
+            .map(|m| m.ino())
+    }
+    fn save_state(
+        &self,
+        current: Option<&str>,
+        token: Option<&str>,
+        legacy_anchor: Option<&LegacySwitcherAnchor>,
+    ) -> Result<()> {
+        let prev = self
+            .storage
+            .read_json(&self.state_path(), json!({"schema":1,"current":null}))
+            .unwrap_or_else(|_| json!({"schema":1,"current":null}));
+        let prev_epoch = prev
+            .get("ownership_epoch")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let prev_active_ino = prev.get("active_dir_ino").and_then(Value::as_u64);
+        let mut v = json!({
+            "schema": 1,
+            "current": current,
+            "ownership_epoch": if token.is_some() { prev_epoch + 1 } else { prev_epoch.max(1) }
+        });
         if let Some(x) = token {
-            v["transaction_id"] = json!(x)
+            v["transaction_id"] = json!(x);
+            if let Some(ino) = self.active_directory_ino() {
+                v["active_dir_ino"] = json!(ino);
+            }
+        } else if prev_active_ino.is_some() {
+            if let Some(ino) = self.active_directory_ino() {
+                v["active_dir_ino"] = json!(ino);
+            }
+        }
+        if let Some(a) = legacy_anchor {
+            if let Some(c) = &a.current {
+                v["legacy_current_observed"] = json!(c);
+            }
+            if let Some(m) = a.mtime_ns {
+                v["legacy_current_mtime_ns"] = json!(m);
+            }
+            if let Some(i) = a.ino {
+                v["legacy_current_ino"] = json!(i);
+            }
         }
         self.storage.atomic_json(&self.state_path(), &v)
     }
+    fn legacy_switcher_dir(&self) -> PathBuf {
+        self.storage.paths.home.join(".claude-switcher")
+    }
+    fn legacy_lock_file(&self) -> PathBuf {
+        self.legacy_switcher_dir().join("cli-operation.lock")
+    }
+    fn legacy_current_file(&self) -> PathBuf {
+        self.legacy_switcher_dir().join("current")
+    }
+    fn observe_legacy_switcher(&self) -> Result<(bool, Option<LegacySwitcherAnchor>)> {
+        let lock_path = self.legacy_lock_file();
+        let external_locked = if lock_path.exists() {
+            self.storage.guarded(&lock_path)?;
+            true
+        } else {
+            false
+        };
+
+        let current_path = self.legacy_current_file();
+        if !current_path.exists() {
+            return Ok((external_locked, None));
+        }
+        self.storage.guarded(&current_path)?;
+        let meta = fs::symlink_metadata(&current_path).map_err(io)?;
+        if meta.file_type().is_symlink() {
+            return Err(err("symlink_rejected", "原版切换器状态文件禁止符号链接"));
+        }
+        use std::os::unix::fs::MetadataExt;
+        let mtime_ns = ((meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128)) as u64;
+        let ino = meta.ino();
+        let content = fs::read_to_string(&current_path).map_err(io)?;
+        let trimmed = content.trim().to_string();
+
+        Ok((
+            external_locked,
+            Some(LegacySwitcherAnchor {
+                current: if trimmed.is_empty() { None } else { Some(trimmed) },
+                mtime_ns: Some(mtime_ns),
+                ino: Some(ino),
+            }),
+        ))
+    }
+    fn read_recorded_ownership_anchors(&self) -> Result<(Option<LegacySwitcherAnchor>, bool)> {
+        let v = self
+            .storage
+            .read_json(&self.state_path(), json!({"schema":1,"current":null}))?;
+        let current = v
+            .get("legacy_current_observed")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mtime_ns = v.get("legacy_current_mtime_ns").and_then(Value::as_u64);
+        let ino = v.get("legacy_current_ino").and_then(Value::as_u64);
+        let recorded_anchor = if current.is_none() && mtime_ns.is_none() && ino.is_none() {
+            None
+        } else {
+            Some(LegacySwitcherAnchor {
+                current,
+                mtime_ns,
+                ino,
+            })
+        };
+        let active_mutated = match v.get("active_dir_ino").and_then(Value::as_u64) {
+            Some(expected_ino) => self.active_directory_ino() != Some(expected_ino),
+            None => false,
+        };
+        Ok((recorded_anchor, active_mutated))
+    }
+    fn check_external_ownership(
+        &self,
+        watch_current: Option<&str>,
+    ) -> Result<AccountOwnershipState> {
+        let (external_locked, current_anchor) = self.observe_legacy_switcher()?;
+        let (recorded_anchor, active_mutated) = self.read_recorded_ownership_anchors()?;
+        let obs = AccountOwnershipObservation {
+            watch_current: watch_current.map(str::to_owned),
+            recorded_anchor,
+            current_anchor,
+            external_locked,
+            active_mutated,
+        };
+        let state = evaluate_account_ownership(&obs);
+        match &state {
+            AccountOwnershipState::ExternalLocked => Err(err(
+                "external_switcher_locked",
+                "检测到原版切换器正在执行操作，未切换账号",
+            )),
+            AccountOwnershipState::SplitBrainConflict { .. } => Err(err(
+                "external_switcher_conflict",
+                "原版切换器当前账号与 Claude Watch 不一致，为防止资料错槽覆盖已阻断切换",
+            )),
+            AccountOwnershipState::UntrackedActiveMutation => Err(err(
+                "external_change",
+                "活动资料已被外部修改，未覆盖",
+            )),
+            AccountOwnershipState::ExclusiveWatch
+            | AccountOwnershipState::AlignedCoexistence => Ok(state),
+        }
+    }
     pub fn status(&self) -> Result<Status> {
         let current = self.state()?;
+        let (external_locked, current_anchor) =
+            self.observe_legacy_switcher().unwrap_or((false, None));
+        let (recorded_anchor, active_mutated) =
+            self.read_recorded_ownership_anchors().unwrap_or((None, false));
+        let obs = AccountOwnershipObservation {
+            watch_current: current.clone(),
+            recorded_anchor,
+            current_anchor,
+            external_locked,
+            active_mutated,
+        };
+        let ownership_state = evaluate_account_ownership(&obs);
+        let legacy_conflict = match ownership_state {
+            AccountOwnershipState::ExternalLocked => Some(json!({
+                "code": "external_switcher_locked",
+                "message": "检测到原版切换器正在执行操作"
+            })),
+            AccountOwnershipState::SplitBrainConflict { watch_current, legacy_current } => Some(json!({
+                "code": "external_switcher_conflict",
+                "watch_current": watch_current,
+                "legacy_current": legacy_current,
+                "message": "原版切换器当前账号与 Claude Watch 不一致"
+            })),
+            AccountOwnershipState::UntrackedActiveMutation => Some(json!({
+                "code": "external_change",
+                "watch_current": current,
+                "message": "活动资料目录已被外部整体替换"
+            })),
+            _ => None,
+        };
         Ok(Status {
             recovery_required: self.storage.paths.journal().exists(),
             accounts: ["A", "B"]
@@ -136,6 +312,7 @@ impl<O: AccountOs> AccountStore<O> {
                 })
                 .collect(),
             current,
+            legacy_conflict,
         })
     }
     pub fn import_legacy(&mut self, legacy: &Path, apply: bool) -> Result<Status> {
@@ -157,6 +334,7 @@ impl<O: AccountOs> AccountStore<O> {
                         current: false,
                     })
                     .collect(),
+                legacy_conflict: None,
             });
         }
         let _guard = self.storage.lock("operation", None)?;
@@ -188,7 +366,8 @@ impl<O: AccountOs> AccountStore<O> {
                 self.copy_tree(&legacy.join("accounts").join(id), &slot.join("profile"))?;
                 self.write_manifest(&slot, &tree_manifest(&slot.join("profile"))?, "legacy")?;
             }
-            self.save_state(current.as_deref(), None)
+            let (_, legacy_anchor) = self.observe_legacy_switcher().unwrap_or((false, None));
+            self.save_state(current.as_deref(), None, legacy_anchor.as_ref())
         })();
         if res.is_err() {
             for p in done {
@@ -211,6 +390,7 @@ impl<O: AccountOs> AccountStore<O> {
             return Err(err("recovery_required", "先恢复未完成的账号切换"));
         }
         let current = self.state()?;
+        self.check_external_ownership(current.as_deref())?;
         // An already selected, initialized slot is a read-only idempotent
         // request.  In particular it must not start requiring a presently
         // observable Claude version merely to report that nothing changed.
@@ -290,6 +470,7 @@ impl<O: AccountOs> AccountStore<O> {
             j["phase"] = json!("publishing");
             self.storage
                 .atomic_json(&self.storage.paths.journal(), &j)?;
+            self.check_external_ownership(current.as_deref())?;
             if self.os.claude_running()?
                 || fingerprint_path(&self.storage.paths.active())? != active_before
             {
@@ -344,7 +525,8 @@ impl<O: AccountOs> AccountStore<O> {
             if !self.state_matches(current.as_deref(), state_existed)? {
                 return Err(err("external_change", "启动期间账号标记被外部修改"));
             }
-            self.save_state(Some(target), Some(&token))?;
+            let (_, latest_anchor) = self.observe_legacy_switcher()?;
+            self.save_state(Some(target), Some(&token), latest_anchor.as_ref())?;
             self.os.checkpoint("state_saved")?;
             j["phase"] = json!("committed");
             self.storage
@@ -484,7 +666,8 @@ impl<O: AccountOs> AccountStore<O> {
     }
     fn restore_state(&self, current: Option<&str>, existed: bool) -> Result<()> {
         if existed {
-            self.save_state(current, None)
+            let (_, latest_anchor) = self.observe_legacy_switcher().unwrap_or((false, None));
+            self.save_state(current, None, latest_anchor.as_ref())
         } else if self.state_path().exists() {
             fs::remove_file(self.state_path()).map_err(io)
         } else {
@@ -524,7 +707,8 @@ impl<O: AccountOs> AccountStore<O> {
                 fs::rename(self.storage.paths.active(), saved).map_err(io)?;
             }
             fs::rename(&old, self.storage.paths.active()).map_err(io)?;
-            self.save_state(previous, None)?;
+            let (_, latest_anchor) = self.observe_legacy_switcher().unwrap_or((false, None));
+            self.save_state(previous, None, latest_anchor.as_ref())?;
         }
         for owned in [&stage, &old] {
             if owned.exists() {
@@ -565,7 +749,8 @@ impl<O: AccountOs> AccountStore<O> {
             }
             fs::rename(old, self.storage.paths.active()).map_err(io)?;
         }
-        self.save_state(previous, None)?;
+        let (_, latest_anchor) = self.observe_legacy_switcher().unwrap_or((false, None));
+        self.save_state(previous, None, latest_anchor.as_ref())?;
         if work.exists() {
             fs::remove_dir_all(work).map_err(io)?;
         }

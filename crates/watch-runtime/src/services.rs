@@ -134,9 +134,25 @@ pub fn service_status<S: ServiceSystem>(system: &S, config: &Config) -> Result<V
         .watchdog_state()
         .unwrap_or_else(|_| json!({"registered":null,"target":null}));
     let original = job(system, "original");
+    let legacy_tz = job(system, "legacy_watchdog");
     let update = job(system, "updater");
     let clock = job(system, "watchdog");
     let ready = !config.update_url.is_empty() && !config.update_public_key.is_empty();
+    let legacy_bodyguard_active = original["registered"] == true;
+    let legacy_tz_active = legacy_tz["registered"] == true;
+    let arbitration = claude_watch_core::policy::arbitrate_legacy_services(
+        config,
+        legacy_bodyguard_active,
+        legacy_tz_active,
+    );
+    let mut issues = policy_issues(config).as_array().cloned().unwrap_or_default();
+    for conflict in &arbitration.conflicts {
+        issues.push(json!({
+            "id": conflict.code,
+            "title": conflict.title,
+            "detail": conflict.detail,
+        }));
+    }
     let guard_state = if health.guard_healthy {
         "running"
     } else if !config.guard_enabled {
@@ -183,12 +199,22 @@ pub fn service_status<S: ServiceSystem>(system: &S, config: &Config) -> Result<V
     } else {
         "mismatch"
     };
+    let now = system.now();
+    let watchdog_last_success = watchdog.get("last_success_at").and_then(Value::as_f64);
+    let watchdog_verified = watchdog_state == "scheduled"
+        && watchdog_last_success.is_some_and(|ts| (0.0..=7200.0).contains(&(now - ts)));
+    let watchdog_basis = if watchdog_verified {
+        "root_execution_receipt"
+    } else {
+        "launchd_registration_only"
+    };
+
     Ok(
-        json!({"status":"ok","observed_at":system.now(),"backend_healthy":health.sampling_healthy,"guard_backend_healthy":health.guard_backend_healthy,"backend_diagnostics":health.diagnostics,"backend_sampling_state":if health.sampling_healthy{"complete"}else{"incomplete"},"admin_helper":helper,"update_source_ready":ready,"policy_issues":policy_issues(config),"services":[
-          {"id":"guard","title":"Claude Watch 保镖","state":guard_state,"desired":config.guard_enabled,"source":"本工具保护心跳 / 后台进程身份"},
-          {"id":"original","title":"原版 Claude切换器保镖","state":original_state,"desired":null,"source":"system/local.claude-bodyguard / 原版任务定义"},
-          {"id":"watchdog","title":"时区守护","state":watchdog_state,"desired":config.timezone_watchdog,"actual_target":watchdog["target"],"accepted_target":desired_target,"source":"时区任务注册 / root 管理的目标文件"},
-          {"id":"updater","title":"自动更新","state":update_state,"desired":config.auto_update,"interval_seconds":UPDATE_INTERVAL,"source":"本项目发布配置 / 用户更新任务"}
+        json!({"status":"ok","observed_at":now,"backend_healthy":health.sampling_healthy,"guard_backend_healthy":health.guard_backend_healthy,"backend_diagnostics":health.diagnostics,"backend_sampling_state":if health.sampling_healthy{"complete"}else{"incomplete"},"admin_helper":helper,"update_source_ready":ready,"authority_arbitration":json!(arbitration),"policy_issues":Value::Array(issues),"services":[
+          {"id":"guard","title":"Claude Watch 保镖","state":guard_state,"desired":config.guard_enabled,"execution_verified":guard_state == "running","health_basis":"heartbeat_and_process_identity","source":"本工具保护心跳 / 后台进程身份"},
+          {"id":"original","title":"原版 Claude切换器保镖","state":original_state,"desired":null,"execution_verified":false,"health_basis":"launchd_registration_only","source":"system/local.claude-bodyguard / 原版任务定义"},
+          {"id":"watchdog","title":"时区守护","state":watchdog_state,"desired":config.timezone_watchdog,"actual_target":watchdog["target"],"accepted_target":desired_target,"last_success_at":watchdog_last_success,"execution_verified":watchdog_verified,"health_basis":watchdog_basis,"source":"时区任务注册 / root 管理的目标文件"},
+          {"id":"updater","title":"自动更新","state":update_state,"desired":config.auto_update,"interval_seconds":UPDATE_INTERVAL,"execution_verified":update_state == "scheduled","health_basis":"launchd_registration_and_manifest","source":"本项目发布配置 / 用户更新任务"}
         ]}),
     )
 }

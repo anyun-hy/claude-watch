@@ -518,3 +518,169 @@ fn import_conflicts_and_nested_legacy_links_do_not_publish_partial_slots() {
         "import_conflict"
     );
 }
+
+#[test]
+fn same_target_idempotence_intercepted_on_external_switcher_conflict() {
+    let f = Fixture::new();
+    let legacy = f.home.join(".claude-switcher");
+    file(&legacy.join("accounts/A/Cookie"), "A-data");
+    file(&legacy.join("accounts/B/Cookie"), "B-data");
+    file(&legacy.join("current"), "A");
+
+    let mut store = AccountStore::new(
+        f.storage(),
+        Fake {
+            running: false,
+            launch_fails: false,
+            clones: 0,
+            fail_preflight: false,
+            fail_stage: None,
+            quits: 0,
+        },
+    );
+    // Initial import: sets Watch current to A and anchors ~/.claude-switcher/current
+    store.import_legacy(&legacy, true).unwrap();
+    assert_eq!(store.status().unwrap().current.as_deref(), Some("A"));
+    assert_eq!(store.status().unwrap().legacy_conflict, None);
+
+    // Simulate upstream switcher switching to B outside of Watch
+    file(&legacy.join("current"), "B");
+
+    // Requesting switch to "A" (target == Watch current) must NOT short-circuit
+    // with Ok("A"). It MUST detect the split brain and return external_switcher_conflict.
+    let err = store.switch("A", &config(), false).unwrap_err();
+    assert_eq!(err.code, "external_switcher_conflict");
+
+    // Status also reflects the conflict in read-only diagnostics
+    let status = store.status().unwrap();
+    let conflict = status.legacy_conflict.expect("should have conflict");
+    assert_eq!(conflict["code"], "external_switcher_conflict");
+    assert_eq!(conflict["watch_current"], "A");
+    assert_eq!(conflict["legacy_current"], "B");
+}
+
+#[test]
+fn aba_roundtrip_switch_is_intercepted_by_mtime_anchor() {
+    let f = Fixture::new();
+    let legacy = f.home.join(".claude-switcher");
+    file(&legacy.join("accounts/A/Cookie"), "A-data");
+    file(&legacy.join("accounts/B/Cookie"), "B-data");
+    file(&legacy.join("current"), "A");
+
+    let mut store = AccountStore::new(
+        f.storage(),
+        Fake {
+            running: false,
+            launch_fails: false,
+            clones: 0,
+            fail_preflight: false,
+            fail_stage: None,
+            quits: 0,
+        },
+    );
+    store.import_legacy(&legacy, true).unwrap();
+    assert_eq!(store.status().unwrap().current.as_deref(), Some("A"));
+    assert_eq!(store.status().unwrap().legacy_conflict, None);
+
+    // Live profile exists
+    file(&store.storage.paths.active().join("Cookie"), "live-A");
+
+    // Now simulate upstream switcher executing A -> B -> A round-trip:
+    // ~/.claude-switcher/current content is still "A", but the file is rewritten!
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::remove_file(legacy.join("current")).unwrap();
+    file(&legacy.join("current"), "A");
+
+    // Attempting to switch to B should detect that ~/.claude-switcher/current was modified externally
+    let err = store.switch("B", &config(), false).unwrap_err();
+    assert_eq!(err.code, "external_switcher_conflict");
+}
+
+#[test]
+fn external_lock_and_custom_slot_conflict() {
+    let f = Fixture::new();
+    let legacy = f.home.join(".claude-switcher");
+    file(&legacy.join("accounts/A/Cookie"), "A-data");
+    file(&legacy.join("accounts/B/Cookie"), "B-data");
+    file(&legacy.join("current"), "A");
+
+    let mut store = AccountStore::new(
+        f.storage(),
+        Fake {
+            running: false,
+            launch_fails: false,
+            clones: 0,
+            fail_preflight: false,
+            fail_stage: None,
+            quits: 0,
+        },
+    );
+    store.import_legacy(&legacy, true).unwrap();
+
+    // 1. External lock file blocks switch
+    file(&legacy.join("cli-operation.lock"), "busy");
+    let err = store.switch("B", &config(), false).unwrap_err();
+    assert_eq!(err.code, "external_switcher_locked");
+    assert_eq!(
+        store.status().unwrap().legacy_conflict.unwrap()["code"],
+        "external_switcher_locked"
+    );
+    fs::remove_file(legacy.join("cli-operation.lock")).unwrap();
+
+    // 2. Upstream custom slot "C" (not A or B) blocks switch
+    file(&legacy.join("current"), "C");
+    let err = store.switch("B", &config(), false).unwrap_err();
+    assert_eq!(err.code, "external_switcher_conflict");
+    let conflict = store.status().unwrap().legacy_conflict.unwrap();
+    assert_eq!(conflict["code"], "external_switcher_conflict");
+    assert_eq!(conflict["legacy_current"], "C");
+}
+
+#[test]
+fn consecutive_watch_switches_do_not_self_deadlock_when_legacy_is_idle() {
+    let f = Fixture::new();
+    let legacy = f.home.join(".claude-switcher");
+    file(&legacy.join("accounts/A/Cookie"), "A-data");
+    file(&legacy.join("accounts/B/Cookie"), "B-data");
+    file(&legacy.join("current"), "A");
+
+    let mut store = AccountStore::new(
+        f.storage(),
+        Fake {
+            running: false,
+            launch_fails: false,
+            clones: 0,
+            fail_preflight: false,
+            fail_stage: None,
+            quits: 0,
+        },
+    );
+    store.import_legacy(&legacy, true).unwrap();
+    file(&store.storage.paths.active().join("Cookie"), "live-A");
+
+    // 1. Watch switches A -> B while ~/.claude-switcher/current remains "A" untouched
+    assert_eq!(store.switch("B", &config(), false).unwrap().current, "B");
+    store.os.running = false;
+    assert_eq!(store.status().unwrap().legacy_conflict, None);
+
+    // 2. Idempotent switch to B succeeds
+    assert_eq!(store.switch("B", &config(), false).unwrap().current, "B");
+
+    // 3. Consecutive Watch switch B -> A succeeds without false SplitBrainConflict
+    assert_eq!(store.switch("A", &config(), false).unwrap().current, "A");
+    store.os.running = false;
+    assert_eq!(store.status().unwrap().legacy_conflict, None);
+
+    // 4. Wholesale external replacement of active directory while idle is blocked
+    let active = store.storage.paths.active();
+    fs::remove_dir_all(&active).unwrap();
+    file(&active.join("Cookie"), "foreign-profile");
+    assert_eq!(
+        store.switch("B", &config(), false).unwrap_err().code,
+        "external_change"
+    );
+    assert_eq!(
+        store.status().unwrap().legacy_conflict.unwrap()["code"],
+        "external_change"
+    );
+}

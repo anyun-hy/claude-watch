@@ -148,6 +148,14 @@ pub fn dispatch(request: &Request, paths: Paths) -> Result<Option<Value>> {
                 ));
             }
             host.mutator.administrative(AdminCommand::LegacyStop)?;
+            let orig = host.service_job("original")?;
+            let leg_tz = host.service_job("legacy_watchdog")?;
+            if orig["registered"] != json!(false) || leg_tz["registered"] != json!(false) {
+                return Err(CoreError::new(
+                    "legacy_stop_unconfirmed",
+                    "原版系统守护未能确认停用",
+                ));
+            }
             Ok(Some(
                 json!({"status":"ok","message":"已按明确命令停用旧后台；原应用与账号资料保留"}),
             ))

@@ -3,6 +3,7 @@
 //! Pure policy functions. No I/O, clocks, process control, account access or launch authority.
 //! A matching proxy chain does not establish connection identity or prove absence of leaks.
 
+pub mod account;
 pub mod audit;
 pub mod cli;
 pub mod config;

@@ -39,6 +39,7 @@ __pycache__/
 /docs/PARITY_2.9.5_VS_3.0.0.md
 /docs/PROJECT_FLOW.md
 /docs/LAUNCH_TRACE.md
+/docs/CROSS_PROJECT_ARCHITECTURE_PLAN.md
 /.workbuddy/memory/
 
 # Machine-specific run artifacts: 8-char random names (4-byte content, not source)
