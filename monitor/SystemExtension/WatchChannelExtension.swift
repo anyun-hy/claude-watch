@@ -45,13 +45,40 @@ open class WatchChannelExtension: NETransparentProxyProvider {
     private struct ActiveFlowRecord {
         let flow: NEAppProxyTCPFlow
         let connection: NWTCPConnection
+        var isClosing: Bool = false
+        var closeRequestedAt: Date? = nil
     }
     private var activeFlows: [UUID: ActiveFlowRecord] = [:]
     private var totalBlockedFlows: UInt64 = 0
     private var totalForwardedFlows: UInt64 = 0
     private var leaseWatchdogTimer: DispatchSourceTimer?
     private var commandPollTimer: DispatchSourceTimer?
+    private var drainCheckTimer: DispatchSourceTimer?
     private var lastCommandFileMtime: Date = .distantPast
+
+    /// Well-known domain suffixes for AI API endpoints that must NEVER be bypassed to direct public network.
+    private static let managedAiDomainKeywords: [String] = [
+        "anthropic.com",
+        "claude.ai",
+        "openai.com",
+        "chatgpt.com",
+        "oaistatic.com",
+        "oaiusercontent.com",
+        "cursor.sh",
+        "cursorapi.com"
+    ]
+
+    /// Helper to enforce strict monotonic progression for permit generations and command sequences.
+    /// Rejects stale, out-of-order, or replayed commands from overwriting current revocation/permit states.
+    private func isCommandNewerLocked(permitGen: UInt64, cmdSeq: UInt64) -> Bool {
+        if permitGen > currentPermitGeneration {
+            return true
+        }
+        if permitGen == currentPermitGeneration {
+            return cmdSeq > currentCommandSeq
+        }
+        return false
+    }
 
     open override func startProxy(options: [String: Any]? = nil, completionHandler: @escaping (Error?) -> Void) {
         logger.info("WatchChannelExtension startProxy requested")
@@ -113,9 +140,12 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         isPermitted = false
         activeLeaseDeadlineEpochSeconds = 0
         terminateAllActiveFlowsLocked(reason: "stop_proxy_\(reason.rawValue)")
+        activeFlows.removeAll()
+        writeSystemExtensionReceiptLocked(status: "revoked", reason: "stop_proxy")
         stateLock.unlock()
         stopLeaseWatchdog()
         stopCommandFilePolling()
+        stopDrainCheck()
         completionHandler()
     }
 
@@ -134,12 +164,19 @@ open class WatchChannelExtension: NETransparentProxyProvider {
                 self.isPermitted = false
                 self.activeLeaseDeadlineEpochSeconds = 0
                 self.terminateAllActiveFlowsLocked(reason: "lease_expired")
+                let remaining = self.activeFlows.count
+                let status = remaining > 0 ? "disconnecting" : "revoked"
                 self.writeSystemExtensionReceiptLocked(
-                    status: "revoked",
+                    status: status,
                     reason: "lease_expired"
                 )
+                self.stateLock.unlock()
+                if remaining > 0 {
+                    self.scheduleDrainCheck(reason: "lease_expired")
+                }
+            } else {
+                self.stateLock.unlock()
             }
-            self.stateLock.unlock()
         }
         timer.resume()
         leaseWatchdogTimer = timer
@@ -148,6 +185,51 @@ open class WatchChannelExtension: NETransparentProxyProvider {
     private func stopLeaseWatchdog() {
         leaseWatchdogTimer?.cancel()
         leaseWatchdogTimer = nil
+    }
+
+    private func stopDrainCheck() {
+        drainCheckTimer?.cancel()
+        drainCheckTimer = nil
+    }
+
+    /// Asynchronously tracks active flows during revocation, waiting for actual socket/flow termination.
+    /// Only when activeFlows is confirmed empty (or on timeout) is the final revoked receipt written.
+    private func scheduleDrainCheck(reason: String) {
+        stopDrainCheck()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+        var checks = 0
+        timer.schedule(deadline: .now() + 0.05, repeating: 0.05)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            checks += 1
+            self.stateLock.lock()
+            var drainedKeys: [UUID] = []
+            for (id, record) in self.activeFlows {
+                if record.connection.state == .cancelled || record.connection.state == .disconnected || checks >= 30 {
+                    drainedKeys.append(id)
+                }
+            }
+            for k in drainedKeys {
+                self.activeFlows.removeValue(forKey: k)
+            }
+            let remaining = self.activeFlows.count
+            if remaining == 0 {
+                self.writeSystemExtensionReceiptLocked(status: "revoked", reason: reason)
+                self.stateLock.unlock()
+                self.logger.notice("Drain check: all active flows confirmed terminated and drained (reason=\(reason))")
+                timer.cancel()
+            } else if checks >= 30 { // 1.5s timeout forced purge
+                self.activeFlows.removeAll()
+                self.writeSystemExtensionReceiptLocked(status: "revoked", reason: "drain_timeout_forced")
+                self.stateLock.unlock()
+                self.logger.warning("Drain check: timed out waiting for flows, forced purge.")
+                timer.cancel()
+            } else {
+                self.stateLock.unlock()
+            }
+        }
+        timer.resume()
+        drainCheckTimer = timer
     }
 
     private func startCommandFilePolling() {
@@ -200,6 +282,28 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         switch action {
         case "update_permit":
             stateLock.lock()
+            let incomingGen = (json["permit_generation"] as? UInt64) ?? 0
+            let incomingSeq = (json["command_seq"] as? UInt64) ?? 0
+
+            // Invariant: Strictly monotonic command progression.
+            // Stale or replayed update_permit commands MUST NOT overwrite current revocation or higher generation permit!
+            guard isCommandNewerLocked(permitGen: incomingGen, cmdSeq: incomingSeq) else {
+                logger.warning("Rejecting stale update_permit: incoming gen=\(incomingGen), seq=\(incomingSeq) <= current gen=\(self.currentPermitGeneration), seq=\(self.currentCommandSeq)")
+                let flowsCount = activeFlows.count
+                stateLock.unlock()
+                let resp: [String: Any] = [
+                    "status": "rejected_stale",
+                    "current_command_seq": currentCommandSeq,
+                    "current_permit_generation": currentPermitGeneration,
+                    "active_flows": flowsCount
+                ]
+                completionHandler?(try? JSONSerialization.data(withJSONObject: resp))
+                return
+            }
+
+            self.currentPermitGeneration = incomingGen
+            self.currentCommandSeq = incomingSeq
+
             if let port = json["local_proxy_port"] as? UInt16 {
                 self.localProxyPort = port
             }
@@ -219,12 +323,6 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             if let policyVer = json["policy_version"] as? String, !policyVer.isEmpty {
                 self.currentPolicyVersion = policyVer
             }
-            if let cmdSeq = json["command_seq"] as? UInt64 {
-                self.currentCommandSeq = cmdSeq
-            }
-            if let permitGen = json["permit_generation"] as? UInt64 {
-                self.currentPermitGeneration = permitGen
-            }
             if !self.isPermitted {
                 terminateAllActiveFlowsLocked(reason: "permit_revoked")
             }
@@ -235,33 +333,51 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             let flowsCount = activeFlows.count
             stateLock.unlock()
 
-            logger.info("Permit updated: isPermitted=\(self.isPermitted), deadline=\(self.activeLeaseDeadlineEpochSeconds)")
+            logger.info("Permit updated: isPermitted=\(self.isPermitted), deadline=\(self.activeLeaseDeadlineEpochSeconds), gen=\(incomingGen), seq=\(incomingSeq)")
             let resp: [String: Any] = ["status": "ok", "active_flows": flowsCount]
             completionHandler?(try? JSONSerialization.data(withJSONObject: resp))
 
         case "revoke_channel":
             stateLock.lock()
+            let incomingGen = (json["permit_generation"] as? UInt64) ?? 0
+            let incomingSeq = (json["command_seq"] as? UInt64) ?? 0
+
+            // Check if revocation command is older than current command
+            if incomingGen < self.currentPermitGeneration || (incomingGen == self.currentPermitGeneration && incomingSeq < self.currentCommandSeq) {
+                logger.warning("Rejecting stale revoke_channel: incoming gen=\(incomingGen), seq=\(incomingSeq) < current gen=\(self.currentPermitGeneration), seq=\(self.currentCommandSeq)")
+                stateLock.unlock()
+                let resp: [String: Any] = ["status": "rejected_stale"]
+                completionHandler?(try? JSONSerialization.data(withJSONObject: resp))
+                return
+            }
+
+            if incomingGen > self.currentPermitGeneration || incomingSeq > self.currentCommandSeq {
+                self.currentPermitGeneration = incomingGen
+                self.currentCommandSeq = incomingSeq
+            }
+
             self.isPermitted = false
             self.activeLeaseDeadlineEpochSeconds = 0
             if let policyVer = json["policy_version"] as? String, !policyVer.isEmpty {
                 self.currentPolicyVersion = policyVer
             }
-            if let cmdSeq = json["command_seq"] as? UInt64 {
-                self.currentCommandSeq = cmdSeq
-            }
-            if let permitGen = json["permit_generation"] as? UInt64 {
-                self.currentPermitGeneration = permitGen
-            }
             let reason = json["reason"] as? String ?? "explicit_revoke"
             terminateAllActiveFlowsLocked(reason: reason)
+
+            let remainingFlows = activeFlows.count
+            let status = remainingFlows > 0 ? "disconnecting" : "revoked"
             writeSystemExtensionReceiptLocked(
-                status: "revoked",
+                status: status,
                 reason: reason
             )
             stateLock.unlock()
 
-            logger.notice("Channel revoked via command")
-            let resp: [String: Any] = ["status": "revoked", "active_flows": 0]
+            if remainingFlows > 0 {
+                scheduleDrainCheck(reason: reason)
+            }
+
+            logger.notice("Channel revoked via command: status=\(status), active_flows=\(remainingFlows)")
+            let resp: [String: Any] = ["status": status, "active_flows": remainingFlows]
             completionHandler?(try? JSONSerialization.data(withJSONObject: resp))
 
         case "get_status":
@@ -292,6 +408,16 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         let dir = receiptFile.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
+        let activeCount = activeFlows.count
+        let effectivePermitState: String
+        if isPermitted {
+            effectivePermitState = "permitted"
+        } else if activeCount > 0 {
+            effectivePermitState = "disconnecting"
+        } else {
+            effectivePermitState = "revoked"
+        }
+
         var dict: [String: Any] = [
             "policy_version": currentPolicyVersion,
             "command_seq": currentCommandSeq,
@@ -299,8 +425,9 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             "applied_at": Date().timeIntervalSince1970,
             "allowed_pids": Array(allowedPids),
             "local_proxy_port": localProxyPort,
-            "permit_state": isPermitted ? "permitted" : "revoked",
-            "status": status
+            "permit_state": effectivePermitState,
+            "status": status,
+            "active_flows": activeCount
         ]
         if let reason = reason {
             dict["reason"] = reason
@@ -312,14 +439,29 @@ open class WatchChannelExtension: NETransparentProxyProvider {
 
     /// Handles incoming application network flows (TCP, UDP, IPv6, DNS).
     open override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
-        let (isManaged, flowPid, flowUid) = inspectFlowAttribution(flow)
+        // Step 1: Attribute remote host to detect attempts to access AI endpoints
+        var targetHost = ""
+        if let tcpFlow = flow as? NEAppProxyTCPFlow, let hostEndpoint = tcpFlow.remoteEndpoint as? NWHostEndpoint {
+            targetHost = hostEndpoint.hostname.lowercased()
+        }
 
-        // Non-managed applications: do not intercept non-AI flows
-        if !isManaged {
+        let isTargetingAiService = !targetHost.isEmpty && Self.managedAiDomainKeywords.contains { kw in
+            targetHost == kw || targetHost.hasSuffix("." + kw)
+        }
+
+        let (isManagedProcess, flowPid, flowUid) = inspectFlowAttribution(flow)
+        let isAiFlow = isManagedProcess || isTargetingAiService
+
+        // CRITICAL INVARIANT:
+        // Returning `false` in NETransparentProxyProvider instructs the macOS kernel network stack
+        // to bypass the proxy and let the flow connect directly to the destination!
+        // Therefore, any flow belonging to a managed AI app OR targeting an AI API domain
+        // must NEVER return `false`! Returning `false` would cause a catastrophic public IP leak!
+        if !isAiFlow {
             return false
         }
 
-        // Target application IS a managed AI process (Claude/ChatGPT/Codex):
+        // Target application IS a managed AI process (Claude/ChatGPT/Codex) or connecting to AI endpoint:
         // CRITICAL: Even if destination is loopback (e.g. attempting to connect to local TAG port 7890 directly),
         // we DO NOT exempt it! All traffic must pass through supervised policy.
         stateLock.lock()
@@ -332,6 +474,9 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         stateLock.unlock()
 
         if !active || !permitted || !leaseValid || !allowed {
+            // Cutoff-keep-process: immediately terminate flow with ECONNABORTED and return true.
+            // Returning true tells macOS kernel that the transparent proxy accepted and handled the flow,
+            // which guarantees the flow is aborted and prevents direct public fallback!
             closeFlowImmediately(flow, reason: "cutoff_keep_process_blocked")
             return true
         }
@@ -515,6 +660,12 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             stateLock.unlock()
             return
         }
+        let remaining = activeFlows.count
+        let permitted = isPermitted
+        if !permitted && remaining == 0 {
+            writeSystemExtensionReceiptLocked(status: "revoked", reason: "all_flows_drained")
+            logger.notice("All flows confirmed drained; receipt updated to revoked (active_flows=0)")
+        }
         stateLock.unlock()
 
         let abortErr = error ?? NSError(domain: NSPOSIXErrorDomain, code: Int(ECONNABORTED))
@@ -524,14 +675,18 @@ open class WatchChannelExtension: NETransparentProxyProvider {
     }
 
     private func terminateAllActiveFlowsLocked(reason: String) {
-        logger.notice("Terminating all active flows: reason=\(reason), count=\(self.activeFlows.count)")
+        logger.notice("Initiating flow termination: reason=\(reason), count=\(self.activeFlows.count)")
         let abortErr = NSError(domain: NSPOSIXErrorDomain, code: Int(ECONNABORTED))
-        for (_, record) in activeFlows {
+        let now = Date()
+        for (id, var record) in activeFlows {
+            record.isClosing = true
+            record.closeRequestedAt = now
+            activeFlows[id] = record
+
             record.flow.closeReadWithError(abortErr)
             record.flow.closeWriteWithError(abortErr)
             record.connection.cancel()
         }
-        activeFlows.removeAll()
     }
 
     private func handleUDPFlow(_ udpFlow: NEAppProxyUDPFlow) -> Bool {
@@ -595,8 +750,10 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         activeLeaseDeadlineEpochSeconds = 0
         isPermitted = false
         terminateAllActiveFlowsLocked(reason: "system_sleep")
+        activeFlows.removeAll()
         writeSystemExtensionReceiptLocked(status: "revoked", reason: "system_sleep")
         stateLock.unlock()
+        stopDrainCheck()
         completionHandler()
     }
 

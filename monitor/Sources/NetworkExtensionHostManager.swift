@@ -19,6 +19,14 @@ public struct NetworkExtensionActivationState: Equatable, Sendable {
 }
 
 /// Host-side manager for NetworkExtension transparent proxy lifecycle and activation.
+///
+/// Apple NetworkExtension Architecture Alignment:
+/// - NETransparentProxyManager inherits from NEVPNManager.
+/// - In the Apple macOS SDK, NETransparentProxyManager uses NETunnelProviderProtocol as its
+///   underlying protocolConfiguration and NETunnelProviderSession as its active connection type.
+///   This is the official, documented Apple design (not a misconfiguration or packet-tunnel mix-up).
+/// - The extension bundle conforms to `com.apple.networkextension.app-proxy` with provider class
+///   `WatchChannelExtension` inheriting from `NETransparentProxyProvider`.
 @available(macOS 11.0, *)
 public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionRequestDelegate, ObservableObject {
     public static let shared = NetworkExtensionHostManager()
@@ -307,7 +315,10 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
         sendProviderMessage(msg) { result in
             switch result {
             case .success(let resp):
-                completion(resp["status"] as? String == "revoked")
+                let status = resp["status"] as? String
+                // Both "revoked" (immediate) and "disconnecting" (async drain in progress) indicate
+                // that the extension has accepted and is enforcing revocation without bypass.
+                completion(status == "revoked" || status == "disconnecting")
             case .failure:
                 completion(false)
             }

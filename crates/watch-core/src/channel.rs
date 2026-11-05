@@ -634,12 +634,27 @@ pub struct SystemExtensionReceipt {
     pub local_proxy_port: u16,
     pub permit_state: String,
     pub status: String,
+    #[serde(default)]
+    pub active_flows: usize,
     pub reason: Option<String>,
 }
 
 impl SystemExtensionReceipt {
     pub fn is_fresh(&self, now: f64, max_age_seconds: f64) -> bool {
         self.applied_at > 0.0 && (now - self.applied_at).abs() <= max_age_seconds
+    }
+
+    pub fn is_disconnecting(&self) -> bool {
+        self.status == "disconnecting"
+            || self.permit_state == "disconnecting"
+            || (self.status == "revoked" && self.active_flows > 0)
+    }
+
+    pub fn is_confirmed_revoked(&self, min_command_seq: u64, min_generation: u64) -> bool {
+        (self.status == "revoked" || self.permit_state == "revoked")
+            && self.active_flows == 0
+            && self.permit_generation >= min_generation
+            && self.command_seq >= min_command_seq
     }
 
     pub fn matches_supervision(
