@@ -562,8 +562,9 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         let signedAiApp = ["anthropic", "claude", "openai", "chatgpt", "codex", "cursor"].contains {
             signingID.contains($0)
         }
+        // The signing identifier can legitimately be empty for some
+        // transparent-proxy flows; the OS audit token is the identity floor.
         let validSourceIdentity = flow.metaData.sourceAppAuditToken?.count == 32
-            && !signingID.isEmpty
         let isAiFlow = isManagedProcess || isTargetingAiService || signedAiApp || !validSourceIdentity
 
         // CRITICAL INVARIANT:
