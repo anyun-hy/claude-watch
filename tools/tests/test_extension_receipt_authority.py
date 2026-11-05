@@ -14,6 +14,8 @@ class ExecutionReceiptAuthority(unittest.TestCase):
         self.assertIn("receipt.is_fresh(now, 8.0)", DAEMON)
         self.assertIn("receipt.policy_version == policy.policy_digest", DAEMON)
         self.assertNotIn('Some("扩展独立心跳在线")', DAEMON)
+        self.assertIn("system_extension_command_superseded", DAEMON)
+        self.assertIn("record_activation_failure", DAEMON)
 
     def test_revoke_requires_final_receipt_and_exact_identity(self):
         method = CORE.split("pub fn is_confirmed_revoked", 1)[1].split(

@@ -248,6 +248,40 @@ impl ProductionChannelStack {
             }
         }
         self.drain_background_events()?;
+        // Process/policy events above can supersede the command checked at
+        // the beginning of this tick. Reconcile again before publication.
+        let still_current = self.supervisor.storage
+            .read_json(&receipt_path, Value::Null)
+            .ok()
+            .and_then(|value| serde_json::from_value::<SystemExtensionReceipt>(value).ok())
+            .and_then(|receipt| {
+                self.supervisor.authoritative_state_for_family("claude")
+                    .map(|(policy, seq, generation, expected)| {
+                        receipt.is_fresh(now, 8.0)
+                            && receipt.policy_version == policy.policy_digest
+                            && receipt.command_seq == seq
+                            && receipt.permit_generation == generation
+                            && match expected {
+                                Some(claude_watch_core::channel::ChannelPermitState::Permitted) =>
+                                    receipt.matches_supervision(&policy.policy_digest, seq, generation),
+                                Some(claude_watch_core::channel::ChannelPermitState::Revoked) =>
+                                    receipt.is_confirmed_revoked(seq, generation),
+                                _ => false,
+                            }
+                    })
+            })
+            .unwrap_or(false);
+        if extension_confirmed && !still_current {
+            let _ = self.enforcer.set_system_extension_active(
+                false, Some("system_extension_command_superseded"), now,
+            );
+            // Publish a failed executor receipt; flipping a boolean without
+            // an event can leave a stale successful supervisor snapshot.
+            let _ = self.enforcer.record_activation_failure(
+                "system_extension_command_superseded", now,
+            );
+            self.drain_background_events()?;
+        }
         let snapshot = self.supervisor.snapshot(system.now());
 
         // Direct command issuance to system extension (operates independently even when UI is not running)
