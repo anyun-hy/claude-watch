@@ -146,7 +146,10 @@ impl Controller {
             // exit (`quit_desktop` / `quit_for_confirmed_ip_risk`).
             receipt["disposition_mode"] = json!("disconnect_channel_keep_process");
             receipt["process_preserved"] = json!(true);
-            Ok(StopOutcome::Confirmed)
+            receipt["action"] = json!("disconnect-channel");
+            receipt["stop_state"] = json!("disconnecting");
+            // The executor receipt, not this request, establishes isolation.
+            Ok(StopOutcome::SkippedWarn)
         } else if action == "force" && family.is_some_and(|f| f.performable("force")) {
             let mut forced = None;
             let result = system.quit_for_confirmed_ip_risk(&mut forced);
