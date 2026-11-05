@@ -1,5 +1,5 @@
 use claude_watch_core::{
-    channel::{BoundProcessToken, ChannelMonitorSnapshot, PolicyVersion},
+    channel::{BoundProcessToken, ChannelMonitorSnapshot, PolicyVersion, SystemExtensionReceipt},
     cli::Request,
     error::{CoreError, Result},
     policy::PolicyCatalog,
@@ -58,6 +58,7 @@ where
         &uuid::Uuid::new_v4().simple().to_string()[..12]
     );
     let enforcer = Arc::new(LocalTunnelEnforcer::new(boot_id, Some(storage.clone())));
+    enforcer.set_strict_peer_verification(true);
     if activate_local_interception {
         let now_ts = native::now();
         // Production: starts local proxy listener, keeping system_extension_active as false
@@ -137,21 +138,58 @@ impl ProductionChannelStack {
         self.drain_background_events()?;
         let now = system.now();
 
-        // Sync system extension activation status from host manager
+        // Sync system extension activation status from host manager with strict freshness check
         let ext_status_path = self
             .supervisor
             .storage
             .paths
             .watch()
             .join("state/system-extension-status.json");
-        if let Ok(ext_val) = self
+        if ext_status_path.exists() {
+            if let Ok(ext_val) = self
+                .supervisor
+                .storage
+                .read_json(&ext_status_path, Value::Null)
+            {
+                let updated_at = ext_val.get("updated_at").and_then(Value::as_f64).unwrap_or(0.0);
+                let is_fresh = updated_at > 0.0 && (now - updated_at).abs() <= 30.0;
+                if is_fresh {
+                    if let Some(active) = ext_val.get("is_tunnel_active").and_then(Value::as_bool) {
+                        let detail = ext_val.get("detail").and_then(Value::as_str);
+                        let _ = self.enforcer.set_system_extension_active(active, detail, now);
+                    }
+                } else {
+                    let _ = self.enforcer.set_system_extension_active(
+                        false,
+                        Some("扩展状态文件过期（可能宿主或扩展已停止）"),
+                        now,
+                    );
+                }
+            }
+        }
+
+        // Validate authoritative system extension receipt
+        let receipt_path = self
             .supervisor
             .storage
-            .read_json(&ext_status_path, Value::Null)
-        {
-            if let Some(active) = ext_val.get("is_tunnel_active").and_then(Value::as_bool) {
-                let detail = ext_val.get("detail").and_then(Value::as_str);
-                let _ = self.enforcer.set_system_extension_active(active, detail, now);
+            .paths
+            .watch()
+            .join("state/system-extension-receipt.json");
+        if receipt_path.exists() {
+            if let Ok(receipt_val) = self
+                .supervisor
+                .storage
+                .read_json(&receipt_path, Value::Null)
+            {
+                if let Ok(receipt) = serde_json::from_value::<SystemExtensionReceipt>(receipt_val) {
+                    if !receipt.is_fresh(now, 30.0) {
+                        let _ = self.enforcer.set_system_extension_active(
+                            false,
+                            Some("系统扩展回执已过期，当前策略可能未在内核层生效"),
+                            now,
+                        );
+                    }
+                }
             }
         }
 
@@ -217,7 +255,67 @@ impl ProductionChannelStack {
             }
         }
         self.drain_background_events()?;
-        Ok(self.supervisor.snapshot(system.now()))
+        let snapshot = self.supervisor.snapshot(system.now());
+
+        // Direct command issuance to system extension (operates independently even when UI is not running)
+        if let Some(claude_state) = snapshot.families.get("claude") {
+            let cmd_path = self
+                .supervisor
+                .storage
+                .paths
+                .watch()
+                .join("state/system-extension-command.json");
+            let secret_path = self
+                .supervisor
+                .storage
+                .paths
+                .watch()
+                .join("state/.extension-secret");
+            let secret = self
+                .supervisor
+                .storage
+                .read_bytes(&secret_path, 4096)
+                .ok()
+                .flatten()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_default();
+            let policy_ver = claude_state
+                .applied_policy_version
+                .as_ref()
+                .map(|p| p.policy_digest.clone())
+                .unwrap_or_else(|| claude_state.saved_policy_version.policy_digest.clone());
+
+            if claude_state.permit_state == claude_watch_core::channel::ChannelPermitState::Permitted {
+                if let (Some(port), Some(deadline)) = (claude_state.local_proxy_port, claude_state.valid_until) {
+                    if deadline > claude_state.updated_at {
+                        let cmd = serde_json::json!({
+                            "action": "update_permit",
+                            "policy_version": policy_ver,
+                            "command_seq": claude_state.command_seq,
+                            "permit_generation": claude_state.permit_generation,
+                            "valid_until": deadline as i64,
+                            "permit_state": "permitted",
+                            "allowed_pids": claude_state.active_member_pids,
+                            "local_proxy_port": port,
+                            "extension_secret": secret.trim(),
+                        });
+                        let _ = self.supervisor.storage.atomic_json(&cmd_path, &cmd);
+                    }
+                }
+            } else {
+                let cmd = serde_json::json!({
+                    "action": "revoke_channel",
+                    "policy_version": policy_ver,
+                    "command_seq": claude_state.command_seq,
+                    "permit_generation": claude_state.permit_generation,
+                    "reason": claude_state.reason_code,
+                    "extension_secret": secret.trim(),
+                });
+                let _ = self.supervisor.storage.atomic_json(&cmd_path, &cmd);
+            }
+        }
+
+        Ok(snapshot)
     }
 
     pub fn wait_or_drain(&mut self, deadline: Instant, stop: &AtomicBool) {
@@ -415,14 +513,56 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                                     launch: true,
                                 },
                             )?;
-                            let egress = audit_host
-                                .network
-                                .fast_egress()
-                                .data
-                                .unwrap_or_else(|| {
-                                    json!({"state":"unknown","observed_at":native::now()})
-                                });
-                            Ok((audit, egress, native::now()))
+                            if req.is_cancelled() {
+                                return Err(CoreError::new("audit_cancelled", "慢审计已超时取消"));
+                            }
+                            let enforcer = claude_watch_runtime::channel_enforcer::registered_production_enforcer(
+                                &audit_paths.watch(),
+                            );
+                            let now_ts = native::now();
+                            let egress = if let Some(ref enf) = enforcer {
+                                let probe_res = enf.probe_via_controlled_diagnostic_channel(
+                                    &req.family,
+                                    &req.session_id.clone().unwrap_or_else(|| "diag-ctx".into()),
+                                    now_ts,
+                                    |proxy_endpoint| {
+                                        let receipt = audit_host.network.fast_egress_via(Some(proxy_endpoint));
+                                        receipt.data.ok_or_else(|| {
+                                            let msg = receipt.error.unwrap_or_else(|| "慢审计受控诊断通道探测无返回".into());
+                                            CoreError::new("controlled_diagnostic_probe_failed", &msg)
+                                        })
+                                    },
+                                );
+                                match probe_res {
+                                    Ok((mut data, evidence)) => {
+                                        data["via_controlled_path"] = serde_json::json!(true);
+                                        data["family"] = serde_json::json!(evidence.family);
+                                        data["upstream_endpoint"] = serde_json::json!(evidence.upstream_endpoint);
+                                        data["context_id"] = serde_json::json!(evidence.context_id);
+                                        data["policy_version"] = serde_json::to_value(&evidence.policy_version)
+                                            .unwrap_or(serde_json::Value::Null);
+                                        data["observed_at"] = serde_json::json!(evidence.observed_at);
+                                        data
+                                    }
+                                    Err(e) => {
+                                        serde_json::json!({
+                                            "state": "unknown",
+                                            "error": e.to_string(),
+                                            "via_controlled_path": false,
+                                            "observed_at": now_ts,
+                                        })
+                                    }
+                                }
+                            } else {
+                                let mut data = audit_host
+                                    .network
+                                    .fast_egress()
+                                    .data
+                                    .unwrap_or_else(|| serde_json::json!({"state":"unknown","observed_at": now_ts}));
+                                data["via_controlled_path"] = serde_json::json!(false);
+                                data
+                            };
+                            Ok((audit, egress, now_ts))
                         },
                     )?;
                     let controller = Controller::new(store.clone());

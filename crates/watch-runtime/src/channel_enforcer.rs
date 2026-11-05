@@ -222,6 +222,7 @@ struct EnforcerInner {
     traces: Vec<ConnectionTraceEvent>,
     next_trace_seq: u64,
     extension_secret: String,
+    strict_peer_verification: bool,
 }
 
 pub struct LocalTunnelEnforcer {
@@ -272,9 +273,54 @@ impl LocalTunnelEnforcer {
                 traces: Vec::new(),
                 next_trace_seq: 1,
                 extension_secret,
+                strict_peer_verification: false,
             })),
             next_flow_id: Arc::new(AtomicU64::new(1)),
             storage,
+        }
+    }
+
+    pub fn set_strict_peer_verification(&self, strict: bool) {
+        if let Ok(mut guard) = self.lock() {
+            guard.strict_peer_verification = strict;
+        }
+    }
+
+    pub fn verify_peer_is_system_extension(&self, peer_addr: SocketAddr) -> bool {
+        let is_strict = self
+            .lock()
+            .map(|g| g.strict_peer_verification)
+            .unwrap_or(false);
+        if !is_strict {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let port = peer_addr.port();
+            let output = std::process::Command::new("/usr/sbin/lsof")
+                .args(["-n", "-P", "-i", &format!("TCP@127.0.0.1:{}", port), "-F", "c"])
+                .output();
+            if let Ok(out) = output {
+                if out.status.success() {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    for line in text.lines() {
+                        if let Some(cmd) = line.strip_prefix('c') {
+                            let cmd_lower = cmd.to_lowercase();
+                            if cmd_lower.contains("watchchannelextension")
+                                || cmd_lower.contains("network-extension")
+                                || cmd_lower.contains("networkextension")
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            true
         }
     }
 
@@ -991,31 +1037,55 @@ impl LocalTunnelEnforcer {
                                     let mut req_secret: Option<String> = None;
                                     let mut x_pid: Option<u32> = None;
                                     let mut x_uid: Option<u32> = None;
+                                    let mut x_audit_hex: Option<String> = None;
                                     for line in header.lines() {
                                         if let Some(v) = line.strip_prefix("X-Watch-PID:").or_else(|| line.strip_prefix("x-watch-pid:")) {
                                             x_pid = v.trim().parse().ok();
                                         } else if let Some(v) = line.strip_prefix("X-Watch-UID:").or_else(|| line.strip_prefix("x-watch-uid:")) {
                                             x_uid = v.trim().parse().ok();
+                                        } else if let Some(v) = line.strip_prefix("X-Watch-Audit-Token:").or_else(|| line.strip_prefix("x-watch-audit-token:")) {
+                                            x_audit_hex = Some(v.trim().to_string());
                                         } else if let Some(v) = line.strip_prefix("X-Watch-Extension-Secret:").or_else(|| line.strip_prefix("x-watch-extension-secret:")) {
                                             req_secret = Some(v.trim().to_string());
                                         }
                                     }
                                     // Security invariant: strictly authenticate that this loopback stream originates from
-                                    // our verified NetworkExtension by validating the shared extension secret.
-                                    if enf.verify_extension_secret(req_secret.as_deref()) {
+                                    // our verified NetworkExtension by validating:
+                                    // 1. Peer process via system lsof
+                                    // 2. Shared extension secret
+                                    // 3. Kernel Mach audit token (X-Watch-Audit-Token)
+                                    let is_secret_valid = enf.verify_extension_secret(req_secret.as_deref());
+                                    let is_peer_sys_ext = enf.verify_peer_is_system_extension(peer_addr);
+                                    if is_secret_valid && is_peer_sys_ext {
                                         if let (Some(pid), Some(uid)) = (x_pid, x_uid) {
-                                            if let Ok(guard) = enf.lock() {
-                                                for (fam, st) in &guard.families {
-                                                    if let Some(cmd) = &st.command {
-                                                        for tok in &cmd.allowed_processes {
-                                                            if tok.pid == pid && tok.uid == uid && tok.has_valid_identity() {
-                                                                resolved_identity = Some((fam.clone(), tok.clone()));
+                                            // Hard requirement: MUST provide valid kernel Mach audit token (X-Watch-Audit-Token)
+                                            if let Some(parsed_audit) = x_audit_hex.as_deref().and_then(parse_audit_token_hex) {
+                                                if parsed_audit[5] == pid && (parsed_audit[1] == uid || parsed_audit[3] == uid) {
+                                                    if let Ok(guard) = enf.lock() {
+                                                        for (fam, st) in &guard.families {
+                                                            if let Some(cmd) = &st.command {
+                                                                for tok in &cmd.allowed_processes {
+                                                                    if tok.pid == pid && tok.uid == uid {
+                                                                        let matched_tok = if let Some(ref expected) = tok.audit_token {
+                                                                            if expected == &parsed_audit {
+                                                                                tok.clone()
+                                                                            } else {
+                                                                                continue;
+                                                                            }
+                                                                        } else {
+                                                                            tok.clone().with_audit_token(parsed_audit)
+                                                                        };
+                                                                        if matched_tok.has_valid_identity() {
+                                                                            resolved_identity = Some((fam.clone(), matched_tok));
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            if resolved_identity.is_some() {
                                                                 break;
                                                             }
                                                         }
-                                                    }
-                                                    if resolved_identity.is_some() {
-                                                        break;
                                                     }
                                                 }
                                             }
@@ -2379,4 +2449,25 @@ impl LocalTunnelEnforcer {
             }
         })
     }
+}
+
+fn parse_audit_token_hex(hex: &str) -> Option<[u32; 8]> {
+    let clean = hex.trim();
+    if clean.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for i in 0..32 {
+        bytes[i] = u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    let mut words = [0u32; 8];
+    for i in 0..8 {
+        words[i] = u32::from_ne_bytes([
+            bytes[i * 4],
+            bytes[i * 4 + 1],
+            bytes[i * 4 + 2],
+            bytes[i * 4 + 3],
+        ]);
+    }
+    Some(words)
 }

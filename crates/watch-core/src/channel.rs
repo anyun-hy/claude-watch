@@ -216,6 +216,10 @@ impl BoundProcessToken {
         }
     }
 
+    pub fn has_verified_audit_token(&self) -> bool {
+        self.has_valid_identity() && self.audit_token.is_some()
+    }
+
     pub fn matches_process(
         &self,
         pid: u32,
@@ -617,6 +621,41 @@ pub fn evaluate_channel_supervision_with_boot_id(
     }
 }
 
+/// System extension execution receipt produced by WatchChannelExtension.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SystemExtensionReceipt {
+    pub policy_version: String,
+    pub command_seq: u64,
+    pub permit_generation: u64,
+    pub applied_at: f64,
+    #[serde(default)]
+    pub allowed_pids: Vec<u32>,
+    #[serde(default)]
+    pub local_proxy_port: u16,
+    pub permit_state: String,
+    pub status: String,
+    pub reason: Option<String>,
+}
+
+impl SystemExtensionReceipt {
+    pub fn is_fresh(&self, now: f64, max_age_seconds: f64) -> bool {
+        self.applied_at > 0.0 && (now - self.applied_at).abs() <= max_age_seconds
+    }
+
+    pub fn matches_supervision(
+        &self,
+        expected_policy_version: &str,
+        expected_command_seq: u64,
+        expected_generation: u64,
+    ) -> bool {
+        self.status == "ok"
+            && self.permit_state == "permitted"
+            && self.policy_version == expected_policy_version
+            && self.command_seq == expected_command_seq
+            && self.permit_generation == expected_generation
+    }
+}
+
 /// Restoring a revoked channel requires fresh evidence sampled strictly after
 /// the revocation timestamp under the current session and current policy version.
 /// Old probe results or another session's audit can never re-open a blocked channel.
@@ -680,24 +719,23 @@ pub fn verify_channel_recovery(
             "当前出口仍处风险区或不晚于阻断时刻，不能恢复通道",
         ));
     }
-    if let Ok(ev) = serde_json::from_value::<ControlledPathEvidence>(egress.clone()) {
-        if let Err(err_code) = ev.matches_path(
-            &previous.family,
-            ev.upstream_endpoint.as_str(),
-            current_policy,
-            Some(context_id),
-            now,
-            GUARD_EGRESS_TTL,
-        ) {
-            return Err(CoreError::new(
-                err_code,
-                "当前出口证据未通过受控通道同路径验证，不能恢复通道",
-            ));
-        }
-    } else if egress.get("via_controlled_path").and_then(|v| v.as_bool()) == Some(false) {
-        return Err(CoreError::new(
+    let ev: ControlledPathEvidence = serde_json::from_value(egress.clone()).map_err(|_| {
+        CoreError::new(
             "evidence_not_from_controlled_path",
-            "当前出口证据非来自受控诊断通道，不能恢复通道",
+            "当前出口证据反序列化失败或缺少受控诊断同路径必要字段，不能恢复通道",
+        )
+    })?;
+    if let Err(err_code) = ev.matches_path(
+        &previous.family,
+        ev.upstream_endpoint.as_str(),
+        current_policy,
+        Some(context_id),
+        now,
+        GUARD_EGRESS_TTL,
+    ) {
+        return Err(CoreError::new(
+            err_code,
+            "当前出口证据未通过受控通道同路径验证，不能恢复通道",
         ));
     }
     if context_id.is_empty() {
@@ -1104,7 +1142,12 @@ mod tests {
             "ip": "1.1.1.1",
             "country": "JP",
             "observed_at": 1005.0,
-            "source": "fixture"
+            "source": "fixture",
+            "via_controlled_path": true,
+            "family": "claude",
+            "upstream_endpoint": "127.0.0.1:7890",
+            "context_id": "ctx-2",
+            "policy_version": v2,
         });
         // Wrong session ("s0" vs "s1") rejected
         assert_eq!(
@@ -1343,19 +1386,21 @@ mod tests {
 
     #[test]
     fn bound_process_token_rejects_zero_uid_or_missing_audit_token() {
-        let valid_token = BoundProcessToken::with_system_identity(
+        let unverified_token = BoundProcessToken::with_system_identity(
             4100,
             501,
             900,
             1,
             ProcessRole::DesktopMain,
         );
-        assert!(valid_token.has_valid_identity());
-        assert!(valid_token.matches_process(4100, 501, 900, 1, None));
-        assert!(!valid_token.matches_process(4100, 0, 900, 1, None));
+        // Basic process identity is present, but verified audit token is not
+        assert!(unverified_token.has_valid_identity());
+        assert!(!unverified_token.has_verified_audit_token());
+        assert!(unverified_token.matches_process(4100, 501, 900, 1, None));
 
-        let audited_token = valid_token.clone().with_audit_token([501, 501, 20, 501, 20, 4100, 1000, 0]);
+        let audited_token = unverified_token.clone().with_audit_token([501, 501, 20, 501, 20, 4100, 1000, 0]);
         assert!(audited_token.has_valid_identity());
+        assert!(audited_token.has_verified_audit_token());
         assert!(audited_token.matches_process(4100, 501, 900, 1, Some(&[501, 501, 20, 501, 20, 4100, 1000, 0])));
         assert!(!audited_token.matches_process(4100, 501, 900, 1, None));
 

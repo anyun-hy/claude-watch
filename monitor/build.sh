@@ -112,7 +112,7 @@ cat > "$SYSEXT_DIR/Contents/Info.plist" <<PLIST
     <key>NEMachServiceName</key><string>io.local.watchpanel.network-extension</string>
     <key>NEProviderClasses</key>
     <dict>
-        <key>com.apple.networkextension.packet-tunnel</key><string>WatchChannelExtension</string>
+        <key>com.apple.networkextension.app-proxy</key><string>WatchChannelExtension</string>
     </dict>
 </dict>
 </dict></plist>

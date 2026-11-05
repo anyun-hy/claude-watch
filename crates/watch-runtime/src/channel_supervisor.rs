@@ -104,7 +104,7 @@ pub enum SupervisionEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct AsyncAuditRequest {
     pub request_id: u64,
     pub family: String,
@@ -112,6 +112,27 @@ pub struct AsyncAuditRequest {
     pub policy_version: PolicyVersion,
     pub requested_at: f64,
     pub timeout_seconds: f64,
+    pub cancellation: Option<Arc<AtomicBool>>,
+}
+
+impl PartialEq for AsyncAuditRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.request_id == other.request_id
+            && self.family == other.family
+            && self.session_id == other.session_id
+            && self.policy_version == other.policy_version
+            && self.requested_at == other.requested_at
+            && self.timeout_seconds == other.timeout_seconds
+    }
+}
+
+impl AsyncAuditRequest {
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .map(|c| c.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -284,7 +305,18 @@ impl ChannelSupervisor {
         let handle = thread::Builder::new()
             .name("channel-async-audit-worker".into())
             .spawn(move || {
+                let mut detached_runners: Vec<(Arc<AtomicBool>, thread::JoinHandle<()>)> = Vec::new();
                 while !stop.load(Ordering::Acquire) {
+                    let mut idx = 0;
+                    while idx < detached_runners.len() {
+                        if detached_runners[idx].1.is_finished() {
+                            let (_, handle) = detached_runners.swap_remove(idx);
+                            let _ = handle.join();
+                        } else {
+                            idx += 1;
+                        }
+                    }
+
                     let Ok(req) = req_rx.recv_timeout(std::time::Duration::from_millis(50)) else {
                         continue;
                     };
@@ -293,7 +325,9 @@ impl ChannelSupervisor {
                     }
                     let runner = Arc::clone(&run_audit);
                     let (result_tx, result_rx) = mpsc::channel();
-                    let req_clone = req.clone();
+                    let cancellation = Arc::new(AtomicBool::new(false));
+                    let mut req_clone = req.clone();
+                    req_clone.cancellation = Some(cancellation.clone());
                     let start_instant = std::time::Instant::now();
                     let runner_thread = thread::Builder::new()
                         .name("channel-audit-runner".into())
@@ -353,7 +387,8 @@ impl ChannelSupervisor {
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // Immediate timeout without wedging runner or blocking subsequent audits
+                            // Immediate timeout: signal cancellation to underlying task and track runner
+                            cancellation.store(true, Ordering::Release);
                             let completed_at = req.requested_at + req.timeout_seconds;
                             let _ = event_tx.send(SupervisionEvent::AsyncAuditCompleted {
                                 request_id: req.request_id,
@@ -366,9 +401,16 @@ impl ChannelSupervisor {
                                 },
                                 completed_at,
                             });
+                            if let Ok(handle) = runner_thread {
+                                detached_runners.push((cancellation, handle));
+                            }
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => {}
                     }
+                }
+                for (cancel, handle) in detached_runners {
+                    cancel.store(true, Ordering::Release);
+                    let _ = handle.join();
                 }
             })
             .map_err(|_| CoreError::new("async_audit_worker_failed", "异步审计工作线程无法启动"))?;
@@ -826,6 +868,7 @@ impl ChannelSupervisor {
             policy_version: self.saved_policy_version.clone(),
             requested_at: now,
             timeout_seconds: DEFAULT_ASYNC_AUDIT_TIMEOUT_SECONDS,
+            cancellation: None,
         };
         if let Some(tx) = &self.audit_tx {
             if tx.send(req.clone()).is_ok() {
