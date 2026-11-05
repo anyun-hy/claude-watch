@@ -8,6 +8,17 @@ CW_BUILD_ARCH="${CW_BUILD_ARCH:-arm64}"
 CW_BACKEND_VARIANT="${CW_BACKEND_VARIANT:-rust-candidate}"
 BACKGROUND_EVIDENCE_SCHEMA=0
 CW_TARGETS="$CW_BUILD_ARCH"
+# Production extension deployment requires a Developer ID, two approved
+# provisioning profiles, and entitlements. Ad-hoc builds are development-only.
+CW_CODESIGN_IDENTITY="${CW_CODESIGN_IDENTITY:--}"
+if [[ "$CW_CODESIGN_IDENTITY" != "-" ]]; then
+  : "${CW_HOST_PROFILE:?Set CW_HOST_PROFILE for the signed host app}"
+  : "${CW_EXTENSION_PROFILE:?Set CW_EXTENSION_PROFILE for the signed system extension}"
+  [[ -f "$CW_HOST_PROFILE" && -f "$CW_EXTENSION_PROFILE" ]] || {
+    echo 'Both provisioning profiles must exist for a signed NetworkExtension build.' >&2
+    exit 1
+  }
+fi
 # The Python backend is retired: the app ships the Rust engine only. A build
 # that asks for anything else is a stale command line, not a supported target.
 if [[ "$CW_BACKEND_VARIANT" != rust-candidate ]]; then
@@ -117,7 +128,15 @@ cat > "$SYSEXT_DIR/Contents/Info.plist" <<PLIST
 </dict>
 </dict></plist>
 PLIST
-/usr/bin/codesign --force --sign - "$SYSEXT_DIR"
+if [[ "$CW_CODESIGN_IDENTITY" != "-" ]]; then
+  cp "$CW_EXTENSION_PROFILE" "$SYSEXT_DIR/Contents/embedded.provisionprofile"
+  /usr/bin/codesign --force --options runtime --sign "$CW_CODESIGN_IDENTITY" \
+    --entitlements "$ROOT/Signing/Extension.entitlements" "$SYSEXT_DIR"
+  /usr/bin/codesign --verify --strict --verbose=2 "$SYSEXT_DIR"
+else
+  /usr/bin/codesign --force --sign - "$SYSEXT_DIR"
+  echo 'WARNING: ad-hoc system extension is not eligible for production activation.' >&2
+fi
 cp "$ROOT/Resources/webrtc_probe.html" "$ROOT/Resources/webrtc_probe.js" "$APP/Contents/Resources/"
 cp "$ROOT/Resources/netcoffee_probe.html" "$ROOT/Resources/netcoffee_probe.js" "$ROOT/Resources/netcoffee_probe.css" "$ROOT/Resources/watch-admin.sh" "$APP/Contents/Resources/"
 cp "$ROOT/Resources/ipleak_probe.html" "$ROOT/Resources/ipleak_probe.js" "$APP/Contents/Resources/"
@@ -139,8 +158,8 @@ for key in ("engine", "native_observer", "process_control"):
     destination.chmod(0o700)
 PY
 chmod 700 "$APP/Contents/Resources/watch-process-control" "$APP/Contents/Resources/watch-admin.sh" "$APP/Contents/Resources/watch-leak-worker"
-/usr/bin/codesign --force --sign - "$APP/Contents/Resources/watch-process-control"
-/usr/bin/codesign --force --sign - "$APP/Contents/Resources/watch-leak-worker"
+/usr/bin/codesign --force --sign "$CW_CODESIGN_IDENTITY" "$APP/Contents/Resources/watch-process-control"
+/usr/bin/codesign --force --sign "$CW_CODESIGN_IDENTITY" "$APP/Contents/Resources/watch-leak-worker"
 cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/"
 mkdir -p "$APP/Contents/Resources/Icons"
 mkdir -p "$APP/Contents/Resources/Identity"
@@ -189,5 +208,13 @@ files = [root / n for n in ("watch-engine", "watch-native-observer", "watch-admi
 value["RuntimeHashes"] = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
 manifest.write_bytes(plistlib.dumps(value))
 PY
-/usr/bin/codesign --force --sign - "$APP"
+if [[ "$CW_CODESIGN_IDENTITY" != "-" ]]; then
+  cp "$CW_HOST_PROFILE" "$APP/Contents/embedded.provisionprofile"
+  /usr/bin/codesign --force --options runtime --sign "$CW_CODESIGN_IDENTITY" \
+    --entitlements "$ROOT/Signing/Host.entitlements" "$APP"
+  /usr/bin/codesign --verify --strict --deep --verbose=2 "$APP"
+  /usr/bin/codesign -d --entitlements :- "$APP" >/dev/null
+else
+  /usr/bin/codesign --force --sign - "$APP"
+fi
 printf 'Built: %s (app %s; backend %s)\n' "$APP" "$APP_VERSION" "$BACKEND_VERSION"

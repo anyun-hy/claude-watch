@@ -2,6 +2,7 @@ import Foundation
 import NetworkExtension
 import SystemExtensions
 import Combine
+import Security
 
 /// Lifecycle and activation state of the system network extension.
 public struct NetworkExtensionActivationState: Equatable, Sendable {
@@ -43,17 +44,29 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
         startAndActivateIfNeeded()
     }
 
-    /// Automatically sets up transparent proxy configuration and requests activation if needed.
+    /// Do not request installation with ad-hoc signing or absent host entitlement.
+    private func canInstallSystemExtension() -> Bool {
+        guard let task = SecTaskCreateFromSelf(nil) else { return false }
+        return SecTaskCopyValueForEntitlement(
+            task, "com.apple.developer.system-extension.install" as CFString, nil
+        ) as? Bool == true
+    }
+
     public func startAndActivateIfNeeded() {
+        guard canInstallSystemExtension() else {
+            let unavailable = NetworkExtensionActivationState(
+                isSystemExtensionActive: false,
+                isTunnelActive: false,
+                detail: "应用未具备系统扩展安装权限，请使用已授权的开发者签名",
+                lastErrorCode: "missing_system_extension_entitlement"
+            )
+            activationState = unavailable
+            persistActivationStatus(state: unavailable)
+            return
+        }
         refreshStatus { [weak self] ready in
             guard let self = self else { return }
-            if !ready {
-                self.setupAndEnableTransparentProxyConfiguration { success in
-                    if success {
-                        self.requestActivation()
-                    }
-                }
-            }
+            if !ready { self.requestActivation() }
         }
     }
 
@@ -85,20 +98,25 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
             self.targetProviderManager = manager
 
             let isEnabled = manager?.isEnabled ?? false
-            let isConnected = manager?.connection.status == .connected
+            let isConnected = isEnabled && manager?.connection.status == .connected
 
             // If configured and enabled but tunnel is disconnected, attempt to connect
             if isEnabled && !isConnected, let session = manager?.connection as? NETunnelProviderSession {
                 if session.status == .disconnected || session.status == .invalid {
-                    try? session.startTunnel(options: nil)
+                    do {
+                        try session.startTunnel(options: nil)
+                    } catch {
+                        self.recordExtensionFailure(reason: "start_tunnel_failed: \(error.localizedDescription)")
+                    }
                 }
             }
 
             DispatchQueue.main.async {
                 let newState = NetworkExtensionActivationState(
-                    isSystemExtensionActive: isEnabled,
+                    // Preferences enabled does not prove the provider is running.
+                    isSystemExtensionActive: isConnected,
                     isTunnelActive: isConnected,
-                    detail: isConnected ? "网络接管正常运行" : (isEnabled ? "扩展已配置但通道建立中" : "网络扩展未启用"),
+                    detail: isConnected ? "透明代理已连接（待执行回执确认保护）" : (isEnabled ? "配置存在，尚未确认网络接管" : "网络扩展未启用"),
                     lastErrorCode: nil
                 )
                 self.activationState = newState
@@ -160,7 +178,7 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
                         }
                     }
                     self.refreshStatus()
-                    completion?(true)
+                    completion?(readyMgr != nil && readyMgr?.isEnabled == true)
                 }
             }
         }
@@ -213,8 +231,10 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
                 lastErrorCode: nil
             )
             // Immediately configure and start tunnel once extension activation succeeds
-            self.setupAndEnableTransparentProxyConfiguration { _ in
-                self.refreshStatus()
+            if active {
+                self.setupAndEnableTransparentProxyConfiguration { _ in
+                    self.refreshStatus()
+                }
             }
         }
     }

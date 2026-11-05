@@ -641,7 +641,9 @@ pub struct SystemExtensionReceipt {
 
 impl SystemExtensionReceipt {
     pub fn is_fresh(&self, now: f64, max_age_seconds: f64) -> bool {
-        self.applied_at > 0.0 && (now - self.applied_at).abs() <= max_age_seconds
+        self.applied_at.is_finite() && now.is_finite() && max_age_seconds > 0.0
+            && self.applied_at > 0.0 && self.applied_at <= now + 1.0
+            && now - self.applied_at <= max_age_seconds
     }
 
     pub fn is_disconnecting(&self) -> bool {
@@ -651,10 +653,10 @@ impl SystemExtensionReceipt {
     }
 
     pub fn is_confirmed_revoked(&self, min_command_seq: u64, min_generation: u64) -> bool {
-        (self.status == "revoked" || self.permit_state == "revoked")
+        self.status == "revoked" && self.permit_state == "revoked"
             && self.active_flows == 0
-            && self.permit_generation >= min_generation
-            && self.command_seq >= min_command_seq
+            && self.permit_generation == min_generation
+            && self.command_seq == min_command_seq
     }
 
     pub fn matches_supervision(
@@ -1430,4 +1432,35 @@ mod tests {
         assert!(!placeholder_token.has_valid_identity());
         assert!(!placeholder_token.matches_process(4100, 0, 900, 1, None));
     }
+    #[test]
+    fn system_extension_receipt_requires_exact_confirmed_execution() {
+        let mut receipt = SystemExtensionReceipt {
+            policy_version: "policy".into(),
+            command_seq: 14,
+            permit_generation: 5,
+            applied_at: 100.0,
+            allowed_pids: vec![],
+            local_proxy_port: 7890,
+            permit_state: "revoked".into(),
+            status: "revoked".into(),
+            active_flows: 0,
+            reason: None,
+        };
+        assert!(receipt.is_confirmed_revoked(14, 5));
+        assert!(receipt.is_fresh(105.0, 8.0));
+        receipt.status = "drain_timeout_unconfirmed".into();
+        assert!(!receipt.is_confirmed_revoked(14, 5));
+        receipt.status = "revoked".into();
+        receipt.permit_state = "disconnecting".into();
+        assert!(!receipt.is_confirmed_revoked(14, 5));
+        receipt.permit_state = "revoked".into();
+        assert!(!receipt.is_confirmed_revoked(13, 5));
+        assert!(!receipt.is_confirmed_revoked(14, 4));
+        receipt.active_flows = 1;
+        assert!(!receipt.is_confirmed_revoked(14, 5));
+        receipt.active_flows = 0;
+        receipt.applied_at = 110.0;
+        assert!(!receipt.is_fresh(100.0, 8.0));
+    }
+
 }

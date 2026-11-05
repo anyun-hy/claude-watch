@@ -34,6 +34,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
     private var localProxyHost: String = "127.0.0.1"
     private var currentPolicyVersion: String = ""
     private var currentCommandSeq: UInt64 = 0
+    private var providerBootEpochSeconds: TimeInterval = 0
     private var currentPermitGeneration: UInt64 = 0
     private var activeLeaseDeadlineEpochSeconds: Int64 = 0
     private var managedPids: Set<UInt32> = []
@@ -118,6 +119,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
     open override func startProxy(options: [String: Any]? = nil, completionHandler: @escaping (Error?) -> Void) {
         logger.info("WatchChannelExtension startProxy requested")
         stateLock.lock()
+        providerBootEpochSeconds = Date().timeIntervalSince1970
         isInterceptionActive = true
         isDirectFallbackBlocked = true
         if let opts = options {
@@ -158,6 +160,13 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             guard let self = self else { return }
             if let error = error {
                 self.logger.error("Failed to set tunnel network settings: \(error.localizedDescription)")
+                self.stateLock.lock()
+                self.isInterceptionActive = false
+                self.isPermitted = false
+                self.writeSystemExtensionReceiptLocked(
+                    status: "activation_failed", reason: "set_tunnel_network_settings"
+                )
+                self.stateLock.unlock()
                 completionHandler(error)
                 return
             }
@@ -363,10 +372,22 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             stateLock.lock()
             let incomingGen = (json["permit_generation"] as? UInt64) ?? 0
             let incomingSeq = (json["command_seq"] as? UInt64) ?? 0
+            let issuedAt = (json["issued_at"] as? Double) ?? 0
+            let issuedInThisBoot = issuedAt >= providerBootEpochSeconds && issuedAt <= Date().timeIntervalSince1970 + 1
 
+            let policy = (json["policy_version"] as? String) ?? ""
+            let wantsPermit = json["permit_state"] as? String == "permitted"
+            let deadline = (json["valid_until"] as? Int64) ?? 0
+            let validPermit = !wantsPermit || (deadline > Int64(Date().timeIntervalSince1970)
+                && (json["local_proxy_port"] as? UInt16) != nil)
+            let validPolicyTransition = !currentPolicyVersion.isEmpty
+                && policy != currentPolicyVersion
+                ? incomingGen > currentPermitGeneration : true
             // Invariant: Strictly monotonic command progression.
             // Stale or replayed update_permit commands MUST NOT overwrite current revocation or higher generation permit!
-            guard isCommandNewerLocked(permitGen: incomingGen, cmdSeq: incomingSeq) else {
+            guard issuedInThisBoot && !policy.isEmpty && validPermit
+                && validPolicyTransition
+                && isCommandNewerLocked(permitGen: incomingGen, cmdSeq: incomingSeq) else {
                 logger.warning("Rejecting stale update_permit: incoming gen=\(incomingGen), seq=\(incomingSeq) <= current gen=\(self.currentPermitGeneration), seq=\(self.currentCommandSeq)")
                 let flowsCount = activeFlows.count
                 stateLock.unlock()
@@ -405,24 +426,31 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             if !self.isPermitted {
                 terminateAllActiveFlowsLocked(reason: "permit_revoked")
             }
-            writeSystemExtensionReceiptLocked(
-                status: "ok",
-                reason: nil
-            )
             let flowsCount = activeFlows.count
+            let permittedNow = isPermitted
+            let resultStatus = permittedNow ? "ok" : (flowsCount == 0 ? "revoked" : "disconnecting")
+            writeSystemExtensionReceiptLocked(status: resultStatus, reason: nil)
             stateLock.unlock()
+            if permittedNow {
+                stopDrainCheck()
+            } else if flowsCount > 0 {
+                scheduleDrainCheck(reason: "permit_revoked")
+            }
 
-            logger.info("Permit updated: isPermitted=\(self.isPermitted), deadline=\(self.activeLeaseDeadlineEpochSeconds), gen=\(incomingGen), seq=\(incomingSeq)")
-            let resp: [String: Any] = ["status": "ok", "active_flows": flowsCount]
+            logger.info("Permit updated: isPermitted=\(permittedNow), deadline=\(self.activeLeaseDeadlineEpochSeconds), gen=\(incomingGen), seq=\(incomingSeq)")
+            let resp: [String: Any] = ["status": resultStatus, "active_flows": flowsCount]
             completionHandler?(try? JSONSerialization.data(withJSONObject: resp))
 
         case "revoke_channel":
             stateLock.lock()
             let incomingGen = (json["permit_generation"] as? UInt64) ?? 0
             let incomingSeq = (json["command_seq"] as? UInt64) ?? 0
+            let issuedAt = (json["issued_at"] as? Double) ?? 0
+            let issuedInThisBoot = issuedAt >= providerBootEpochSeconds && issuedAt <= Date().timeIntervalSince1970 + 1
 
             // Check if revocation command is older than current command
-            if !isCommandNewerLocked(permitGen: incomingGen, cmdSeq: incomingSeq) {
+            if !issuedInThisBoot || (json["policy_version"] as? String ?? "").isEmpty
+                || !isCommandNewerLocked(permitGen: incomingGen, cmdSeq: incomingSeq) {
                 logger.warning("Rejecting stale revoke_channel: incoming gen=\(incomingGen), seq=\(incomingSeq) < current gen=\(self.currentPermitGeneration), seq=\(self.currentCommandSeq)")
                 stateLock.unlock()
                 let resp: [String: Any] = ["status": "rejected_stale"]
@@ -527,7 +555,13 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         }
 
         let (isManagedProcess, flowPid, flowUid) = inspectFlowAttribution(flow)
-        let isAiFlow = isManagedProcess || isTargetingAiService
+        let signingID = flow.metaData.sourceAppSigningIdentifier.lowercased()
+        let signedAiApp = ["anthropic", "claude", "openai", "chatgpt", "codex", "cursor"].contains {
+            signingID.contains($0)
+        }
+        let validSourceIdentity = flow.metaData.sourceAppAuditToken?.count == 32
+            && !signingID.isEmpty
+        let isAiFlow = isManagedProcess || isTargetingAiService || signedAiApp || !validSourceIdentity
 
         // CRITICAL INVARIANT:
         // Returning `false` in NETransparentProxyProvider instructs the macOS kernel network stack
@@ -581,9 +615,19 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         let flowID = UUID()
 
         stateLock.lock()
-        activeFlows[flowID] = ActiveFlowRecord(flow: tcpFlow, connection: connection)
-        totalForwardedFlows += 1
+        let authorizedAtRegistration = isInterceptionActive && isPermitted
+            && activeLeaseDeadlineEpochSeconds > Int64(Date().timeIntervalSince1970)
+            && allowedPids.contains(flowPid)
+        if authorizedAtRegistration {
+            activeFlows[flowID] = ActiveFlowRecord(flow: tcpFlow, connection: connection)
+            totalForwardedFlows += 1
+        }
         stateLock.unlock()
+        guard authorizedAtRegistration else {
+            connection.cancel()
+            closeFlowImmediately(tcpFlow, reason: "permit_changed_before_registration")
+            return true
+        }
 
         // Extract Mach sourceAppAuditToken hex for authentic source verification
         var auditTokenHex = ""
@@ -614,12 +658,19 @@ open class WatchChannelExtension: NETransparentProxyProvider {
                     self.logger.error("Gateway rejected CONNECT handshake: \(err.localizedDescription)")
                     self.cleanupFlow(id: flowID, error: err)
                 case .success(let remainingPayload):
-                    // Step 3: Gateway tunnel established! Open client flow and start bidirectional data pump
+                    guard self.isForwardAuthorized(flowID: flowID, pid: flowPid) else {
+                        self.cleanupFlow(id: flowID, error: nil)
+                        return
+                    }
                     tcpFlow.open(withLocalEndpoint: nil) { [weak self, weak tcpFlow, weak connection] openErr in
                         guard let self = self, let tcpFlow = tcpFlow, let connection = connection else { return }
                         if let openErr = openErr {
                             self.logger.error("Failed to open TCP flow to client: \(openErr.localizedDescription)")
                             self.cleanupFlow(id: flowID, error: openErr)
+                            return
+                        }
+                        guard self.isForwardAuthorized(flowID: flowID, pid: flowPid) else {
+                            self.cleanupFlow(id: flowID, error: nil)
                             return
                         }
 
@@ -637,6 +688,15 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             }
         }
         return true
+    }
+
+    private func isForwardAuthorized(flowID: UUID, pid: UInt32) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard let record = activeFlows[flowID], !record.isClosing else { return false }
+        return isInterceptionActive && isPermitted
+            && activeLeaseDeadlineEpochSeconds > Int64(Date().timeIntervalSince1970)
+            && allowedPids.contains(pid)
     }
 
     /// Reads CONNECT response from gateway until full `\r\n\r\n` boundary is found, parsing the status line.
@@ -733,22 +793,24 @@ open class WatchChannelExtension: NETransparentProxyProvider {
 
     private func cleanupFlow(id: UUID, error: Error?) {
         stateLock.lock()
-        guard let record = activeFlows.removeValue(forKey: id) else {
+        guard let record = activeFlows[id] else {
             stateLock.unlock()
             return
         }
-        let remaining = activeFlows.count
         let permitted = isPermitted
-        if !permitted && remaining == 0 {
-            writeSystemExtensionReceiptLocked(status: "revoked", reason: "all_flows_drained")
-            logger.notice("All flows confirmed drained; receipt updated to revoked (active_flows=0)")
+        if permitted {
+            activeFlows.removeValue(forKey: id)
+        } else {
+            var closing = record
+            closing.isClosing = true
+            activeFlows[id] = closing
         }
         stateLock.unlock()
-
         let abortErr = error ?? NSError(domain: NSPOSIXErrorDomain, code: Int(ECONNABORTED))
         record.flow.closeReadWithError(abortErr)
         record.flow.closeWriteWithError(abortErr)
         record.connection.cancel()
+        if !permitted { scheduleDrainCheck(reason: "all_flows_drained") }
     }
 
     private func terminateAllActiveFlowsLocked(reason: String) {
@@ -805,7 +867,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
                 let u = ptr.load(fromByteOffset: 4, as: UInt32.self)
                 return (p, u)
             }
-            if managed.contains(pid) {
+            if managed.contains(pid) || hasManagedAncestor(pid: pid, uid: uid, managed: managed) {
                 return (true, pid, uid)
             }
             // Check process name via libproc to catch unlisted/fresh AI processes!
@@ -819,6 +881,24 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             }
         }
         return (false, 0, 0)
+    }
+
+    /// Descendants are classified as managed but never auto-authorized.
+    private func hasManagedAncestor(pid: UInt32, uid: UInt32, managed: Set<UInt32>) -> Bool {
+        var cursor = pid
+        var visited = Set<UInt32>([pid])
+        for _ in 0..<16 {
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(Int32(cursor), PROC_PIDTBSDINFO, 0, &info, size) == size,
+                  info.pbi_uid == uid else { return false }
+            let parent = info.pbi_ppid
+            guard parent > 1 && !visited.contains(parent) else { return false }
+            if managed.contains(parent) { return true }
+            visited.insert(parent)
+            cursor = parent
+        }
+        return false
     }
 
     open override func sleep(completionHandler: @escaping () -> Void) {

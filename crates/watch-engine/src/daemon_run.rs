@@ -138,114 +138,53 @@ impl ProductionChannelStack {
         self.drain_background_events()?;
         let now = system.now();
 
-        // Sync system extension status: prioritize independent extension liveness heartbeat over host UI status
-        let heartbeat_path = self
-            .supervisor
-            .storage
-            .paths
-            .watch()
+        // A fresh heartbeat proves liveness, NOT execution of the newest
+        // permit/revoke command. The two signals must match independently.
+        let heartbeat_path = self.supervisor.storage.paths.watch()
             .join("state/system-extension-heartbeat.json");
-        let mut heartbeat_active = false;
-        if heartbeat_path.exists() {
-            if let Ok(hb_val) = self.supervisor.storage.read_json(&heartbeat_path, Value::Null) {
-                let hb_at = hb_val.get("heartbeat_at").and_then(Value::as_f64).unwrap_or(0.0);
-                let is_interception_active = hb_val.get("interception_active").and_then(Value::as_bool).unwrap_or(false);
-                // 8-second freshness window for heartbeat emitted every 2 seconds by WatchChannelExtension
-                if hb_at > 0.0 && (now - hb_at).abs() <= 8.0 && is_interception_active {
-                    heartbeat_active = true;
-                    let _ = self.enforcer.set_system_extension_active(
-                        true,
-                        Some("扩展独立心跳在线"),
-                        now,
-                    );
-                }
-            }
-        }
+        let heartbeat_active = self.supervisor.storage
+            .read_json(&heartbeat_path, Value::Null)
+            .ok()
+            .is_some_and(|hb| {
+                let at = hb["heartbeat_at"].as_f64().unwrap_or(0.0);
+                at > 0.0 && at <= now + 1.0 && now - at <= 8.0
+                    && hb["interception_active"].as_bool() == Some(true)
+                    && hb["direct_fallback_blocked"].as_bool() == Some(true)
+            });
 
-        if !heartbeat_active {
-            let ext_status_path = self
-                .supervisor
-                .storage
-                .paths
-                .watch()
-                .join("state/system-extension-status.json");
-            if ext_status_path.exists() {
-                if let Ok(ext_val) = self
-                    .supervisor
-                    .storage
-                    .read_json(&ext_status_path, Value::Null)
-                {
-                    let updated_at = ext_val.get("updated_at").and_then(Value::as_f64).unwrap_or(0.0);
-                    let is_fresh = updated_at > 0.0 && (now - updated_at).abs() <= 30.0;
-                    if is_fresh {
-                        if let Some(active) = ext_val.get("is_tunnel_active").and_then(Value::as_bool) {
-                            let detail = ext_val.get("detail").and_then(Value::as_str);
-                            let _ = self.enforcer.set_system_extension_active(active, detail, now);
-                        }
-                    } else {
-                        let _ = self.enforcer.set_system_extension_active(
-                            false,
-                            Some("扩展心跳超时且宿主失联"),
-                            now,
-                        );
-                    }
-                }
-            }
-        }
-
-        // Validate authoritative system extension receipt against current supervision state
-        let receipt_path = self
-            .supervisor
-            .storage
-            .paths
-            .watch()
+        let receipt_path = self.supervisor.storage.paths.watch()
             .join("state/system-extension-receipt.json");
-        if receipt_path.exists() {
-            if let Ok(receipt_val) = self
-                .supervisor
-                .storage
-                .read_json(&receipt_path, Value::Null)
-            {
-                if let Ok(receipt) = serde_json::from_value::<SystemExtensionReceipt>(receipt_val) {
-                    if let Some((policy_ver, cmd_seq, permit_gen, desired_state)) =
-                        self.supervisor.authoritative_state_for_family("claude")
-                    {
-                        match desired_state {
-                            Some(claude_watch_core::channel::ChannelPermitState::Permitted) => {
-                                let matches = receipt.matches_supervision(
-                                    &policy_ver.policy_digest,
-                                    cmd_seq,
-                                    permit_gen,
-                                );
-                                if !matches {
-                                    let _ = self.enforcer.set_system_extension_active(
-                                        false,
-                                        Some("扩展执行回执与当前权威策略不匹配（待同步或被拒绝）"),
-                                        now,
-                                    );
-                                }
-                            }
-                            Some(claude_watch_core::channel::ChannelPermitState::Revoked) => {
-                                if receipt.is_disconnecting() {
-                                    let _ = self.enforcer.set_system_extension_active(
-                                        true,
-                                        Some("扩展正在断流排空中（disconnecting）"),
-                                        now,
-                                    );
-                                } else if !receipt.is_confirmed_revoked(cmd_seq, permit_gen) {
-                                    let _ = self.enforcer.set_system_extension_active(
-                                        false,
-                                        Some("扩展撤销回执缺失或未确认排空"),
-                                        now,
-                                    );
-                                }
-                            }
-                            _ => {}
+        let receipt_confirmed = self.supervisor.storage
+            .read_json(&receipt_path, Value::Null)
+            .ok()
+            .and_then(|value| serde_json::from_value::<SystemExtensionReceipt>(value).ok())
+            .and_then(|receipt| {
+                self.supervisor.authoritative_state_for_family("claude")
+                    .map(|(policy, seq, generation, expected)| {
+                        let identity_fresh = receipt.is_fresh(now, 8.0)
+                            && receipt.policy_version == policy.policy_digest
+                            && receipt.command_seq == seq
+                            && receipt.permit_generation == generation;
+                        identity_fresh && match expected {
+                            Some(claude_watch_core::channel::ChannelPermitState::Permitted) =>
+                                receipt.matches_supervision(&policy.policy_digest, seq, generation),
+                            Some(claude_watch_core::channel::ChannelPermitState::Revoked) =>
+                                receipt.is_confirmed_revoked(seq, generation),
+                            _ => false,
                         }
-                    }
-                }
-            }
-        }
+                    })
+            })
+            .unwrap_or(false);
+
+        let extension_confirmed = heartbeat_active && receipt_confirmed;
+        // An absent, stale, failed, or merely disconnecting receipt must
+        // never be promoted to Blocked by a stale host status file.
+        let _ = self.enforcer.set_system_extension_active(
+            extension_confirmed,
+            if extension_confirmed { None }
+            else { Some("system_extension_execution_unconfirmed") },
+            now,
+        );
 
         if let Ok(cfg) = (ConfigStore {
             storage: self.supervisor.storage.clone(),
@@ -344,6 +283,7 @@ impl ProductionChannelStack {
                     if deadline > claude_state.updated_at {
                         let cmd = serde_json::json!({
                             "action": "update_permit",
+                            "issued_at": system.now(),
                             "policy_version": policy_ver,
                             "command_seq": claude_state.command_seq,
                             "permit_generation": claude_state.permit_generation,
@@ -359,6 +299,7 @@ impl ProductionChannelStack {
             } else {
                 let cmd = serde_json::json!({
                     "action": "revoke_channel",
+                    "issued_at": system.now(),
                     "policy_version": policy_ver,
                     "command_seq": claude_state.command_seq,
                     "permit_generation": claude_state.permit_generation,

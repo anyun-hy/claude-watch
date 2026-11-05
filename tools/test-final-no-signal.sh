@@ -17,7 +17,11 @@ python3 -m unittest -v \
   tools/tests/test_guard_stop_consolidation.py \
   tools/tests/test_platform_contract.py \
   tools/tests/test_architecture_boundaries.py \
-  tools/tests/test_snapshot_transport_contract.py
+  tools/tests/test_snapshot_transport_contract.py \
+  tools/tests/test_extension_cutoff_contract.py \
+  tools/tests/test_channel_stop_contract.py \
+  tools/tests/test_extension_activation_and_attribution.py \
+  tools/tests/test_extension_receipt_authority.py
 python3 tools/generate-ai-policy-swift.py --check
 bash -n monitor/build.sh monitor/package-dmg.sh tools/build-rust-components.sh
 
