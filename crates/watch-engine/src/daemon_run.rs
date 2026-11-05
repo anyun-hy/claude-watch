@@ -142,15 +142,16 @@ impl ProductionChannelStack {
         // permit/revoke command. The two signals must match independently.
         let heartbeat_path = self.supervisor.storage.paths.watch()
             .join("state/system-extension-heartbeat.json");
-        let heartbeat_active = self.supervisor.storage
+        let heartbeat = self.supervisor.storage
             .read_json(&heartbeat_path, Value::Null)
-            .ok()
-            .is_some_and(|hb| {
-                let at = hb["heartbeat_at"].as_f64().unwrap_or(0.0);
-                at > 0.0 && at <= now + 1.0 && now - at <= 8.0
-                    && hb["interception_active"].as_bool() == Some(true)
-                    && hb["direct_fallback_blocked"].as_bool() == Some(true)
-            });
+            .unwrap_or(Value::Null);
+        let heartbeat_boot_id = heartbeat["executor_boot_id"]
+            .as_str().unwrap_or("").to_string();
+        let hb_at = heartbeat["heartbeat_at"].as_f64().unwrap_or(0.0);
+        let heartbeat_active = !heartbeat_boot_id.is_empty()
+            && hb_at > 0.0 && hb_at <= now + 1.0 && now - hb_at <= 8.0
+            && heartbeat["interception_active"].as_bool() == Some(true)
+            && heartbeat["direct_fallback_blocked"].as_bool() == Some(true);
 
         let receipt_path = self.supervisor.storage.paths.watch()
             .join("state/system-extension-receipt.json");
@@ -161,7 +162,9 @@ impl ProductionChannelStack {
             .and_then(|receipt| {
                 self.supervisor.authoritative_state_for_family("claude")
                     .map(|(policy, seq, generation, expected)| {
-                        let identity_fresh = receipt.is_fresh(now, 8.0)
+                        let identity_fresh = !receipt.executor_boot_id.is_empty()
+                            && receipt.executor_boot_id == heartbeat_boot_id
+                            && receipt.is_fresh(now, 8.0)
                             && receipt.policy_version == policy.policy_digest
                             && receipt.command_seq == seq
                             && receipt.permit_generation == generation;
@@ -257,7 +260,9 @@ impl ProductionChannelStack {
             .and_then(|receipt| {
                 self.supervisor.authoritative_state_for_family("claude")
                     .map(|(policy, seq, generation, expected)| {
-                        receipt.is_fresh(now, 8.0)
+                        !receipt.executor_boot_id.is_empty()
+                            && receipt.executor_boot_id == heartbeat_boot_id
+                            && receipt.is_fresh(now, 8.0)
                             && receipt.policy_version == policy.policy_digest
                             && receipt.command_seq == seq
                             && receipt.permit_generation == generation

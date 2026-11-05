@@ -624,6 +624,8 @@ pub fn evaluate_channel_supervision_with_boot_id(
 /// System extension execution receipt produced by WatchChannelExtension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SystemExtensionReceipt {
+    #[serde(default)]
+    pub executor_boot_id: String,
     pub policy_version: String,
     pub command_seq: u64,
     pub permit_generation: u64,
@@ -1435,6 +1437,7 @@ mod tests {
     #[test]
     fn system_extension_receipt_requires_exact_confirmed_execution() {
         let mut receipt = SystemExtensionReceipt {
+            executor_boot_id: "extension-test-boot".into(),
             policy_version: "policy".into(),
             command_seq: 14,
             permit_generation: 5,

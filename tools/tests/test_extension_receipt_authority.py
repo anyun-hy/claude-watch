@@ -13,6 +13,8 @@ class ExecutionReceiptAuthority(unittest.TestCase):
         self.assertIn("let extension_confirmed = heartbeat_active && receipt_confirmed", DAEMON)
         self.assertIn("receipt.is_fresh(now, 8.0)", DAEMON)
         self.assertIn("receipt.policy_version == policy.policy_digest", DAEMON)
+        self.assertIn("receipt.executor_boot_id == heartbeat_boot_id", DAEMON)
+        self.assertIn('"executor_boot_id": executorBootID', EXT)
         self.assertNotIn('Some("扩展独立心跳在线")', DAEMON)
         self.assertIn("system_extension_command_superseded", DAEMON)
         self.assertIn("record_activation_failure", DAEMON)

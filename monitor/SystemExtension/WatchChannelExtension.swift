@@ -28,6 +28,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
     private let logger = Logger(subsystem: "io.local.watchpanel.extension", category: "FlowGate")
 
     private let stateLock = NSLock()
+    private let executorBootID = UUID().uuidString
     private var isInterceptionActive: Bool = false
     private var isDirectFallbackBlocked: Bool = false
     private var localProxyPort: UInt16 = 7890
@@ -306,6 +307,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         let heartbeatFile = stateDir.appendingPathComponent("system-extension-heartbeat.json")
         let dict: [String: Any] = [
             "heartbeat_at": Date().timeIntervalSince1970,
+            "executor_boot_id": executorBootID,
             "interception_active": active,
             "direct_fallback_blocked": true,
             "is_permitted": permitted,
@@ -524,6 +526,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         }
 
         var dict: [String: Any] = [
+            "executor_boot_id": executorBootID,
             "policy_version": currentPolicyVersion,
             "command_seq": currentCommandSeq,
             "permit_generation": currentPermitGeneration,
