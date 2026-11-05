@@ -981,6 +981,56 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
     fn quit_for_confirmed_ip_risk(&mut self, forced: &mut Option<u32>) -> Result<()> {
         self.desktop.quit_for_confirmed_ip_risk(forced)
     }
+    fn channel_mode(&self) -> bool {
+        true
+    }
+    fn delegates_slow_audit_to_worker(&self) -> bool {
+        crate::channel_enforcer::registered_production_enforcer(&self.storage.paths.watch())
+            .is_some()
+    }
+    fn enforce_channel(
+        &mut self,
+        command: &claude_watch_core::channel::ChannelEnforcementCommand,
+    ) -> Result<Option<claude_watch_core::channel::ChannelEnforcementReceipt>> {
+        if let Some(enforcer) =
+            crate::channel_enforcer::registered_production_enforcer(&self.storage.paths.watch())
+        {
+            use crate::channel_enforcer::ChannelEnforcer;
+            let receipt = enforcer.apply_command(command, self.now())?;
+            return Ok(Some(receipt));
+        }
+        let cmd_path = self
+            .storage
+            .paths
+            .watch()
+            .join(format!("state/channel-command-{}.json", command.family));
+        self.storage
+            .atomic_json(&cmd_path, &serde_json::to_value(command).unwrap_or(Value::Null))?;
+        self.channel_receipt(&command.family)
+    }
+    fn channel_receipt(
+        &mut self,
+        family: &str,
+    ) -> Result<Option<claude_watch_core::channel::ChannelEnforcementReceipt>> {
+        if let Some(enforcer) =
+            crate::channel_enforcer::registered_production_enforcer(&self.storage.paths.watch())
+        {
+            use crate::channel_enforcer::ChannelEnforcer;
+            if let Some(receipt) = enforcer.receipt_for(family, self.now())? {
+                return Ok(Some(receipt));
+            }
+        }
+        let receipt_path = self
+            .storage
+            .paths
+            .watch()
+            .join(format!("state/channel-receipt-{family}.json"));
+        let raw = self.storage.read_json(&receipt_path, Value::Null)?;
+        if raw.is_null() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_value(raw).ok())
+    }
 }
 
 #[cfg(test)]

@@ -69,7 +69,10 @@ impl Fixture {
                 "observations":[{"kind":"srflx","address":rtc}]})).unwrap();
     }
     fn tick(&self, system: &mut Mock) -> Value {
-        self.controller.guard_tick_family(system, self.family).unwrap()
+        self.controller
+            .guard_tick_family(system, self.family, true)
+            .unwrap()
+            .into_value()
     }
 }
 impl Drop for Fixture {
@@ -101,6 +104,7 @@ impl Mock {
     }
 }
 impl DesktopSystem for Mock {
+    fn channel_mode(&self) -> bool { false }
     fn launch_target(&self) -> LaunchTarget { self.target }
     fn set_family(&mut self, family: &str) -> Result<()> {
         self.target = PolicyCatalog::family(family).and_then(PolicyCatalog::guard_target)

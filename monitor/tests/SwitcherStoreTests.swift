@@ -552,6 +552,18 @@ struct SwitcherStoreTests {
                    && SetupProgressPhase(rawValue: "bind_session") == .bindSession
                    && SetupProgressPhase(rawValue: "open_application") == .openApplication,
                "the interface decodes the stage codes the backend emits")
+        let scheduledDefault = try JSONDecoder().decode(
+            BackgroundServiceRow.self,
+            from: Data(#"{"id":"guard","title":"保护","state":"scheduled","detail":"","source":"launchctl","desired":true,"last_checked":1000}"#.utf8)
+        )
+        expect(scheduledDefault.healthy && scheduledDefault.statusLabel == "已加载",
+               "scheduled service without execution_verified keeps legacy healthy state")
+        let scheduledUnverified = try JSONDecoder().decode(
+            BackgroundServiceRow.self,
+            from: Data(#"{"id":"guard","title":"保护","state":"scheduled","detail":"","source":"launchctl","desired":true,"last_checked":1000,"execution_verified":false,"health_basis":"launchd_loaded_only"}"#.utf8)
+        )
+        expect(!scheduledUnverified.healthy && scheduledUnverified.statusLabel == "已加载（执行待确认）",
+               "scheduled service with execution_verified=false is not reported as healthy")
         print("SwitcherStore: \(checks) isolated assertions passed")
     }
 }

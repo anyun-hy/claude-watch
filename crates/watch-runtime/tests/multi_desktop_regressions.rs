@@ -79,7 +79,8 @@ impl Fixture {
             mains: (0..count).map(|i| desktop(77 + i as u32, 900)).collect(), claude: vec![],
             hidden: vec![], helper: false, ip: "1.1.1.1", country: "JP", dns_country: "JP",
             closes: 0, forces: 0, audits: 0, fail_quit: false, support_group: true,
-            change_on_audit: false, change_on_revalidate: false, lock_on_revalidate: false }
+            change_on_audit: false, change_on_revalidate: false, lock_on_revalidate: false,
+            events: vec![] }
     }
     fn tick(&self, system: &mut Mock) -> Value {
         self.controller.guard_tick(system).unwrap()["families"].as_array().unwrap()
@@ -100,6 +101,7 @@ struct Mock {
     ip: &'static str, country: &'static str, dns_country: &'static str,
     closes: usize, forces: usize, audits: usize, fail_quit: bool, support_group: bool,
     change_on_audit: bool, change_on_revalidate: bool, lock_on_revalidate: bool,
+    events: Vec<String>,
 }
 impl Mock {
     fn roots(&self) -> &[Desktop] { if self.family == "openai" { &self.mains } else { &self.claude } }
@@ -115,6 +117,7 @@ impl Mock {
     }
 }
 impl DesktopSystem for Mock {
+    fn channel_mode(&self) -> bool { false }
     fn launch_target(&self) -> LaunchTarget { if self.family == "openai" { LaunchTarget::CodexDesktop } else { LaunchTarget::ClaudeDesktop } }
     fn set_family(&mut self, family: &str) -> Result<()> {
         self.family = match family { "openai" => "openai", "claude" => "claude", _ => return Err(CoreError::new("unknown_family", "fixture")) }; Ok(())
@@ -128,6 +131,7 @@ impl DesktopSystem for Mock {
     fn launcher(&mut self) -> Result<Launcher> { Ok(Launcher { pid: 90, start: "fixture".into() }) }
     fn full_audit(&mut self) -> Result<Value> {
         self.audits += 1;
+        self.events.push(format!("{}:full_audit", self.family));
         if self.change_on_audit { self.change_on_audit = false; self.mains.push(desktop(99, 901)); }
         Ok(audit(&self.store, self.now, self.family == "openai", self.ip, self.country))
     }
@@ -136,9 +140,16 @@ impl DesktopSystem for Mock {
     fn backend_healthy(&mut self) -> Result<bool> { Ok(true) }
     fn launcher_matches(&mut self, _: &Launcher) -> Result<bool> { Ok(true) }
     fn open_desktop(&mut self) -> Result<()> { panic!("these tests must never open an app") }
-    fn quit_desktop(&mut self) -> Result<()> { self.closes += 1; self.stop() }
+    fn quit_desktop(&mut self) -> Result<()> {
+        self.closes += 1;
+        self.events.push(format!("{}:quit_desktop", self.family));
+        self.stop()
+    }
     fn quit_for_confirmed_ip_risk(&mut self, forced: &mut Option<u32>) -> Result<()> {
-        self.forces += 1; *forced = Some(self.roots().len() as u32); self.stop()
+        self.forces += 1;
+        self.events.push(format!("{}:force_desktop", self.family));
+        *forced = Some(self.roots().len() as u32);
+        self.stop()
     }
 }
 impl EvidenceSystem for Mock {
@@ -433,4 +444,41 @@ fn group_recheck_rejects_another_familys_audit_without_writing_leases() {
         .unwrap_err().code, "launch_target_mismatch");
     assert_eq!(f.session(system.now), pending);
     assert!(!f.store.paths.watch().join("state/sessions/rust-78.session").exists());
+}
+#[test]
+fn slow_initial_adoption_in_one_family_does_not_delay_fast_stop_in_another_family() {
+    let f = Fixture::new();
+    let mut system = f.mock(1);
+    f.tick(&mut system);
+    assert_eq!(f.session(system.now).state, Phase::Active);
+    system.events.clear();
+    system.now += 1.;
+    // Claude (family 0 in PolicyCatalog) is newly opened without a session and
+    // needs a slow initial full_audit() adoption; OpenAI (family 1) already has
+    // an active session whose baseline IP ("1.1.1.1") has drifted to "8.8.8.8".
+    // Pass 1 must execute OpenAI's fast stop before Pass 2 runs Claude's full_audit().
+    system.claude = vec![desktop(177, 905)];
+    system.ip = "8.8.8.8";
+    let heartbeat = f.controller.guard_tick(&mut system).unwrap();
+    assert_eq!(
+        system.events,
+        vec!["openai:quit_desktop".to_string(), "claude:full_audit".to_string()]
+    );
+    assert!(system.mains.is_empty());
+    assert_eq!(system.claude.len(), 1);
+    let families = heartbeat["families"].as_array().unwrap();
+    assert_eq!(families[0]["family"], "claude");
+    assert_eq!(families[0]["session_guard"]["reason"]["code"], "session_adopted");
+    assert_eq!(families[0]["channel_permit"]["state"], "permitted");
+    assert_eq!(families[0]["channel_permit"]["reason_code"], "session_adopted");
+    assert_eq!(families[0]["channel_permit"]["members"].as_array().unwrap().len(), 1);
+    assert_eq!(families[1]["family"], "openai");
+    assert_eq!(families[1]["action"], "close-desktop");
+    assert_eq!(families[1]["channel_permit"]["state"], "revoked");
+    assert_eq!(families[1]["channel_permit"]["reason_code"], "egress_ip_changed");
+    assert!(
+        families[1]["channel_permit"]["policy_version"]["policy_digest"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
 }

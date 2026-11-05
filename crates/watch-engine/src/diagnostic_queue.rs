@@ -595,6 +595,9 @@ mod tests {
             family: &'static str,
         }
         impl DesktopSystem for Fake {
+            fn channel_mode(&self) -> bool {
+                false
+            }
             fn now(&self) -> f64 {
                 1001.0
             }

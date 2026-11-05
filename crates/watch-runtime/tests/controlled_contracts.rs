@@ -199,6 +199,9 @@ impl claude_watch_runtime::controlled::CliProcess for FakeCliChild {
     }
 }
 impl DesktopSystem for Fake {
+    fn channel_mode(&self) -> bool {
+        false
+    }
     fn prepare_cli(&mut self) -> Result<()> {
         Ok(())
     }

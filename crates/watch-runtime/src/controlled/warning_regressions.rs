@@ -68,7 +68,10 @@ impl Fixture {
         receipt
     }
     fn tick(&self, system: &mut Mock) -> Value {
-        self.controller.guard_tick_family(system, self.family).unwrap()
+        self.controller
+            .guard_tick_family(system, self.family, true)
+            .unwrap()
+            .into_value()
     }
 }
 impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.home); } }
@@ -89,6 +92,7 @@ impl Mock {
     }
 }
 impl DesktopSystem for Mock {
+    fn channel_mode(&self) -> bool { false }
     fn launch_target(&self) -> LaunchTarget { self.target }
     fn now(&self) -> f64 { self.now }
     fn monotonic(&self) -> Duration { Duration::from_secs_f64(self.now) }

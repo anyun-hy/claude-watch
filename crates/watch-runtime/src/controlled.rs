@@ -90,6 +90,34 @@ pub trait DesktopSystem {
     /// Writes the verified force-request count when the helper can report it,
     /// including when some processes still remain.
     fn quit_for_confirmed_ip_risk(&mut self, forced: &mut Option<u32>) -> Result<()>;
+    /// Default disposition is cutting off the application's network channel
+    /// while keeping its processes alive (`断流保进程`), rather than calling
+    /// legacy process exit (`quit_desktop` / `quit_for_confirmed_ip_risk`).
+    fn channel_mode(&self) -> bool {
+        true
+    }
+    /// When true, slow initial-adoption `full_audit()` is handled by the
+    /// background async audit worker (`ChannelSupervisor::spawn_async_audit_worker`)
+    /// rather than blocking the synchronous guard execution path.
+    fn delegates_slow_audit_to_worker(&self) -> bool {
+        false
+    }
+    /// Sends a versioned, sequenced channel command to the network enforcer
+    /// and returns its execution receipt.
+    fn enforce_channel(
+        &mut self,
+        _command: &claude_watch_core::channel::ChannelEnforcementCommand,
+    ) -> Result<Option<claude_watch_core::channel::ChannelEnforcementReceipt>> {
+        Ok(None)
+    }
+    /// Queries the latest execution receipt for `family` from the network
+    /// enforcer (including autonomous lease-expiry actions).
+    fn channel_receipt(
+        &mut self,
+        _family: &str,
+    ) -> Result<Option<claude_watch_core::channel::ChannelEnforcementReceipt>> {
+        Ok(None)
+    }
 }
 pub trait CliProcess {
     fn wait(&mut self) -> Result<i32>;
@@ -98,19 +126,45 @@ pub struct CliOutcome {
     pub exit_code: i32,
     pub diagnostic: Option<String>,
 }
+#[derive(Debug, Clone, Default)]
+struct FamilyChannelLedger {
+    permit_generation: u64,
+    command_seq: u64,
+    last_permit: Option<claude_watch_core::channel::ChannelPermit>,
+    revoked_at: Option<f64>,
+}
 pub struct Controller {
     pub storage: StateStore,
     failed_persistence_session:
         std::sync::Mutex<std::collections::HashMap<&'static str, PendingRisk>>,
+    channel_ledger:
+        std::sync::Mutex<std::collections::HashMap<&'static str, FamilyChannelLedger>>,
 }
 impl Controller {
     pub fn new(storage: StateStore) -> Self {
         Self {
             storage,
             failed_persistence_session: std::sync::Mutex::new(std::collections::HashMap::new()),
+            channel_ledger: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
+enum FamilyTickPass {
+    Complete(Value),
+    DeferredSlowAdopt,
+}
+impl FamilyTickPass {
+    #[cfg(test)]
+    fn into_value(self) -> Value {
+        match self {
+            Self::Complete(v) => v,
+            Self::DeferredSlowAdopt => {
+                json!({"status":"pending","action":"observe","deferred_slow_adopt":true})
+            }
+        }
+    }
+}
+
 impl Controller {
     pub fn guard_tick<S: DesktopSystem>(&self, system: &mut S) -> Result<Value> {
         // Which services the guard supervises is declared by the policy table,
@@ -129,15 +183,22 @@ impl Controller {
             return Ok(json!({"status":"disabled","action":"observe"}));
         }
         let mut receipts = Vec::with_capacity(families.len());
-        for family in families {
+        let mut deferred_slow_adopts = Vec::new();
+        for (index, family) in families.iter().enumerate() {
+            // Pass 1 runs fast supervision and immediate stops across every
+            // family before any family enters a slow initial-adoption full_audit().
             // One family's failure must not stop the others: record it as an
             // unknown round for that family and keep supervising the rest of
             // the table.
             let receipt = match system
                 .set_family(family.id)
-                .and_then(|()| self.guard_tick_family(system, family.id))
+                .and_then(|()| self.guard_tick_family(system, family.id, false))
             {
-                Ok(receipt) => receipt,
+                Ok(FamilyTickPass::Complete(receipt)) => receipt,
+                Ok(FamilyTickPass::DeferredSlowAdopt) => {
+                    deferred_slow_adopts.push((index, family.id));
+                    Value::Null
+                }
                 Err(error) => json!({
                     "family": family.id,
                     "status": "unknown",
@@ -148,6 +209,30 @@ impl Controller {
                 }),
             };
             receipts.push(receipt);
+        }
+        for (index, family_id) in deferred_slow_adopts {
+            receipts[index] = match system
+                .set_family(family_id)
+                .and_then(|()| self.guard_tick_family(system, family_id, true))
+            {
+                Ok(FamilyTickPass::Complete(receipt)) => receipt,
+                Ok(FamilyTickPass::DeferredSlowAdopt) => json!({
+                    "family": family_id,
+                    "status": "unknown",
+                    "action": "observe",
+                    "time": system.now(),
+                    "code": "deferred_adoption_incomplete",
+                    "message": "延后的首次接管未能完成",
+                }),
+                Err(error) => json!({
+                    "family": family_id,
+                    "status": "unknown",
+                    "action": "observe",
+                    "time": system.now(),
+                    "code": error.code,
+                    "message": error.message,
+                }),
+            };
         }
         let heartbeat = fold_guard_receipts(receipts);
         self.storage.atomic_json(
@@ -160,7 +245,8 @@ impl Controller {
         &self,
         system: &mut S,
         family: &'static str,
-    ) -> Result<Value> {
+        allow_slow_adopt: bool,
+    ) -> Result<FamilyTickPass> {
         // Supervision is a desktop matter: a CLI target has its own shared
         // lifecycle entry and never enters this automatic-exit path.
         let target = system.launch_target();
@@ -177,31 +263,38 @@ impl Controller {
         {
             Ok(value) => value,
             Err(error) => {
-                return Ok(json!({"status":"unknown","action":"observe","family":family,
+                return Ok(FamilyTickPass::Complete(json!({"status":"unknown","action":"observe","family":family,
                     "time":system.now(),"code":error.code,"message":error.message,
                     "stop_action":"warn","stop_state":"skipped_warn_only",
-                    "policy_state":"unavailable"}));
+                    "policy_state":"unavailable"})));
             }
         };
         if !config.enabled || !config.guard_enabled {
-            return Ok(json!({"status":"disabled","action":"observe","family":family}));
+            return Ok(FamilyTickPass::Complete(json!({"status":"disabled","action":"observe","family":family})));
         }
         let sessions = SessionStore::for_family(self.storage.clone(), family);
         let receipts = ReceiptStore {
             storage: self.storage.clone(),
         };
         let now = system.now();
-        let mut receipt = json!({"status":"unknown","action":"observe","family":family,"time":now,"policy":crate::config_store::policy_digest(&config.value()?)?,"guard_policy_v1":crate::config_store::guard_policy_digest(&config)?});
+        let policy_digest = crate::config_store::policy_digest(&config.value()?)?;
+        let guard_policy_digest = crate::config_store::guard_policy_digest(&config)?;
+        let mut receipt = json!({"status":"unknown","action":"observe","family":family,"time":now,"policy":policy_digest,"guard_policy_v1":guard_policy_digest});
+        let mut deferred = false;
         let result: Result<()> = (|| {
             let mut desktops = system.desktops()?;
             let mut current = sessions.load(system.now())?;
             let mut identity_unconfirmed = false;
             let mut exit_pending = false;
             let group_round = self.prepare_desktop_group(
-                system, &sessions, &receipts, family, &config,
+                system, &sessions, &receipts, family, &config, allow_slow_adopt,
                 &mut desktops, &mut current, &mut identity_unconfirmed,
                 &mut exit_pending, &mut receipt,
             )?;
+            if group_round == GroupRound::DeferredSlowAdopt {
+                deferred = true;
+                return Ok(());
+            }
             if group_round == GroupRound::Handled { return Ok(()); }
             if let Some(previous) = current.as_ref().filter(|s| {
                 group_round == GroupRound::Legacy && matches!(
@@ -428,6 +521,23 @@ impl Controller {
                     let healthy = session::Egress::fresh(&egress, now, session::GUARD_EGRESS_TTL)
                         .is_some_and(|exit| exit.country != "CN");
                     if healthy {
+                        if system.delegates_slow_audit_to_worker() {
+                            receipt["status"] = json!("ok");
+                            receipt["action"] = json!("observe");
+                            receipt["session_guard"] = json!({
+                                "state": "pending_verification",
+                                "phase": "pending",
+                                "reason": {
+                                    "code": "initial_audit_pending",
+                                    "detail": "新发现的桌面进程已转交后台异步审计线程核验，不阻塞保护路径"
+                                }
+                            });
+                            return Ok(());
+                        }
+                        if !allow_slow_adopt {
+                            deferred = true;
+                            return Ok(());
+                        }
                         let adopted = system
                             .full_audit()
                             .and_then(|audit| {
@@ -672,7 +782,253 @@ impl Controller {
         if let Err(error) = result {
             self.sampling_failure(system, family, &mut receipt, error)?;
         }
-        Ok(receipt)
+        if deferred {
+            return Ok(FamilyTickPass::DeferredSlowAdopt);
+        }
+        let latest_session = sessions.load(system.now()).ok().flatten();
+        self.sync_family_channel(
+            system,
+            family,
+            &config,
+            latest_session.as_ref(),
+            claude_watch_core::channel::PolicyVersion {
+                policy_digest,
+                guard_policy_digest,
+            },
+            &mut receipt,
+        )?;
+        Ok(FamilyTickPass::Complete(receipt))
+    }
+
+    fn sync_family_channel<S: DesktopSystem>(
+        &self,
+        system: &mut S,
+        family: &'static str,
+        config: &claude_watch_core::config::Config,
+        latest_session: Option<&session::Session>,
+        policy_version: claude_watch_core::channel::PolicyVersion,
+        receipt: &mut Value,
+    ) -> Result<()> {
+        use claude_watch_core::channel::{
+            evaluate_channel_supervision, verify_channel_recovery, BoundProcessToken,
+            ChannelEnforcementCommand, ChannelPermit, ChannelPermitState,
+            ChannelSupervisionVerdict, DEFAULT_PERMIT_TTL,
+        };
+        use claude_watch_core::processes::ProcessRole;
+
+        let now = system.now();
+        let (prev_permit, prev_revoked_at, base_gen, next_cmd_seq) = {
+            let mut map = self.channel_ledger.lock().map_err(|_| {
+                CoreError::new("guard_memory_unavailable", "保护内存状态不可用")
+            })?;
+            let entry = map.entry(family).or_default();
+            if entry.permit_generation == 0 {
+                entry.permit_generation = 1;
+            }
+            entry.command_seq = entry.command_seq.saturating_add(1);
+            (
+                entry.last_permit.clone(),
+                entry.revoked_at,
+                entry.permit_generation,
+                entry.command_seq,
+            )
+        };
+
+        let mut candidate = ChannelPermit::from_guard_round(
+            family,
+            latest_session,
+            receipt,
+            policy_version.clone(),
+            base_gen,
+            next_cmd_seq,
+            now,
+            DEFAULT_PERMIT_TTL,
+        )?;
+        if candidate.state == ChannelPermitState::Permitted {
+            if let Some(exit) =
+                session::Egress::fresh(&system.egress(), now, session::GUARD_EGRESS_TTL)
+            {
+                let evidence_expires_at = exit.observed_at + session::GUARD_EGRESS_TTL;
+                if evidence_expires_at > now {
+                    candidate.valid_until = candidate.valid_until.min(evidence_expires_at);
+                } else if system.channel_mode() {
+                    candidate.state = ChannelPermitState::Revoked;
+                    candidate.reason_code = "egress_evidence_expired".into();
+                }
+            } else if system.channel_mode() {
+                candidate.state = ChannelPermitState::Revoked;
+                candidate.reason_code = "egress_evidence_expired".into();
+            }
+        }
+
+        if let Some(prev) = prev_permit.as_ref() {
+            let session_changed = prev.session_id != candidate.session_id;
+            let policy_changed = prev.policy_version != candidate.policy_version;
+            let state_changed = prev.state != candidate.state;
+            if session_changed || policy_changed || state_changed {
+                candidate.permit_generation = prev.permit_generation.saturating_add(1);
+            }
+            // If previously revoked under the same session, returning to
+            // Permitted requires passing `verify_channel_recovery` with fresh
+            // post-revocation evidence under the current policy version.
+            if prev.state == ChannelPermitState::Revoked
+                && candidate.state == ChannelPermitState::Permitted
+                && !session_changed
+            {
+                let audit_path = self.storage.paths.base().join("last-audit.json");
+                let stored_audit = self
+                    .storage
+                    .read_json(&audit_path, Value::Null)
+                    .unwrap_or(Value::Null);
+                let audit_ready = stored_audit["ready"] == true
+                    && stored_audit["grants_launch_permission"] == true;
+                let audit_observed_at = stored_audit["observed_at"]
+                    .as_f64()
+                    .or_else(|| latest_session.map(|s| s.created_at))
+                    .unwrap_or(0.0);
+                let egress = system.egress();
+                let context_id = candidate
+                    .context_id
+                    .clone()
+                    .unwrap_or_else(|| "recovered-ctx".into());
+                match verify_channel_recovery(
+                    prev,
+                    prev_revoked_at.unwrap_or(prev.issued_at),
+                    candidate.session_id.as_deref(),
+                    audit_ready,
+                    audit_observed_at,
+                    &policy_version,
+                    &egress,
+                    candidate.session_id.as_deref(),
+                    &policy_version,
+                    &context_id,
+                    candidate.permit_generation,
+                    candidate.command_seq,
+                    now,
+                    DEFAULT_PERMIT_TTL,
+                ) {
+                    Ok(recovered) => candidate = recovered,
+                    Err(err) if system.channel_mode() => {
+                        candidate.state = ChannelPermitState::Revoked;
+                        candidate.reason_code = err.code;
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
+        let allowed_processes: Vec<BoundProcessToken> = system
+            .desktops()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(d, main, _)| BoundProcessToken {
+                pid: d.pid,
+                uid: 0,
+                start_seconds: d.start_seconds,
+                start_microseconds: d.start_microseconds,
+                role: if main {
+                    ProcessRole::DesktopMain
+                } else {
+                    ProcessRole::DesktopHelper
+                },
+                audit_token: None,
+            })
+            .collect();
+
+        let upstream_endpoint = if config.proxy_url.trim().is_empty() {
+            "127.0.0.1:7890".to_string()
+        } else {
+            config.proxy_url.clone()
+        };
+
+        let command = ChannelEnforcementCommand {
+            family: family.into(),
+            session_id: candidate.session_id.clone(),
+            policy_version: policy_version.clone(),
+            permit_generation: candidate.permit_generation,
+            command_seq: candidate.command_seq,
+            permit: candidate.clone(),
+            allowed_processes,
+            upstream_endpoint,
+            issued_at: now,
+        };
+
+        let enforcer_receipt = match system.enforce_channel(&command)? {
+            Some(r) => Some(r),
+            None => system.channel_receipt(family)?,
+        };
+
+        let verdict = evaluate_channel_supervision(
+            &candidate,
+            enforcer_receipt.as_ref(),
+            &policy_version,
+            now,
+        );
+
+        {
+            let mut map = self.channel_ledger.lock().map_err(|_| {
+                CoreError::new("guard_memory_unavailable", "保护内存状态不可用")
+            })?;
+            let entry = map.entry(family).or_default();
+            entry.permit_generation = candidate.permit_generation;
+            entry.command_seq = candidate.command_seq;
+            if candidate.state == ChannelPermitState::Revoked
+                && entry
+                    .last_permit
+                    .as_ref()
+                    .is_none_or(|p| p.state != ChannelPermitState::Revoked)
+            {
+                entry.revoked_at = Some(now);
+            } else if candidate.state == ChannelPermitState::Permitted {
+                entry.revoked_at = None;
+            }
+            entry.last_permit = Some(candidate.clone());
+        }
+
+        if let Ok(value) = serde_json::to_value(&candidate) {
+            receipt["channel_permit"] = value;
+        }
+        if let Some(r) = &enforcer_receipt {
+            if let Ok(value) = serde_json::to_value(r) {
+                receipt["channel_receipt"] = value;
+            }
+        }
+        if let Ok(value) = serde_json::to_value(&verdict) {
+            receipt["channel_supervision"] = value;
+        }
+
+        if system.channel_mode() {
+            receipt["disposition_mode"] = json!("disconnect_channel_keep_process");
+            receipt["process_preserved"] = json!(true);
+            if candidate.state == ChannelPermitState::Revoked {
+                receipt["action"] = json!("disconnect-channel");
+                match &verdict {
+                    ChannelSupervisionVerdict::IsolatedKeepProcess => {
+                        receipt["stop_state"] = json!("channel_blocked");
+                        receipt["channel_state"] = json!("blocked");
+                        receipt["channel_status_label"] = json!("已阻断");
+                    }
+                    ChannelSupervisionVerdict::PendingIsolation { .. } => {
+                        receipt["stop_state"] = json!("disconnecting");
+                        receipt["channel_state"] = json!("disconnecting");
+                        receipt["channel_status_label"] = json!("正在断开");
+                    }
+                    ChannelSupervisionVerdict::EnforcementFailed {
+                        code,
+                        status_label_zh,
+                    } => {
+                        receipt["status"] = json!("protection_unavailable");
+                        receipt["stop_state"] = json!("enforcement_failed");
+                        receipt["channel_state"] = json!("failed");
+                        receipt["channel_error"] = json!(code);
+                        receipt["channel_status_label"] = json!(status_label_zh);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(())
     }
 
 }
@@ -686,6 +1042,7 @@ impl Controller {
 fn fold_guard_receipts(receipts: Vec<Value>) -> Value {
     let severity = |status: &str| -> u8 {
         match status {
+            "protection_unavailable" => 6,
             "protection_triggered" => 5,
             "unknown" => 4,
             "degraded" => 3,
@@ -695,8 +1052,11 @@ fn fold_guard_receipts(receipts: Vec<Value>) -> Value {
         }
     };
     let rank = |receipt: &Value| -> (u8, u8) {
-        // A family that actually closed outranks one that only reported.
-        let acted = u8::from(receipt["action"].as_str() == Some("close-desktop"));
+        // A family that actually closed or disconnected outranks one that only reported.
+        let acted = u8::from(matches!(
+            receipt["action"].as_str(),
+            Some("close-desktop" | "disconnect-channel")
+        ));
         (severity(receipt["status"].as_str().unwrap_or("")), acted)
     };
     let mut primary: Option<Value> = None;

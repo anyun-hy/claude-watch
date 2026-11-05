@@ -154,6 +154,93 @@ struct AIProcessExitEvidenceTests {
         let anotherProduct = row(30, product: .claude)
         let unrelated = AIProcessClosePolicy.exitEvidence(original, inventory: [anotherProduct]) { _ in .gone }
         expect(unrelated.complete, "another family is not silently added to close scope")
+        let claudeDesktop = row(40, product: .claude, path: "/Applications/Claude.app/Contents/MacOS/Claude")
+        let claudeDesktopChild = row(41, parent: 40, path: "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper")
+        let claudeCLI = row(42, product: .claude, path: "/Users/test/.local/share/claude/versions/1.0.0/claude")
+        let claudeCLIChild = row(43, parent: 42, path: "/usr/bin/git")
+        let mixedClaude = [claudeDesktop, claudeDesktopChild, claudeCLI, claudeCLIChild]
+        expect(AIProcessClosePolicy.automaticDesktopScope(for: .claude) == .desktopBundleOnly,
+               "automatic Claude desktop scope excludes standalone CLI roots")
+        expect(AIProcessClosePolicy.automaticDesktopScope(for: .openAI) == .allProductProcesses,
+               "automatic OpenAI scope includes attributed family processes")
+        expect(AIProcessClosePolicy.manualCloseScope(for: .claude) == .allProductProcesses &&
+               AIProcessClosePolicy.manualCloseScope(for: .openAI) == .allProductProcesses,
+               "manual UI close scope includes both desktop and CLI trees")
+        let autoClaudeScoped = AIProcessClosePolicy.scopedInventory(
+            mixedClaude, for: .claude, scope: AIProcessClosePolicy.automaticDesktopScope(for: .claude))
+        let autoClaudePlan = AIProcessClosePolicy.plan(.claude, inventory: autoClaudeScoped, uid: 501, protected: [])
+        expect(autoClaudePlan.targets.map(\.pid) == [40, 41],
+               "automatic Claude desktop close plan excludes standalone Claude CLI and its children")
+        let manualClaudeScoped = AIProcessClosePolicy.scopedInventory(
+            mixedClaude, for: .claude, scope: AIProcessClosePolicy.manualCloseScope(for: .claude))
+        let manualClaudePlan = AIProcessClosePolicy.plan(.claude, inventory: manualClaudeScoped, uid: 501, protected: [])
+        expect(manualClaudePlan.targets.map(\.pid) == [40, 41, 42, 43],
+               "manual Claude close plan includes both desktop and standalone CLI trees")
+        let home = "/Users/test"
+        expect(AIProcessClosePolicy.classifyRoot(
+            executable: "/opt/homebrew/bin/node",
+            arguments: "/opt/homebrew/bin/node --require /tmp/preload.js --import=file:///tmp/boot.mjs node_modules/@anthropic-ai/claude-code/cli.js",
+            cwd: "/opt/claude",
+            home: home) == (.claude, false),
+            "nodeEntry skips --require and --import flags and resolves relative script with cwd")
+        expect(AIProcessClosePolicy.classifyRoot(
+            executable: "/usr/bin/node",
+            arguments: "/usr/bin/node -- /opt/node_modules/@openai/codex/bin/codex.js",
+            home: home) == (.openAI, false),
+            "nodeEntry supports -- argument separator")
+        expect(AIProcessClosePolicy.classifyRoot(
+            executable: "/opt/homebrew/bin/node",
+            argumentTokens: [
+                "/opt/homebrew/bin/node",
+                "/Users/test/AI Tools/node_modules/@anthropic-ai/claude-code/cli.js"
+            ],
+            home: home) == (.claude, false),
+            "nodeEntryTokens preserves absolute script paths containing spaces")
+        expect(AIProcessClosePolicy.classifyRoot(
+            executable: "/opt/homebrew/bin/node",
+            argumentTokens: [
+                "/opt/homebrew/bin/node",
+                "AI Tools/node_modules/@openai/codex/bin/codex.js"
+            ],
+            cwd: "/Users/test",
+            home: home) == (.openAI, false),
+            "nodeEntryTokens resolves relative script paths containing spaces against cwd")
+        let daemonBin = "/Users/test/.codex/packages/app-server-daemon/releases/1.2.3/bin/codex"
+        expect(AIProcessClosePolicy.classifyRoot(
+            executable: daemonBin,
+            arguments: daemonBin + " app-server daemon",
+            home: home) == (.openAI, false),
+            "managed codex app-server daemon is attributed to OpenAI CLI role")
+        expect(AIProcessClosePolicy.classifyRoot(
+            executable: daemonBin,
+            arguments: daemonBin + " app-server --listen 127.0.0.1:4500",
+            home: home) == (.openAI, false),
+            "managed codex app-server --listen <addr> is attributed to OpenAI CLI role")
+        expect(AIProcessClosePolicy.classifyRoot(
+            executable: daemonBin,
+            arguments: daemonBin + " --help",
+            home: home) == (nil, false),
+            "managed codex binary without app-server arguments is not classified as daemon")
+        expect(AIProcessClosePolicy.classifyRoot(
+            executable: daemonBin,
+            arguments: daemonBin + " app-server --listen --bad",
+            home: home) == (nil, false),
+            "managed codex app-server with flag instead of listen address is rejected")
+        expect(AIProcessClosePolicy.classifyRoot(
+            executable: "/Applications/ChatGPT.app/Contents/Resources/codex",
+            bundleIdentifier: "com.openai.chat",
+            home: home) == (.openAI, false),
+            "bundled Codex CLI inside ChatGPT.app is classified as OpenAI non-desktopMain")
+        expect(AIProcessClosePolicy.classifyRoot(
+            executable: "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            bundleIdentifier: "com.openai.chat",
+            home: home) == (.openAI, true),
+            "ChatGPT.app main executable is classified as OpenAI desktopMain")
+        expect(AIProcessClosePolicy.classifyRoot(
+            executable: "/Applications/Fake.app/Contents/MacOS/Fake",
+            bundleIdentifier: "com.openai.chat",
+            home: home) == (nil, false),
+            "mismatched OpenAI bundle name is rejected")
         print("AIProcessExitEvidenceTests: \(checks) assertions passed; all identities and actions mocked")
     }
 }

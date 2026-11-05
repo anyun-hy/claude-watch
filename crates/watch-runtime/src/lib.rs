@@ -8,6 +8,8 @@ pub mod alert_gate;
 pub mod app_lifecycle;
 pub mod audit_store;
 pub mod background_evidence;
+pub mod channel_enforcer;
+pub mod channel_supervisor;
 pub mod commands;
 pub mod config_store;
 pub mod controlled;

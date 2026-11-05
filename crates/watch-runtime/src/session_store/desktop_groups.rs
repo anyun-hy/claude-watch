@@ -5,20 +5,13 @@ use super::*;
 use crate::{config_store::ConfigStore, receipt_store::ReceiptStore};
 use claude_watch_core::config::Config;
 
-pub(crate) const GROUP: &str = "desktop_group_v1";
-const RECHECK: &str = "desktop_group_recheck_v1";
-const CONTINUITY: &str = "desktop_group_continuity_v1";
-pub const MAX_DESKTOP_MEMBERS: usize = 32;
+pub(crate) const GROUP: &str = claude_watch_core::session::GROUP_KEY;
+const RECHECK: &str = claude_watch_core::session::GROUP_RECHECK_KEY;
+const CONTINUITY: &str = claude_watch_core::session::GROUP_CONTINUITY_KEY;
+pub const MAX_DESKTOP_MEMBERS: usize = claude_watch_core::session::MAX_DESKTOP_MEMBERS;
 
-pub fn canonical_desktops(mut members: Vec<Desktop>) -> Result<Vec<Desktop>> {
-    if members.len() > MAX_DESKTOP_MEMBERS || members.iter().any(|d| !d.valid()) {
-        return Err(CoreError::new("desktop_identity_unavailable", "主进程集合超限或身份无效"));
-    }
-    members.sort_by_key(|d| (d.pid, d.start_seconds, d.start_microseconds));
-    if members.windows(2).any(|pair| pair[0].pid == pair[1].pid) {
-        return Err(CoreError::new("desktop_inventory_incomplete", "同一轮主进程身份重复或冲突"));
-    }
-    Ok(members)
+pub fn canonical_desktops(members: Vec<Desktop>) -> Result<Vec<Desktop>> {
+    claude_watch_core::session::canonical_desktops(members)
 }
 
 pub fn observed_desktops(rows: &[(Desktop, bool, String)]) -> Result<Vec<Desktop>> {
@@ -46,43 +39,15 @@ pub fn group_stamps(expected: &[Desktop], rows: &[(Desktop, bool, String)])
 }
 
 pub fn desktop_members(session: &Session) -> Result<Vec<Desktop>> {
-    let Some(raw) = session.extra.get(GROUP) else {
-        if session.extra.contains_key(RECHECK) || session.extra.contains_key(CONTINUITY) {
-            return Err(CoreError::new("invalid_session", "集合复核标记缺少对应主进程集合"));
-        }
-        return canonical_desktops(session.desktop.iter().cloned().collect());
-    };
-    let members: Vec<Desktop> = serde_json::from_value(raw.clone())
-        .map_err(|_| CoreError::new("invalid_session", "会话主进程集合格式无效"))?;
-    let sorted = canonical_desktops(members.clone())
-        .map_err(|_| CoreError::new("invalid_session", "会话主进程集合身份无效"))?;
-    if sorted.is_empty() || sorted != members || session.desktop.as_ref() != sorted.first() {
-        return Err(CoreError::new("invalid_session", "会话主进程集合与兼容身份不一致"));
-    }
-    for key in [RECHECK, CONTINUITY] {
-        if session.extra.get(key).is_some_and(|v| v != &json!(true)) {
-            return Err(CoreError::new("invalid_session", "会话集合复核标记无效"));
-        }
-    }
-    if session.extra.contains_key(CONTINUITY) && !group_rechecking(session) {
-        return Err(CoreError::new("invalid_session", "集合连续基线标记缺少复核状态"));
-    }
-    if group_rechecking(session) && (!matches!(session.state, Phase::Rechecking | Phase::Locked | Phase::Ended)
-        || !session.created_at.is_finite()
-        || session.created_at <= 0.0 || !session.pending_deadline.is_finite()
-        || session.pending_deadline <= session.created_at)
-    {
-        return Err(CoreError::new("invalid_session", "会话集合复核期限无效"));
-    }
-    Ok(sorted)
+    session.desktop_members()
 }
 
 pub fn group_rechecking(session: &Session) -> bool {
-    session.extra.get(RECHECK) == Some(&json!(true))
+    session.group_rechecking()
 }
 
 pub fn has_desktop_group(session: &Session) -> bool {
-    session.extra.contains_key(GROUP)
+    session.has_desktop_group()
 }
 
 pub fn desktop_set_matches(session: &Session, rows: &[(Desktop, bool, String)]) -> Result<bool> {

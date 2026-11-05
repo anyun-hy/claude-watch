@@ -9,6 +9,7 @@ the test.  It only invokes documented read commands against a private home.
 from __future__ import annotations
 
 import json
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -161,8 +162,18 @@ class RustSwiftReceiptContractTests(unittest.TestCase):
     def test_offline_engine_receipts_decode_with_real_swift_models(self):
         self.assertTrue(ENGINE.is_file(), f"missing built engine: {ENGINE}; run cargo build first")
         self.assertTrue(RUST_ONLINE_LOOKUP.is_file(), f"missing Rust online lookup fixture: {RUST_ONLINE_LOOKUP}")
-        swiftc = shutil.which("swiftc")
-        self.assertIsNotNone(swiftc, "swiftc is required for the production-model decoder")
+        swift_flags = ["-parse-as-library"]
+        if platform.system() == "Darwin":
+            xcrun = shutil.which("xcrun")
+            self.assertIsNotNone(xcrun, "xcrun is required on macOS for the production-model decoder")
+            swiftc = subprocess.check_output([xcrun, "--sdk", "macosx", "--find", "swiftc"], text=True).strip()
+            sdk = subprocess.check_output([xcrun, "--sdk", "macosx", "--show-sdk-path"], text=True).strip()
+            minimum = (ROOT / "monitor" / "macos-minimum.txt").read_text(encoding="utf-8").strip()
+            arch = platform.machine()
+            swift_flags.extend(["-sdk", sdk, "-target", f"{arch}-apple-macosx{minimum}"])
+        else:
+            swiftc = shutil.which("swiftc")
+            self.assertIsNotNone(swiftc, "swiftc is required for the production-model decoder")
         commands = {
             "status": ["status"],
             "audit": ["checkdetail", "--no-report"],
@@ -174,6 +185,8 @@ class RustSwiftReceiptContractTests(unittest.TestCase):
             work = Path(temp)
             home = work / "private-home"
             home.mkdir()
+            module_cache = work / "module-cache"
+            module_cache.mkdir()
             receipt_paths: dict[str, Path] = {}
             for name, command in commands.items():
                 output = subprocess.run(
@@ -195,7 +208,7 @@ class RustSwiftReceiptContractTests(unittest.TestCase):
             source.write_text("import Darwin\n" + production_models() + "\n" + HARNESS, encoding="utf-8")
             executable = work / "RustSwiftReceiptContract"
             compiled = subprocess.run(
-                [swiftc, "-parse-as-library", str(source), "-o", str(executable)],
+                [swiftc, *swift_flags, "-module-cache-path", str(module_cache), str(source), "-o", str(executable)],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,

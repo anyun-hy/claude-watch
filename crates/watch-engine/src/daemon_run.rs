@@ -1,11 +1,18 @@
 use claude_watch_core::{
+    channel::{BoundProcessToken, ChannelMonitorSnapshot, PolicyVersion},
     cli::Request,
     error::{CoreError, Result},
+    policy::PolicyCatalog,
+    processes::ProcessRole,
 };
 use claude_watch_runtime::{
     alert_gate::AlertGate,
+    channel_enforcer::{
+        register_production_enforcer, unregister_production_enforcer, LocalTunnelEnforcer,
+    },
+    channel_supervisor::{AsyncAuditRequest, ChannelSupervisor, SupervisionEvent},
     config_store::ConfigStore,
-    controlled::Controller,
+    controlled::{Controller, DesktopSystem},
     daemon::{DaemonLease, PROCESS_INTERVAL},
     desktop_native::{DesktopRuntime, NativeDesktop},
     events::{Alert, EventFields, EventStore, Severity},
@@ -20,11 +27,186 @@ use serde_json::{json, Value};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
+        mpsc::Receiver,
         Arc,
     },
     thread,
     time::{Duration, Instant},
 };
+
+pub struct ProductionChannelStack {
+    pub enforcer: Arc<LocalTunnelEnforcer>,
+    pub supervisor: ChannelSupervisor,
+    pub event_rx: Receiver<SupervisionEvent>,
+    pub lease_watchdog: thread::JoinHandle<()>,
+    pub async_audit_worker: thread::JoinHandle<()>,
+    pub last_policy_version: Option<PolicyVersion>,
+}
+
+pub fn assemble_production_channel_stack<F>(
+    storage: StateStore,
+    stop: Arc<AtomicBool>,
+    activate_local_interception: bool,
+    run_audit: F,
+) -> Result<ProductionChannelStack>
+where
+    F: FnMut(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + 'static,
+{
+    let boot_id = format!(
+        "daemon-{}-{}",
+        std::process::id(),
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let enforcer = Arc::new(LocalTunnelEnforcer::new(boot_id, Some(storage.clone())));
+    if activate_local_interception {
+        let now_ts = native::now();
+        let _ = enforcer.activate_interception(now_ts);
+        let _ = enforcer.start_local_proxy_listener("127.0.0.1:0", stop.clone(), now_ts);
+    }
+    let _ = storage.atomic_json(
+        &storage
+            .paths
+            .watch()
+            .join("state/channel-protocol-coverage.json"),
+        &enforcer.protocol_coverage_boundaries(),
+    );
+    register_production_enforcer(&storage.paths.watch(), enforcer.clone());
+
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let lease_tx = event_tx.clone();
+    let lease_watchdog = enforcer.spawn_lease_watchdog(
+        stop.clone(),
+        Duration::from_millis(250),
+        native::now,
+        move |expired_receipts| {
+            let received_at = native::now();
+            for receipt in expired_receipts {
+                let _ = lease_tx.send(SupervisionEvent::EnforcementReceiptArrived {
+                    receipt,
+                    received_at,
+                });
+            }
+        },
+    )?;
+
+    let (audit_req_tx, async_audit_worker) =
+        ChannelSupervisor::spawn_async_audit_worker(stop, event_tx, run_audit)?;
+
+    let supervisor = ChannelSupervisor::new(
+        storage,
+        Some(enforcer.clone()),
+        Some(audit_req_tx),
+    )?;
+
+    Ok(ProductionChannelStack {
+        enforcer,
+        supervisor,
+        event_rx,
+        lease_watchdog,
+        async_audit_worker,
+        last_policy_version: None,
+    })
+}
+
+impl ProductionChannelStack {
+    pub fn drain_background_events(&mut self) -> Result<()> {
+        while let Ok(ev) = self.event_rx.try_recv() {
+            self.supervisor.handle_event(ev)?;
+        }
+        Ok(())
+    }
+
+    pub fn step_with_system<S: DesktopSystem>(
+        &mut self,
+        system: &mut S,
+    ) -> Result<ChannelMonitorSnapshot> {
+        self.drain_background_events()?;
+        let now = system.now();
+        if let Ok(cfg) = (ConfigStore {
+            storage: self.supervisor.storage.clone(),
+        })
+        .load()
+        {
+            if let Ok(ver) = ChannelSupervisor::compute_policy_version(&cfg) {
+                if self.last_policy_version.as_ref() != Some(&ver) {
+                    self.last_policy_version = Some(ver);
+                    self.supervisor.handle_event(SupervisionEvent::PolicyUpdated {
+                        config: cfg,
+                        observed_at: now,
+                    })?;
+                }
+            }
+        }
+        let egress = system.egress();
+        let local_guard = system
+            .local_guard()
+            .unwrap_or_else(|_| json!({"proxy": "unknown", "tun": "unknown"}));
+        self.supervisor
+            .handle_event(SupervisionEvent::EnvironmentUpdated {
+                egress,
+                local_guard,
+                observed_at: now,
+            })?;
+
+        for family in PolicyCatalog::families() {
+            if PolicyCatalog::guard_target(family).is_none() {
+                continue;
+            }
+            if system.set_family(family.id).is_ok() {
+                let desktops = system.desktops().unwrap_or_default();
+                let processes: Vec<BoundProcessToken> = desktops
+                    .iter()
+                    .map(|(d, main, _)| BoundProcessToken {
+                        pid: d.pid,
+                        uid: 0,
+                        start_seconds: d.start_seconds,
+                        start_microseconds: d.start_microseconds,
+                        role: if *main {
+                            ProcessRole::DesktopMain
+                        } else {
+                            ProcessRole::DesktopHelper
+                        },
+                        audit_token: None,
+                    })
+                    .collect();
+                self.supervisor
+                    .handle_event(SupervisionEvent::ProcessInventoryUpdated {
+                        family: family.id.to_string(),
+                        desktops,
+                        processes,
+                        observed_at: system.now(),
+                    })?;
+            }
+        }
+        self.drain_background_events()?;
+        Ok(self.supervisor.snapshot(system.now()))
+    }
+
+    pub fn wait_or_drain(&mut self, deadline: Instant, stop: &AtomicBool) {
+        while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+            let wait_for = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100));
+            match self.event_rx.recv_timeout(wait_for) {
+                Ok(ev) => {
+                    let _ = self.supervisor.handle_event(ev);
+                    let _ = self.drain_background_events();
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    thread::sleep(wait_for);
+                }
+            }
+        }
+    }
+
+    pub fn shutdown(self) {
+        unregister_production_enforcer(&self.supervisor.storage.paths.watch());
+        let _ = self.lease_watchdog.join();
+        let _ = self.async_audit_worker.join();
+    }
+}
 
 /// `PROCESS_INTERVAL` rounds of continuous degradation before the user is
 /// interrupted (15 × 2 s ≈ 30 s).
@@ -162,10 +344,49 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
         let store = storage.clone();
         let stop = stop.clone();
         let guard_alerts = alerts.clone();
+        let audit_paths = paths.clone();
         Some(
             thread::Builder::new()
                 .name("claude-session-guard".into())
                 .spawn(move || -> Result<()> {
+                    let audit_store_state = store.clone();
+                    let mut channel_stack = assemble_production_channel_stack(
+                        store.clone(),
+                        stop.clone(),
+                        true,
+                        move |req| {
+                            let mut audit_host = super::runtime::host(
+                                audit_paths.clone(),
+                                Authority::ExplicitPermit,
+                            )?;
+                            let target = PolicyCatalog::family(&req.family)
+                                .and_then(PolicyCatalog::guard_target)
+                                .unwrap_or(
+                                    claude_watch_core::processes::LaunchTarget::ClaudeDesktop,
+                                );
+                            let audit = claude_watch_runtime::audit_store::AuditStore::new(
+                                audit_store_state.clone(),
+                            )
+                            .collect_target(
+                                &mut audit_host,
+                                &claude_watch_runtime::region_catalog::load_system_catalog(),
+                                target,
+                                claude_watch_runtime::audit_store::AuditOptions {
+                                    online: true,
+                                    persist: true,
+                                    launch: true,
+                                },
+                            )?;
+                            let egress = audit_host
+                                .network
+                                .fast_egress()
+                                .data
+                                .unwrap_or_else(|| {
+                                    json!({"state":"unknown","observed_at":native::now()})
+                                });
+                            Ok((audit, egress, native::now()))
+                        },
+                    )?;
                     let controller = Controller::new(store.clone());
                     let network = host.network.clone();
                     let mut runtime = DesktopRuntime {
@@ -187,17 +408,37 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                     let mut guard_history = super::diagnostic_queue::GuardHistory::default();
                     let mut unknown_gate =
                         AlertGate::new(SUSTAINED_SAMPLING_ROUNDS, SAMPLING_QUIET);
-                    while !stop.load(Ordering::Acquire) {
-                        let started = Instant::now();
-                        let receipt=controller.guard_tick(&mut runtime)?;
-                        guard_history.observe(&guard_diagnostics, &receipt, native::now());
-                        if let Some(alerts)=&guard_alerts {
-                            if receipt["action"]=="close-desktop"{unknown_gate.observe(false);alerts.enqueue(Alert{title:"Claude Watch：已触发保护".into(),message:"检测到会话风险并已按配置处置受监督的应用。请查看具体检测结果；重新启动仍会执行完整校验。".into(),severity:Severity::Warning});}
-                            else if unknown_gate.observe(receipt["status"]=="unknown"){alerts.enqueue(Alert{title:"Claude Watch：保护采样异常".into(),message:"本轮保护证据未能完整取得，后台正在重试。详情见环境状态；这不等于已检测到网络泄漏。".into(),severity:Severity::Critical});}
+                    let loop_result: Result<()> = (|| {
+                        while !stop.load(Ordering::Acquire) {
+                            let started = Instant::now();
+                            let _ = channel_stack.step_with_system(&mut runtime);
+                            let receipt = controller.guard_tick(&mut runtime)?;
+                            guard_history.observe(&guard_diagnostics, &receipt, native::now());
+                            if let Some(alerts) = &guard_alerts {
+                                if matches!(
+                                    receipt["action"].as_str(),
+                                    Some("close-desktop" | "disconnect-channel")
+                                ) {
+                                    unknown_gate.observe(false);
+                                    alerts.enqueue(Alert {
+                                        title: "Claude Watch：已触发保护".into(),
+                                        message: "检测到会话风险并已按配置处置受监督的应用。请查看具体检测结果；重新启动仍会执行完整校验。".into(),
+                                        severity: Severity::Warning,
+                                    });
+                                } else if unknown_gate.observe(receipt["status"] == "unknown") {
+                                    alerts.enqueue(Alert {
+                                        title: "Claude Watch：保护采样异常".into(),
+                                        message: "本轮保护证据未能完整取得，后台正在重试。详情见环境状态；这不等于已检测到网络泄漏。".into(),
+                                        severity: Severity::Critical,
+                                    });
+                                }
+                            }
+                            channel_stack.wait_or_drain(started + PROCESS_INTERVAL, &stop);
                         }
-                        sleep_until(started + PROCESS_INTERVAL, &stop);
-                    }
-                    Ok(())
+                        Ok(())
+                    })();
+                    channel_stack.shutdown();
+                    loop_result
                 })
                 .map_err(|_| CoreError::new("guard_start_failed", "后台保护工作线程无法启动"))?,
         )
@@ -390,5 +631,202 @@ mod tests {
             {"pid": 9, "label": "com.example.other", "ownership": "unconfirmed"}
         ]);
         assert_ne!(evidence_signature(&before), evidence_signature(&after));
+    }
+
+    #[test]
+    fn production_daemon_channel_stack_wires_enforcer_supervisor_async_audit_and_lease_watchdog() {
+        use claude_watch_core::{
+            channel::{ChannelMonitorDisplayState, ChannelPermitState},
+            config::Config,
+            processes::LaunchTarget,
+            session::{Desktop, Launcher},
+        };
+        use claude_watch_runtime::channel_enforcer::{registered_production_enforcer, ChannelEnforcer};
+
+        struct DaemonFixtureSystem {
+            family: &'static str,
+            now: f64,
+            country: &'static str,
+        }
+        impl DesktopSystem for DaemonFixtureSystem {
+            fn launch_target(&self) -> LaunchTarget {
+                if self.family == "openai" {
+                    LaunchTarget::CodexDesktop
+                } else {
+                    LaunchTarget::ClaudeDesktop
+                }
+            }
+            fn set_family(&mut self, family_id: &str) -> Result<()> {
+                self.family = if family_id == "openai" { "openai" } else { "claude" };
+                Ok(())
+            }
+            fn now(&self) -> f64 {
+                self.now
+            }
+            fn monotonic(&self) -> Duration {
+                Duration::from_secs(1)
+            }
+            fn wait(&mut self, _: Duration) {}
+            fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
+                if self.family == "claude" {
+                    Ok(vec![(
+                        Desktop {
+                            pid: 4100,
+                            start_seconds: 900,
+                            start_microseconds: 1,
+                        },
+                        true,
+                        "u501:900:1".into(),
+                    )])
+                } else {
+                    Ok(vec![])
+                }
+            }
+            fn desktop_alive(&mut self, _: &Desktop) -> Result<bool> {
+                Ok(true)
+            }
+            fn desktop_tree_running(&mut self) -> Result<bool> {
+                Ok(self.family == "claude")
+            }
+            fn launcher(&mut self) -> Result<Launcher> {
+                Ok(Launcher {
+                    pid: 1,
+                    start: "init".into(),
+                })
+            }
+            fn full_audit(&mut self) -> Result<Value> {
+                panic!("guard loop must not call synchronous full_audit when async worker is active")
+            }
+            fn egress(&mut self) -> Value {
+                json!({
+                    "ip": if self.country == "CN" { "223.5.5.5" } else { "1.1.1.1" },
+                    "country": self.country,
+                    "observed_at": self.now,
+                    "source": "fixture"
+                })
+            }
+            fn local_guard(&mut self) -> Result<Value> {
+                Ok(json!({
+                    "context": "ctx",
+                    "context_id": "ctx",
+                    "proxy": "ok",
+                    "tun": "ok",
+                    "guard_backend_healthy": true,
+                    "observation_unavailable": []
+                }))
+            }
+            fn backend_healthy(&mut self) -> Result<bool> {
+                Ok(true)
+            }
+            fn launcher_matches(&mut self, _: &Launcher) -> Result<bool> {
+                Ok(true)
+            }
+            fn open_desktop(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn quit_desktop(&mut self) -> Result<()> {
+                panic!("channel mode must preserve process and never call quit_desktop")
+            }
+            fn quit_for_confirmed_ip_risk(&mut self, _: &mut Option<u32>) -> Result<()> {
+                panic!("channel mode must preserve process and never call quit_for_confirmed_ip_risk")
+            }
+        }
+
+        let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let root = std::path::PathBuf::from("/tmp").join(format!("cwdm-{short_id}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new(Paths::new(&root).unwrap());
+        let mut cfg = Config::default();
+        cfg.enabled = true;
+        cfg.guard_enabled = true;
+        store
+            .atomic_json(&store.paths.config(), &cfg.value().unwrap())
+            .unwrap();
+
+        let now = native::now();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (release_audit_tx, release_audit_rx) = std::sync::mpsc::channel();
+        let mut stack = assemble_production_channel_stack(
+            store.clone(),
+            stop.clone(),
+            true,
+            move |req| {
+                let _ = release_audit_rx.recv_timeout(Duration::from_secs(2));
+                Ok((
+                    json!({
+                        "ready": true,
+                        "observed_at": req.requested_at + 0.1,
+                        "expires_at": req.requested_at + 30.1,
+                        "context_id": "ctx",
+                        "observation_id": "fixture",
+                        "context_transition": {"state": "stable"},
+                        "policy": req.policy_version.policy_digest,
+                        "egress_reference": {
+                            "ip": "1.1.1.1",
+                            "country": "JP",
+                            "checked_at": req.requested_at + 0.1,
+                            "context": "ctx",
+                            "source": "fixture"
+                        }
+                    }),
+                    json!({
+                        "ip": "1.1.1.1",
+                        "country": "JP",
+                        "observed_at": req.requested_at + 0.1,
+                        "source": "fixture"
+                    }),
+                    req.requested_at + 0.1,
+                ))
+            },
+        )
+        .unwrap();
+
+        assert!(stack.enforcer.is_ready().unwrap());
+        assert!(registered_production_enforcer(&store.paths.watch()).is_some());
+
+        let mut sys = DaemonFixtureSystem {
+            family: "claude",
+            now,
+            country: "JP",
+        };
+        // Step 1: Running Claude without a session schedules async audit on the worker
+        let snap1 = stack.step_with_system(&mut sys).unwrap();
+        assert_eq!(
+            snap1.families["claude"].permit_state,
+            ChannelPermitState::PendingVerification
+        );
+
+        // Wait for async audit completion via `wait_or_drain`
+        let _ = release_audit_tx.send(());
+        stack.wait_or_drain(Instant::now() + Duration::from_secs(2), &stop);
+        sys.now += 0.2;
+        let snap2 = stack.step_with_system(&mut sys).unwrap();
+        assert_eq!(
+            snap2.families["claude"].permit_state,
+            ChannelPermitState::Permitted
+        );
+        assert_eq!(
+            snap2.families["claude"].display_state,
+            ChannelMonitorDisplayState::Forwarding
+        );
+
+        // Step 2: Trigger CN exit risk -> cuts off channel while preserving process
+        sys.now += 1.0;
+        sys.country = "CN";
+        let snap3 = stack.step_with_system(&mut sys).unwrap();
+        assert_eq!(
+            snap3.families["claude"].permit_state,
+            ChannelPermitState::Revoked
+        );
+        assert_eq!(
+            snap3.families["claude"].display_state,
+            ChannelMonitorDisplayState::Blocked
+        );
+        assert!(snap3.families["claude"].process_preserved);
+
+        stop.store(true, Ordering::Release);
+        stack.shutdown();
+        assert!(registered_production_enforcer(&store.paths.watch()).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

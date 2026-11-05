@@ -7,7 +7,7 @@ use crate::session_store::desktop_groups::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum GroupRound { Legacy, Continue, Handled }
+pub(super) enum GroupRound { Legacy, Continue, Handled, DeferredSlowAdopt }
 
 impl Controller {
     /// Reconcile membership before the legacy single-main lifecycle runs.
@@ -15,7 +15,7 @@ impl Controller {
     /// a joining/restarted app gets a bounded background audit, not a new baseline.
     pub(super) fn prepare_desktop_group<S: DesktopSystem>(
         &self, system: &mut S, sessions: &SessionStore, receipts: &ReceiptStore,
-        family: &'static str, config: &Config,
+        family: &'static str, config: &Config, allow_slow_adopt: bool,
         rows: &mut Vec<(Desktop, bool, String)>, current: &mut Option<Session>,
         identity_unconfirmed: &mut bool, exit_pending: &mut bool, receipt: &mut Value,
     ) -> Result<GroupRound> {
@@ -28,6 +28,9 @@ impl Controller {
             let before = system.egress();
             let Some(initial) = session::Egress::fresh(&before, system.now(), session::GUARD_EGRESS_TTL)
                 .filter(|e| e.country != "CN") else { return Ok(GroupRound::Legacy) };
+            if !allow_slow_adopt {
+                return Ok(GroupRound::DeferredSlowAdopt);
+            }
             let audit = match system.full_audit() {
                 Ok(value) => value,
                 Err(error) => { receipt["adopt_error"] = json!(error.code); return Ok(GroupRound::Legacy); }

@@ -110,6 +110,23 @@ impl LaunchTarget {
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessRole {
+    DesktopMain,
+    DesktopHelper,
+    Cli,
+    Child,
+    Launcher,
+}
+impl ProcessRole {
+    pub fn desktop(self) -> bool {
+        matches!(self, Self::DesktopMain | Self::DesktopHelper)
+    }
+    pub fn launcher(self) -> bool {
+        matches!(self, Self::Launcher)
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     #[serde(rename = "desktop-main")]
     ClaudeMain,
@@ -168,34 +185,58 @@ impl Kind {
             _ => Provider::Openai,
         }
     }
-    pub fn child(self) -> Self {
-        match self.provider() {
-            Provider::Claude => Self::ClaudeChild,
-            Provider::Codex => Self::CodexChild,
-            Provider::Chatgpt => Self::ChatgptChild,
-            Provider::Openai => Self::OpenaiChild,
+    pub fn role(self) -> ProcessRole {
+        match self {
+            Self::ClaudeMain | Self::CodexMain | Self::ChatgptMain | Self::OpenaiMain => {
+                ProcessRole::DesktopMain
+            }
+            Self::ClaudeHelper | Self::CodexHelper | Self::ChatgptHelper | Self::OpenaiHelper => {
+                ProcessRole::DesktopHelper
+            }
+            Self::ClaudeCode | Self::CodexCli => ProcessRole::Cli,
+            Self::ClaudeChild | Self::CodexChild | Self::ChatgptChild | Self::OpenaiChild => {
+                ProcessRole::Child
+            }
+            Self::ClaudeLauncher
+            | Self::CodexLauncher
+            | Self::ChatgptLauncher
+            | Self::OpenaiLauncher => ProcessRole::Launcher,
         }
     }
+    pub fn from_provider_role(provider: Provider, role: ProcessRole) -> Option<Self> {
+        match (provider, role) {
+            (Provider::Claude, ProcessRole::DesktopMain) => Some(Self::ClaudeMain),
+            (Provider::Claude, ProcessRole::DesktopHelper) => Some(Self::ClaudeHelper),
+            (Provider::Claude, ProcessRole::Cli) => Some(Self::ClaudeCode),
+            (Provider::Claude, ProcessRole::Child) => Some(Self::ClaudeChild),
+            (Provider::Claude, ProcessRole::Launcher) => Some(Self::ClaudeLauncher),
+            (Provider::Codex, ProcessRole::DesktopMain) => Some(Self::CodexMain),
+            (Provider::Codex, ProcessRole::DesktopHelper) => Some(Self::CodexHelper),
+            (Provider::Codex, ProcessRole::Cli) => Some(Self::CodexCli),
+            (Provider::Codex, ProcessRole::Child) => Some(Self::CodexChild),
+            (Provider::Codex, ProcessRole::Launcher) => Some(Self::CodexLauncher),
+            (Provider::Chatgpt, ProcessRole::DesktopMain) => Some(Self::ChatgptMain),
+            (Provider::Chatgpt, ProcessRole::DesktopHelper) => Some(Self::ChatgptHelper),
+            (Provider::Chatgpt, ProcessRole::Cli) => None,
+            (Provider::Chatgpt, ProcessRole::Child) => Some(Self::ChatgptChild),
+            (Provider::Chatgpt, ProcessRole::Launcher) => Some(Self::ChatgptLauncher),
+            (Provider::Openai, ProcessRole::DesktopMain) => Some(Self::OpenaiMain),
+            (Provider::Openai, ProcessRole::DesktopHelper) => Some(Self::OpenaiHelper),
+            (Provider::Openai, ProcessRole::Cli) => None,
+            (Provider::Openai, ProcessRole::Child) => Some(Self::OpenaiChild),
+            (Provider::Openai, ProcessRole::Launcher) => Some(Self::OpenaiLauncher),
+        }
+    }
+    pub fn child(self) -> Self {
+        Self::from_provider_role(self.provider(), ProcessRole::Child).unwrap()
+    }
     pub fn launcher(self) -> bool {
-        matches!(
-            self,
-            Self::ClaudeLauncher
-                | Self::CodexLauncher
-                | Self::ChatgptLauncher
-                | Self::OpenaiLauncher
-        )
+        self.role() == ProcessRole::Launcher
     }
     pub fn desktop(self) -> bool {
         matches!(
-            self,
-            Self::ClaudeMain
-                | Self::ClaudeHelper
-                | Self::CodexMain
-                | Self::CodexHelper
-                | Self::ChatgptMain
-                | Self::ChatgptHelper
-                | Self::OpenaiMain
-                | Self::OpenaiHelper
+            self.role(),
+            ProcessRole::DesktopMain | ProcessRole::DesktopHelper
         )
     }
 }

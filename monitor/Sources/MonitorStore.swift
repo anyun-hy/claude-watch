@@ -28,6 +28,7 @@ final class MonitorStore: ObservableObject {
     @Published var networkSelection = NetworkGraphSelection()
     @Published private(set) var graphContinuity = GraphContinuityStore()
     @Published private(set) var serverReferences: [String: ServerReference] = [:]
+    @Published private(set) var channelSubscription = ChannelMonitorSubscriptionStore()
     private var referenceQueryRunning = false
     private var referenceQueriesEnabled = false
     private var timer: Timer?
@@ -66,6 +67,11 @@ final class MonitorStore: ObservableObject {
         self.switcher.onWebRTCRiskRecorded = { [weak self] in
             guard let self, !self.initializing else { return }
             Task { await self.switcher.refreshBackground() }
+        }
+        self.switcher.onConfigUpdated = { [weak self] in
+            guard let self else { return }
+            self.channelSubscription.markReconnected()
+            self.refresh(full: true, manual: true)
         }
         self.switcher.onReceiptDiagnostic = { kind, event, runID, code in
             guard case .rustCandidate? = BundledBackendVariant.current(), let runID else { return }
@@ -203,6 +209,7 @@ final class MonitorStore: ObservableObject {
             case .failure(let message):
                 if case .rustCandidate? = BundledBackendVariant.current() { LeakDiagnosticTrace.shared.schedule(kind: "all", event: "snapshot_failed") }
                 error = message
+                channelSubscription.markReconnected()
                 now = completedAt
                 leakChecks.now = completedAt
                 aiChecks.now = completedAt
@@ -220,6 +227,21 @@ final class MonitorStore: ObservableObject {
         error = nil
         let transition = observeDiagnosticContext(from: value, at: receivedAt)
         snapshot = value
+        if !channelSubscription.needsResync, let events = value.channelEvents {
+            for event in events {
+                ingestChannelEvent(event)
+            }
+        }
+        if channelSubscription.needsResync, let channelSnap = value.channelSupervision {
+            channelSubscription.applySnapshot(channelSnap)
+            if let events = value.channelEvents {
+                for event in events where event.event_seq > channelSubscription.lastEventSeq {
+                    ingestChannelEvent(event)
+                }
+            }
+        } else if let channelSnap = value.channelSupervision, (value.channelEvents ?? []).isEmpty {
+            channelSubscription.applySnapshot(channelSnap)
+        }
         // Re-evaluate only after both the tracker and snapshot describe this
         // observation. Otherwise a recovered sampler can leave a fresh
         // receipt marked incomplete until an unrelated later clock tick.
@@ -229,6 +251,20 @@ final class MonitorStore: ObservableObject {
             leakChecks.refreshWebRTCIfNeeded()
             refreshEnvironmentIfNeeded()
         }
+    }
+    func ingestChannelEvent(_ event: ChannelMonitorEvent) {
+        let outcome = channelSubscription.applyEvent(event)
+        if case .gapDetectedResyncRequired = outcome {
+            refresh(full: true, manual: true)
+        }
+    }
+    func channelState(for product: MonitoredProduct) -> FamilyChannelMonitorState? {
+        let family = product == .claude ? "claude" : "openai"
+        return channelSubscription.effectiveState(
+            for: family,
+            now: now.timeIntervalSince1970,
+            live: live
+        )
     }
     private func refreshBackgroundIfNeeded(at date: Date, force: Bool = false) {
         guard !backgroundReadRunning, !switcher.busy,

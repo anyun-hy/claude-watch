@@ -569,9 +569,21 @@ pub fn assemble(
         .join("Library/LaunchAgents/io.local.claudewatch.agent.plist");
     let installed = store.paths.watch().join("runtime/watch-engine").is_file() && agent.is_file();
     let (events, event_error) = match events(store) { Ok(events) => (events, None), Err(_) => (Vec::new(), Some("事件日志不可读取")) };
+    let channel_supervision = store
+        .read_json(
+            &store.paths.watch().join("state/channel-supervision.json"),
+            Value::Null,
+        )
+        .unwrap_or(Value::Null);
+    let channel_events = store
+        .read_json(
+            &store.paths.watch().join("state/channel-events.json"),
+            json!([]),
+        )
+        .unwrap_or_else(|_| json!([]));
     json!({"capturedAt":at,"health":{"state":if quality{"running"}else{"degraded"},"mode":mode,"pid":producer.pid,"heartbeatAge":0.0,"started":producer.start_stamp,"detail":if quality{"后台进程存活，采样心跳正常"}else{"部分监控采样需要检查"},"alerts":"开启"},
         "installed":installed,"autoStart":false,"keepAlive":false,"hasBaseline":has_session_reference(store,at),"stderrBytes":0,
-        "processes":process_rows(round,&[]),"events":events,"eventError":event_error,"proxy":proxy(tag),"proxyError":Value::Null,"backendVersion":VERSION,"monitoredApps":MONITORED,"logPath":store.paths.base().join("events.jsonl")})
+        "processes":process_rows(round,&[]),"events":events,"eventError":event_error,"proxy":proxy(tag),"proxyError":Value::Null,"channelSupervision":channel_supervision,"channelEvents":channel_events,"backendVersion":VERSION,"monitoredApps":MONITORED,"logPath":store.paths.base().join("events.jsonl")})
 }
 /// Applies independently verified LaunchAgent registration facts without changing
 /// the legacy monitor snapshot shape or its sampling-health interpretation.

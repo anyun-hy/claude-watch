@@ -188,6 +188,181 @@ struct ConnectionObservation: Decodable, Sendable {
     }
 }
 
+struct ChannelPolicyVersionModel: Codable, Equatable, Sendable {
+    let policy_digest: String
+    let guard_policy_digest: String
+}
+
+enum ChannelMonitorDisplayState: String, Codable, Equatable, Sendable {
+    case pendingVerification = "pending_verification"
+    case forwarding = "forwarding"
+    case disconnecting = "disconnecting"
+    case blocked = "blocked"
+    case failed = "failed"
+
+    var labelZh: String {
+        switch self {
+        case .pendingVerification: return "待验证"
+        case .forwarding: return "获准转发"
+        case .disconnecting: return "正在断开"
+        case .blocked: return "已阻断"
+        case .failed: return "执行失败"
+        }
+    }
+}
+
+enum PolicySyncState: String, Codable, Equatable, Sendable {
+    case applied = "applied"
+    case pendingApply = "pending_apply"
+    case applyFailed = "apply_failed"
+
+    var labelZh: String {
+        switch self {
+        case .applied: return "执行器已应用"
+        case .pendingApply: return "配置已保存（待执行器应用）"
+        case .applyFailed: return "配置已保存（执行器应用失败）"
+        }
+    }
+}
+
+struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
+    let family: String
+    let session_id: String?
+    let saved_policy_version: ChannelPolicyVersionModel
+    let applied_policy_version: ChannelPolicyVersionModel?
+    let policy_sync_state: PolicySyncState
+    let policy_sync_label_zh: String
+    let permit_generation: UInt64
+    let command_seq: UInt64
+    let permit_state: String
+    let display_state: ChannelMonitorDisplayState
+    let display_label_zh: String
+    let reason_code: String
+    let process_preserved: Bool
+    let active_member_pids: [UInt32]
+    let active_flows_count: UInt32
+    let terminated_flows_count: UInt32
+    let blocked_new_connections: UInt32
+    let updated_at: Double
+
+    /// Binds network flows and process rows to the same supervised session and
+    /// policy version so stale flows or another session's processes are never
+    /// mixed with the current channel disposition.
+    func matchesProcess(_ process: WatchedProcess) -> Bool {
+        active_member_pids.contains(UInt32(max(0, process.pid)))
+    }
+}
+
+struct ChannelMonitorSnapshot: Codable, Equatable, Sendable {
+    let snapshot_seq: UInt64
+    let captured_at: Double
+    let saved_policy_version: ChannelPolicyVersionModel
+    let families: [String: FamilyChannelMonitorState]
+}
+
+struct ChannelMonitorEvent: Codable, Equatable, Sendable {
+    let event_seq: UInt64
+    let family_state: FamilyChannelMonitorState
+}
+
+enum ChannelSubscriptionApplyOutcome: Equatable, Sendable {
+    case applied
+    case ignoredStaleEvent
+    case gapDetectedResyncRequired(expectedSeq: UInt64, receivedSeq: UInt64)
+}
+
+struct ChannelMonitorSubscriptionStore: Sendable {
+    private(set) var lastEventSeq: UInt64 = 0
+    private(set) var needsResync: Bool = true
+    private(set) var savedPolicyVersion: ChannelPolicyVersionModel? = nil
+    private(set) var families: [String: FamilyChannelMonitorState] = [:]
+
+    mutating func markReconnected() {
+        needsResync = true
+    }
+
+    @discardableResult
+    mutating func applySnapshot(_ snapshot: ChannelMonitorSnapshot) -> Bool {
+        if snapshot.snapshot_seq < lastEventSeq && !needsResync {
+            return false
+        }
+        lastEventSeq = snapshot.snapshot_seq
+        savedPolicyVersion = snapshot.saved_policy_version
+        families = snapshot.families
+        needsResync = false
+        return true
+    }
+
+    mutating func applyEvent(_ event: ChannelMonitorEvent) -> ChannelSubscriptionApplyOutcome {
+        if needsResync {
+            return .gapDetectedResyncRequired(
+                expectedSeq: lastEventSeq + 1,
+                receivedSeq: event.event_seq
+            )
+        }
+        if event.event_seq <= lastEventSeq {
+            return .ignoredStaleEvent
+        }
+        if event.event_seq > lastEventSeq + 1 {
+            needsResync = true
+            return .gapDetectedResyncRequired(
+                expectedSeq: lastEventSeq + 1,
+                receivedSeq: event.event_seq
+            )
+        }
+        if let existing = families[event.family_state.family] {
+            if event.family_state.permit_generation < existing.permit_generation
+                || (event.family_state.permit_generation == existing.permit_generation
+                    && event.family_state.command_seq < existing.command_seq)
+            {
+                return .ignoredStaleEvent
+            }
+        }
+        lastEventSeq = event.event_seq
+        savedPolicyVersion = event.family_state.saved_policy_version
+        families[event.family_state.family] = event.family_state
+        return .applied
+    }
+
+    /// Returns the effective display state for `family`, degrading to
+    /// `.pendingVerification` if the subscriber is disconnected (`!live`),
+    /// requires resync (`needsResync`), or the state is older than `maxAge`.
+    func effectiveState(
+        for family: String,
+        now: Double,
+        live: Bool,
+        maxAge: Double = 30.0
+    ) -> FamilyChannelMonitorState? {
+        guard let state = families[family] else {
+            return nil
+        }
+        let expired = !now.isFinite || !state.updated_at.isFinite || (now - state.updated_at) > maxAge
+        if !live || needsResync || expired {
+            return FamilyChannelMonitorState(
+                family: state.family,
+                session_id: state.session_id,
+                saved_policy_version: state.saved_policy_version,
+                applied_policy_version: state.applied_policy_version,
+                policy_sync_state: state.policy_sync_state,
+                policy_sync_label_zh: state.policy_sync_label_zh,
+                permit_generation: state.permit_generation,
+                command_seq: state.command_seq,
+                permit_state: state.permit_state,
+                display_state: .pendingVerification,
+                display_label_zh: "待验证（订阅失联或状态已过期）",
+                reason_code: "subscription_stale_or_disconnected",
+                process_preserved: state.process_preserved,
+                active_member_pids: state.active_member_pids,
+                active_flows_count: state.active_flows_count,
+                terminated_flows_count: state.terminated_flows_count,
+                blocked_new_connections: state.blocked_new_connections,
+                updated_at: state.updated_at
+            )
+        }
+        return state
+    }
+}
+
 struct MonitorSnapshot: Decodable, Sendable {
     let capturedAt: Double
     let health: Health
@@ -197,6 +372,8 @@ struct MonitorSnapshot: Decodable, Sendable {
     let events: [Event]
     let proxy: ProxySnapshot?
     let proxyError: String?
+    var channelSupervision: ChannelMonitorSnapshot? = nil
+    var channelEvents: [ChannelMonitorEvent]? = nil
     let logPath: String
     /// Absent when an older installed script has not yet published multi-product capability.
     let backendVersion: String?

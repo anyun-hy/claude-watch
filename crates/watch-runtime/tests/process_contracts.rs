@@ -352,3 +352,204 @@ fn data_root_owner_must_match_the_login_identity() {
     assert!(std::fs::read_dir(&root).unwrap().next().is_none());
     std::fs::remove_dir(root).unwrap();
 }
+
+#[test]
+fn provider_and_role_roundtrip_matches_all_18_kinds_and_root_classification_vectors() {
+    use claude_watch_core::{
+        process_roots::{self, Classification, RootEvidence, TrustedCliPaths},
+        processes::ProcessRole,
+    };
+    use std::path::Path;
+
+    let all_kinds = [
+        Kind::ClaudeMain,
+        Kind::ClaudeHelper,
+        Kind::ClaudeCode,
+        Kind::ClaudeChild,
+        Kind::ClaudeLauncher,
+        Kind::CodexMain,
+        Kind::CodexHelper,
+        Kind::CodexCli,
+        Kind::CodexChild,
+        Kind::CodexLauncher,
+        Kind::ChatgptMain,
+        Kind::ChatgptHelper,
+        Kind::ChatgptChild,
+        Kind::ChatgptLauncher,
+        Kind::OpenaiMain,
+        Kind::OpenaiHelper,
+        Kind::OpenaiChild,
+        Kind::OpenaiLauncher,
+    ];
+    for kind in all_kinds {
+        let role = kind.role();
+        assert_eq!(
+            Kind::from_provider_role(kind.provider(), role),
+            Some(kind),
+            "roundtrip failed for {kind:?}"
+        );
+        assert_eq!(kind.desktop(), role.desktop());
+        assert_eq!(kind.launcher(), matches!(role, ProcessRole::Launcher));
+        assert_eq!(
+            Kind::from_provider_role(kind.provider(), ProcessRole::Child),
+            Some(kind.child())
+        );
+    }
+    assert_eq!(
+        Kind::from_provider_role(Provider::Chatgpt, ProcessRole::Cli),
+        None
+    );
+    assert_eq!(
+        Kind::from_provider_role(Provider::Openai, ProcessRole::Cli),
+        None
+    );
+
+    let home = Path::new("/Users/test");
+    let trusted = TrustedCliPaths::default();
+    let check = |executable: &str,
+                 bundle_path: Option<&str>,
+                 bundle_id: Option<&str>,
+                 args: Option<&[&str]>,
+                 cwd: Option<&str>| {
+        let id = Identity {
+            executable: executable.into(),
+            ..identity(42, 1)
+        };
+        let owned_args: Option<Vec<String>> =
+            args.map(|slice| slice.iter().map(|s| (*s).to_string()).collect());
+        process_roots::classify(
+            RootEvidence {
+                identity: &id,
+                bundle_path,
+                bundle_id,
+                arguments: owned_args.as_deref(),
+                cwd,
+            },
+            home,
+            &trusted,
+            |p| Some(p.to_path_buf()),
+        )
+    };
+
+    assert_eq!(
+        check(
+            "/opt/homebrew/bin/node",
+            None,
+            None,
+            Some(&[
+                "/opt/homebrew/bin/node",
+                "--require",
+                "/tmp/preload.js",
+                "--import=file:///tmp/boot.mjs",
+                "node_modules/@anthropic-ai/claude-code/cli.js"
+            ]),
+            Some("/opt/claude")
+        ),
+        Classification::Root(Kind::ClaudeCode)
+    );
+    assert_eq!(
+        check(
+            "/usr/bin/node",
+            None,
+            None,
+            Some(&[
+                "/usr/bin/node",
+                "--",
+                "/opt/node_modules/@openai/codex/bin/codex.js"
+            ]),
+            None
+        ),
+        Classification::Root(Kind::CodexCli)
+    );
+    assert_eq!(
+        check(
+            "/opt/homebrew/bin/node",
+            None,
+            None,
+            Some(&[
+                "/opt/homebrew/bin/node",
+                "/Users/test/AI Tools/node_modules/@anthropic-ai/claude-code/cli.js"
+            ]),
+            None
+        ),
+        Classification::Root(Kind::ClaudeCode)
+    );
+    assert_eq!(
+        check(
+            "/opt/homebrew/bin/node",
+            None,
+            None,
+            Some(&[
+                "/opt/homebrew/bin/node",
+                "AI Tools/node_modules/@openai/codex/bin/codex.js"
+            ]),
+            Some("/Users/test")
+        ),
+        Classification::Root(Kind::CodexCli)
+    );
+    let daemon_bin = "/Users/test/.codex/packages/app-server-daemon/releases/1.2.3/bin/codex";
+    assert_eq!(
+        check(
+            daemon_bin,
+            None,
+            None,
+            Some(&[daemon_bin, "app-server", "daemon"]),
+            None
+        ),
+        Classification::Root(Kind::CodexCli)
+    );
+    assert_eq!(
+        check(
+            daemon_bin,
+            None,
+            None,
+            Some(&[daemon_bin, "app-server", "--listen", "127.0.0.1:4500"]),
+            None
+        ),
+        Classification::Root(Kind::CodexCli)
+    );
+    assert_eq!(
+        check(daemon_bin, None, None, Some(&[daemon_bin, "--help"]), None),
+        Classification::NotTarget
+    );
+    assert_eq!(
+        check(
+            daemon_bin,
+            None,
+            None,
+            Some(&[daemon_bin, "app-server", "--listen", "--bad"]),
+            None
+        ),
+        Classification::NotTarget
+    );
+    assert_eq!(
+        check(
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            Some("/Applications/ChatGPT.app"),
+            Some("com.openai.chat"),
+            None,
+            None
+        ),
+        Classification::Root(Kind::CodexCli)
+    );
+    assert_eq!(
+        check(
+            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            Some("/Applications/ChatGPT.app"),
+            Some("com.openai.chat"),
+            None,
+            None
+        ),
+        Classification::Root(Kind::ChatgptMain)
+    );
+    assert_eq!(
+        check(
+            "/Applications/Fake.app/Contents/MacOS/Fake",
+            Some("/Applications/Fake.app"),
+            Some("com.openai.chat"),
+            None,
+            None
+        ),
+        Classification::NotTarget
+    );
+}

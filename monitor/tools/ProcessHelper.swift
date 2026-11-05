@@ -8,23 +8,18 @@ enum MonitoredProduct: Equatable, Sendable { case claude, openAI }
 @main
 struct WatchProcessHelper {
     static func desktopInventory() throws -> [AIProcessIdentity] {
-        var inventory = try AIProcessInventory.read()
-        for i in inventory.indices {
-            if inventory[i].rootProduct == .claude && !inventory[i].executable.contains(".app/Contents/") {
-                inventory[i].rootProduct = nil
-            }
-        }
-        return inventory
+        AIProcessClosePolicy.scopedInventory(
+            try AIProcessInventory.read(),
+            for: .claude,
+            scope: AIProcessClosePolicy.automaticDesktopScope(for: .claude)
+        )
     }
     static func inventory(for product: MonitoredProduct) throws -> [AIProcessIdentity] {
-        switch product {
-        // A bare binary named like Claude is not a Claude install; only the
-        // app bundle's own tree is eligible.
-        case .claude: return try desktopInventory()
-        // ChatGPT / Codex also runs as an independent CLI, which carries no
-        // bundle, so the full inventory is the eligible set.
-        case .openAI: return try AIProcessInventory.read()
-        }
+        AIProcessClosePolicy.scopedInventory(
+            try AIProcessInventory.read(),
+            for: product,
+            scope: AIProcessClosePolicy.automaticDesktopScope(for: product)
+        )
     }
     static func plan(_ product: MonitoredProduct, inventory: [AIProcessIdentity]) -> AIProcessClosePlan {
         AIProcessClosePolicy.plan(product, inventory: inventory, uid: getuid(),

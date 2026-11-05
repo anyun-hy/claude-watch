@@ -268,10 +268,12 @@ struct BackgroundServiceRow: Decodable, Identifiable {
     let id, title, state, detail, source: String
     let desired: Bool?
     let last_checked: Double?
+    var execution_verified: Bool? = nil
+    var health_basis: String? = nil
     var statusLabel: String {
         switch state {
         case "running": return "断线保护就绪"
-        case "scheduled": return "已加载"
+        case "scheduled": return execution_verified == false ? "已加载（执行待确认）" : "已加载"
         case "inactive": return "已停用"
         case "unavailable": return "尚不可用"
         case "mismatch": return "待同步"
@@ -279,7 +281,7 @@ struct BackgroundServiceRow: Decodable, Identifiable {
         default: return "未确认"
         }
     }
-    var healthy: Bool { state == "running" || state == "scheduled" }
+    var healthy: Bool { state == "running" || (state == "scheduled" && execution_verified != false) }
 }
 struct PolicyIssue: Decodable, Identifiable { let id, title, detail: String }
 struct BackgroundServiceReceipt: Decodable {
@@ -499,6 +501,7 @@ final class SwitcherStore: ObservableObject {
     var awaitFreshDNSReceipt: ((TimeInterval) async -> Bool)?
     var onDNSReceiptRecorded: (() -> Void)?
     var onWebRTCRiskRecorded: (() -> Void)?
+    var onConfigUpdated: (() -> Void)?
     var onReceiptDiagnostic: ((LeakKind, String, UUID?, String?) -> Void)?
     var receiptCommandFixture: ((String, Data) async throws -> Data)?
     var diagnosticContextProvider: (() -> String?)?
@@ -1361,7 +1364,7 @@ final class SwitcherStore: ObservableObject {
                 else if args == ["repair"] || args == ["set-region"] {
                     plan = .init(id: "fixture-plan", actions: [.init(id: "timezone", title: "设置时区（模拟）", scope: "administrator", detail: "Asia/Tokyo → Asia/Tokyo")])
                 }
-                else if args.starts(with: ["config", "set"]) { savedSettings = settings; hasUnsavedSettings = false }
+                else if args.starts(with: ["config", "set"]) { savedSettings = settings; hasUnsavedSettings = false; onConfigUpdated?() }
                 else if fullInitializationFixture && args.starts(with: ["setup", "apply"]) {
                     settings[Setting.enabled.key] = setupEnablePolicy
                     settings[Setting.guardEnabled.key] = setupGuard
@@ -1454,6 +1457,7 @@ final class SwitcherStore: ObservableObject {
                 if args.first == "logs" { operationLog = raw["message"] as? String ?? "暂无操作记录" }
                 if let result = raw["config"] as? [String: Any], args.first == "config", !failure {
                     settings = result; savedSettings = result; hasUnsavedSettings = false; audit = nil
+                    onConfigUpdated?()
                 }
                 if refresh && !(args.first == "config" && failure) {
                     setupProgress?(.verifySettings)

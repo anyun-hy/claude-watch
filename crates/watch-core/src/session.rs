@@ -13,6 +13,27 @@ pub const UNKNOWN_GRACE: f64 = 15.0;
 pub const RISK_EVIDENCE_TTL: f64 = 300.0;
 pub const AUDIT_EGRESS_TTL: f64 = 30.0;
 pub const GUARD_EGRESS_TTL: f64 = 10.0;
+pub const GROUP_KEY: &str = "desktop_group_v1";
+pub const GROUP_RECHECK_KEY: &str = "desktop_group_recheck_v1";
+pub const GROUP_CONTINUITY_KEY: &str = "desktop_group_continuity_v1";
+pub const MAX_DESKTOP_MEMBERS: usize = 32;
+
+pub fn canonical_desktops(mut members: Vec<Desktop>) -> Result<Vec<Desktop>> {
+    if members.len() > MAX_DESKTOP_MEMBERS || members.iter().any(|d| !d.valid()) {
+        return Err(CoreError::new(
+            "desktop_identity_unavailable",
+            "主进程集合超限或身份无效",
+        ));
+    }
+    members.sort_by_key(|d| (d.pid, d.start_seconds, d.start_microseconds));
+    if members.windows(2).any(|pair| pair[0].pid == pair[1].pid) {
+        return Err(CoreError::new(
+            "desktop_inventory_incomplete",
+            "同一轮主进程身份重复或冲突",
+        ));
+    }
+    Ok(members)
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Reason {
@@ -144,6 +165,58 @@ pub struct Session {
     pub extra: BTreeMap<String, Value>,
 }
 impl Session {
+    pub fn has_desktop_group(&self) -> bool {
+        self.extra.contains_key(GROUP_KEY)
+    }
+    pub fn group_rechecking(&self) -> bool {
+        self.extra.get(GROUP_RECHECK_KEY) == Some(&json!(true))
+    }
+    /// Unified membership accessor for both single-desktop (`desktop`) and
+    /// multi-desktop (`desktop_group_v1`) sessions.
+    pub fn desktop_members(&self) -> Result<Vec<Desktop>> {
+        let Some(raw) = self.extra.get(GROUP_KEY) else {
+            if self.extra.contains_key(GROUP_RECHECK_KEY)
+                || self.extra.contains_key(GROUP_CONTINUITY_KEY)
+            {
+                return Err(CoreError::new(
+                    "invalid_session",
+                    "集合复核标记缺少对应主进程集合",
+                ));
+            }
+            return canonical_desktops(self.desktop.iter().cloned().collect());
+        };
+        let members: Vec<Desktop> = serde_json::from_value(raw.clone())
+            .map_err(|_| CoreError::new("invalid_session", "会话主进程集合格式无效"))?;
+        let sorted = canonical_desktops(members.clone())
+            .map_err(|_| CoreError::new("invalid_session", "会话主进程集合身份无效"))?;
+        if sorted.is_empty() || sorted != members || self.desktop.as_ref() != sorted.first() {
+            return Err(CoreError::new(
+                "invalid_session",
+                "会话主进程集合与兼容身份不一致",
+            ));
+        }
+        for key in [GROUP_RECHECK_KEY, GROUP_CONTINUITY_KEY] {
+            if self.extra.get(key).is_some_and(|v| v != &json!(true)) {
+                return Err(CoreError::new("invalid_session", "会话集合复核标记无效"));
+            }
+        }
+        if self.extra.contains_key(GROUP_CONTINUITY_KEY) && !self.group_rechecking() {
+            return Err(CoreError::new(
+                "invalid_session",
+                "集合连续基线标记缺少复核状态",
+            ));
+        }
+        if self.group_rechecking()
+            && (!matches!(self.state, Phase::Rechecking | Phase::Locked | Phase::Ended)
+                || !self.created_at.is_finite()
+                || self.created_at <= 0.0
+                || !self.pending_deadline.is_finite()
+                || self.pending_deadline <= self.created_at)
+        {
+            return Err(CoreError::new("invalid_session", "会话集合复核期限无效"));
+        }
+        Ok(sorted)
+    }
     pub fn validate(&mut self, now: f64) -> Result<()> {
         if self.schema != 1
             || self.session_id.is_empty()

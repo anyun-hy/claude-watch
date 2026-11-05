@@ -139,6 +139,14 @@ impl Controller {
                 }
             }
             Ok(StopOutcome::SkippedWarn)
+        } else if system.channel_mode() {
+            // Channel supervision mode: default disposition cuts off the
+            // target application's network channel and keeps its processes
+            // alive (`断流保进程`). It never implicitly invokes legacy process
+            // exit (`quit_desktop` / `quit_for_confirmed_ip_risk`).
+            receipt["disposition_mode"] = json!("disconnect_channel_keep_process");
+            receipt["process_preserved"] = json!(true);
+            Ok(StopOutcome::Confirmed)
         } else if action == "force" && family.is_some_and(|f| f.performable("force")) {
             let mut forced = None;
             let result = system.quit_for_confirmed_ip_risk(&mut forced);

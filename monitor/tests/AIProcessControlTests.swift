@@ -220,6 +220,24 @@ struct AIProcessControlTests {
         expect(AIProcessInventory.nodeEntry("/usr/bin/node /x/node_modules/@anthropic-ai/claude-code/cli.js")?.hasSuffix("cli.js") == true, "executed node script recognized")
         expect(AIProcessInventory.nodeEntry("/usr/bin/node -e /x/node_modules/@anthropic-ai/claude-code/cli.js") == nil, "inline code cannot impersonate script entry")
         expect(AIProcessInventory.nodeEntry("/usr/bin/node /unrelated.js /x/node_modules/@anthropic-ai/claude-code/cli.js") == "/unrelated.js", "later data argument is not an entry")
+        expect(AIProcessInventory.nodeEntry(
+            "/usr/bin/node --require /tmp/preload.js --experimental-vm-modules node_modules/@anthropic-ai/claude-code/cli.js",
+            cwd: "/opt/claude") == "/opt/claude/node_modules/@anthropic-ai/claude-code/cli.js",
+            "nodeEntry skips two-token --require and resolves relative path against cwd")
+        expect(AIProcessClosePolicy.managedCodexAppServer(
+            path: "/Users/test/.codex/packages/app-server-daemon/releases/1.0.0/bin/codex",
+            home: "/Users/test",
+            arguments: "codex app-server daemon"),
+            "managed codex app-server requires release path and daemon subcommand")
+        expect(!AIProcessClosePolicy.managedCodexAppServer(
+            path: "/Users/test/.codex/packages/app-server-daemon/releases/1.0.0/bin/codex",
+            home: "/Users/test",
+            arguments: "codex --version"),
+            "managed codex app-server rejects non-daemon invocation")
+        expect(AIProcessInventory.currentDirectory(getpid()) == FileManager.default.currentDirectoryPath,
+               "production currentDirectory reads live process cwd via PROC_PIDVNODEPATHINFO")
+        expect(AIProcessInventory.arguments(getpid())?.first?.isEmpty == false,
+               "production arguments reads NUL-delimited argv tokens via KERN_PROCARGS2")
         let fixture = AIProcessControl(isFixture: true)
         let mock = [WatchedProcess(id: "p", pid: 999999, started: "mock", kind: "code", authorized: true)]
         let prepared = try await fixture.prepare(.claude, sampled: mock, backendPID: nil)
