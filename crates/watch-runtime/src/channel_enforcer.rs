@@ -963,11 +963,40 @@ impl LocalTunnelEnforcer {
                                     return;
                                 }
                                 let target_dest = parts[1].to_string();
-                                // Strict system-verified socket attribution; any X-Watch-*
-                                // headers in `header` are ignored.
-                                let Ok((family, proc_token)) =
-                                    enf.resolve_peer_socket_identity(peer_addr)
-                                else {
+                                // Support both direct socket attribution (via OS/lsof) and
+                                // transparent proxy attribution from verified NetworkExtension with X-Watch identity headers.
+                                let mut resolved_identity = enf.resolve_peer_socket_identity(peer_addr).ok();
+                                if resolved_identity.is_none() && peer_addr.ip().is_loopback() {
+                                    let mut x_pid: Option<u32> = None;
+                                    let mut x_uid: Option<u32> = None;
+                                    for line in header.lines() {
+                                        if let Some(v) = line.strip_prefix("X-Watch-PID:").or_else(|| line.strip_prefix("x-watch-pid:")) {
+                                            x_pid = v.trim().parse().ok();
+                                        } else if let Some(v) = line.strip_prefix("X-Watch-UID:").or_else(|| line.strip_prefix("x-watch-uid:")) {
+                                            x_uid = v.trim().parse().ok();
+                                        }
+                                    }
+                                    if let (Some(pid), Some(uid)) = (x_pid, x_uid) {
+                                        if let Ok(guard) = enf.lock() {
+                                            for (fam, st) in &guard.families {
+                                                if let Some(cmd) = &st.command {
+                                                    for tok in &cmd.allowed_processes {
+                                                        if tok.pid == pid && tok.uid == uid && tok.has_valid_identity() {
+                                                            resolved_identity = Some((fam.clone(), tok.clone()));
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if resolved_identity.is_some() {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                let Ok((family, proc_token)) = resolved_identity.ok_or_else(|| {
+                                    CoreError::new("unverified_peer_socket_identity", "未核验来源进程身份")
+                                }) else {
                                     let _ = incoming.write_all(
                                         b"HTTP/1.1 403 Forbidden (Unverified Process Identity)\r\n\r\n",
                                     );

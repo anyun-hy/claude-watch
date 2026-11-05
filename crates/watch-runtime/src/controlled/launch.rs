@@ -161,56 +161,60 @@ impl Controller {
             let _ = self.clear_pending();
             if system.channel_mode() {
                 // 断流保进程：启动失败时撤销通道并保留进程，绝不调用 quit_desktop
-                let now = system.now();
-                if let Ok(config) = (ConfigStore { storage: self.storage.clone() }).load() {
-                    if let (Ok(pd), Ok(gpd)) = (
-                        crate::config_store::policy_digest(&config.value().unwrap_or_default()),
-                        crate::config_store::guard_policy_digest(&config),
-                    ) {
-                        let policy_version = claude_watch_core::channel::PolicyVersion {
-                            policy_digest: pd,
-                            guard_policy_digest: gpd,
-                        };
-                        let (next_gen, next_seq) = {
-                            if let Ok(Some(r)) = system.channel_receipt("claude") {
-                                (r.permit_generation.saturating_add(1), r.command_seq.saturating_add(1))
-                            } else {
-                                (1, 1)
-                            }
-                        };
-                        let cmd = claude_watch_core::channel::ChannelEnforcementCommand {
-                            family: "claude".into(),
-                            session_id: Some(id.clone()),
-                            policy_version: policy_version.clone(),
-                            permit_generation: next_gen,
-                            command_seq: next_seq,
-                            permit: claude_watch_core::channel::ChannelPermit {
+                // In supervisor-delegated mode, ChannelSupervisor is the sole authoritative
+                // command issuer. It observes the failed session state and revokes the permit uniformly.
+                if !system.delegates_slow_audit_to_worker() {
+                    let now = system.now();
+                    if let Ok(config) = (ConfigStore { storage: self.storage.clone() }).load() {
+                        if let (Ok(pd), Ok(gpd)) = (
+                            crate::config_store::policy_digest(&config.value().unwrap_or_default()),
+                            crate::config_store::guard_policy_digest(&config),
+                        ) {
+                            let policy_version = claude_watch_core::channel::PolicyVersion {
+                                policy_digest: pd,
+                                guard_policy_digest: gpd,
+                            };
+                            let (next_gen, next_seq) = {
+                                if let Ok(Some(r)) = system.channel_receipt("claude") {
+                                    (r.permit_generation.saturating_add(1), r.command_seq.saturating_add(1))
+                                } else {
+                                    (1, 1)
+                                }
+                            };
+                            let cmd = claude_watch_core::channel::ChannelEnforcementCommand {
                                 family: "claude".into(),
                                 session_id: Some(id.clone()),
-                                policy_version,
+                                policy_version: policy_version.clone(),
                                 permit_generation: next_gen,
                                 command_seq: next_seq,
-                                state: claude_watch_core::channel::ChannelPermitState::Revoked,
-                                reason_code: "launch_failed".into(),
+                                permit: claude_watch_core::channel::ChannelPermit {
+                                    family: "claude".into(),
+                                    session_id: Some(id.clone()),
+                                    policy_version,
+                                    permit_generation: next_gen,
+                                    command_seq: next_seq,
+                                    state: claude_watch_core::channel::ChannelPermitState::Revoked,
+                                    reason_code: "launch_failed".into(),
+                                    issued_at: now,
+                                    valid_until: now + claude_watch_core::channel::DEFAULT_PERMIT_TTL,
+                                    context_id: None,
+                                    baseline_ip: None,
+                                    members: vec![],
+                                },
+                                allowed_processes: vec![],
+                                upstream_endpoint: if config.proxy_url.trim().is_empty() {
+                                    "127.0.0.1:7890".to_string()
+                                } else {
+                                    config.proxy_url.clone()
+                                },
                                 issued_at: now,
-                                valid_until: now + claude_watch_core::channel::DEFAULT_PERMIT_TTL,
-                                context_id: None,
-                                baseline_ip: None,
-                                members: vec![],
-                            },
-                            allowed_processes: vec![],
-                            upstream_endpoint: if config.proxy_url.trim().is_empty() {
-                                "127.0.0.1:7890".to_string()
-                            } else {
-                                config.proxy_url.clone()
-                            },
-                            issued_at: now,
-                        };
-                        if let Err(e) = system.enforce_channel(&cmd) {
-                            return Err(CoreError::new(
-                                "launch_channel_revoke_failed",
-                                &format!("启动失败通道阻断发令失败: {}", e.message),
-                            ));
+                            };
+                            if let Err(e) = system.enforce_channel(&cmd) {
+                                return Err(CoreError::new(
+                                    "launch_channel_revoke_failed",
+                                    &format!("启动失败通道阻断发令失败: {}", e.message),
+                                ));
+                            }
                         }
                     }
                 }

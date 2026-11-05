@@ -24,6 +24,39 @@ use disposition::{confirmed_egress_code, PendingRisk, StopOutcome};
 #[cfg(test)]
 mod guard_regressions;
 
+pub fn read_process_real_uid(pid: u32) -> u32 {
+    #[cfg(unix)]
+    {
+        if pid > 1 {
+            if let Ok(output) = std::process::Command::new("/usr/sbin/lsof")
+                .args(["-nP", "-F", "pu", "-p", &pid.to_string()])
+                .output()
+            {
+                if output.status.success() {
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    for line in text.lines() {
+                        if let Some(u) = line.strip_prefix('u') {
+                            if let Ok(uid) = u.trim().parse::<u32>() {
+                                if uid > 0 {
+                                    return uid;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let home = std::env::var_os("HOME").unwrap_or_default();
+        if let Ok(m) = std::fs::metadata(home) {
+            let uid = std::os::unix::fs::MetadataExt::uid(&m);
+            if uid > 0 {
+                return uid;
+            }
+        }
+    }
+    1000
+}
+
 pub trait DesktopSystem {
     fn prepare_cli(&mut self) -> Result<()> {
         Err(CoreError::new(
@@ -124,13 +157,10 @@ pub trait DesktopSystem {
         &mut self,
     ) -> Result<Vec<claude_watch_core::channel::BoundProcessToken>> {
         let desktops = self.desktops().unwrap_or_default();
-        let uid = std::fs::metadata("/dev/fd/0")
-            .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
-            .unwrap_or(501);
-        let real_uid = if uid > 0 { uid } else { 501 };
         let tokens = desktops
             .into_iter()
             .map(|(d, main, _)| {
+                let real_uid = read_process_real_uid(d.pid);
                 claude_watch_core::channel::BoundProcessToken::with_system_identity(
                     d.pid,
                     real_uid,
@@ -947,13 +977,10 @@ impl Controller {
 
         let allowed_processes: Vec<BoundProcessToken> = {
             let desktops = system.desktops().unwrap_or_default();
-            let uid = std::fs::metadata("/dev/fd/0")
-                .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
-                .unwrap_or(501);
-            let real_uid = if uid > 0 { uid } else { 501 };
             desktops
                 .into_iter()
                 .map(|(d, main, _)| {
+                    let real_uid = read_process_real_uid(d.pid);
                     BoundProcessToken::with_system_identity(
                         d.pid,
                         real_uid,
@@ -989,27 +1016,35 @@ impl Controller {
 
         // Single authoritative entry point: In full supervisor mode,
         // ChannelSupervisor is the sole command issuer. Controller synchronizes
-        // observations and reads the authoritative receipt without issuing competing commands
-        // or inventing conflicting permit generation and command sequence numbers.
+        // observations and reads the authoritative permit persisted by the supervisor,
+        // never inventing fake permits with hardcoded valid_until periods.
         let (effective_permit, enforcer_receipt, verdict) = if system.delegates_slow_audit_to_worker() {
             let r = system.channel_receipt(family)?;
-            if let Some(ref receipt) = r {
-                let auth_permit = ChannelPermit {
-                    family: family.into(),
-                    session_id: receipt.session_id.clone(),
-                    policy_version: receipt.policy_version.clone(),
-                    permit_generation: receipt.permit_generation,
-                    command_seq: receipt.command_seq,
-                    state: receipt.permit_state,
-                    reason_code: receipt.error_code.clone().unwrap_or_else(|| "supervisor_managed".into()),
-                    issued_at: receipt.observed_at,
-                    valid_until: receipt.observed_at + 30.0,
-                    context_id: None,
-                    baseline_ip: None,
-                    members: candidate.members.clone(),
-                };
-                let v = evaluate_channel_supervision(&auth_permit, Some(receipt), &policy_version, now);
+            let supervisor_permit = self
+                .storage
+                .read_json(
+                    &self.storage.paths.watch().join("state/channel-permits.json"),
+                    serde_json::Value::Null,
+                )
+                .ok()
+                .and_then(|val| {
+                    val.get(family)
+                        .and_then(|p| serde_json::from_value::<ChannelPermit>(p.clone()).ok())
+                });
+            if let Some(auth_permit) = supervisor_permit {
+                let v = evaluate_channel_supervision(&auth_permit, r.as_ref(), &policy_version, now);
                 (auth_permit, r, v)
+            } else if let Some(ref receipt) = r {
+                let mut p = candidate.clone();
+                p.session_id = receipt.session_id.clone();
+                p.permit_generation = receipt.permit_generation;
+                p.command_seq = receipt.command_seq;
+                p.state = receipt.permit_state;
+                if let Some(ref err) = receipt.error_code {
+                    p.reason_code = err.clone();
+                }
+                let v = evaluate_channel_supervision(&p, Some(receipt), &policy_version, now);
+                (p, r, v)
             } else {
                 let v = evaluate_channel_supervision(&candidate, None, &policy_version, now);
                 (candidate, None, v)

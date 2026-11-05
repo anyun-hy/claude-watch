@@ -88,6 +88,28 @@ final class MonitorStore: ObservableObject {
         self.switcher.onCurrentEnvironment = { [weak self] result in
             self?.refreshEnvironmentQuality(result)
         }
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let name = "io.local.watchpanel.channel_update" as CFString
+        let observer = Unmanaged.passUnretained(self).toOpaque()
+        CFNotificationCenterAddObserver(
+            center,
+            observer,
+            { _, observer, _, _, _ in
+                guard let observer = observer else { return }
+                let store = Unmanaged<MonitorStore>.fromOpaque(observer).takeUnretainedValue()
+                DispatchQueue.main.async {
+                    store.refresh(full: false)
+                }
+            },
+            name,
+            nil,
+            .deliverImmediately
+        )
+    }
+    deinit {
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let observer = Unmanaged.passUnretained(self).toOpaque()
+        CFNotificationCenterRemoveEveryObserver(center, observer)
     }
     func start() {
         guard timer == nil else { return }
@@ -241,6 +263,9 @@ final class MonitorStore: ObservableObject {
             }
         } else if let channelSnap = value.channelSupervision, (value.channelEvents ?? []).isEmpty {
             channelSubscription.applySnapshot(channelSnap)
+        }
+        if let channelSnap = value.channelSupervision {
+            NetworkExtensionHostManager.shared.syncWithChannelPermits(snapshot: channelSnap)
         }
         // Re-evaluate only after both the tracker and snapshot describe this
         // observation. Otherwise a recovered sampler can leave a fresh

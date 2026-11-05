@@ -59,12 +59,14 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
             let isConnected = manager?.connection.status == .connected
 
             DispatchQueue.main.async {
-                self.activationState = NetworkExtensionActivationState(
+                let newState = NetworkExtensionActivationState(
                     isSystemExtensionActive: isEnabled,
                     isTunnelActive: isConnected,
                     detail: isConnected ? "网络接管正常运行" : (isEnabled ? "扩展已启用但隧道未连接" : "网络扩展未启用"),
                     lastErrorCode: nil
                 )
+                self.activationState = newState
+                self.persistActivationStatus(state: newState)
             }
         }
     }
@@ -191,6 +193,51 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
             case .failure:
                 completion(false)
             }
+        }
+    }
+
+    /// Synchronizes channel supervision permits and revocation with the network extension.
+    public func syncWithChannelPermits(snapshot: ChannelMonitorSnapshot) {
+        for (family, state) in snapshot.families {
+            guard family == "claude" else { continue }
+            if state.permit_state == .permitted {
+                let validUntil = Int64(state.updated_at + 30.0)
+                let allowed = state.active_member_pids
+                self.pushPermit(
+                    validUntil: validUntil,
+                    permitState: "permitted",
+                    allowedPids: allowed,
+                    localProxyPort: 7890
+                ) { success in
+                    if !success {
+                        NSLog("[NetworkExtensionHostManager] Failed to push permit to extension for family %@", family)
+                    }
+                }
+            } else {
+                self.revokeChannel(reason: state.reason_code) { success in
+                    if !success {
+                        NSLog("[NetworkExtensionHostManager] Failed to revoke channel in extension for family %@", family)
+                    }
+                }
+            }
+        }
+    }
+
+    private func persistActivationStatus(state: NetworkExtensionActivationState) {
+        let fileManager = FileManager.default
+        let home = fileManager.homeDirectoryForCurrentUser
+        let statusFile = home.appendingPathComponent(".claude-watch/state/system-extension-status.json")
+        let dir = statusFile.deletingLastPathComponent()
+        try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dict: [String: Any] = [
+            "is_system_extension_active": state.isSystemExtensionActive,
+            "is_tunnel_active": state.isTunnelActive,
+            "detail": state.detail,
+            "last_error_code": state.lastErrorCode as Any,
+            "updated_at": Date().timeIntervalSince1970
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
+            try? data.write(to: statusFile, options: .atomic)
         }
     }
 }

@@ -136,6 +136,25 @@ impl ProductionChannelStack {
     ) -> Result<ChannelMonitorSnapshot> {
         self.drain_background_events()?;
         let now = system.now();
+
+        // Sync system extension activation status from host manager
+        let ext_status_path = self
+            .supervisor
+            .storage
+            .paths
+            .watch()
+            .join("state/system-extension-status.json");
+        if let Ok(ext_val) = self
+            .supervisor
+            .storage
+            .read_json(&ext_status_path, Value::Null)
+        {
+            if let Some(active) = ext_val.get("is_tunnel_active").and_then(Value::as_bool) {
+                let detail = ext_val.get("detail").and_then(Value::as_str);
+                let _ = self.enforcer.set_system_extension_active(active, detail, now);
+            }
+        }
+
         if let Ok(cfg) = (ConfigStore {
             storage: self.supervisor.storage.clone(),
         })
@@ -177,9 +196,10 @@ impl ProductionChannelStack {
                             } else {
                                 ProcessRole::DesktopHelper
                             };
+                            let uid = claude_watch_runtime::controlled::read_process_real_uid(d.pid);
                             BoundProcessToken::with_system_identity(
                                 d.pid,
-                                501,
+                                uid,
                                 d.start_seconds,
                                 d.start_microseconds,
                                 role,

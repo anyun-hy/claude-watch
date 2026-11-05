@@ -21,6 +21,15 @@ pub fn now() -> f64 {
         .map(|v| v.as_secs_f64())
         .unwrap_or(0.0)
 }
+
+pub fn notify_channel_update() {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("/usr/bin/notifyutil")
+            .args(["-p", "io.local.watchpanel.channel_update"])
+            .spawn();
+    }
+}
 pub fn built_observer_path() -> Option<&'static std::path::Path> {
     let path = env!("CW_NATIVE_OBSERVER_BUILD_PATH");
     if path.is_empty() {

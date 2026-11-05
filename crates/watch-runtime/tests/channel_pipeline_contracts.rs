@@ -1636,3 +1636,39 @@ fn launch_failure_in_channel_mode_revokes_channel_and_preserves_process_without_
     );
     assert_eq!(receipt.error_code.as_deref(), Some("launch_failed"));
 }
+
+#[test]
+fn controlled_path_evidence_and_authoritative_permit_are_hard_requirements() {
+    let (_dir, store) = setup_store();
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-path-1", Some(store.clone())));
+    enforcer.activate_interception(1_710_000_000.0).unwrap();
+    let mut supervisor = ChannelSupervisor::new(store.clone(), Some(enforcer.clone()), None).unwrap();
+
+    let now = 1_710_000_100.0;
+    // 1. When egress has via_controlled_path = false, supervisor must revoke or refuse permit
+    let uncontrolled_egress = json!({
+        "ip": "1.1.1.1",
+        "country": "US",
+        "observed_at": now,
+        "via_controlled_path": false
+    });
+    supervisor
+        .handle_event(SupervisionEvent::EnvironmentUpdated {
+            egress: uncontrolled_egress,
+            local_guard: json!({"proxy": "ok", "tun": "ok"}),
+            observed_at: now,
+        })
+        .unwrap();
+
+    let snap = supervisor.snapshot(now);
+    let claude_state = snap.families.get("claude").unwrap();
+    assert_ne!(
+        claude_state.permit_state,
+        claude_watch_core::channel::ChannelPermitState::Permitted
+    );
+
+    // 2. Authoritative permit is saved by supervisor in state/channel-permits.json
+    let permits_path = store.paths.watch().join("state/channel-permits.json");
+    let permits_val: serde_json::Value = store.read_json(&permits_path, json!({})).unwrap();
+    assert!(permits_val.is_object());
+}

@@ -972,7 +972,8 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
             }
         }
 
-        // Controlled proxy fallback for CLI or direct config without active enforcer
+        // Direct proxy fallback for CLI or direct config without active enforcer.
+        // This is an unverified fallback path and MUST NOT be marked as via_controlled_path!
         let controlled_proxy = if self.desktop.target().cli() {
             self.cli.as_ref().and_then(|s| s.proxy.clone())
         } else {
@@ -988,7 +989,7 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
         if let Some(ref proxy) = controlled_proxy {
             let receipt = self.network.fast_egress_via(Some(proxy.as_str()));
             if let Some(mut data) = receipt.data {
-                data["via_controlled_path"] = serde_json::json!(true);
+                data["via_controlled_path"] = serde_json::json!(false);
                 data["upstream_endpoint"] = serde_json::json!(proxy);
                 return data;
             }

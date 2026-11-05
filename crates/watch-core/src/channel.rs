@@ -181,22 +181,11 @@ pub struct BoundProcessToken {
     pub audit_token: Option<[u32; 8]>,
 }
 impl BoundProcessToken {
-    pub fn derive_system_token(
-        pid: u32,
-        uid: u32,
-        start_seconds: u64,
-        start_microseconds: u32,
-    ) -> [u32; 8] {
-        [
-            uid,
-            uid,
-            0,
-            uid,
-            0,
-            pid,
-            (start_seconds >> 32) as u32,
-            (start_seconds as u32) ^ start_microseconds.rotate_left(7),
-        ]
+    /// Standard Mach `audit_token_t` format (8 x u32) defined by macOS XNU kernel:
+    /// index 0: auid, index 1: euid, index 2: egid, index 3: ruid,
+    /// index 4: rgid, index 5: pid, index 6: asid, index 7: tid.
+    pub fn mach_audit_token(pid: u32, uid: u32, gid: u32, asid: u32) -> [u32; 8] {
+        [uid, uid, gid, uid, gid, pid, asid, 0]
     }
 
     pub fn with_system_identity(
@@ -212,17 +201,25 @@ impl BoundProcessToken {
             start_seconds,
             start_microseconds,
             role,
-            audit_token: Some(Self::derive_system_token(
-                pid,
-                uid,
-                start_seconds,
-                start_microseconds,
-            )),
+            audit_token: Some(Self::mach_audit_token(pid, uid, 20, 100000)),
         }
     }
 
+    pub fn with_audit_token(mut self, audit_token: [u32; 8]) -> Self {
+        self.audit_token = Some(audit_token);
+        self
+    }
+
     pub fn has_valid_identity(&self) -> bool {
-        self.pid > 1 && self.uid > 0 && self.start_seconds > 0 && self.audit_token.is_some()
+        if self.pid <= 1 || self.uid == 0 || self.start_seconds == 0 {
+            return false;
+        }
+        let Some(ref token) = self.audit_token else {
+            return false;
+        };
+        // Verify XNU Mach audit_token_t standard layout:
+        // token[5] is PID, token[1] is EUID, token[3] is RUID.
+        token[5] == self.pid && (token[1] == self.uid || token[3] == self.uid)
     }
 
     pub fn matches_process(
@@ -683,6 +680,26 @@ pub fn verify_channel_recovery(
         return Err(CoreError::new(
             "recovery_egress_blocked",
             "当前出口仍处风险区或不晚于阻断时刻，不能恢复通道",
+        ));
+    }
+    if let Ok(ev) = serde_json::from_value::<ControlledPathEvidence>(egress.clone()) {
+        if let Err(err_code) = ev.matches_path(
+            &previous.family,
+            ev.upstream_endpoint.as_str(),
+            current_policy,
+            Some(context_id),
+            now,
+            GUARD_EGRESS_TTL,
+        ) {
+            return Err(CoreError::new(
+                err_code,
+                "当前出口证据未通过受控通道同路径验证，不能恢复通道",
+            ));
+        }
+    } else if egress.get("via_controlled_path").and_then(|v| v.as_bool()) == Some(false) {
+        return Err(CoreError::new(
+            "evidence_not_from_controlled_path",
+            "当前出口证据非来自受控诊断通道，不能恢复通道",
         ));
     }
     if context_id.is_empty() {

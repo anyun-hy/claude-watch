@@ -1,6 +1,7 @@
 import Foundation
 import NetworkExtension
 import os.log
+import Darwin
 
 /// Production NetworkExtension Transparent Proxy & Flow Gate.
 ///
@@ -37,6 +38,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
     private var activeFlows: [UUID: ActiveFlowRecord] = [:]
     private var totalBlockedFlows: UInt64 = 0
     private var totalForwardedFlows: UInt64 = 0
+    private var leaseWatchdogTimer: DispatchSourceTimer?
 
     open override func startProxy(options: [String: Any]? = nil, completionHandler: @escaping (Error?) -> Void) {
         logger.info("WatchChannelExtension startProxy requested")
@@ -73,6 +75,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
                 completionHandler(error)
             } else {
                 self?.logger.info("WatchChannelExtension tunnel settings applied successfully")
+                self?.startLeaseWatchdog()
                 completionHandler(nil)
             }
         }
@@ -80,12 +83,38 @@ open class WatchChannelExtension: NETransparentProxyProvider {
 
     open override func stopProxy(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         logger.info("WatchChannelExtension stopProxy reason: \(reason.rawValue)")
+        stopLeaseWatchdog()
         stateLock.lock()
         isInterceptionActive = false
         isDirectFallbackBlocked = false
         terminateAllActiveFlowsLocked(reason: "proxy_stopped")
         stateLock.unlock()
         completionHandler()
+    }
+
+    private func startLeaseWatchdog() {
+        stopLeaseWatchdog()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+        timer.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250))
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            self.stateLock.lock()
+            let now = Int64(Date().timeIntervalSince1970)
+            let deadline = self.activeLeaseDeadlineEpochSeconds
+            let permitted = self.isPermitted
+            if (!permitted || (deadline > 0 && now >= deadline)) && !self.activeFlows.isEmpty {
+                self.logger.notice("Autonomous lease watchdog terminating \(self.activeFlows.count) active flows (now: \(now), deadline: \(deadline), permitted: \(permitted))")
+                self.terminateAllActiveFlowsLocked(reason: "autonomous_lease_expired")
+            }
+            self.stateLock.unlock()
+        }
+        self.leaseWatchdogTimer = timer
+        timer.resume()
+    }
+
+    private func stopLeaseWatchdog() {
+        leaseWatchdogTimer?.cancel()
+        leaseWatchdogTimer = nil
     }
 
     /// IPC interface: receives dynamic permit updates, revoking commands, and status queries from host.
@@ -151,7 +180,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
 
     /// Handles incoming application network flows (TCP, UDP, IPv6, DNS).
     open override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
-        let (isManaged, flowPid) = inspectFlowAttribution(flow)
+        let (isManaged, flowPid, flowUid) = inspectFlowAttribution(flow)
 
         // Non-managed applications: do not intercept non-AI flows
         if !isManaged {
@@ -176,7 +205,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         }
 
         if let tcpFlow = flow as? NEAppProxyTCPFlow {
-            return forwardTCPFlow(tcpFlow)
+            return forwardTCPFlow(tcpFlow, flowPid: flowPid, flowUid: flowUid)
         } else if let udpFlow = flow as? NEAppProxyUDPFlow {
             return handleUDPFlow(udpFlow)
         }
@@ -185,17 +214,14 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         return true
     }
 
-    private func forwardTCPFlow(_ tcpFlow: NEAppProxyTCPFlow) -> Bool {
+    private func forwardTCPFlow(_ tcpFlow: NEAppProxyTCPFlow, flowPid: UInt32, flowUid: UInt32) -> Bool {
         guard let remoteEndpoint = tcpFlow.remoteEndpoint as? NWHostEndpoint else {
             closeFlowImmediately(tcpFlow, reason: "invalid_remote_endpoint")
             return true
         }
 
-        // Avoid proxy loop: if the flow originates from our own local proxy port, pass through
-        if remoteEndpoint.hostname == localProxyHost && remoteEndpoint.port == String(localProxyPort) {
-            return false
-        }
-
+        let targetHost = remoteEndpoint.hostname
+        let targetPort = remoteEndpoint.port
         let proxyEndpoint = NWHostEndpoint(hostname: localProxyHost, port: String(localProxyPort))
         let connection = self.createTCPConnection(to: proxyEndpoint, enableTLS: false, tlsParameters: nil, delegate: nil)
         let flowID = UUID()
@@ -205,18 +231,52 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         totalForwardedFlows += 1
         stateLock.unlock()
 
-        tcpFlow.open(withLocalEndpoint: nil) { [weak self, weak connection] error in
-            guard let self = self, let connection = connection else { return }
-            if let error = error {
-                self.logger.error("Failed to open TCP flow: \(error.localizedDescription)")
-                self.cleanupFlow(id: flowID, error: error)
+        // Step 1: Send CONNECT handshake to local gateway with verified process identity headers
+        let connectReq = "CONNECT \(targetHost):\(targetPort) HTTP/1.1\r\nHost: \(targetHost):\(targetPort)\r\nX-Watch-PID: \(flowPid)\r\nX-Watch-UID: \(flowUid)\r\n\r\n"
+        guard let connectData = connectReq.data(using: .utf8) else {
+            closeFlowImmediately(tcpFlow, reason: "connect_req_encoding_error")
+            return true
+        }
+
+        connection.write(connectData) { [weak self, weak tcpFlow, weak connection] writeErr in
+            guard let self = self, let tcpFlow = tcpFlow, let connection = connection else { return }
+            if let writeErr = writeErr {
+                self.logger.error("Failed to send CONNECT to gateway: \(writeErr.localizedDescription)")
+                self.cleanupFlow(id: flowID, error: writeErr)
                 return
             }
 
-            // Pipe Client -> Proxy
-            self.pumpClientToProxy(flowID: flowID, flow: tcpFlow, connection: connection)
-            // Pipe Proxy -> Client
-            self.pumpProxyToClient(flowID: flowID, flow: tcpFlow, connection: connection)
+            // Step 2: Read CONNECT response from gateway, requiring HTTP/1.1 200
+            connection.readMinimumLength(12, maximumLength: 4096) { [weak self, weak tcpFlow, weak connection] respData, readErr in
+                guard let self = self, let tcpFlow = tcpFlow, let connection = connection else { return }
+                if let readErr = readErr {
+                    self.logger.error("Failed to read CONNECT response from gateway: \(readErr.localizedDescription)")
+                    self.cleanupFlow(id: flowID, error: readErr)
+                    return
+                }
+                guard let respData = respData,
+                      let respStr = String(data: respData, encoding: .utf8),
+                      respStr.contains(" 200 ") else {
+                    self.logger.error("Gateway rejected CONNECT handshake or returned non-200")
+                    self.cleanupFlow(id: flowID, error: NSError(domain: "WatchChannel", code: 403, userInfo: [NSLocalizedDescriptionKey: "Gateway CONNECT failed"]))
+                    return
+                }
+
+                // Step 3: Gateway tunnel established! Open client flow and start bidirectional data pump
+                tcpFlow.open(withLocalEndpoint: nil) { [weak self, weak tcpFlow, weak connection] openErr in
+                    guard let self = self, let tcpFlow = tcpFlow, let connection = connection else { return }
+                    if let openErr = openErr {
+                        self.logger.error("Failed to open TCP flow to client: \(openErr.localizedDescription)")
+                        self.cleanupFlow(id: flowID, error: openErr)
+                        return
+                    }
+
+                    // Pipe Client -> Proxy
+                    self.pumpClientToProxy(flowID: flowID, flow: tcpFlow, connection: connection)
+                    // Pipe Proxy -> Client
+                    self.pumpProxyToClient(flowID: flowID, flow: tcpFlow, connection: connection)
+                }
+            }
         }
         return true
     }
@@ -316,21 +376,33 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         stateLock.unlock()
     }
 
-    private func inspectFlowAttribution(_ flow: NEAppProxyFlow) -> (isManaged: Bool, pid: UInt32) {
+    private func inspectFlowAttribution(_ flow: NEAppProxyFlow) -> (isManaged: Bool, pid: UInt32, uid: UInt32) {
         stateLock.lock()
         let managed = managedPids
         stateLock.unlock()
 
         if let auditToken = flow.sourceProcessAuditToken, auditToken.count == 32 {
-            // Mach audit_token_t: 8 x UInt32, index 5 is pid
-            let pid = auditToken.withUnsafeBytes { ptr -> UInt32 in
-                ptr.load(fromByteOffset: 20, as: UInt32.self)
+            // Mach audit_token_t: 8 x UInt32
+            // offset 4: euid, offset 20: pid
+            let (pid, uid) = auditToken.withUnsafeBytes { ptr -> (UInt32, UInt32) in
+                let p = ptr.load(fromByteOffset: 20, as: UInt32.self)
+                let u = ptr.load(fromByteOffset: 4, as: UInt32.self)
+                return (p, u)
             }
             if managed.contains(pid) {
-                return (true, pid)
+                return (true, pid, uid)
+            }
+            // Check process name via libproc to catch unlisted/fresh AI processes!
+            var nameBuffer = [CChar](repeating: 0, count: 256)
+            let nameLen = proc_name(Int32(pid), &nameBuffer, UInt32(nameBuffer.count))
+            if nameLen > 0 {
+                let procName = String(cString: nameBuffer).lowercased()
+                if procName.contains("claude") || procName.contains("chatgpt") || procName.contains("codex") || procName.contains("cursor") {
+                    return (true, pid, uid)
+                }
             }
         }
-        return (false, 0)
+        return (false, 0, 0)
     }
 
     open override func sleep(completionHandler: @escaping () -> Void) {

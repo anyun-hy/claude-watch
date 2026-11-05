@@ -573,6 +573,7 @@ impl ChannelSupervisor {
             &self.storage.paths.watch().join("state/channel-events.json"),
             &json!(self.persisted_events),
         );
+        crate::native::notify_channel_update();
         Ok(snap)
     }
 
@@ -603,6 +604,24 @@ impl ChannelSupervisor {
         let evidence_valid = fresh_exit
             .as_ref()
             .is_some_and(|exit| exit.observed_at + session::GUARD_EGRESS_TTL > now);
+        let path_evidence = serde_json::from_value::<claude_watch_core::channel::ControlledPathEvidence>(self.latest_egress.clone()).ok();
+        let path_matches_err = match path_evidence {
+            Some(ref ev) => ev.matches_path(
+                family,
+                &self.upstream_endpoint,
+                &self.saved_policy_version,
+                None,
+                now,
+                session::GUARD_EGRESS_TTL,
+            ).err(),
+            None => {
+                if self.latest_egress.get("via_controlled_path").and_then(|v| v.as_bool()) == Some(false) {
+                    Some("evidence_not_from_controlled_path")
+                } else {
+                    None
+                }
+            }
+        };
         let had_active_or_permitted = session
             .as_ref()
             .is_some_and(|s| s.state == Phase::Active)
@@ -613,7 +632,7 @@ impl ChannelSupervisor {
                 .is_some_and(|p| p.state == ChannelPermitState::Permitted);
 
         // Check if there is an active risk on the current session or environment,
-        // or if key evidence (egress / local_guard) has expired while a session is active.
+        // or if key evidence (egress / local_guard / path) has expired while a session is active.
         let mut risk_code: Option<String> = None;
         let mut evidence_expired_or_missing = false;
         if self.latest_local_guard["proxy"] == "fail" || self.latest_local_guard["tun"] == "fail" {
@@ -621,6 +640,11 @@ impl ChannelSupervisor {
         } else if !local_guard_ok && had_active_or_permitted {
             risk_code = Some("local_guard_unverified".into());
             evidence_expired_or_missing = true;
+        } else if let Some(path_err) = path_matches_err {
+            if had_active_or_permitted {
+                risk_code = Some(path_err.into());
+                evidence_expired_or_missing = true;
+            }
         } else if let Some(exit) = fresh_exit.as_ref() {
             if !evidence_valid && had_active_or_permitted {
                 risk_code = Some("egress_evidence_expired".into());
@@ -690,11 +714,12 @@ impl ChannelSupervisor {
                         ChannelPermitState::Revoked,
                         "awaiting_recovery_verification".into(),
                     )
-                } else if !local_guard_ok || !evidence_valid {
+                } else if !local_guard_ok || !evidence_valid || path_matches_err.is_some() {
                     self.request_async_audit_if_needed(family, Some(s.session_id.clone()), now);
+                    let err_code = path_matches_err.unwrap_or("egress_evidence_expired");
                     (
                         ChannelPermitState::Revoked,
-                        "egress_evidence_expired".into(),
+                        err_code.into(),
                     )
                 } else {
                     (ChannelPermitState::Permitted, "active".into())
@@ -708,6 +733,7 @@ impl ChannelSupervisor {
                 if self.config.close_action(&code, provider) == "warn"
                     && local_guard_ok
                     && evidence_valid
+                    && path_matches_err.is_none()
                 {
                     (ChannelPermitState::Permitted, code)
                 } else {
@@ -1221,6 +1247,16 @@ impl ChannelSupervisor {
             track.command_seq = permit.command_seq;
             track.current_permit = Some(permit);
         }
+        let mut all_permits: std::collections::BTreeMap<String, ChannelPermit> = std::collections::BTreeMap::new();
+        for (fam, tr) in &self.tracks {
+            if let Some(ref p) = tr.current_permit {
+                all_permits.insert(fam.clone(), p.clone());
+            }
+        }
+        let _ = self.storage.atomic_json(
+            &self.storage.paths.watch().join("state/channel-permits.json"),
+            &serde_json::to_value(&all_permits).unwrap_or(serde_json::Value::Null),
+        );
         if let Some(enforcer) = self.enforcer.clone() {
             match enforcer.apply_command(&command, now) {
                 Ok(receipt) => {
