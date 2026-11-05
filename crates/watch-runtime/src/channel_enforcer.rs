@@ -902,11 +902,19 @@ impl LocalTunnelEnforcer {
         {
             let mut guard = self.lock()?;
             guard.local_proxy_ready = true;
-            guard.system_extension_active = true;
-            guard.interception_active = true;
-            guard.direct_fallback_blocked = true;
+            // The local listener only proves that the proxy server is ready.
+            // System extension activation and direct fallback blocking must be
+            // confirmed separately by the system extension manager or IPC!
+            if guard.system_extension_active {
+                guard.interception_active = true;
+                guard.direct_fallback_blocked = true;
+                guard.activation_error_code = None;
+            } else {
+                guard.interception_active = false;
+                guard.direct_fallback_blocked = false;
+                guard.activation_error_code = Some("system_extension_inactive".into());
+            }
             guard.require_upstream_connect_handshake = true;
-            guard.activation_error_code = None;
             guard.local_listener_addr = Some(addr.to_string());
             guard.last_wall_now = Some(now);
         }

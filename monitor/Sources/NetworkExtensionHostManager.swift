@@ -130,5 +130,68 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
             )
         }
     }
+
+    // MARK: - Extension IPC Communication
+
+    /// Sends an IPC message to the running NetworkExtension provider via `NETunnelProviderSession.sendProviderMessage`.
+    public func sendProviderMessage(_ message: [String: Any], completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        guard let manager = targetProviderManager,
+              let session = manager.connection as? NETunnelProviderSession,
+              manager.connection.status == .connected else {
+            completion(.failure(NSError(domain: "NetworkExtensionHostManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "Tunnel session is not connected"])))
+            return
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: message) else {
+            completion(.failure(NSError(domain: "NetworkExtensionHostManager", code: -2, userInfo: [NSLocalizedDescriptionKey: "Failed to serialize message"])))
+            return
+        }
+        do {
+            try session.sendProviderMessage(data) { responseData in
+                guard let responseData = responseData,
+                      let json = (try? JSONSerialization.jsonObject(with: responseData)) as? [String: Any] else {
+                    completion(.success([:]))
+                    return
+                }
+                completion(.success(json))
+            }
+        } catch {
+            completion(.failure(error))
+        }
+    }
+
+    /// Pushes a permit update to the extension.
+    public func pushPermit(validUntil: Int64, permitState: String, allowedPids: [UInt32], localProxyPort: UInt16, completion: @escaping (Bool) -> Void) {
+        let msg: [String: Any] = [
+            "action": "update_permit",
+            "valid_until": validUntil,
+            "permit_state": permitState,
+            "allowed_pids": allowedPids,
+            "local_proxy_port": localProxyPort
+        ]
+        sendProviderMessage(msg) { result in
+            switch result {
+            case .success(let resp):
+                completion(resp["status"] as? String == "ok")
+            case .failure:
+                completion(false)
+            }
+        }
+    }
+
+    /// Revokes channel access in the extension.
+    public func revokeChannel(reason: String, completion: @escaping (Bool) -> Void) {
+        let msg: [String: Any] = [
+            "action": "revoke_channel",
+            "reason": reason
+        ]
+        sendProviderMessage(msg) { result in
+            switch result {
+            case .success(let resp):
+                completion(resp["status"] as? String == "revoked")
+            case .failure:
+                completion(false)
+            }
+        }
+    }
 }
 

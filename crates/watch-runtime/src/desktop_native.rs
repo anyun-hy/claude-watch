@@ -946,38 +946,65 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
         Ok(audit)
     }
     fn egress(&mut self) -> Value {
+        let enforcer = crate::channel_enforcer::registered_production_enforcer(&self.storage.paths.watch());
+        let now = native::now();
+
+        // If a production enforcer is registered, route through the verified diagnostic channel
+        if let Some(ref enf) = enforcer {
+            let probe_res = enf.probe_via_controlled_diagnostic_channel(
+                "claude",
+                "diag-egress-ctx",
+                now,
+                |proxy_endpoint| {
+                    let receipt = self.network.fast_egress_via(Some(proxy_endpoint));
+                    receipt.data.ok_or_else(|| {
+                        let msg = receipt.error.unwrap_or_else(|| "诊断通道探测无返回".into());
+                        CoreError::new("controlled_diagnostic_probe_failed", &msg)
+                    })
+                },
+            );
+            if let Ok((mut data, evidence)) = probe_res {
+                data["via_controlled_path"] = serde_json::json!(true);
+                data["upstream_endpoint"] = serde_json::json!(evidence.upstream_endpoint);
+                data["context_id"] = serde_json::json!(evidence.context_id);
+                data["policy_version"] = serde_json::to_value(&evidence.policy_version).unwrap_or(serde_json::Value::Null);
+                return data;
+            }
+        }
+
+        // Controlled proxy fallback for CLI or direct config without active enforcer
         let controlled_proxy = if self.desktop.target().cli() {
             self.cli.as_ref().and_then(|s| s.proxy.clone())
         } else {
-            let config_proxy = ConfigStore {
+            ConfigStore {
                 storage: self.storage.clone(),
             }
             .load()
             .ok()
             .map(|c| c.proxy_url.clone())
-            .filter(|p| !p.trim().is_empty());
-            config_proxy.or_else(|| {
-                crate::channel_enforcer::registered_production_enforcer(&self.storage.paths.watch())
-                    .and_then(|e| e.local_listener_addr().ok().flatten())
-            })
+            .filter(|p| !p.trim().is_empty())
         };
-        let receipt = if let Some(ref proxy) = controlled_proxy {
-            self.network.fast_egress_via(Some(proxy.as_str()))
-        } else {
-            self.network.fast_egress()
-        };
+
+        if let Some(ref proxy) = controlled_proxy {
+            let receipt = self.network.fast_egress_via(Some(proxy.as_str()));
+            if let Some(mut data) = receipt.data {
+                data["via_controlled_path"] = serde_json::json!(true);
+                data["upstream_endpoint"] = serde_json::json!(proxy);
+                return data;
+            }
+        }
+
+        // Standard exit fallback: explicitly marks via_controlled_path as false
+        let receipt = self.network.fast_egress();
         let mut data = receipt.data.unwrap_or_else(|| {
             serde_json::json!({
                 "state": "unknown",
                 "error": receipt.error,
-                "observed_at": native::now(),
-                "source": "Cloudflare trace（受控网关，未缓存）"
+                "observed_at": now,
+                "source": "Cloudflare trace（直连未受控）"
             })
         });
-        if let Some(proxy) = controlled_proxy {
-            data["via_controlled_path"] = serde_json::json!(true);
-            data["upstream_endpoint"] = serde_json::json!(proxy);
-        }
+        data["via_controlled_path"] = serde_json::json!(false);
         data
     }
     fn local_guard(&mut self) -> Result<Value> {

@@ -286,18 +286,18 @@ impl ChannelSupervisor {
                     let runner = Arc::clone(&run_audit);
                     let (result_tx, result_rx) = mpsc::channel();
                     let req_clone = req.clone();
+                    let start_instant = std::time::Instant::now();
                     let runner_thread = thread::Builder::new()
                         .name("channel-audit-runner".into())
                         .spawn(move || {
-                            let res = {
-                                if let Ok(mut locked) = runner.lock() {
-                                    locked(&req_clone)
-                                } else {
-                                    Err(CoreError::new(
-                                        "audit_runner_lock_poisoned",
-                                        "审计执行器锁不可用",
-                                    ))
-                                }
+                            // Non-blocking try_lock: If previous timed-out runner is still stuck in-flight,
+                            // immediately fail without wedging the new runner or queueing on the poisoned lock.
+                            let res = match runner.try_lock() {
+                                Ok(mut locked) => locked(&req_clone),
+                                Err(_) => Err(CoreError::new(
+                                    "audit_runner_busy_previous_in_flight",
+                                    "上一次慢审计任务仍在运行，本次执行跳过阻塞并立即释放资源",
+                                )),
                             };
                             let _ = result_tx.send(res);
                         });
@@ -334,7 +334,8 @@ impl ChannelSupervisor {
                             }
                         }
                         Ok(Err(err)) => {
-                            let completed_at = req.requested_at;
+                            let elapsed = start_instant.elapsed().as_secs_f64();
+                            let completed_at = req.requested_at + elapsed;
                             let _ = event_tx.send(SupervisionEvent::AsyncAuditCompleted {
                                 request_id: req.request_id,
                                 family: req.family,
@@ -352,7 +353,7 @@ impl ChannelSupervisor {
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // Immediate timeout while run_audit is still stuck in-flight!
+                            // Immediate timeout without wedging runner or blocking subsequent audits
                             let completed_at = req.requested_at + req.timeout_seconds;
                             let _ = event_tx.send(SupervisionEvent::AsyncAuditCompleted {
                                 request_id: req.request_id,
@@ -365,7 +366,6 @@ impl ChannelSupervisor {
                                 },
                                 completed_at,
                             });
-                            // Do not wait/block on runner_thread join here; let it finish asynchronously.
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => {}
                     }

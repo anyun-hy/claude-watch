@@ -231,7 +231,7 @@ struct BoundProcessTokenModel: Codable, Equatable, Sendable {
     let start_seconds: UInt64
     let start_microseconds: UInt64
     let role: String
-    let audit_token: [UInt8]?
+    let audit_token: [UInt32]?
 }
 
 struct FamilyChannelMonitorState: Codable, Equatable, Sendable {

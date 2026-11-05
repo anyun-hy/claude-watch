@@ -989,44 +989,61 @@ impl Controller {
 
         // Single authoritative entry point: In full supervisor mode,
         // ChannelSupervisor is the sole command issuer. Controller synchronizes
-        // observations and reads the authoritative receipt without issuing competing commands.
-        let enforcer_receipt = if system.delegates_slow_audit_to_worker() {
-            system.channel_receipt(family)?
+        // observations and reads the authoritative receipt without issuing competing commands
+        // or inventing conflicting permit generation and command sequence numbers.
+        let (effective_permit, enforcer_receipt, verdict) = if system.delegates_slow_audit_to_worker() {
+            let r = system.channel_receipt(family)?;
+            if let Some(ref receipt) = r {
+                let auth_permit = ChannelPermit {
+                    family: family.into(),
+                    session_id: receipt.session_id.clone(),
+                    policy_version: receipt.policy_version.clone(),
+                    permit_generation: receipt.permit_generation,
+                    command_seq: receipt.command_seq,
+                    state: receipt.permit_state,
+                    reason_code: receipt.error_code.clone().unwrap_or_else(|| "supervisor_managed".into()),
+                    issued_at: receipt.observed_at,
+                    valid_until: receipt.observed_at + 30.0,
+                    context_id: None,
+                    baseline_ip: None,
+                    members: candidate.members.clone(),
+                };
+                let v = evaluate_channel_supervision(&auth_permit, Some(receipt), &policy_version, now);
+                (auth_permit, r, v)
+            } else {
+                let v = evaluate_channel_supervision(&candidate, None, &policy_version, now);
+                (candidate, None, v)
+            }
         } else {
-            match system.enforce_channel(&command)? {
+            let r = match system.enforce_channel(&command)? {
                 Some(r) => Some(r),
                 None => system.channel_receipt(family)?,
-            }
+            };
+            let v = evaluate_channel_supervision(&candidate, r.as_ref(), &policy_version, now);
+            (candidate, r, v)
         };
-
-        let verdict = evaluate_channel_supervision(
-            &candidate,
-            enforcer_receipt.as_ref(),
-            &policy_version,
-            now,
-        );
 
         {
             let mut map = self.channel_ledger.lock().map_err(|_| {
                 CoreError::new("guard_memory_unavailable", "保护内存状态不可用")
             })?;
             let entry = map.entry(family).or_default();
-            entry.permit_generation = candidate.permit_generation;
-            entry.command_seq = candidate.command_seq;
-            if candidate.state == ChannelPermitState::Revoked
+            entry.permit_generation = effective_permit.permit_generation;
+            entry.command_seq = effective_permit.command_seq;
+            if effective_permit.state == ChannelPermitState::Revoked
                 && entry
                     .last_permit
                     .as_ref()
                     .is_none_or(|p| p.state != ChannelPermitState::Revoked)
             {
                 entry.revoked_at = Some(now);
-            } else if candidate.state == ChannelPermitState::Permitted {
+            } else if effective_permit.state == ChannelPermitState::Permitted {
                 entry.revoked_at = None;
             }
-            entry.last_permit = Some(candidate.clone());
+            entry.last_permit = Some(effective_permit.clone());
         }
 
-        if let Ok(value) = serde_json::to_value(&candidate) {
+        if let Ok(value) = serde_json::to_value(&effective_permit) {
             receipt["channel_permit"] = value;
         }
         if let Some(r) = &enforcer_receipt {
@@ -1041,7 +1058,7 @@ impl Controller {
         if system.channel_mode() {
             receipt["disposition_mode"] = json!("disconnect_channel_keep_process");
             receipt["process_preserved"] = json!(true);
-            if candidate.state == ChannelPermitState::Revoked {
+            if effective_permit.state == ChannelPermitState::Revoked {
                 receipt["action"] = json!("disconnect-channel");
                 match &verdict {
                     ChannelSupervisionVerdict::IsolatedKeepProcess => {

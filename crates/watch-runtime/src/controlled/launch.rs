@@ -171,18 +171,25 @@ impl Controller {
                             policy_digest: pd,
                             guard_policy_digest: gpd,
                         };
+                        let (next_gen, next_seq) = {
+                            if let Ok(Some(r)) = system.channel_receipt("claude") {
+                                (r.permit_generation.saturating_add(1), r.command_seq.saturating_add(1))
+                            } else {
+                                (1, 1)
+                            }
+                        };
                         let cmd = claude_watch_core::channel::ChannelEnforcementCommand {
                             family: "claude".into(),
                             session_id: Some(id.clone()),
                             policy_version: policy_version.clone(),
-                            permit_generation: 1,
-                            command_seq: 1,
+                            permit_generation: next_gen,
+                            command_seq: next_seq,
                             permit: claude_watch_core::channel::ChannelPermit {
                                 family: "claude".into(),
                                 session_id: Some(id.clone()),
                                 policy_version,
-                                permit_generation: 1,
-                                command_seq: 1,
+                                permit_generation: next_gen,
+                                command_seq: next_seq,
                                 state: claude_watch_core::channel::ChannelPermitState::Revoked,
                                 reason_code: "launch_failed".into(),
                                 issued_at: now,
@@ -199,7 +206,12 @@ impl Controller {
                             },
                             issued_at: now,
                         };
-                        let _ = system.enforce_channel(&cmd);
+                        if let Err(e) = system.enforce_channel(&cmd) {
+                            return Err(CoreError::new(
+                                "launch_channel_revoke_failed",
+                                &format!("启动失败通道阻断发令失败: {}", e.message),
+                            ));
+                        }
                     }
                 }
             } else {

@@ -60,8 +60,11 @@ where
     let enforcer = Arc::new(LocalTunnelEnforcer::new(boot_id, Some(storage.clone())));
     if activate_local_interception {
         let now_ts = native::now();
-        let _ = enforcer.activate_interception(now_ts);
-        let _ = enforcer.start_local_proxy_listener("127.0.0.1:0", stop.clone(), now_ts);
+        // Production: starts local proxy listener, keeping system_extension_active as false
+        // until verified system extension activation is confirmed by the host manager.
+        if let Err(e) = enforcer.start_local_proxy_listener("127.0.0.1:0", stop.clone(), now_ts) {
+            let _ = enforcer.record_activation_failure(&e.code, now_ts);
+        }
     }
     let _ = storage.atomic_json(
         &storage
@@ -73,6 +76,17 @@ where
     register_production_enforcer(&storage.paths.watch(), enforcer.clone());
 
     let (event_tx, event_rx) = std::sync::mpsc::channel();
+
+    // Wire receipt sink: Active and closed flows immediately emit events to supervisor
+    let sink_tx = event_tx.clone();
+    let _ = enforcer.set_receipt_event_sink(move |receipt| {
+        let received_at = native::now();
+        let _ = sink_tx.send(SupervisionEvent::EnforcementReceiptArrived {
+            receipt,
+            received_at,
+        });
+    });
+
     let lease_tx = event_tx.clone();
     let lease_watchdog = enforcer.spawn_lease_watchdog(
         stop.clone(),
@@ -785,6 +799,10 @@ mod tests {
         )
         .unwrap();
 
+        // The enforcer requires both local proxy and system extension to be active.
+        // Local proxy is ready, but system extension is not yet confirmed -> not ready!
+        assert!(!stack.enforcer.is_ready().unwrap());
+        stack.enforcer.set_system_extension_active(true, None, now).unwrap();
         assert!(stack.enforcer.is_ready().unwrap());
         assert!(registered_production_enforcer(&store.paths.watch()).is_some());
 
