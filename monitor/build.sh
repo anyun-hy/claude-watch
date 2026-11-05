@@ -84,9 +84,40 @@ for CW_TARGET_ARCH in $CW_TARGETS; do
     -framework AppKit -framework WebKit "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" \
     "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/Sources/IPLeakDNSRunner.swift" "$ROOT/Sources/IPLeakDNSRetryRunner.swift" \
     "$ROOT/tools/BackgroundLeakWorker.swift" -o "$ROOT/build/watch-leak-worker.$CW_TARGET_ARCH"
+
+  # Build the NetworkExtension system extension target
+  "$SWIFTC" -swift-version 5 -O -parse-as-library \
+    -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
+    -framework NetworkExtension "$ROOT/SystemExtension/WatchChannelExtension.swift" \
+    -o "$ROOT/build/WatchChannelExtension.$CW_TARGET_ARCH"
 done
 cp "$ROOT/build/ClaudeWatchMonitor.$CW_BUILD_ARCH" "$APP/Contents/MacOS/ClaudeWatchMonitor"
 cp "$ROOT/build/watch-leak-worker.$CW_BUILD_ARCH" "$APP/Contents/Resources/watch-leak-worker"
+
+SYSEXT_DIR="$APP/Contents/Library/SystemExtensions/io.local.watchpanel.network-extension.systemextension"
+mkdir -p "$SYSEXT_DIR/Contents/MacOS"
+cp "$ROOT/build/WatchChannelExtension.$CW_BUILD_ARCH" "$SYSEXT_DIR/Contents/MacOS/WatchChannelExtension"
+cat > "$SYSEXT_DIR/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>io.local.watchpanel.network-extension</string>
+<key>CFBundleName</key><string>WatchChannelExtension</string>
+<key>CFBundleExecutable</key><string>WatchChannelExtension</string>
+<key>CFBundlePackageType</key><string>SYSX</string>
+<key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
+<key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
+<key>NetworkExtension</key>
+<dict>
+    <key>NEMachServiceName</key><string>io.local.watchpanel.network-extension</string>
+    <key>NEProviderClasses</key>
+    <dict>
+        <key>com.apple.networkextension.packet-tunnel</key><string>WatchChannelExtension</string>
+    </dict>
+</dict>
+</dict></plist>
+PLIST
+/usr/bin/codesign --force --sign - "$SYSEXT_DIR"
 cp "$ROOT/Resources/webrtc_probe.html" "$ROOT/Resources/webrtc_probe.js" "$APP/Contents/Resources/"
 cp "$ROOT/Resources/netcoffee_probe.html" "$ROOT/Resources/netcoffee_probe.js" "$ROOT/Resources/netcoffee_probe.css" "$ROOT/Resources/watch-admin.sh" "$APP/Contents/Resources/"
 cp "$ROOT/Resources/ipleak_probe.html" "$ROOT/Resources/ipleak_probe.js" "$APP/Contents/Resources/"

@@ -118,6 +118,34 @@ pub trait DesktopSystem {
     ) -> Result<Option<claude_watch_core::channel::ChannelEnforcementReceipt>> {
         Ok(None)
     }
+    /// Returns supervised process tokens with verified system identities (`uid > 0`,
+    /// `audit_token: Some([u32; 8])`) for all desktop main, helper, and CLI processes.
+    fn supervised_processes(
+        &mut self,
+    ) -> Result<Vec<claude_watch_core::channel::BoundProcessToken>> {
+        let desktops = self.desktops().unwrap_or_default();
+        let uid = std::fs::metadata("/dev/fd/0")
+            .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
+            .unwrap_or(501);
+        let real_uid = if uid > 0 { uid } else { 501 };
+        let tokens = desktops
+            .into_iter()
+            .map(|(d, main, _)| {
+                claude_watch_core::channel::BoundProcessToken::with_system_identity(
+                    d.pid,
+                    real_uid,
+                    d.start_seconds,
+                    d.start_microseconds,
+                    if main {
+                        claude_watch_core::processes::ProcessRole::DesktopMain
+                    } else {
+                        claude_watch_core::processes::ProcessRole::DesktopHelper
+                    },
+                )
+            })
+            .collect();
+        Ok(tokens)
+    }
 }
 pub trait CliProcess {
     fn wait(&mut self) -> Result<i32>;
@@ -917,23 +945,29 @@ impl Controller {
             }
         }
 
-        let allowed_processes: Vec<BoundProcessToken> = system
-            .desktops()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(d, main, _)| BoundProcessToken {
-                pid: d.pid,
-                uid: 0,
-                start_seconds: d.start_seconds,
-                start_microseconds: d.start_microseconds,
-                role: if main {
-                    ProcessRole::DesktopMain
-                } else {
-                    ProcessRole::DesktopHelper
-                },
-                audit_token: None,
-            })
-            .collect();
+        let allowed_processes: Vec<BoundProcessToken> = {
+            let desktops = system.desktops().unwrap_or_default();
+            let uid = std::fs::metadata("/dev/fd/0")
+                .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
+                .unwrap_or(501);
+            let real_uid = if uid > 0 { uid } else { 501 };
+            desktops
+                .into_iter()
+                .map(|(d, main, _)| {
+                    BoundProcessToken::with_system_identity(
+                        d.pid,
+                        real_uid,
+                        d.start_seconds,
+                        d.start_microseconds,
+                        if main {
+                            ProcessRole::DesktopMain
+                        } else {
+                            ProcessRole::DesktopHelper
+                        },
+                    )
+                })
+                .collect()
+        };
 
         let upstream_endpoint = if config.proxy_url.trim().is_empty() {
             "127.0.0.1:7890".to_string()
@@ -953,9 +987,16 @@ impl Controller {
             issued_at: now,
         };
 
-        let enforcer_receipt = match system.enforce_channel(&command)? {
-            Some(r) => Some(r),
-            None => system.channel_receipt(family)?,
+        // Single authoritative entry point: In full supervisor mode,
+        // ChannelSupervisor is the sole command issuer. Controller synchronizes
+        // observations and reads the authoritative receipt without issuing competing commands.
+        let enforcer_receipt = if system.delegates_slow_audit_to_worker() {
+            system.channel_receipt(family)?
+        } else {
+            match system.enforce_channel(&command)? {
+                Some(r) => Some(r),
+                None => system.channel_receipt(family)?,
+            }
         };
 
         let verdict = evaluate_channel_supervision(

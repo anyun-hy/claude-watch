@@ -946,15 +946,39 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
         Ok(audit)
     }
     fn egress(&mut self) -> Value {
-        let receipt = if self.desktop.target().cli() {
-            let Some(proxy) = self.cli.as_ref().and_then(|s| s.proxy.as_deref()) else {
-                return serde_json::json!({"state":"unknown","error":"CLI入口未确认"});
-            };
-            self.network.fast_egress_via(Some(proxy))
+        let controlled_proxy = if self.desktop.target().cli() {
+            self.cli.as_ref().and_then(|s| s.proxy.clone())
+        } else {
+            let config_proxy = ConfigStore {
+                storage: self.storage.clone(),
+            }
+            .load()
+            .ok()
+            .map(|c| c.proxy_url.clone())
+            .filter(|p| !p.trim().is_empty());
+            config_proxy.or_else(|| {
+                crate::channel_enforcer::registered_production_enforcer(&self.storage.paths.watch())
+                    .and_then(|e| e.local_listener_addr().ok().flatten())
+            })
+        };
+        let receipt = if let Some(ref proxy) = controlled_proxy {
+            self.network.fast_egress_via(Some(proxy.as_str()))
         } else {
             self.network.fast_egress()
         };
-        receipt.data.unwrap_or_else(||serde_json::json!({"state":"unknown","error":receipt.error,"observed_at":native::now(),"source":"Cloudflare trace（系统TUN，未缓存）"}))
+        let mut data = receipt.data.unwrap_or_else(|| {
+            serde_json::json!({
+                "state": "unknown",
+                "error": receipt.error,
+                "observed_at": native::now(),
+                "source": "Cloudflare trace（受控网关，未缓存）"
+            })
+        });
+        if let Some(proxy) = controlled_proxy {
+            data["via_controlled_path"] = serde_json::json!(true);
+            data["upstream_endpoint"] = serde_json::json!(proxy);
+        }
+        data
     }
     fn local_guard(&mut self) -> Result<Value> {
         let config = ConfigStore {

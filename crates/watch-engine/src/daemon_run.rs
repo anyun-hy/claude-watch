@@ -154,21 +154,25 @@ impl ProductionChannelStack {
             }
             if system.set_family(family.id).is_ok() {
                 let desktops = system.desktops().unwrap_or_default();
-                let processes: Vec<BoundProcessToken> = desktops
-                    .iter()
-                    .map(|(d, main, _)| BoundProcessToken {
-                        pid: d.pid,
-                        uid: 0,
-                        start_seconds: d.start_seconds,
-                        start_microseconds: d.start_microseconds,
-                        role: if *main {
-                            ProcessRole::DesktopMain
-                        } else {
-                            ProcessRole::DesktopHelper
-                        },
-                        audit_token: None,
-                    })
-                    .collect();
+                let processes = system.supervised_processes().unwrap_or_else(|_| {
+                    desktops
+                        .iter()
+                        .map(|(d, main, _)| {
+                            let role = if *main {
+                                ProcessRole::DesktopMain
+                            } else {
+                                ProcessRole::DesktopHelper
+                            };
+                            BoundProcessToken::with_system_identity(
+                                d.pid,
+                                501,
+                                d.start_seconds,
+                                d.start_microseconds,
+                                role,
+                            )
+                        })
+                        .collect()
+                });
                 self.supervisor
                     .handle_event(SupervisionEvent::ProcessInventoryUpdated {
                         family: family.id.to_string(),

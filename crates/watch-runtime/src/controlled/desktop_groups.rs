@@ -28,6 +28,19 @@ impl Controller {
             let before = system.egress();
             let Some(initial) = session::Egress::fresh(&before, system.now(), session::GUARD_EGRESS_TTL)
                 .filter(|e| e.country != "CN") else { return Ok(GroupRound::Legacy) };
+            if system.delegates_slow_audit_to_worker() {
+                receipt["status"] = json!("ok");
+                receipt["action"] = json!("observe");
+                receipt["session_guard"] = json!({
+                    "state": "pending_verification",
+                    "phase": "pending",
+                    "reason": {
+                        "code": "initial_audit_pending",
+                        "detail": "多桌面 OpenAI 进程已转交后台异步审计线程核验，不阻塞快速保护路径"
+                    }
+                });
+                return Ok(GroupRound::Handled);
+            }
             if !allow_slow_adopt {
                 return Ok(GroupRound::DeferredSlowAdopt);
             }

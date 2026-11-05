@@ -42,6 +42,8 @@ use std::{
 pub const DEFAULT_ASYNC_AUDIT_TIMEOUT_SECONDS: f64 = 15.0;
 pub const MAX_ASYNC_AUDIT_RETRIES: u32 = 3;
 pub const ASYNC_AUDIT_RETRY_BACKOFF_SECONDS: f64 = 2.0;
+pub const MAX_EMITTED_EVENTS: usize = 128;
+pub const MAX_PERSISTED_EVENTS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub enum AsyncAuditOutcome {
@@ -73,6 +75,14 @@ pub enum SupervisionEvent {
     },
     PolicyUpdated {
         config: Config,
+        observed_at: f64,
+    },
+    NetworkContextChanged {
+        context_id: String,
+        observed_at: f64,
+    },
+    ExecutorRestarted {
+        new_boot_id: String,
         observed_at: f64,
     },
     LeaseExpired {
@@ -148,6 +158,7 @@ impl FamilyRuntimeTrack {
 
 pub struct ChannelSupervisor {
     pub storage: StateStore,
+    pub producer_boot_id: String,
     enforcer: Option<Arc<dyn ChannelEnforcer>>,
     expected_executor_boot_id: Option<String>,
     audit_tx: Option<Sender<AsyncAuditRequest>>,
@@ -188,8 +199,13 @@ impl ChannelSupervisor {
         for family in PolicyCatalog::families() {
             tracks.insert(family.id.to_string(), FamilyRuntimeTrack::new());
         }
+        let producer_boot_id = format!(
+            "sup-boot-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
         Ok(Self {
             storage,
+            producer_boot_id,
             enforcer,
             expected_executor_boot_id,
             audit_tx,
@@ -240,18 +256,23 @@ impl ChannelSupervisor {
     }
 
     /// Spawns an independent background worker that executes slow `full_audit()`
-    /// requests without blocking the main supervision event loop, sending
-    /// `SupervisionEvent::AsyncAuditCompleted` back when finished, failed, or timed out.
+    /// requests without blocking the main supervision event loop.
+    ///
+    /// Uses an isolated per-request runner and timeout monitor so `timeout_seconds`
+    /// takes effect immediately even if `run_audit` is stuck in-flight,
+    /// emitting `AsyncAuditOutcome::TimedOut`, clearing `audit_in_flight`, and
+    /// never wedging the worker or blocking subsequent retries.
     pub fn spawn_async_audit_worker<F>(
         stop: Arc<AtomicBool>,
         event_tx: Sender<SupervisionEvent>,
-        mut run_audit: F,
+        run_audit: F,
     ) -> Result<(Sender<AsyncAuditRequest>, thread::JoinHandle<()>)>
     where
         F: FnMut(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + 'static,
     {
         let (req_tx, req_rx): (Sender<AsyncAuditRequest>, Receiver<AsyncAuditRequest>) =
             mpsc::channel();
+        let run_audit = Arc::new(std::sync::Mutex::new(run_audit));
         let handle = thread::Builder::new()
             .name("channel-async-audit-worker".into())
             .spawn(move || {
@@ -262,8 +283,33 @@ impl ChannelSupervisor {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    match run_audit(&req) {
-                        Ok((audit, egress, completed_at)) => {
+                    let runner = Arc::clone(&run_audit);
+                    let (result_tx, result_rx) = mpsc::channel();
+                    let req_clone = req.clone();
+                    let runner_thread = thread::Builder::new()
+                        .name("channel-audit-runner".into())
+                        .spawn(move || {
+                            let res = {
+                                if let Ok(mut locked) = runner.lock() {
+                                    locked(&req_clone)
+                                } else {
+                                    Err(CoreError::new(
+                                        "audit_runner_lock_poisoned",
+                                        "审计执行器锁不可用",
+                                    ))
+                                }
+                            };
+                            let _ = result_tx.send(res);
+                        });
+
+                    let timeout = if req.timeout_seconds > 0.0 {
+                        std::time::Duration::from_secs_f64(req.timeout_seconds)
+                    } else {
+                        std::time::Duration::from_secs(30)
+                    };
+
+                    match result_rx.recv_timeout(timeout) {
+                        Ok(Ok((audit, egress, completed_at))) => {
                             let elapsed = (completed_at - req.requested_at).max(0.0);
                             let outcome = if req.timeout_seconds > 0.0
                                 && elapsed >= req.timeout_seconds
@@ -283,9 +329,12 @@ impl ChannelSupervisor {
                                 outcome,
                                 completed_at,
                             });
+                            if let Ok(handle) = runner_thread {
+                                let _ = handle.join();
+                            }
                         }
-                        Err(err) => {
-                            let completed_at = req.requested_at + 0.001;
+                        Ok(Err(err)) => {
+                            let completed_at = req.requested_at;
                             let _ = event_tx.send(SupervisionEvent::AsyncAuditCompleted {
                                 request_id: req.request_id,
                                 family: req.family,
@@ -298,7 +347,27 @@ impl ChannelSupervisor {
                                 },
                                 completed_at,
                             });
+                            if let Ok(handle) = runner_thread {
+                                let _ = handle.join();
+                            }
                         }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            // Immediate timeout while run_audit is still stuck in-flight!
+                            let completed_at = req.requested_at + req.timeout_seconds;
+                            let _ = event_tx.send(SupervisionEvent::AsyncAuditCompleted {
+                                request_id: req.request_id,
+                                family: req.family,
+                                session_id: req.session_id,
+                                policy_version: req.policy_version,
+                                requested_at: req.requested_at,
+                                outcome: AsyncAuditOutcome::TimedOut {
+                                    elapsed_seconds: req.timeout_seconds,
+                                },
+                                completed_at,
+                            });
+                            // Do not wait/block on runner_thread join here; let it finish asynchronously.
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {}
                     }
                 }
             })
@@ -316,6 +385,7 @@ impl ChannelSupervisor {
             families.insert(family.clone(), self.build_family_monitor_state(family, track, now));
         }
         ChannelMonitorSnapshot {
+            producer_boot_id: self.producer_boot_id.clone(),
             snapshot_seq: self.event_seq,
             captured_at: now,
             saved_policy_version: self.saved_policy_version.clone(),
@@ -328,12 +398,43 @@ impl ChannelSupervisor {
             SupervisionEvent::EnvironmentUpdated { observed_at, .. } => *observed_at,
             SupervisionEvent::ProcessInventoryUpdated { observed_at, .. } => *observed_at,
             SupervisionEvent::PolicyUpdated { observed_at, .. } => *observed_at,
+            SupervisionEvent::NetworkContextChanged { observed_at, .. } => *observed_at,
+            SupervisionEvent::ExecutorRestarted { observed_at, .. } => *observed_at,
             SupervisionEvent::LeaseExpired { observed_at, .. } => *observed_at,
             SupervisionEvent::EnforcementReceiptArrived { received_at, .. } => *received_at,
             SupervisionEvent::AsyncAuditCompleted { completed_at, .. } => *completed_at,
         };
 
         match event {
+            SupervisionEvent::NetworkContextChanged {
+                context_id,
+                observed_at,
+            } => {
+                let family_ids: Vec<String> = self.tracks.keys().cloned().collect();
+                for family in family_ids {
+                    if let Some(track) = self.tracks.get_mut(&family) {
+                        track.permit_generation = track.permit_generation.saturating_add(1);
+                        track.revoked_at = Some(observed_at);
+                        track.last_risk_at = Some(observed_at);
+                        track.audit_in_flight = None;
+                        track.audit_retry_count = 0;
+                        track.audit_retry_not_before = None;
+                        track.audit_last_failure_code = None;
+                        if let Some(permit) = track.current_permit.as_mut() {
+                            permit.state = ChannelPermitState::Revoked;
+                            permit.reason_code = "network_context_changed".into();
+                            permit.context_id = Some(context_id.clone());
+                        }
+                    }
+                    self.evaluate_family(&family, observed_at)?;
+                }
+            }
+            SupervisionEvent::ExecutorRestarted {
+                new_boot_id,
+                observed_at,
+            } => {
+                self.register_executor_handshake(new_boot_id, observed_at);
+            }
             SupervisionEvent::EnvironmentUpdated {
                 egress,
                 local_guard,
@@ -892,41 +993,71 @@ impl ChannelSupervisor {
             return Ok(());
         }
 
-        // Case 2: Initial adoption of a newly opened desktop
+        // Case 2: Initial adoption of newly opened desktop(s)
         let desktops = self
             .tracks
             .get(family)
             .map(|t| t.desktops.clone())
             .unwrap_or_default();
-        let mains: Vec<_> = desktops.iter().filter(|(_, main, _)| *main).collect();
-        if current_session.is_none() && mains.len() == 1 {
-            let (desktop, _, _) = mains[0];
-            if let Ok(pending) =
-                sessions.begin_verified(&receipts_store, &audit, &egress, completed_at)
-            {
-                let id = pending.session_id.clone();
-                if sessions
-                    .bind_desktop(&id, desktop.clone(), completed_at)
-                    .is_ok()
+        let mains: Vec<_> = desktops
+            .iter()
+            .filter(|(_, main, _)| *main)
+            .map(|(d, _, _)| d.clone())
+            .collect();
+        if current_session.is_none() {
+            if mains.len() == 1 {
+                let desktop = &mains[0];
+                if let Ok(pending) =
+                    sessions.begin_verified(&receipts_store, &audit, &egress, completed_at)
                 {
-                    let _ = sessions.mark_adopted(&id, completed_at);
-                    let adopted_session = sessions.load(completed_at)?;
+                    let id = pending.session_id.clone();
+                    if sessions
+                        .bind_desktop(&id, desktop.clone(), completed_at)
+                        .is_ok()
+                    {
+                        let _ = sessions.mark_adopted(&id, completed_at);
+                        let adopted_session = sessions.load(completed_at)?;
+                        self.issue_family_command(
+                            family,
+                            adopted_session.as_ref(),
+                            ChannelPermitState::Permitted,
+                            "session_adopted",
+                            completed_at,
+                        )?;
+                        return Ok(());
+                    }
+                }
+                return self.record_async_audit_failure(
+                    family,
+                    None,
+                    "initial_audit_rejected",
+                    completed_at,
+                );
+            } else if mains.len() >= 2 && family == "openai" {
+                if let Ok(Some(adopted_group)) = sessions.adopt_desktop_group(
+                    &receipts_store,
+                    &audit,
+                    &egress,
+                    mains,
+                    &self.config,
+                    completed_at,
+                ) {
                     self.issue_family_command(
                         family,
-                        adopted_session.as_ref(),
+                        Some(&adopted_group),
                         ChannelPermitState::Permitted,
                         "session_adopted",
                         completed_at,
                     )?;
                     return Ok(());
                 }
+                return self.record_async_audit_failure(
+                    family,
+                    None,
+                    "initial_group_audit_rejected",
+                    completed_at,
+                );
             }
-            return self.record_async_audit_failure(
-                family,
-                None,
-                "initial_audit_rejected",
-                completed_at,
-            );
         }
 
         Ok(())
@@ -1175,6 +1306,7 @@ impl ChannelSupervisor {
         }
         track.verdict = Some(verdict);
         let family_state = Self::build_family_monitor_state_from_track(
+            &self.producer_boot_id,
             &self.saved_policy_version,
             family,
             track,
@@ -1182,13 +1314,18 @@ impl ChannelSupervisor {
         );
         self.event_seq = self.event_seq.saturating_add(1);
         let event = ChannelMonitorEvent {
+            producer_boot_id: self.producer_boot_id.clone(),
             event_seq: self.event_seq,
             family_state,
         };
         self.emitted_events.push(event.clone());
+        if self.emitted_events.len() > MAX_EMITTED_EVENTS {
+            let overflow = self.emitted_events.len() - MAX_EMITTED_EVENTS;
+            self.emitted_events.drain(0..overflow);
+        }
         self.persisted_events.push(event);
-        if self.persisted_events.len() > 64 {
-            let drain_count = self.persisted_events.len() - 64;
+        if self.persisted_events.len() > MAX_PERSISTED_EVENTS {
+            let drain_count = self.persisted_events.len() - MAX_PERSISTED_EVENTS;
             self.persisted_events.drain(0..drain_count);
         }
     }
@@ -1199,10 +1336,17 @@ impl ChannelSupervisor {
         track: &FamilyRuntimeTrack,
         now: f64,
     ) -> FamilyChannelMonitorState {
-        Self::build_family_monitor_state_from_track(&self.saved_policy_version, family, track, now)
+        Self::build_family_monitor_state_from_track(
+            &self.producer_boot_id,
+            &self.saved_policy_version,
+            family,
+            track,
+            now,
+        )
     }
 
     fn build_family_monitor_state_from_track(
+        producer_boot_id: &str,
         saved_policy_version: &PolicyVersion,
         family: &str,
         track: &FamilyRuntimeTrack,
@@ -1241,7 +1385,13 @@ impl ChannelSupervisor {
             .iter()
             .map(|(d, _, _)| d.pid)
             .collect::<Vec<_>>();
-        let (active_flows_count, terminated_flows_count, blocked_new_connections) = track
+        let (
+            active_flows_count,
+            terminated_flows_count,
+            blocked_new_connections,
+            local_proxy_ready,
+            system_extension_active,
+        ) = track
             .latest_receipt
             .as_ref()
             .map(|r| {
@@ -1249,11 +1399,14 @@ impl ChannelSupervisor {
                     r.active_flows_count,
                     r.terminated_flows_count,
                     r.blocked_new_connections,
+                    r.local_proxy_ready,
+                    r.system_extension_active,
                 )
             })
-            .unwrap_or((0, 0, 0));
+            .unwrap_or((0, 0, 0, false, false));
 
         FamilyChannelMonitorState {
+            producer_boot_id: producer_boot_id.into(),
             family: family.into(),
             session_id: track.session_id.clone(),
             saved_policy_version: saved_policy_version.clone(),
@@ -1268,6 +1421,9 @@ impl ChannelSupervisor {
             reason_code,
             process_preserved: true,
             active_member_pids,
+            active_members: track.processes.clone(),
+            local_proxy_ready,
+            system_extension_active,
             active_flows_count,
             terminated_flows_count,
             blocked_new_connections,

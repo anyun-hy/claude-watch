@@ -1,0 +1,65 @@
+AI 应用网络监管与受控网关：图像生成提示词
+
+生成方式：内置 image_gen 工具。
+模型版本：工具未提供选择或核验接口；用户已明确接受版本不作保证。
+图像性质：目标方案，不代表当前实现或实机验收已完成。
+源设计：AI_NETWORK_CONTROL_TARGET.txt
+最终图像：AI_NETWORK_CONTROL_TARGET.png
+
+=== 初次生成提示词 ===
+Use case: infographic-diagram
+Asset type: A single polished technical architecture diagram for a macOS Rust project; Chinese language; landscape, high resolution, designed for reading on a desktop and sharing as one image.
+Primary request: Turn the agreed target architecture below into ONE coherent connected architecture diagram. It is a target design, not a claim of completed implementation. The project supervises AI application networking. Claude runs as a normal native application on the host Mac. No virtual machine, hardware fingerprint spoofing, account switching, or file sandbox belongs in this diagram.
+
+Style: precise flat technical diagram, white or very pale gray background, dark readable Chinese sans-serif typography, rounded rectangular cards, restrained thin borders, generous spacing. Use blue solid arrows for permitted network traffic, amber dashed arrows for policy commands, teal arrows for local monitoring events and execution receipts, red arrows for revocation/disconnection, green for verified recovery. A small legend explains these arrow types. Orthogonal arrows must be unambiguous and never cross through unrelated cards. Chinese text must be correctly rendered, large enough to read, not compressed into tiny paragraphs. Avoid illustration, photorealism, 3D, gradients, marketing decoration and fake product logos.
+
+Exact title at top: "AI 应用网络监管与受控网关"
+Small subtitle: "目标方案 · 待实机验收"
+
+Composition and semantic structure:
+The dominant middle row is ONE left-to-right network path, five cards:
+1. "受管 AI 应用" with smaller lines "Claude / Code / 辅助进程" and "保留原生窗口"
+2. "macOS 系统级网络约束" with "强制进入受控入口" and "禁止直连与绕行"
+3. "Rust 受控网关" with "有效许可才转发" and "独立检查许可期限"
+4. "指定隧道" with "已确认出口" and "禁止直连回退"
+5. "外部服务" with "AI 服务 / 代码仓库"
+Connect them strictly in that order using blue arrows. No allowed arrow from AI apps directly to an external service. Near the system constraint, show a short red crossed-out bypass stub labeled "直连 / 其他出口：拒绝". A compact note beneath the system constraint reads "网关故障也不解除约束".
+
+Above the network path, four compact event sources labeled "环境检测", "进程变化", "策略变更", "隧道健康" feed a card "Rust 策略控制器". Under that card, small text "快速风险判断，慢审计异步执行".
+Two amber dashed commands from that controller reach the system constraint and the gateway. Label the policy command "当前版本策略" and the gateway command "授予 / 更新 / 撤销许可". Initial state must be clear through one small note near the gateway: "初始未验证：禁止转发".
+
+Below the gateway, a red downward path leads to ONE abnormal-action card:
+Title "异常断流"
+Lines "风险 / 隧道故障 / 许可过期"
+"拒绝新连接 + 关闭已有连接"
+"Claude 进程与窗口保持运行"
+Add a small adjacent note "控制失联：许可到期自动断流".
+Below or beside that action card, show the actual result logic, legible and concise:
+"执行确认" leads to "已阻断"
+"失败或无有效回执" leads to "执行失败 / 保护不可用"
+The chart must never present a sent command alone as proof of successful blocking. A small explanatory line says "确认新连接已拒绝、旧连接已关闭".
+
+In the lower-left or lower-right region, place a monitor card:
+Title "本地监控"
+Lines "进程存活 / 通道状态 / 生效策略"
+"处置原因 / 时间 / 执行回执"
+"外网断开后仍持续同步"
+Teal event arrows from the gateway and execution-result nodes flow into this monitor. These links are LOCAL and independent of the external tunnel; do not route monitoring through the external services. One teal input from the controller can carry policy/process state to monitoring, if the layout stays clean.
+
+Draw ONE green recovery arrow looping from the abnormal/result region back to the policy controller, outside the main flow so it does not obscure other arrows. Label "新证据验证通过 → 新许可 → 允许重连". Recovery never terminates or restarts Claude and never removes the system prohibition on direct connections.
+
+Design constraints:
+- One unified diagram, not three independent panels, not a slide collage.
+- Maintain clear hierarchy: traffic in the middle; decision and event sources above; abnormal handling and local monitoring below.
+- Distinguish actual execution receipt from a policy command.
+- Do not add processes being killed, operating systems being virtualized, login credentials, TLS decryption or claims of zero leakage already achieved.
+- Keep every essential node and relationship specified, but do not add long prose beyond the quoted labels.
+- Keep generous outer margins and coherent alignment.
+- Output a finished architecture image with crisp typography.
+
+=== 精确修正提示词 ===
+Edit this existing Chinese technical architecture diagram with exactly ONE correction. Preserve the complete image composition, every label, typography, title, subtitle, cards, and all other arrows.
+Remove ONLY the teal connector that leaves the LEFT edge of the top "Rust 策略控制器" card, runs horizontally left, then turns downward and points into the TOP edge of the "受管 AI 应用" card. There is no controller-to-application monitoring-event relationship, so this entire one connector must disappear and the pale background be restored.
+Do NOT remove or change the separate teal line going from the BOTTOM of "受管 AI 应用" down to "本地监控". Keep all four teal event-input arrows above the controller. Keep both amber dashed policy arrows, the entire blue network path, the red abnormal-disconnection path, lower teal execution-receipt paths, and the green recovery path exactly as they are.
+No other edits. This is a precise deletion of one erroneous arrow only.
+

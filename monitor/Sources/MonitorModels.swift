@@ -225,7 +225,17 @@ enum PolicySyncState: String, Codable, Equatable, Sendable {
     }
 }
 
+struct BoundProcessTokenModel: Codable, Equatable, Sendable {
+    let pid: UInt32
+    let uid: UInt32
+    let start_seconds: UInt64
+    let start_microseconds: UInt64
+    let role: String
+    let audit_token: [UInt8]?
+}
+
 struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
+    var producer_boot_id: String = ""
     let family: String
     let session_id: String?
     let saved_policy_version: ChannelPolicyVersionModel
@@ -240,6 +250,9 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
     let reason_code: String
     let process_preserved: Bool
     let active_member_pids: [UInt32]
+    var active_members: [BoundProcessTokenModel] = []
+    var local_proxy_ready: Bool = false
+    var system_extension_active: Bool = false
     let active_flows_count: UInt32
     let terminated_flows_count: UInt32
     let blocked_new_connections: UInt32
@@ -254,6 +267,7 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
 }
 
 struct ChannelMonitorSnapshot: Codable, Equatable, Sendable {
+    var producer_boot_id: String = ""
     let snapshot_seq: UInt64
     let captured_at: Double
     let saved_policy_version: ChannelPolicyVersionModel
@@ -261,6 +275,7 @@ struct ChannelMonitorSnapshot: Codable, Equatable, Sendable {
 }
 
 struct ChannelMonitorEvent: Codable, Equatable, Sendable {
+    var producer_boot_id: String = ""
     let event_seq: UInt64
     let family_state: FamilyChannelMonitorState
 }
@@ -272,6 +287,7 @@ enum ChannelSubscriptionApplyOutcome: Equatable, Sendable {
 }
 
 struct ChannelMonitorSubscriptionStore: Sendable {
+    private(set) var producerBootId: String? = nil
     private(set) var lastEventSeq: UInt64 = 0
     private(set) var needsResync: Bool = true
     private(set) var savedPolicyVersion: ChannelPolicyVersionModel? = nil
@@ -283,8 +299,15 @@ struct ChannelMonitorSubscriptionStore: Sendable {
 
     @discardableResult
     mutating func applySnapshot(_ snapshot: ChannelMonitorSnapshot) -> Bool {
-        if snapshot.snapshot_seq < lastEventSeq && !needsResync {
+        let bootIdChanged = !snapshot.producer_boot_id.isEmpty
+            && producerBootId != nil
+            && !producerBootId!.isEmpty
+            && producerBootId != snapshot.producer_boot_id
+        if snapshot.snapshot_seq < lastEventSeq && !needsResync && !bootIdChanged {
             return false
+        }
+        if !snapshot.producer_boot_id.isEmpty {
+            producerBootId = snapshot.producer_boot_id
         }
         lastEventSeq = snapshot.snapshot_seq
         savedPolicyVersion = snapshot.saved_policy_version
@@ -294,6 +317,20 @@ struct ChannelMonitorSubscriptionStore: Sendable {
     }
 
     mutating func applyEvent(_ event: ChannelMonitorEvent) -> ChannelSubscriptionApplyOutcome {
+        let eventBootId = !event.producer_boot_id.isEmpty
+            ? event.producer_boot_id
+            : event.family_state.producer_boot_id
+        if !eventBootId.isEmpty
+            && producerBootId != nil
+            && !producerBootId!.isEmpty
+            && producerBootId != eventBootId
+        {
+            needsResync = true
+            return .gapDetectedResyncRequired(
+                expectedSeq: lastEventSeq + 1,
+                receivedSeq: event.event_seq
+            )
+        }
         if needsResync {
             return .gapDetectedResyncRequired(
                 expectedSeq: lastEventSeq + 1,

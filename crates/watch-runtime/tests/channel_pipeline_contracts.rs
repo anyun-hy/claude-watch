@@ -126,6 +126,7 @@ struct ChannelSystem {
     channel_mode: bool,
     family: &'static str,
     now: f64,
+    monotonic: Duration,
     ip: String,
     country: String,
     claude_mains: Vec<Desktop>,
@@ -142,6 +143,7 @@ impl ChannelSystem {
             channel_mode,
             family: "claude",
             now: 1_710_000_000.0,
+            monotonic: Duration::from_secs(10),
             ip: "1.1.1.1".into(),
             country: "JP".into(),
             claude_mains: vec![Desktop {
@@ -183,10 +185,12 @@ impl DesktopSystem for ChannelSystem {
     }
 
     fn monotonic(&self) -> Duration {
-        Duration::from_secs(10)
+        self.monotonic
     }
 
-    fn wait(&mut self, _: Duration) {}
+    fn wait(&mut self, dur: Duration) {
+        self.monotonic += dur;
+    }
 
     fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
         let list = if self.family == "openai" {
@@ -384,14 +388,13 @@ fn real_tcp_connection_traces_permit_forwarding_revocation_disconnecting_and_con
     );
 
     // Connect a real TCP socket from Claude's verified process through the enforcer
-    let claude_proc = BoundProcessToken {
-        pid: 4100,
-        uid: 0,
-        start_seconds: 900,
-        start_microseconds: 1,
-        role: ProcessRole::DesktopMain,
-        audit_token: None,
-    };
+    let claude_proc = BoundProcessToken::with_system_identity(
+        4100,
+        501,
+        900,
+        1,
+        ProcessRole::DesktopMain,
+    );
     let (flow_id, mut client_stream) = enforcer
         .connect_supervised_tcp("claude", &claude_proc, system.now)
         .unwrap();
@@ -404,14 +407,13 @@ fn real_tcp_connection_traces_permit_forwarding_revocation_disconnecting_and_con
     assert_eq!(&reply, b"hello-tunnel");
 
     // Unattributed process is rejected immediately by process attribution check
-    let rogue_proc = BoundProcessToken {
-        pid: 9999,
-        uid: 0,
-        start_seconds: 999,
-        start_microseconds: 1,
-        role: ProcessRole::Cli,
-        audit_token: None,
-    };
+    let rogue_proc = BoundProcessToken::with_system_identity(
+        9999,
+        501,
+        999,
+        1,
+        ProcessRole::Cli,
+    );
     assert_eq!(
         enforcer
             .connect_supervised_tcp("claude", &rogue_proc, system.now)
@@ -579,14 +581,13 @@ fn active_lease_expiry_cuts_off_existing_long_lived_connection_with_zero_new_con
         .as_f64()
         .unwrap();
 
-    let claude_proc = BoundProcessToken {
-        pid: 4100,
-        uid: 0,
-        start_seconds: 900,
-        start_microseconds: 1,
-        role: ProcessRole::DesktopMain,
-        audit_token: None,
-    };
+    let claude_proc = BoundProcessToken::with_system_identity(
+        4100,
+        501,
+        900,
+        1,
+        ProcessRole::DesktopMain,
+    );
     let (_flow_id, mut client_stream) = enforcer
         .connect_supervised_tcp("claude", &claude_proc, system.now)
         .unwrap();
@@ -1016,14 +1017,13 @@ fn mid_dial_policy_session_or_revocation_change_aborts_connection_and_shuts_down
         })
         .unwrap();
 
-    let proc_token = BoundProcessToken {
-        pid: 4100,
-        uid: 0,
-        start_seconds: 900,
-        start_microseconds: 1,
-        role: ProcessRole::DesktopMain,
-        audit_token: None,
-    };
+    let proc_token = BoundProcessToken::with_system_identity(
+        4100,
+        501,
+        900,
+        1,
+        ProcessRole::DesktopMain,
+    );
     let policy_v1 = PolicyVersion {
         policy_digest: "a".repeat(64),
         guard_policy_digest: "b".repeat(64),
@@ -1384,6 +1384,9 @@ fn receiver_clock_and_executor_boot_id_handshake_reject_delayed_or_pre_restart_r
         enforcement_state: ChannelEnforcementState::Forwarding,
         interception_active: true,
         direct_fallback_blocked: true,
+        local_proxy_ready: true,
+        system_extension_active: true,
+        new_connections_blocked: false,
         active_flows_closed: false,
         active_flows_count: 1,
         terminated_flows_count: 0,
@@ -1458,6 +1461,9 @@ impl DummyReceiptExt for claude_watch_core::channel::FamilyChannelMonitorState {
             enforcement_state: ChannelEnforcementState::Forwarding,
             interception_active: true,
             direct_fallback_blocked: true,
+            local_proxy_ready: true,
+            system_extension_active: true,
+            new_connections_blocked: false,
             active_flows_closed: false,
             active_flows_count: 1,
             terminated_flows_count: 0,
@@ -1467,4 +1473,166 @@ impl DummyReceiptExt for claude_watch_core::channel::FamilyChannelMonitorState {
             observed_at: self.updated_at,
         }
     }
+}
+
+#[test]
+fn upstream_tag_connect_handshake_verifies_200_and_clears_read_timeout_or_rejects() {
+    let (_dir, store) = setup_store();
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-tag-1", Some(store)));
+    enforcer.activate_interception(1_710_000_000.0).unwrap();
+
+    // 1. Success case: Upstream proxy returns HTTP/1.1 200 Connection Established
+    let (client_end, mut server_end) = UnixStream::pair().unwrap();
+    let server_thread = thread::spawn(move || {
+        let mut buf = [0u8; 128];
+        let n = server_end.read(&mut buf).unwrap();
+        let req = String::from_utf8_lossy(&buf[..n]);
+        assert!(req.starts_with("CONNECT api.anthropic.com:443 HTTP/1.1\r\n"));
+        assert!(req.contains("Host: api.anthropic.com:443\r\n"));
+        assert!(req.contains("Proxy-Connection: keep-alive\r\n"));
+        server_end
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        // Server continues to echo
+        let mut echo_buf = [0u8; 64];
+        let en = server_end.read(&mut echo_buf).unwrap();
+        server_end.write_all(&echo_buf[..en]).unwrap();
+    });
+
+    let mut stream = TunnelStream::Unix(client_end);
+    LocalTunnelEnforcer::perform_upstream_connect_handshake(
+        &mut stream,
+        "api.anthropic.com:443",
+    )
+    .unwrap();
+    // After handshake, stream is ready and unblocked by handshake timeout
+    stream.write_all(b"ping-through-tag").unwrap();
+    let mut resp = [0u8; 16];
+    stream.read_exact(&mut resp).unwrap();
+    assert_eq!(&resp, b"ping-through-tag");
+    server_thread.join().unwrap();
+
+    // 2. Failure case: Upstream proxy returns HTTP/1.1 502 Bad Gateway
+    let (bad_client, mut bad_server) = UnixStream::pair().unwrap();
+    let bad_server_thread = thread::spawn(move || {
+        let mut buf = [0u8; 128];
+        let _ = bad_server.read(&mut buf);
+        bad_server
+            .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            .unwrap();
+    });
+    let mut bad_stream = TunnelStream::Unix(bad_client);
+    let err = LocalTunnelEnforcer::perform_upstream_connect_handshake(
+        &mut bad_stream,
+        "api.anthropic.com:443",
+    )
+    .unwrap_err();
+    assert_eq!(err.code, "upstream_connect_rejected");
+    bad_server_thread.join().unwrap();
+}
+
+#[test]
+fn daemon_restart_resync_with_producer_boot_id() {
+    let mut subscriber = ChannelMonitorSubscriber::default();
+    let initial_now = 1_710_000_000.0;
+
+    let dummy_state = claude_watch_core::channel::FamilyChannelMonitorState {
+        producer_boot_id: "sup-boot-1".into(),
+        family: "claude".into(),
+        session_id: Some("sess-1".into()),
+        saved_policy_version: claude_watch_core::channel::PolicyVersion {
+            policy_digest: "p1".repeat(32),
+            guard_policy_digest: "g1".repeat(32),
+        },
+        applied_policy_version: Some(claude_watch_core::channel::PolicyVersion {
+            policy_digest: "p1".repeat(32),
+            guard_policy_digest: "g1".repeat(32),
+        }),
+        permit_generation: 1,
+        command_seq: 1,
+        permit_state: claude_watch_core::channel::ChannelPermitState::Permitted,
+        display_state: ChannelMonitorDisplayState::Forwarding,
+        display_label_zh: "受控放行中".into(),
+        policy_sync_state: PolicySyncState::Applied,
+        policy_sync_label_zh: "执行器已应用".into(),
+        reason_code: "active".into(),
+        process_preserved: true,
+        active_member_pids: vec![4100],
+        active_members: vec![],
+        local_proxy_ready: true,
+        system_extension_active: true,
+        active_flows_count: 1,
+        terminated_flows_count: 0,
+        blocked_new_connections: 0,
+        updated_at: initial_now,
+    };
+
+    let snap = claude_watch_core::channel::ChannelMonitorSnapshot {
+        producer_boot_id: "sup-boot-1".into(),
+        snapshot_seq: 0,
+        captured_at: initial_now,
+        saved_policy_version: claude_watch_core::channel::PolicyVersion {
+            policy_digest: "p1".repeat(32),
+            guard_policy_digest: "g1".repeat(32),
+        },
+        families: [("claude".into(), dummy_state.clone())].into_iter().collect(),
+    };
+    assert!(subscriber.apply_snapshot(snap));
+
+    let ev1 = claude_watch_core::channel::ChannelMonitorEvent {
+        producer_boot_id: "sup-boot-1".into(),
+        event_seq: 1,
+        family_state: dummy_state.clone(),
+    };
+    assert_eq!(
+        subscriber.apply_event(ev1),
+        SubscriptionApplyOutcome::Applied
+    );
+
+    // Daemon restarts: event_seq resets to 1, but producer_boot_id is different ("sup-boot-2")
+    let mut restart_state = dummy_state;
+    restart_state.producer_boot_id = "sup-boot-2".into();
+    let ev_restart = claude_watch_core::channel::ChannelMonitorEvent {
+        producer_boot_id: "sup-boot-2".into(),
+        event_seq: 1,
+        family_state: restart_state,
+    };
+    // Must recognize producer restart and request resync!
+    assert_eq!(
+        subscriber.apply_event(ev_restart),
+        SubscriptionApplyOutcome::GapDetectedResyncRequired {
+            expected_seq: 2,
+            received_seq: 1,
+        }
+    );
+    assert!(subscriber.needs_resync);
+}
+
+#[test]
+fn launch_failure_in_channel_mode_revokes_channel_and_preserves_process_without_quit() {
+    let (_dir, store) = setup_store();
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-lnch-1", Some(store.clone())));
+    enforcer.activate_interception(1_710_000_000.0).unwrap();
+
+    let mut system = ChannelSystem::new(store.clone(), Some(enforcer), true);
+    // Desktops empty initially so launch check proceeds past `already_running`
+    system.claude_mains.clear();
+
+    let controller = Controller::new(store);
+    // Launch will fail because desktops remains empty during post-open wait
+    let result = controller.launch(&mut system);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code, "desktop_identity_unavailable");
+
+    // Channel mode must preserve the process and NEVER call quit_desktop!
+    assert_eq!(system.closes, 0);
+    assert_eq!(system.forces, 0);
+
+    // Channel must be revoked with reason launch_failed
+    let receipt = system.channel_receipt("claude").unwrap().unwrap();
+    assert_eq!(
+        receipt.permit_state,
+        claude_watch_core::channel::ChannelPermitState::Revoked
+    );
+    assert_eq!(receipt.error_code.as_deref(), Some("launch_failed"));
 }

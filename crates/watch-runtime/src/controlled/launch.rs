@@ -159,7 +159,52 @@ impl Controller {
                 true,
             );
             let _ = self.clear_pending();
-            let _ = sessions.close_if_current(Some(&id), system.now(), || system.quit_desktop());
+            if system.channel_mode() {
+                // 断流保进程：启动失败时撤销通道并保留进程，绝不调用 quit_desktop
+                let now = system.now();
+                if let Ok(config) = (ConfigStore { storage: self.storage.clone() }).load() {
+                    if let (Ok(pd), Ok(gpd)) = (
+                        crate::config_store::policy_digest(&config.value().unwrap_or_default()),
+                        crate::config_store::guard_policy_digest(&config),
+                    ) {
+                        let policy_version = claude_watch_core::channel::PolicyVersion {
+                            policy_digest: pd,
+                            guard_policy_digest: gpd,
+                        };
+                        let cmd = claude_watch_core::channel::ChannelEnforcementCommand {
+                            family: "claude".into(),
+                            session_id: Some(id.clone()),
+                            policy_version: policy_version.clone(),
+                            permit_generation: 1,
+                            command_seq: 1,
+                            permit: claude_watch_core::channel::ChannelPermit {
+                                family: "claude".into(),
+                                session_id: Some(id.clone()),
+                                policy_version,
+                                permit_generation: 1,
+                                command_seq: 1,
+                                state: claude_watch_core::channel::ChannelPermitState::Revoked,
+                                reason_code: "launch_failed".into(),
+                                issued_at: now,
+                                valid_until: now + claude_watch_core::channel::DEFAULT_PERMIT_TTL,
+                                context_id: None,
+                                baseline_ip: None,
+                                members: vec![],
+                            },
+                            allowed_processes: vec![],
+                            upstream_endpoint: if config.proxy_url.trim().is_empty() {
+                                "127.0.0.1:7890".to_string()
+                            } else {
+                                config.proxy_url.clone()
+                            },
+                            issued_at: now,
+                        };
+                        let _ = system.enforce_channel(&cmd);
+                    }
+                }
+            } else {
+                let _ = sessions.close_if_current(Some(&id), system.now(), || system.quit_desktop());
+            }
         }
         result
     }

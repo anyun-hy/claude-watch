@@ -102,6 +102,74 @@ impl PolicySyncState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowTransportProtocol {
+    TcpIpv4,
+    TcpIpv6,
+    UdpQuic,
+    Dns,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolDisposition {
+    ForwardViaControlledTunnel,
+    ClaimAndBlock,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ControlledPathEvidence {
+    pub family: String,
+    pub upstream_endpoint: String,
+    pub policy_version: PolicyVersion,
+    pub context_id: String,
+    pub via_controlled_path: bool,
+    pub observed_at: f64,
+}
+impl ControlledPathEvidence {
+    pub fn matches_path(
+        &self,
+        family: &str,
+        expected_upstream: &str,
+        current_policy: &PolicyVersion,
+        expected_context_id: Option<&str>,
+        now: f64,
+        ttl: f64,
+    ) -> std::result::Result<(), &'static str> {
+        if !self.via_controlled_path {
+            return Err("evidence_not_from_controlled_path");
+        }
+        if self.family != family {
+            return Err("evidence_family_mismatch");
+        }
+        if expected_upstream.trim().is_empty()
+            || self.upstream_endpoint.trim() != expected_upstream.trim()
+        {
+            return Err("evidence_path_mismatch");
+        }
+        if !current_policy.valid() || &self.policy_version != current_policy {
+            return Err("evidence_policy_version_mismatch");
+        }
+        if let Some(ctx) = expected_context_id.filter(|s| !s.is_empty()) {
+            if self.context_id != ctx {
+                return Err("evidence_context_mismatch");
+            }
+        } else if self.context_id.trim().is_empty() {
+            return Err("evidence_context_missing");
+        }
+        if !self.observed_at.is_finite()
+            || !now.is_finite()
+            || self.observed_at > now + 1.0
+            || now - self.observed_at >= ttl
+        {
+            return Err("egress_evidence_expired");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundProcessToken {
     pub pid: u32,
@@ -113,6 +181,50 @@ pub struct BoundProcessToken {
     pub audit_token: Option<[u32; 8]>,
 }
 impl BoundProcessToken {
+    pub fn derive_system_token(
+        pid: u32,
+        uid: u32,
+        start_seconds: u64,
+        start_microseconds: u32,
+    ) -> [u32; 8] {
+        [
+            uid,
+            uid,
+            0,
+            uid,
+            0,
+            pid,
+            (start_seconds >> 32) as u32,
+            (start_seconds as u32) ^ start_microseconds.rotate_left(7),
+        ]
+    }
+
+    pub fn with_system_identity(
+        pid: u32,
+        uid: u32,
+        start_seconds: u64,
+        start_microseconds: u32,
+        role: ProcessRole,
+    ) -> Self {
+        Self {
+            pid,
+            uid,
+            start_seconds,
+            start_microseconds,
+            role,
+            audit_token: Some(Self::derive_system_token(
+                pid,
+                uid,
+                start_seconds,
+                start_microseconds,
+            )),
+        }
+    }
+
+    pub fn has_valid_identity(&self) -> bool {
+        self.pid > 1 && self.uid > 0 && self.start_seconds > 0 && self.audit_token.is_some()
+    }
+
     pub fn matches_process(
         &self,
         pid: u32,
@@ -121,7 +233,9 @@ impl BoundProcessToken {
         start_microseconds: u32,
         audit_token: Option<&[u32; 8]>,
     ) -> bool {
-        if self.pid != pid
+        if !self.has_valid_identity()
+            || uid == 0
+            || self.pid != pid
             || self.uid != uid
             || self.start_seconds != start_seconds
             || self.start_microseconds != start_microseconds
@@ -130,8 +244,7 @@ impl BoundProcessToken {
         }
         match (&self.audit_token, audit_token) {
             (Some(expected), Some(actual)) => expected == actual,
-            (Some(_), None) => false,
-            (None, _) => true,
+            _ => false,
         }
     }
 }
@@ -275,6 +388,10 @@ pub struct ChannelEnforcementCommand {
     pub issued_at: f64,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChannelEnforcementReceipt {
     pub family: String,
@@ -288,6 +405,12 @@ pub struct ChannelEnforcementReceipt {
     /// Must remain true even when the channel is revoked. Turning off proxy
     /// interception on macOS lets connections bypass the tunnel directly.
     pub interception_active: bool,
+    #[serde(default)]
+    pub local_proxy_ready: bool,
+    #[serde(default)]
+    pub system_extension_active: bool,
+    #[serde(default = "default_true")]
+    pub new_connections_blocked: bool,
     pub active_flows_closed: bool,
     pub direct_fallback_blocked: bool,
     pub active_flows_count: u32,
@@ -466,14 +589,24 @@ pub fn evaluate_channel_supervision_with_boot_id(
             }
         }
         ChannelPermitState::Revoked => {
-            // Premature "Blocked" before all active flows are confirmed closed
-            // is rejected.
             if receipt.enforcement_state == ChannelEnforcementState::Blocked
+                && !receipt.new_connections_blocked
+            {
+                return ChannelSupervisionVerdict::EnforcementFailed {
+                    code: "new_connections_not_blocked".into(),
+                    status_label_zh: "执行失败".into(),
+                };
+            }
+            // "已阻断" requires traffic takeover active, new connections prohibited,
+            // and all existing connections confirmed closed.
+            if receipt.enforcement_state == ChannelEnforcementState::Blocked
+                && receipt.new_connections_blocked
                 && receipt.active_flows_closed
                 && receipt.active_flows_count == 0
             {
                 ChannelSupervisionVerdict::IsolatedKeepProcess
             } else if receipt.enforcement_state == ChannelEnforcementState::Disconnecting
+                && receipt.new_connections_blocked
                 && (permit_reason == "current_permit" || permit_reason == "permit_lease_expired")
             {
                 ChannelSupervisionVerdict::PendingIsolation {
@@ -589,6 +722,8 @@ pub fn verify_channel_recovery(
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FamilyChannelMonitorState {
+    #[serde(default)]
+    pub producer_boot_id: String,
     pub family: String,
     pub session_id: Option<String>,
     pub saved_policy_version: PolicyVersion,
@@ -603,6 +738,12 @@ pub struct FamilyChannelMonitorState {
     pub reason_code: String,
     pub process_preserved: bool,
     pub active_member_pids: Vec<u32>,
+    #[serde(default)]
+    pub active_members: Vec<BoundProcessToken>,
+    #[serde(default)]
+    pub local_proxy_ready: bool,
+    #[serde(default)]
+    pub system_extension_active: bool,
     pub active_flows_count: u32,
     pub terminated_flows_count: u32,
     pub blocked_new_connections: u32,
@@ -611,6 +752,8 @@ pub struct FamilyChannelMonitorState {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChannelMonitorSnapshot {
+    #[serde(default)]
+    pub producer_boot_id: String,
     pub snapshot_seq: u64,
     pub captured_at: f64,
     pub saved_policy_version: PolicyVersion,
@@ -619,6 +762,8 @@ pub struct ChannelMonitorSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChannelMonitorEvent {
+    #[serde(default)]
+    pub producer_boot_id: String,
     pub event_seq: u64,
     pub family_state: FamilyChannelMonitorState,
 }
@@ -631,10 +776,12 @@ pub enum SubscriptionApplyOutcome {
 }
 
 /// Monitor-side subscriber state machine that enforces monotonic `event_seq`,
-/// rejects stale/out-of-order events, and requires a full snapshot resync
-/// whenever a sequence gap or reconnect occurs.
+/// detects producer restarts via `producer_boot_id`, rejects stale/out-of-order
+/// events, and requires a full snapshot resync whenever a sequence gap,
+/// producer restart, or reconnect occurs.
 #[derive(Debug, Clone)]
 pub struct ChannelMonitorSubscriber {
+    pub producer_boot_id: Option<String>,
     pub last_event_seq: u64,
     pub needs_resync: bool,
     pub saved_policy_version: Option<PolicyVersion>,
@@ -643,6 +790,7 @@ pub struct ChannelMonitorSubscriber {
 impl Default for ChannelMonitorSubscriber {
     fn default() -> Self {
         Self {
+            producer_boot_id: None,
             last_event_seq: 0,
             needs_resync: true,
             saved_policy_version: None,
@@ -656,8 +804,16 @@ impl ChannelMonitorSubscriber {
     }
 
     pub fn apply_snapshot(&mut self, snapshot: ChannelMonitorSnapshot) -> bool {
-        if snapshot.snapshot_seq < self.last_event_seq && !self.needs_resync {
+        let boot_id_changed = !snapshot.producer_boot_id.is_empty()
+            && self
+                .producer_boot_id
+                .as_deref()
+                .is_some_and(|prev| !prev.is_empty() && prev != snapshot.producer_boot_id);
+        if snapshot.snapshot_seq < self.last_event_seq && !self.needs_resync && !boot_id_changed {
             return false;
+        }
+        if !snapshot.producer_boot_id.is_empty() {
+            self.producer_boot_id = Some(snapshot.producer_boot_id);
         }
         self.last_event_seq = snapshot.snapshot_seq;
         self.saved_policy_version = Some(snapshot.saved_policy_version);
@@ -667,6 +823,23 @@ impl ChannelMonitorSubscriber {
     }
 
     pub fn apply_event(&mut self, event: ChannelMonitorEvent) -> SubscriptionApplyOutcome {
+        let event_boot_id = if !event.producer_boot_id.is_empty() {
+            event.producer_boot_id.as_str()
+        } else {
+            event.family_state.producer_boot_id.as_str()
+        };
+        if !event_boot_id.is_empty()
+            && self
+                .producer_boot_id
+                .as_deref()
+                .is_some_and(|prev| !prev.is_empty() && prev != event_boot_id)
+        {
+            self.needs_resync = true;
+            return SubscriptionApplyOutcome::GapDetectedResyncRequired {
+                expected_seq: self.last_event_seq + 1,
+                received_seq: event.event_seq,
+            };
+        }
         if self.needs_resync {
             return SubscriptionApplyOutcome::GapDetectedResyncRequired {
                 expected_seq: self.last_event_seq + 1,
@@ -690,6 +863,9 @@ impl ChannelMonitorSubscriber {
             {
                 return SubscriptionApplyOutcome::IgnoredStaleEvent;
             }
+        }
+        if !event_boot_id.is_empty() && self.producer_boot_id.is_none() {
+            self.producer_boot_id = Some(event_boot_id.to_string());
         }
         self.last_event_seq = event.event_seq;
         self.saved_policy_version = Some(event.family_state.saved_policy_version.clone());
@@ -775,6 +951,9 @@ mod tests {
             permit_state: permit.state,
             enforcement_state,
             interception_active: true,
+            local_proxy_ready: true,
+            system_extension_active: true,
+            new_connections_blocked: permit.state != ChannelPermitState::Permitted,
             active_flows_closed,
             direct_fallback_blocked: true,
             active_flows_count,
@@ -830,6 +1009,16 @@ mod tests {
             evaluate_channel_supervision(&permit, Some(&bad_receipt), &v1, 1003.0),
             ChannelSupervisionVerdict::EnforcementFailed {
                 code: "interception_inactive_direct_leak_risk".into(),
+                status_label_zh: "执行失败".into(),
+            }
+        );
+        let mut unblocked_new_conn =
+            sample_receipt(&permit, ChannelEnforcementState::Blocked, true, 0);
+        unblocked_new_conn.new_connections_blocked = false;
+        assert_eq!(
+            evaluate_channel_supervision(&permit, Some(&unblocked_new_conn), &v1, 1003.0),
+            ChannelSupervisionVerdict::EnforcementFailed {
+                code: "new_connections_not_blocked".into(),
                 status_label_zh: "执行失败".into(),
             }
         );
@@ -966,10 +1155,11 @@ mod tests {
     }
 
     #[test]
-    fn monitor_subscriber_rejects_stale_events_and_resyncs_on_sequence_gap() {
+    fn monitor_subscriber_rejects_stale_events_and_resyncs_on_sequence_gap_or_producer_restart() {
         let v1 = policy("v1");
         let mut sub = ChannelMonitorSubscriber::default();
         let state1 = FamilyChannelMonitorState {
+            producer_boot_id: "daemon-boot-1".into(),
             family: "claude".into(),
             session_id: Some("s1".into()),
             saved_policy_version: v1.clone(),
@@ -984,6 +1174,15 @@ mod tests {
             reason_code: "active".into(),
             process_preserved: true,
             active_member_pids: vec![42],
+            active_members: vec![BoundProcessToken::with_system_identity(
+                42,
+                501,
+                900,
+                1,
+                ProcessRole::DesktopMain,
+            )],
+            local_proxy_ready: true,
+            system_extension_active: true,
             active_flows_count: 1,
             terminated_flows_count: 0,
             blocked_new_connections: 0,
@@ -992,15 +1191,17 @@ mod tests {
         let mut families = BTreeMap::new();
         families.insert("claude".into(), state1.clone());
         assert!(sub.apply_snapshot(ChannelMonitorSnapshot {
+            producer_boot_id: "daemon-boot-1".into(),
             snapshot_seq: 10,
             captured_at: 1000.0,
             saved_policy_version: v1.clone(),
             families,
         }));
         assert!(!sub.needs_resync);
-        // Stale event_seq <= 10 is ignored
+        // Stale event_seq <= 10 from the SAME producer is ignored
         assert_eq!(
             sub.apply_event(ChannelMonitorEvent {
+                producer_boot_id: "daemon-boot-1".into(),
                 event_seq: 10,
                 family_state: state1.clone(),
             }),
@@ -1013,27 +1214,60 @@ mod tests {
         state2.display_label_zh = ChannelMonitorDisplayState::Disconnecting.label_zh().into();
         assert_eq!(
             sub.apply_event(ChannelMonitorEvent {
+                producer_boot_id: "daemon-boot-1".into(),
                 event_seq: 11,
                 family_state: state2.clone(),
             }),
             SubscriptionApplyOutcome::Applied
         );
-        // Gap (event 13 arrives when 12 was expected) triggers resync
-        let mut state3 = state2.clone();
-        state3.command_seq = 3;
+        // Simulate daemon restart ("daemon-boot-2") where event_seq resets to 1 (< 11):
+        // must NOT be ignored as stale! Must trigger resync and accept snapshot_seq = 1.
+        let mut restarted_state = state2.clone();
+        restarted_state.producer_boot_id = "daemon-boot-2".into();
+        restarted_state.permit_generation = 1;
+        restarted_state.command_seq = 1;
         assert_eq!(
             sub.apply_event(ChannelMonitorEvent {
-                event_seq: 13,
-                family_state: state3,
+                producer_boot_id: "daemon-boot-2".into(),
+                event_seq: 1,
+                family_state: restarted_state.clone(),
             }),
             SubscriptionApplyOutcome::GapDetectedResyncRequired {
                 expected_seq: 12,
-                received_seq: 13,
+                received_seq: 1,
+            }
+        );
+        assert!(sub.needs_resync);
+        let mut restarted_families = BTreeMap::new();
+        restarted_families.insert("claude".into(), restarted_state.clone());
+        assert!(sub.apply_snapshot(ChannelMonitorSnapshot {
+            producer_boot_id: "daemon-boot-2".into(),
+            snapshot_seq: 1,
+            captured_at: 1002.0,
+            saved_policy_version: v1.clone(),
+            families: restarted_families,
+        }));
+        assert!(!sub.needs_resync);
+        assert_eq!(sub.last_event_seq, 1);
+        assert_eq!(sub.producer_boot_id.as_deref(), Some("daemon-boot-2"));
+
+        // Gap (event 3 arrives when 2 was expected) triggers resync
+        let mut state3 = restarted_state;
+        state3.command_seq = 3;
+        assert_eq!(
+            sub.apply_event(ChannelMonitorEvent {
+                producer_boot_id: "daemon-boot-2".into(),
+                event_seq: 3,
+                family_state: state3,
+            }),
+            SubscriptionApplyOutcome::GapDetectedResyncRequired {
+                expected_seq: 2,
+                received_seq: 3,
             }
         );
         assert!(sub.needs_resync);
         // While needs_resync is true, effective_family_state degrades to PendingVerification
-        let degraded = sub.effective_family_state("claude", 1001.0, 30.0).unwrap();
+        let degraded = sub.effective_family_state("claude", 1002.5, 30.0).unwrap();
         assert_eq!(
             degraded.display_state,
             ChannelMonitorDisplayState::PendingVerification
@@ -1084,5 +1318,43 @@ mod tests {
                 status_label_zh: "执行失败".into(),
             }
         );
+    }
+
+    #[test]
+    fn bound_process_token_rejects_zero_uid_or_missing_audit_token() {
+        let valid_token = BoundProcessToken::with_system_identity(
+            4100,
+            501,
+            900,
+            1,
+            ProcessRole::DesktopMain,
+        );
+        assert!(valid_token.has_valid_identity());
+        assert!(valid_token.matches_process(
+            4100,
+            501,
+            900,
+            1,
+            valid_token.audit_token.as_ref()
+        ));
+        assert!(!valid_token.matches_process(4100, 501, 900, 1, None));
+        assert!(!valid_token.matches_process(
+            4100,
+            0,
+            900,
+            1,
+            valid_token.audit_token.as_ref()
+        ));
+
+        let placeholder_token = BoundProcessToken {
+            pid: 4100,
+            uid: 0,
+            start_seconds: 900,
+            start_microseconds: 1,
+            role: ProcessRole::DesktopMain,
+            audit_token: None,
+        };
+        assert!(!placeholder_token.has_valid_identity());
+        assert!(!placeholder_token.matches_process(4100, 0, 900, 1, None));
     }
 }
