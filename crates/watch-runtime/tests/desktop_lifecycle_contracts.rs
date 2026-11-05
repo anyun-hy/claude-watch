@@ -108,7 +108,7 @@ fn quit_is_confirmed_by_the_full_tree_even_when_the_request_was_accepted() {
     let root = std::env::temp_dir().join(format!("cw-desktop-quit-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&root).unwrap();
     let helper = root.join("watch-process-control");
-    std::fs::write(&helper, "#!/bin/sh\nprintf '%s\\n' '{\"status\":\"ok\"}'\n").unwrap();
+    std::fs::write(&helper, "#!/bin/sh\nprintf '%s\\n' '{\"schema\":1,\"product\":\"claude\",\"status\":\"ok\",\"code\":\"\",\"planned\":1,\"requested\":1,\"skipped\":0,\"failed\":0,\"remaining\":0,\"identity_unconfirmed\":0,\"force_requested\":0,\"force_skipped\":0,\"force_failed\":0}'\n").unwrap();
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let record = json!({"pid":88,"parent":1,"uid":501,
         "executable":"/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper",
@@ -133,7 +133,12 @@ fn quit_is_confirmed_by_the_full_tree_even_when_the_request_was_accepted() {
     );
     std::fs::write(
         &helper,
-        "#!/bin/sh\nprintf '%s\\n' '{\"status\":\"error\",\"force_requested\":1}'\n",
+        "#!/bin/sh\n\
+        if [ \"$1\" = 'guard-close-desktop' ]; then\n\
+            printf '%s\\n' '{\"schema\":1,\"product\":\"claude\",\"status\":\"error\",\"code\":\"target_still_running\",\"planned\":1,\"requested\":1,\"skipped\":0,\"failed\":0,\"remaining\":1,\"identity_unconfirmed\":0,\"force_requested\":1,\"force_skipped\":0,\"force_failed\":0}'\n\
+        else\n\
+            printf '%s\\n' '{\"schema\":1,\"product\":\"claude\",\"status\":\"ok\",\"code\":\"\",\"planned\":1,\"requested\":1,\"skipped\":0,\"failed\":0,\"remaining\":0,\"identity_unconfirmed\":0,\"force_requested\":0,\"force_skipped\":0,\"force_failed\":0}'\n\
+        fi\n",
     )
     .unwrap();
     assert_eq!(
@@ -172,10 +177,14 @@ fn quit_is_confirmed_by_the_full_tree_even_when_the_request_was_accepted() {
     .unwrap();
     gone.quit().unwrap();
     std::fs::write(&helper, "#!/bin/sh\nexit 7\n").unwrap();
-    gone.quit().unwrap(); // Another protector already stopped the entire tree.
-    gone.quit_for_confirmed_ip_risk(&mut forced).unwrap();
-    assert_eq!(forced, None);
-    std::fs::write(&helper, "#!/bin/sh\n[ \"$1\" = guard-close-desktop ] || exit 9\nprintf '%s\\n' '{\"status\":\"ok\",\"force_requested\":1}'\n").unwrap();
+    assert!(gone.quit().is_err());
+    assert!(gone.quit_for_confirmed_ip_risk(&mut forced).is_err());
+    std::fs::write(
+        &helper,
+        "#!/bin/sh\n[ \"$1\" = guard-close-desktop ] || exit 9\n\
+        printf '%s\\n' '{\"schema\":1,\"product\":\"claude\",\"status\":\"ok\",\"code\":\"\",\"planned\":1,\"requested\":1,\"skipped\":0,\"failed\":0,\"remaining\":0,\"identity_unconfirmed\":0,\"force_requested\":1,\"force_skipped\":0,\"force_failed\":0}'\n",
+    )
+    .unwrap();
     gone.quit_for_confirmed_ip_risk(&mut forced).unwrap();
     assert_eq!(forced, Some(1));
     std::fs::remove_dir_all(root).unwrap();
@@ -188,7 +197,17 @@ fn forced_helper_entry_is_separate_and_rejected_without_explicit_authority() {
     std::fs::create_dir(&root).unwrap();
     let helper = root.join("watch-process-control");
     let calls = root.join("calls");
-    std::fs::write(&helper, format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\nprintf '%s\\n' '{{\"status\":\"error\",\"force_requested\":1}}'\n", calls.display())).unwrap();
+    let script = format!(
+        "#!/bin/sh\n\
+        printf '%s\\n' \"$1\" >> '{}'\n\
+        if [ \"$1\" = 'guard-close-desktop' ]; then\n\
+            printf '%s\\n' '{{\"schema\":1,\"product\":\"claude\",\"status\":\"error\",\"code\":\"target_still_running\",\"planned\":1,\"requested\":1,\"skipped\":0,\"failed\":0,\"remaining\":1,\"identity_unconfirmed\":0,\"force_requested\":1,\"force_skipped\":0,\"force_failed\":0}}'\n\
+        else\n\
+            printf '%s\\n' '{{\"schema\":1,\"product\":\"claude\",\"status\":\"error\",\"code\":\"target_still_running\",\"planned\":1,\"requested\":1,\"skipped\":0,\"failed\":0,\"remaining\":1,\"identity_unconfirmed\":0,\"force_requested\":0,\"force_skipped\":0,\"force_failed\":0}}'\n\
+        fi\n",
+        calls.display()
+    );
+    std::fs::write(&helper, script).unwrap();
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let record = json!({"pid":88,"parent":1,"uid":501,
         "executable":"/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper",

@@ -948,11 +948,14 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
     fn egress(&mut self) -> Value {
         let enforcer = crate::channel_enforcer::registered_production_enforcer(&self.storage.paths.watch());
         let now = native::now();
+        let family_id = PolicyCatalog::family_for(self.desktop.target().provider())
+            .map(|f| f.id)
+            .unwrap_or("claude");
 
         // If a production enforcer is registered, route through the verified diagnostic channel
         if let Some(ref enf) = enforcer {
             let probe_res = enf.probe_via_controlled_diagnostic_channel(
-                "claude",
+                family_id,
                 "diag-egress-ctx",
                 now,
                 |proxy_endpoint| {
@@ -965,9 +968,11 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
             );
             if let Ok((mut data, evidence)) = probe_res {
                 data["via_controlled_path"] = serde_json::json!(true);
+                data["family"] = serde_json::json!(evidence.family);
                 data["upstream_endpoint"] = serde_json::json!(evidence.upstream_endpoint);
                 data["context_id"] = serde_json::json!(evidence.context_id);
                 data["policy_version"] = serde_json::to_value(&evidence.policy_version).unwrap_or(serde_json::Value::Null);
+                data["observed_at"] = serde_json::json!(evidence.observed_at);
                 return data;
             }
         }

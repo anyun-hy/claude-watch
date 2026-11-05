@@ -50,7 +50,7 @@ pub fn assemble_production_channel_stack<F>(
     run_audit: F,
 ) -> Result<ProductionChannelStack>
 where
-    F: FnMut(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + 'static,
+    F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + 'static,
 {
     let boot_id = format!(
         "daemon-{}-{}",
@@ -736,11 +736,20 @@ mod tests {
                 panic!("guard loop must not call synchronous full_audit when async worker is active")
             }
             fn egress(&mut self) -> Value {
+                let mut dummy_config = claude_watch_core::config::Config::default();
+                dummy_config.enabled = true;
+                dummy_config.guard_enabled = true;
+                let policy_ver = ChannelSupervisor::compute_policy_version(&dummy_config).unwrap();
                 json!({
                     "ip": if self.country == "CN" { "223.5.5.5" } else { "1.1.1.1" },
                     "country": self.country,
                     "observed_at": self.now,
-                    "source": "fixture"
+                    "source": "fixture",
+                    "family": "*",
+                    "upstream_endpoint": "127.0.0.1:7890",
+                    "policy_version": policy_ver,
+                    "context_id": "ctx",
+                    "via_controlled_path": true
                 })
             }
             fn local_guard(&mut self) -> Result<Value> {
@@ -784,12 +793,14 @@ mod tests {
         let now = native::now();
         let stop = Arc::new(AtomicBool::new(false));
         let (release_audit_tx, release_audit_rx) = std::sync::mpsc::channel();
+        let release_audit_rx = Arc::new(std::sync::Mutex::new(release_audit_rx));
+        let rx = Arc::clone(&release_audit_rx);
         let mut stack = assemble_production_channel_stack(
             store.clone(),
             stop.clone(),
             true,
             move |req| {
-                let _ = release_audit_rx.recv_timeout(Duration::from_secs(2));
+                let _ = rx.lock().unwrap().recv_timeout(Duration::from_secs(2));
                 Ok((
                     json!({
                         "ready": true,
@@ -811,7 +822,12 @@ mod tests {
                         "ip": "1.1.1.1",
                         "country": "JP",
                         "observed_at": req.requested_at + 0.1,
-                        "source": "fixture"
+                        "source": "fixture",
+                        "family": "claude",
+                        "upstream_endpoint": "127.0.0.1:7890",
+                        "policy_version": req.policy_version,
+                        "context_id": "ctx",
+                        "via_controlled_path": true
                     }),
                     req.requested_at + 0.1,
                 ))

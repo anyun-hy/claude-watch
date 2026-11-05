@@ -113,6 +113,10 @@ pub trait ChannelEnforcer: Send + Sync {
         now: f64,
         woke_from_sleep: bool,
     ) -> Result<Vec<ChannelEnforcementReceipt>>;
+
+    fn local_proxy_port(&self) -> Option<u16> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +221,7 @@ struct EnforcerInner {
     families: BTreeMap<String, FamilyEnforcerState>,
     traces: Vec<ConnectionTraceEvent>,
     next_trace_seq: u64,
+    extension_secret: String,
 }
 
 pub struct LocalTunnelEnforcer {
@@ -236,6 +241,11 @@ impl LocalTunnelEnforcer {
         let mut local_control_endpoints = BTreeSet::new();
         local_control_endpoints.insert("127.0.0.1:ipc".into());
         local_control_endpoints.insert("localhost:ipc".into());
+        let extension_secret = uuid::Uuid::new_v4().simple().to_string();
+        if let Some(ref st) = storage {
+            let secret_path = st.paths.watch().join("state/.extension-secret");
+            let _ = st.atomic_bytes(&secret_path, extension_secret.as_bytes(), 0o600);
+        }
         Self {
             inner: Arc::new(Mutex::new(EnforcerInner {
                 boot_id: boot_id.into(),
@@ -261,10 +271,21 @@ impl LocalTunnelEnforcer {
                 families: BTreeMap::new(),
                 traces: Vec::new(),
                 next_trace_seq: 1,
+                extension_secret,
             })),
             next_flow_id: Arc::new(AtomicU64::new(1)),
             storage,
         }
+    }
+
+    pub fn verify_extension_secret(&self, secret: Option<&str>) -> bool {
+        let Ok(guard) = self.lock() else { return false; };
+        let Some(s) = secret else { return false; };
+        !s.trim().is_empty() && s.trim() == guard.extension_secret.trim()
+    }
+
+    pub fn extension_secret(&self) -> String {
+        self.lock().map(|g| g.extension_secret.clone()).unwrap_or_default()
     }
 
     /// Activates local tunnel interception and direct-fallback blocking,
@@ -967,6 +988,7 @@ impl LocalTunnelEnforcer {
                                 // transparent proxy attribution from verified NetworkExtension with X-Watch identity headers.
                                 let mut resolved_identity = enf.resolve_peer_socket_identity(peer_addr).ok();
                                 if resolved_identity.is_none() && peer_addr.ip().is_loopback() {
+                                    let mut req_secret: Option<String> = None;
                                     let mut x_pid: Option<u32> = None;
                                     let mut x_uid: Option<u32> = None;
                                     for line in header.lines() {
@@ -974,21 +996,27 @@ impl LocalTunnelEnforcer {
                                             x_pid = v.trim().parse().ok();
                                         } else if let Some(v) = line.strip_prefix("X-Watch-UID:").or_else(|| line.strip_prefix("x-watch-uid:")) {
                                             x_uid = v.trim().parse().ok();
+                                        } else if let Some(v) = line.strip_prefix("X-Watch-Extension-Secret:").or_else(|| line.strip_prefix("x-watch-extension-secret:")) {
+                                            req_secret = Some(v.trim().to_string());
                                         }
                                     }
-                                    if let (Some(pid), Some(uid)) = (x_pid, x_uid) {
-                                        if let Ok(guard) = enf.lock() {
-                                            for (fam, st) in &guard.families {
-                                                if let Some(cmd) = &st.command {
-                                                    for tok in &cmd.allowed_processes {
-                                                        if tok.pid == pid && tok.uid == uid && tok.has_valid_identity() {
-                                                            resolved_identity = Some((fam.clone(), tok.clone()));
-                                                            break;
+                                    // Security invariant: strictly authenticate that this loopback stream originates from
+                                    // our verified NetworkExtension by validating the shared extension secret.
+                                    if enf.verify_extension_secret(req_secret.as_deref()) {
+                                        if let (Some(pid), Some(uid)) = (x_pid, x_uid) {
+                                            if let Ok(guard) = enf.lock() {
+                                                for (fam, st) in &guard.families {
+                                                    if let Some(cmd) = &st.command {
+                                                        for tok in &cmd.allowed_processes {
+                                                            if tok.pid == pid && tok.uid == uid && tok.has_valid_identity() {
+                                                                resolved_identity = Some((fam.clone(), tok.clone()));
+                                                                break;
+                                                            }
                                                         }
                                                     }
-                                                }
-                                                if resolved_identity.is_some() {
-                                                    break;
+                                                    if resolved_identity.is_some() {
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         }
@@ -2269,6 +2297,13 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
             }
         }
         Ok(updated)
+    }
+
+    fn local_proxy_port(&self) -> Option<u16> {
+        let guard = self.lock().ok()?;
+        guard.local_listener_addr.as_ref().and_then(|addr| {
+            addr.split(':').last()?.parse::<u16>().ok()
+        })
     }
 }
 

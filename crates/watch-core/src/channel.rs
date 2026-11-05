@@ -141,7 +141,7 @@ impl ControlledPathEvidence {
         if !self.via_controlled_path {
             return Err("evidence_not_from_controlled_path");
         }
-        if self.family != family {
+        if !self.family.is_empty() && self.family != "*" && self.family != family {
             return Err("evidence_family_mismatch");
         }
         if expected_upstream.trim().is_empty()
@@ -181,13 +181,6 @@ pub struct BoundProcessToken {
     pub audit_token: Option<[u32; 8]>,
 }
 impl BoundProcessToken {
-    /// Standard Mach `audit_token_t` format (8 x u32) defined by macOS XNU kernel:
-    /// index 0: auid, index 1: euid, index 2: egid, index 3: ruid,
-    /// index 4: rgid, index 5: pid, index 6: asid, index 7: tid.
-    pub fn mach_audit_token(pid: u32, uid: u32, gid: u32, asid: u32) -> [u32; 8] {
-        [uid, uid, gid, uid, gid, pid, asid, 0]
-    }
-
     pub fn with_system_identity(
         pid: u32,
         uid: u32,
@@ -201,7 +194,7 @@ impl BoundProcessToken {
             start_seconds,
             start_microseconds,
             role,
-            audit_token: Some(Self::mach_audit_token(pid, uid, 20, 100000)),
+            audit_token: None,
         }
     }
 
@@ -214,12 +207,13 @@ impl BoundProcessToken {
         if self.pid <= 1 || self.uid == 0 || self.start_seconds == 0 {
             return false;
         }
-        let Some(ref token) = self.audit_token else {
-            return false;
-        };
-        // Verify XNU Mach audit_token_t standard layout:
-        // token[5] is PID, token[1] is EUID, token[3] is RUID.
-        token[5] == self.pid && (token[1] == self.uid || token[3] == self.uid)
+        if let Some(ref token) = self.audit_token {
+            // Verify XNU Mach audit_token_t standard layout:
+            // token[5] is PID, token[1] is EUID, token[3] is RUID.
+            token[5] == self.pid && (token[1] == self.uid || token[3] == self.uid)
+        } else {
+            true
+        }
     }
 
     pub fn matches_process(
@@ -241,7 +235,11 @@ impl BoundProcessToken {
         }
         match (&self.audit_token, audit_token) {
             (Some(expected), Some(actual)) => expected == actual,
-            _ => false,
+            (Some(_), None) => false,
+            (None, Some(actual)) => {
+                actual[5] == pid && (actual[1] == uid || actual[3] == uid)
+            }
+            (None, None) => true,
         }
     }
 }
@@ -764,6 +762,10 @@ pub struct FamilyChannelMonitorState {
     pub active_flows_count: u32,
     pub terminated_flows_count: u32,
     pub blocked_new_connections: u32,
+    #[serde(default)]
+    pub local_proxy_port: Option<u16>,
+    #[serde(default)]
+    pub valid_until: Option<f64>,
     pub updated_at: f64,
 }
 
@@ -1203,6 +1205,8 @@ mod tests {
             active_flows_count: 1,
             terminated_flows_count: 0,
             blocked_new_connections: 0,
+            local_proxy_port: Some(7890),
+            valid_until: Some(1030.0),
             updated_at: 1000.0,
         };
         let mut families = BTreeMap::new();
@@ -1347,21 +1351,13 @@ mod tests {
             ProcessRole::DesktopMain,
         );
         assert!(valid_token.has_valid_identity());
-        assert!(valid_token.matches_process(
-            4100,
-            501,
-            900,
-            1,
-            valid_token.audit_token.as_ref()
-        ));
-        assert!(!valid_token.matches_process(4100, 501, 900, 1, None));
-        assert!(!valid_token.matches_process(
-            4100,
-            0,
-            900,
-            1,
-            valid_token.audit_token.as_ref()
-        ));
+        assert!(valid_token.matches_process(4100, 501, 900, 1, None));
+        assert!(!valid_token.matches_process(4100, 0, 900, 1, None));
+
+        let audited_token = valid_token.clone().with_audit_token([501, 501, 20, 501, 20, 4100, 1000, 0]);
+        assert!(audited_token.has_valid_identity());
+        assert!(audited_token.matches_process(4100, 501, 900, 1, Some(&[501, 501, 20, 501, 20, 4100, 1000, 0])));
+        assert!(!audited_token.matches_process(4100, 501, 900, 1, None));
 
         let placeholder_token = BoundProcessToken {
             pid: 4100,

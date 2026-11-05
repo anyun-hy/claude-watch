@@ -16,7 +16,14 @@ import Darwin
 /// 4. Forwarded flows are directed through the verified local proxy listener using bidirectional pumping.
 /// 5. IPC via `handleAppMessage` enables Rust daemon and host manager to push dynamic permits and revoking commands.
 @available(macOS 11.0, *)
+@main
 open class WatchChannelExtension: NETransparentProxyProvider {
+    public static func main() {
+        autoreleasepool {
+            NEProvider.startSystemExtensionMode()
+        }
+    }
+
     private let logger = Logger(subsystem: "io.local.watchpanel.extension", category: "FlowGate")
 
     private let stateLock = NSLock()
@@ -29,6 +36,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
     private var managedPids: Set<UInt32> = []
     private var allowedPids: Set<UInt32> = []
     private var isPermitted: Bool = false
+    private var extensionSecret: String = ""
 
     // Active flow tracking for immediate cutoff on revocation or lease expiry
     private struct ActiveFlowRecord {
@@ -55,19 +63,29 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             if let policyVer = opts["policy_version"] as? String {
                 currentPolicyVersion = policyVer
             }
+            if let secret = opts["extension_secret"] as? String {
+                extensionSecret = secret
+            }
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let secretFile = home.appendingPathComponent("Library/Application Support/ClaudeWatch/state/.extension-secret")
+        if let secretData = try? Data(contentsOf: secretFile),
+           let secretStr = String(data: secretData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !secretStr.isEmpty {
+            extensionSecret = secretStr
         }
         stateLock.unlock()
 
         let settings = NETransparentProxyNetworkSettings(tunnelRemoteAddress: localProxyHost)
-        let defaultIPv4Route = NEIPv4Route.default()
-        let ipv4Settings = NEIPv4Settings(addresses: ["198.18.0.1"], subnetMasks: ["255.255.0.0"])
-        ipv4Settings.includedRoutes = [defaultIPv4Route]
-        settings.ipv4Settings = ipv4Settings
-
-        let defaultIPv6Route = NEIPv6Route.default()
-        let ipv6Settings = NEIPv6Settings(addresses: ["fd00::1"], networkPrefixLengths: [64])
-        ipv6Settings.includedRoutes = [defaultIPv6Route]
-        settings.ipv6Settings = ipv6Settings
+        let anyNetworkRule = NENetworkRule(
+            remoteNetwork: nil,
+            remotePrefix: 0,
+            localNetwork: nil,
+            localPrefix: 0,
+            protocol: .any,
+            direction: .outbound
+        )
+        settings.includedNetworkRules = [anyNetworkRule]
 
         setTunnelNetworkSettings(settings) { [weak self] error in
             if let error = error {
@@ -140,6 +158,9 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             if let pids = json["allowed_pids"] as? [UInt32] {
                 self.allowedPids = Set(pids)
                 self.managedPids.formUnion(pids)
+            }
+            if let secret = json["extension_secret"] as? String, !secret.isEmpty {
+                self.extensionSecret = secret
             }
             if !self.isPermitted {
                 terminateAllActiveFlowsLocked(reason: "permit_revoked")
@@ -231,8 +252,8 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         totalForwardedFlows += 1
         stateLock.unlock()
 
-        // Step 1: Send CONNECT handshake to local gateway with verified process identity headers
-        let connectReq = "CONNECT \(targetHost):\(targetPort) HTTP/1.1\r\nHost: \(targetHost):\(targetPort)\r\nX-Watch-PID: \(flowPid)\r\nX-Watch-UID: \(flowUid)\r\n\r\n"
+        // Step 1: Send CONNECT handshake to local gateway with verified process identity headers & extension secret
+        let connectReq = "CONNECT \(targetHost):\(targetPort) HTTP/1.1\r\nHost: \(targetHost):\(targetPort)\r\nX-Watch-PID: \(flowPid)\r\nX-Watch-UID: \(flowUid)\r\nX-Watch-Extension-Secret: \(self.extensionSecret)\r\n\r\n"
         guard let connectData = connectReq.data(using: .utf8) else {
             closeFlowImmediately(tcpFlow, reason: "connect_req_encoding_error")
             return true
@@ -315,7 +336,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
                 self.cleanupFlow(id: flowID, error: nil)
                 return
             }
-            flow.writeData(data) { writeErr in
+            flow.write(data) { writeErr in
                 if let writeErr = writeErr {
                     self.cleanupFlow(id: flowID, error: writeErr)
                 } else {
@@ -381,7 +402,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         let managed = managedPids
         stateLock.unlock()
 
-        if let auditToken = flow.sourceProcessAuditToken, auditToken.count == 32 {
+        if let auditToken = flow.metaData.sourceAppAuditToken, auditToken.count == 32 {
             // Mach audit_token_t: 8 x UInt32
             // offset 4: euid, offset 20: pid
             let (pid, uid) = auditToken.withUnsafeBytes { ptr -> (UInt32, UInt32) in

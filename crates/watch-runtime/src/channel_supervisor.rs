@@ -39,7 +39,7 @@ use std::{
     thread,
 };
 
-pub const DEFAULT_ASYNC_AUDIT_TIMEOUT_SECONDS: f64 = 15.0;
+pub const DEFAULT_ASYNC_AUDIT_TIMEOUT_SECONDS: f64 = 10.0;
 pub const MAX_ASYNC_AUDIT_RETRIES: u32 = 3;
 pub const ASYNC_AUDIT_RETRY_BACKOFF_SECONDS: f64 = 2.0;
 pub const MAX_EMITTED_EVENTS: usize = 128;
@@ -222,6 +222,14 @@ impl ChannelSupervisor {
         })
     }
 
+    pub fn saved_policy_version(&self) -> &PolicyVersion {
+        &self.saved_policy_version
+    }
+
+    pub fn upstream_endpoint(&self) -> &str {
+        &self.upstream_endpoint
+    }
+
     /// Handshakes or updates the expected executor `boot_id`. When an executor
     /// restarts with a new `boot_id`, all tracks advance `permit_generation`
     /// and invalidate prior receipts so pre-restart receipts or reused sequence
@@ -268,11 +276,11 @@ impl ChannelSupervisor {
         run_audit: F,
     ) -> Result<(Sender<AsyncAuditRequest>, thread::JoinHandle<()>)>
     where
-        F: FnMut(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + 'static,
+        F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + 'static,
     {
         let (req_tx, req_rx): (Sender<AsyncAuditRequest>, Receiver<AsyncAuditRequest>) =
             mpsc::channel();
-        let run_audit = Arc::new(std::sync::Mutex::new(run_audit));
+        let run_audit = Arc::new(run_audit);
         let handle = thread::Builder::new()
             .name("channel-async-audit-worker".into())
             .spawn(move || {
@@ -290,15 +298,7 @@ impl ChannelSupervisor {
                     let runner_thread = thread::Builder::new()
                         .name("channel-audit-runner".into())
                         .spawn(move || {
-                            // Non-blocking try_lock: If previous timed-out runner is still stuck in-flight,
-                            // immediately fail without wedging the new runner or queueing on the poisoned lock.
-                            let res = match runner.try_lock() {
-                                Ok(mut locked) => locked(&req_clone),
-                                Err(_) => Err(CoreError::new(
-                                    "audit_runner_busy_previous_in_flight",
-                                    "上一次慢审计任务仍在运行，本次执行跳过阻塞并立即释放资源",
-                                )),
-                            };
+                            let res = runner(&req_clone);
                             let _ = result_tx.send(res);
                         });
 
@@ -604,9 +604,9 @@ impl ChannelSupervisor {
         let evidence_valid = fresh_exit
             .as_ref()
             .is_some_and(|exit| exit.observed_at + session::GUARD_EGRESS_TTL > now);
-        let path_evidence = serde_json::from_value::<claude_watch_core::channel::ControlledPathEvidence>(self.latest_egress.clone()).ok();
+        let path_evidence = serde_json::from_value::<claude_watch_core::channel::ControlledPathEvidence>(self.latest_egress.clone());
         let path_matches_err = match path_evidence {
-            Some(ref ev) => ev.matches_path(
+            Ok(ref ev) => ev.matches_path(
                 family,
                 &self.upstream_endpoint,
                 &self.saved_policy_version,
@@ -614,13 +614,7 @@ impl ChannelSupervisor {
                 now,
                 session::GUARD_EGRESS_TTL,
             ).err(),
-            None => {
-                if self.latest_egress.get("via_controlled_path").and_then(|v| v.as_bool()) == Some(false) {
-                    Some("evidence_not_from_controlled_path")
-                } else {
-                    None
-                }
-            }
+            Err(_) => Some("evidence_not_from_controlled_path"),
         };
         let had_active_or_permitted = session
             .as_ref()
@@ -1341,11 +1335,13 @@ impl ChannelSupervisor {
             track.policy_sync_state = PolicySyncState::ApplyFailed;
         }
         track.verdict = Some(verdict);
+        let local_proxy_port = self.enforcer.as_ref().and_then(|e| e.local_proxy_port());
         let family_state = Self::build_family_monitor_state_from_track(
             &self.producer_boot_id,
             &self.saved_policy_version,
             family,
             track,
+            local_proxy_port,
             now,
         );
         self.event_seq = self.event_seq.saturating_add(1);
@@ -1372,11 +1368,13 @@ impl ChannelSupervisor {
         track: &FamilyRuntimeTrack,
         now: f64,
     ) -> FamilyChannelMonitorState {
+        let local_proxy_port = self.enforcer.as_ref().and_then(|e| e.local_proxy_port());
         Self::build_family_monitor_state_from_track(
             &self.producer_boot_id,
             &self.saved_policy_version,
             family,
             track,
+            local_proxy_port,
             now,
         )
     }
@@ -1386,6 +1384,7 @@ impl ChannelSupervisor {
         saved_policy_version: &PolicyVersion,
         family: &str,
         track: &FamilyRuntimeTrack,
+        local_proxy_port: Option<u16>,
         now: f64,
     ) -> FamilyChannelMonitorState {
         let permit_state = track
@@ -1463,6 +1462,8 @@ impl ChannelSupervisor {
             active_flows_count,
             terminated_flows_count,
             blocked_new_connections,
+            local_proxy_port,
+            valid_until: track.current_permit.as_ref().map(|p| p.valid_until),
             updated_at: now,
         }
     }

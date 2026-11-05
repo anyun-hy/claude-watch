@@ -256,7 +256,13 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
     let active_flows_count: UInt32
     let terminated_flows_count: UInt32
     let blocked_new_connections: UInt32
+    var local_proxy_port: UInt16? = nil
+    var valid_until: Double? = nil
     let updated_at: Double
+
+    var isPermitted: Bool {
+        permit_state == "permitted"
+    }
 
     /// Binds network flows and process rows to the same supervised session and
     /// policy version so stale flows or another session's processes are never

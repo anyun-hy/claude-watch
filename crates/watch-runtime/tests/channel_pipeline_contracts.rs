@@ -54,11 +54,25 @@ fn fixture_local() -> Value {
 }
 
 fn fixture_egress(now: f64, ip: &str, country: &str) -> Value {
+    let mut dummy_config = claude_watch_core::config::Config::default();
+    dummy_config.enabled = true;
+    dummy_config.guard_enabled = true;
+    let policy_ver = ChannelSupervisor::compute_policy_version(&dummy_config).unwrap();
+    let upstream = if dummy_config.proxy_url.trim().is_empty() {
+        "127.0.0.1:7890".to_string()
+    } else {
+        dummy_config.proxy_url.clone()
+    };
     json!({
         "ip": ip,
         "country": country,
         "observed_at": now,
-        "source": "fixture"
+        "source": "fixture",
+        "family": "*",
+        "upstream_endpoint": upstream,
+        "policy_version": policy_ver,
+        "context_id": "ctx",
+        "via_controlled_path": true
     })
 }
 
@@ -686,14 +700,16 @@ fn slow_async_audit_does_not_block_revocation_and_policy_hot_reload_discards_sta
     let (event_tx, event_rx) = mpsc::channel();
     let (audit_started_tx, audit_started_rx) = mpsc::channel();
     let (release_audit_tx, release_audit_rx) = mpsc::channel();
+    let release_audit_rx = Arc::new(std::sync::Mutex::new(release_audit_rx));
 
+    let rx = Arc::clone(&release_audit_rx);
     let (audit_req_tx, worker_handle) = ChannelSupervisor::spawn_async_audit_worker(
         stop.clone(),
         event_tx,
         move |req: &AsyncAuditRequest| {
             let _ = audit_started_tx.send(req.clone());
             // Hold the slow audit until released by the test
-            let _ = release_audit_rx.recv_timeout(Duration::from_secs(5));
+            let _ = rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
             Ok((
                 json!({
                     "ready": true,
@@ -758,7 +774,7 @@ fn slow_async_audit_does_not_block_revocation_and_policy_hot_reload_discards_sta
     // desktop without a session (which triggers an async slow audit on the background worker)
     supervisor
         .handle_event(SupervisionEvent::EnvironmentUpdated {
-            egress: json!({"ip":"1.1.1.1","country":"JP","observed_at":now,"source":"fixture"}),
+            egress: fixture_egress(now, "1.1.1.1", "JP"),
             local_guard: json!({"proxy":"ok","tun":"ok"}),
             observed_at: now,
         })
@@ -1564,6 +1580,8 @@ fn daemon_restart_resync_with_producer_boot_id() {
         active_flows_count: 1,
         terminated_flows_count: 0,
         blocked_new_connections: 0,
+        local_proxy_port: Some(7890),
+        valid_until: Some(initial_now + 30.0),
         updated_at: initial_now,
     };
 
@@ -1645,30 +1663,141 @@ fn controlled_path_evidence_and_authoritative_permit_are_hard_requirements() {
     let mut supervisor = ChannelSupervisor::new(store.clone(), Some(enforcer.clone()), None).unwrap();
 
     let now = 1_710_000_100.0;
-    // 1. When egress has via_controlled_path = false, supervisor must revoke or refuse permit
-    let uncontrolled_egress = json!({
+
+    // 1. Establish an Active session in store
+    let active_session = json!({
+        "schema": 1,
+        "state": "active",
+        "session_id": "sess-active-1",
+        "context_id": "ctx-active-1",
+        "baseline": {
+            "ip": "1.1.1.1",
+            "country": "JP",
+            "observed_at": now - 5.0,
+            "source": "HTTP egress"
+        },
+        "created_at": now - 10.0,
+        "pending_deadline": now + 60.0,
+        "desktop": {
+            "pid": 1234,
+            "start_seconds": (now - 10.0) as u64,
+            "start_microseconds": 0,
+            "app_name": "Claude"
+        },
+        "bound_at": now - 5.0
+    });
+    store.atomic_json(&store.paths.session_for("claude"), &active_session).unwrap();
+
+    // Inject managed process inventory
+    let claude_desktop = Desktop {
+        pid: 1234,
+        start_seconds: (now - 10.0) as u64,
+        start_microseconds: 0,
+    };
+    supervisor
+        .handle_event(SupervisionEvent::ProcessInventoryUpdated {
+            family: "claude".into(),
+            desktops: vec![(claude_desktop, true, "desktop-1".into())],
+            processes: vec![BoundProcessToken::with_system_identity(
+                1234,
+                501,
+                (now - 10.0) as u64,
+                1,
+                ProcessRole::DesktopMain,
+            )],
+            observed_at: now,
+        })
+        .unwrap();
+
+    // 2. Inject valid controlled-path evidence: Must issue Permitted
+    let policy_ver = supervisor.saved_policy_version().clone();
+    let upstream_endpoint = supervisor.upstream_endpoint().to_string();
+    let valid_controlled_egress = json!({
         "ip": "1.1.1.1",
-        "country": "US",
+        "country": "JP",
         "observed_at": now,
-        "via_controlled_path": false
+        "via_controlled_path": true,
+        "family": "claude",
+        "upstream_endpoint": upstream_endpoint,
+        "policy_version": policy_ver,
+        "context_id": "ctx-active-1"
     });
     supervisor
         .handle_event(SupervisionEvent::EnvironmentUpdated {
-            egress: uncontrolled_egress,
+            egress: valid_controlled_egress,
             local_guard: json!({"proxy": "ok", "tun": "ok"}),
             observed_at: now,
         })
         .unwrap();
 
-    let snap = supervisor.snapshot(now);
-    let claude_state = snap.families.get("claude").unwrap();
-    assert_ne!(
-        claude_state.permit_state,
+    let snap1 = supervisor.snapshot(now);
+    let claude_state1 = snap1.families.get("claude").unwrap();
+    assert_eq!(
+        claude_state1.permit_state,
         claude_watch_core::channel::ChannelPermitState::Permitted
     );
+    assert!(claude_state1.valid_until.is_some_and(|u| u > now));
 
-    // 2. Authoritative permit is saved by supervisor in state/channel-permits.json
+    // Check authoritative permit file on disk
     let permits_path = store.paths.watch().join("state/channel-permits.json");
     let permits_val: serde_json::Value = store.read_json(&permits_path, json!({})).unwrap();
-    assert!(permits_val.is_object());
+    assert_eq!(permits_val["claude"]["state"], "permitted");
+    assert!(permits_val["claude"]["valid_until"].as_f64().unwrap() > now);
+    assert_eq!(permits_val["claude"]["members"][0]["pid"], 1234);
+
+    // 3. Inject uncontrolled-path evidence (via_controlled_path = false): Must immediately Revoke
+    let uncontrolled_egress = json!({
+        "ip": "1.1.1.1",
+        "country": "JP",
+        "observed_at": now + 1.0,
+        "via_controlled_path": false,
+        "family": "claude",
+        "upstream_endpoint": upstream_endpoint.clone(),
+        "policy_version": policy_ver,
+        "context_id": "ctx-active-1"
+    });
+    supervisor
+        .handle_event(SupervisionEvent::EnvironmentUpdated {
+            egress: uncontrolled_egress,
+            local_guard: json!({"proxy": "ok", "tun": "ok"}),
+            observed_at: now + 1.0,
+        })
+        .unwrap();
+
+    let snap2 = supervisor.snapshot(now + 1.0);
+    let claude_state2 = snap2.families.get("claude").unwrap();
+    assert_eq!(
+        claude_state2.permit_state,
+        claude_watch_core::channel::ChannelPermitState::Revoked
+    );
+    assert_eq!(
+        claude_state2.reason_code,
+        "evidence_not_from_controlled_path"
+    );
+
+    // 4. Inject evidence missing required fields (e.g., family): Must also Revoke
+    let malformed_egress = json!({
+        "ip": "1.1.1.1",
+        "country": "JP",
+        "observed_at": now + 2.0,
+        "via_controlled_path": true
+    });
+    supervisor
+        .handle_event(SupervisionEvent::EnvironmentUpdated {
+            egress: malformed_egress,
+            local_guard: json!({"proxy": "ok", "tun": "ok"}),
+            observed_at: now + 2.0,
+        })
+        .unwrap();
+
+    let snap3 = supervisor.snapshot(now + 2.0);
+    let claude_state3 = snap3.families.get("claude").unwrap();
+    assert_eq!(
+        claude_state3.permit_state,
+        claude_watch_core::channel::ChannelPermitState::Revoked
+    );
+    assert_eq!(
+        claude_state3.reason_code,
+        "evidence_not_from_controlled_path"
+    );
 }
