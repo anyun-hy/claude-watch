@@ -15,8 +15,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
     private let logger = Logger(subsystem: "io.local.watchpanel.extension", category: "FlowGate")
     private let stateLock = NSLock()
     private let controlQueue = DispatchQueue(label: "watch.extension.control", qos: .userInitiated)
-    private let extensionBoot = UUID().uuidString
-    private var providerStartedAt: Double = 0
+    private var executionEpoch = ChannelExecutionEpoch(startedAt: 0)
     private var executorBoot = ""
     private var stateDirectory: ExtensionStateDirectory?
     private var controlUID: uid_t = 0
@@ -64,7 +63,9 @@ open class WatchChannelExtension: NETransparentProxyProvider {
     private var activeFlows: [UUID: ActiveFlowRecord] = [:]
 
     open override func startProxy(options: [String: Any]? = nil, completionHandler: @escaping (Error?) -> Void) {
-        providerStartedAt = Date().timeIntervalSince1970
+        stateLock.lock()
+        executionEpoch = ChannelExecutionEpoch(startedAt: Date().timeIntervalSince1970)
+        stateLock.unlock()
         do {
             guard let config = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration,
                   let home = config["control_home"] as? String,
@@ -193,15 +194,19 @@ open class WatchChannelExtension: NETransparentProxyProvider {
             let family = command.family
             let policy = command.policy_version.dictionary
             let previous = families[family]
+            // A new epoch echo can confirm an already-denied identical revoke.
+            // An identical grant still cannot re-enable the previous permit.
+            let allowed = executionEpoch.permits(command, acknowledgedBoot: envelope.extension_boot_id, now: now)
             if let previous = previous, previous.seq == command.command_seq && previous.generation == command.permit_generation { continue }
-            let allowed = command.canGrant(providerStartedAt: providerStartedAt, now: now)
             var permit = Permit(policy: policy, seq: command.command_seq, generation: command.permit_generation,
                 issuedAt: command.issued_at, appliedAt: now, deadline: command.valid_until,
                 monotonicDeadline: ProcessInfo.processInfo.systemUptime + max(0, min(10, command.valid_until - now)),
                 pids: Set(command.allowed_pids), processes: command.allowed_processes, sessionID: command.session_id,
                 commandBinding: command.command_binding,
                 requestedState: command.permit_state, permitted: allowed,
-                status: allowed ? "ok" : "disconnecting", reason: command.reason, closingSince: allowed ? nil : now)
+                status: allowed ? "ok" : "disconnecting",
+                reason: command.permit_state == "permitted" && !allowed ? "extension_epoch_reverify_required" : command.reason,
+                closingSince: allowed ? nil : now)
             for process in command.allowed_processes { ownership.remember(process) }
             let previousPolicy = previous.flatMap { p -> ChannelPolicy? in
                 guard let policy = p.policy["policy_digest"] as? String,
@@ -225,9 +230,16 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         let present = Set(envelope.commands.map { $0.family })
         for family in families.keys.filter({ !present.contains($0) }) {
             families[family]?.permitted = false
-            families[family]?.closingSince = now
-            families[family]?.reason = "family_command_removed"
             terminateFlowsLocked(family: family)
+            let remaining = activeFlows.values.filter { $0.family == family }
+            let closeFailed = remaining.contains { $0.connection.state == .failed }
+            let update = ChannelDrainUpdate(remaining: remaining.count,
+                previouslyStarted: families[family]?.closingSince, closeFailed: closeFailed, now: now)
+            families[family]?.status = update.status
+            families[family]?.closingSince = update.closingSince
+            families[family]?.appliedAt = update.appliedAt
+            families[family]?.reason = closeFailed ? "flow_close_failed"
+                : (update.status == "failed" ? "drain_timeout" : "family_command_removed")
         }
         managedProcesses = families.values.flatMap { $0.processes }
         ownership.prune(current: { ChannelCodeIdentity.process(pid: $0)?.identity }, exited: { pid in
@@ -240,7 +252,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         let receipts: [[String: Any]] = families.map { family, permit in
             let count = activeFlows.values.filter { $0.family == family }.count
             var value: [String: Any] = [
-                "family": family, "executor_boot_id": executorBoot, "extension_boot_id": extensionBoot,
+                "family": family, "executor_boot_id": executorBoot, "extension_boot_id": executionEpoch.bootID,
                 "command_binding": permit.commandBinding,
                 "policy_version": permit.policy, "command_seq": permit.seq, "permit_generation": permit.generation,
                 "applied_at": permit.appliedAt, "allowed_pids": Array(permit.pids), "local_proxy_port": 0,
@@ -262,7 +274,7 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         stateLock.lock(); defer { stateLock.unlock() }
         do {
             try stateDirectory?.writeObservation([
-                "executor_boot_id": executorBoot, "extension_boot_id": extensionBoot,
+                "executor_boot_id": executorBoot, "extension_boot_id": executionEpoch.bootID,
                 "heartbeat_at": Date().timeIntervalSince1970,
                 "interception_active": isInterceptionActive && observationHealthy
             ], name: "system-extension-heartbeat.json")
@@ -270,7 +282,10 @@ open class WatchChannelExtension: NETransparentProxyProvider {
     }
     open override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
         // Commands have one authority: Rust. UI messages cannot grant or revoke permits.
-        completionHandler?(try? JSONSerialization.data(withJSONObject: ["status": "read_only", "extension_boot_id": extensionBoot]))
+        stateLock.lock()
+        let boot = executionEpoch.bootID
+        stateLock.unlock()
+        completionHandler?(try? JSONSerialization.data(withJSONObject: ["status": "read_only", "extension_boot_id": boot]))
     }
     open override func stopProxy(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         controlTimer?.cancel(); heartbeatTimer?.cancel(); commandEvents?.cancel()
@@ -296,10 +311,25 @@ open class WatchChannelExtension: NETransparentProxyProvider {
         writeReceiptsLocked()
     }
     open override func sleep(completionHandler: @escaping () -> Void) {
-        stateLock.lock(); revokeAllLocked(reason: "system_sleep"); stateLock.unlock()
+        stateLock.lock()
+        executionEpoch.suspend()
+        revokeAllLocked(reason: "system_sleep")
+        stateLock.unlock()
         completionHandler()
     }
-    open override func wake() { controlQueue.async { [weak self] in self?.controlTick(); self?.emitHeartbeat() } }
+    open override func wake() {
+        // Install the fence synchronously: an RPC already running on the control
+        // queue must not restore permission while this callback is queued.
+        stateLock.lock()
+        executionEpoch.wake(at: Date().timeIntervalSince1970)
+        revokeAllLocked(reason: "system_wake_reverify_required")
+        stateLock.unlock()
+        emitHeartbeat()
+        controlQueue.async { [weak self] in
+            self?.lastCommandData = nil
+            self?.controlTick()
+        }
+    }
 
     open override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
         let (classification, source) = inspectFlowAttribution(flow)

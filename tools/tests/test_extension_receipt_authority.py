@@ -15,7 +15,7 @@ class ExecutionReceiptAuthority(unittest.TestCase):
         self.assertIn('r.matches_supervision(&cmd.policy_version, cmd.command_seq', ENFORCER)
         self.assertIn('self.executor_boot_id == expected_boot', CORE)
         self.assertIn('self.extension_boot_id == extension_boot', CORE)
-        self.assertIn('"executor_boot_id": executorBoot, "extension_boot_id": extensionBoot', EXT)
+        self.assertIn('"executor_boot_id": executorBoot, "extension_boot_id": executionEpoch.bootID', EXT)
         self.assertNotIn('Some("扩展独立心跳在线")', DAEMON)
         self.assertIn('extension_receipt_pending_or_invalid', ENFORCER)
         self.assertIn("record_activation_failure", DAEMON)

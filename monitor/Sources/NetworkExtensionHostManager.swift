@@ -50,24 +50,33 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
     }
     deinit { if let observer = statusObserver { NotificationCenter.default.removeObserver(observer) } }
 
-    /// Check the signed host's entitlement before requesting OS activation.
-    private func canInstallSystemExtension() -> Bool {
+    /// Both capabilities are required at every entry that can start/configure the provider.
+    private func hasRequiredSigningEntitlements() -> Bool {
         guard let task = SecTaskCreateFromSelf(nil) else { return false }
-        return SecTaskCopyValueForEntitlement(
-            task, "com.apple.developer.system-extension.install" as CFString, nil
-        ) as? Bool == true
+        return NetworkExtensionCapabilities.allowsActivation(
+            installation: SecTaskCopyValueForEntitlement(task, "com.apple.developer.system-extension.install" as CFString, nil),
+            providers: SecTaskCopyValueForEntitlement(task, "com.apple.developer.networking.networkextension" as CFString, nil)
+        )
     }
 
-    public func startAndActivateIfNeeded() {
-        guard canInstallSystemExtension() else {
+    private func failUnsignedActivation() {
+        let publish = {
             let unavailable = NetworkExtensionActivationState(
                 isSystemExtensionActive: false,
                 isTunnelActive: false,
-                detail: "应用未具备系统扩展安装权限，请使用已授权的开发者签名",
-                lastErrorCode: "missing_system_extension_entitlement"
+                detail: "应用缺少系统扩展安装或网络扩展签名权限，请使用已授权的开发者签名",
+                lastErrorCode: "network_extension_entitlement_missing"
             )
-            activationState = unavailable
-            persistActivationStatus(state: unavailable)
+            self.activationState = unavailable
+            self.persistActivationStatus(state: unavailable)
+        }
+        if Thread.isMainThread { publish() }
+        else { DispatchQueue.main.async(execute: publish) }
+    }
+
+    public func startAndActivateIfNeeded() {
+        guard hasRequiredSigningEntitlements() else {
+            failUnsignedActivation()
             return
         }
         refreshStatus { [weak self] ready in
@@ -82,6 +91,11 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
 
     /// Checks the current system extension and transparent proxy tunnel status.
     public func refreshStatus(completion: ((Bool) -> Void)? = nil) {
+        guard hasRequiredSigningEntitlements() else {
+            failUnsignedActivation()
+            completion?(false)
+            return
+        }
         NETransparentProxyManager.loadAllFromPreferences { [weak self] managers, error in
             guard let self = self else {
                 completion?(false)
@@ -141,6 +155,11 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
 
     /// Sets up and enables transparent proxy configuration via NETransparentProxyManager.
     public func setupAndEnableTransparentProxyConfiguration(completion: ((Bool) -> Void)? = nil) {
+        guard hasRequiredSigningEntitlements() else {
+            failUnsignedActivation()
+            completion?(false)
+            return
+        }
         guard !isSettingUpConfiguration else {
             completion?(false)
             return
@@ -221,6 +240,10 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
 
     /// Requests system extension installation and activation via `OSSystemExtensionRequest`.
     public func requestActivation() {
+        guard hasRequiredSigningEntitlements() else {
+            failUnsignedActivation()
+            return
+        }
         let request = OSSystemExtensionRequest.activationRequest(
             forExtensionWithIdentifier: Self.extensionBundleIdentifier,
             queue: .main

@@ -8,16 +8,29 @@ CW_BUILD_ARCH="${CW_BUILD_ARCH:-arm64}"
 CW_BACKEND_VARIANT="${CW_BACKEND_VARIANT:-rust-candidate}"
 BACKGROUND_EVIDENCE_SCHEMA=0
 CW_TARGETS="$CW_BUILD_ARCH"
-# Accept both published spellings, but never silently select conflicting inputs.
-if [[ -n "${CW_SIGNING_IDENTITY:-}" && -n "${CW_CODESIGN_IDENTITY:-}" && "$CW_SIGNING_IDENTITY" != "$CW_CODESIGN_IDENTITY" ]] ||
-   [[ -n "${CW_HOST_PROVISION_PROFILE:-}" && -n "${CW_HOST_PROFILE:-}" && "$CW_HOST_PROVISION_PROFILE" != "$CW_HOST_PROFILE" ]] ||
-   [[ -n "${CW_EXTENSION_PROVISION_PROFILE:-}" && -n "${CW_EXTENSION_PROFILE:-}" && "$CW_EXTENSION_PROVISION_PROFILE" != "$CW_EXTENSION_PROFILE" ]]; then
-  echo 'Conflicting signing identity/profile aliases.' >&2
-  exit 1
-fi
-CW_SIGNING_IDENTITY="${CW_SIGNING_IDENTITY:-${CW_CODESIGN_IDENTITY:--}}"
-CW_HOST_PROVISION_PROFILE="${CW_HOST_PROVISION_PROFILE:-${CW_HOST_PROFILE:-}}"
-CW_EXTENSION_PROVISION_PROFILE="${CW_EXTENSION_PROVISION_PROFILE:-${CW_EXTENSION_PROFILE:-}}"
+# Accept existing and older signing spellings without silently resolving conflicts.
+cw_resolve_signing_aliases() {
+  local cw_alias_name cw_alias_value cw_resolved_value=''
+  for cw_alias_name in "$@"; do
+    cw_alias_value="${!cw_alias_name-}"
+    [[ -n "$cw_alias_value" ]] || continue
+    if [[ -n "$cw_resolved_value" && "$cw_resolved_value" != "$cw_alias_value" ]]; then
+      echo 'Conflicting signing identity/profile aliases.' >&2
+      return 1
+    fi
+    cw_resolved_value="$cw_alias_value"
+  done
+  printf '%s' "$cw_resolved_value"
+}
+CW_SIGNING_IDENTITY=$(cw_resolve_signing_aliases CW_SIGNING_IDENTITY CW_CODESIGN_IDENTITY CW_SIGN_IDENTITY)
+CW_SIGNING_IDENTITY="${CW_SIGNING_IDENTITY:--}"
+CW_HOST_PROVISION_PROFILE=$(cw_resolve_signing_aliases CW_HOST_PROVISION_PROFILE CW_HOST_PROFILE CW_APP_PROVISIONING_PROFILE)
+CW_EXTENSION_PROVISION_PROFILE=$(cw_resolve_signing_aliases CW_EXTENSION_PROVISION_PROFILE CW_EXTENSION_PROFILE CW_EXTENSION_PROVISIONING_PROFILE)
+case "${CW_REQUIRE_ENTITLED_NETWORK_EXTENSION:-0}" in
+  0) ;;
+  1) [[ "$CW_SIGNING_IDENTITY" != - ]] || { echo 'Production NetworkExtension build cannot use an ad-hoc signature.' >&2; exit 1; } ;;
+  *) echo 'CW_REQUIRE_ENTITLED_NETWORK_EXTENSION must be 0 or 1.' >&2; exit 1 ;;
+esac
 CW_SIGN_OPTIONS=()
 CW_EXTENSION_MACH_SERVICE=io.local.watchpanel.network-extension
 if [[ "$CW_SIGNING_IDENTITY" != - ]]; then

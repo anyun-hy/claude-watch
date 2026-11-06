@@ -28,7 +28,7 @@ class ExtensionActivationAndAttribution(unittest.TestCase):
     def test_connected_is_not_conflated_with_enabled(self):
         self.assertIn('isSystemExtensionActive: isConnected', HOST)
         self.assertNotIn('isSystemExtensionActive: isEnabled', HOST)
-        self.assertIn('guard canInstallSystemExtension()', HOST)
+        self.assertIn('guard hasRequiredSigningEntitlements()', HOST)
 
     def test_managed_source_requires_bound_permission(self):
         self.assertIn('sourceAppSigningIdentifier', EXT)
@@ -42,9 +42,9 @@ class ExtensionActivationAndAttribution(unittest.TestCase):
         self.assertLess(cleanup.index('if record.connection.cancel()'), cleanup.index('activeFlows.removeValue'))
 
     def test_old_disk_commands_not_authorized_after_restart(self):
-        self.assertIn('providerStartedAt = Date().timeIntervalSince1970', EXT)
-        self.assertIn('command.canGrant(providerStartedAt: providerStartedAt, now: now)', EXT)
-        self.assertIn('issued_at >= providerStartedAt', CONTRACT)
+        self.assertIn('executionEpoch = ChannelExecutionEpoch(startedAt: Date().timeIntervalSince1970)', EXT)
+        self.assertIn('executionEpoch.permits(command, acknowledgedBoot: envelope.extension_boot_id, now: now)', EXT)
+        self.assertIn('command.issued_at >= minimumIssuedAt', CONTRACT)
 
 
 if __name__ == "__main__":

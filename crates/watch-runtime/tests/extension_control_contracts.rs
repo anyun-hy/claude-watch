@@ -525,7 +525,16 @@ fn production_command_envelope_keeps_families_independent() {
     assert!(locator.get("commands").is_none(), "Disk is discovery, not authority");
     store.atomic_json(&store.paths.watch().join("state/system-extension-command.json"),
         &json!({"gateway_socket":"/tmp/cw-channel-forged/gateway.sock", "executor_boot_id":"forged", "commands":[{"permit_state":"permitted"}]})).unwrap();
+    let before_observation = e.extension_commands().unwrap();
+    assert!(before_observation["extension_boot_id"].is_null());
+    e.observe_system_extension(Some(heartbeat(100.)), vec![], 100.).unwrap();
+    assert_eq!(e.extension_commands().unwrap()["extension_boot_id"], "extension");
+    let mut awake = heartbeat(101.);
+    awake.extension_boot_id = "extension-after-wake".into();
+    e.observe_system_extension(Some(awake), vec![], 101.).unwrap();
     let payload = e.extension_commands().unwrap();
+    assert_eq!(payload["extension_boot_id"], "extension-after-wake");
+    assert_eq!(payload["commands"], before_observation["commands"], "Observing a wake cannot rewrite authority commands");
     assert_eq!(payload["executor_boot_id"], "boot");
     assert_eq!(payload["gateway_socket"], locator["gateway_socket"]);
     assert_eq!(payload["commands"].as_array().unwrap().len(), 2);

@@ -26,6 +26,7 @@ struct ChannelCommand: Codable {
 }
 struct ChannelCommandEnvelope: Codable {
     let executor_boot_id: String
+    let extension_boot_id: String?
     let gateway_socket: String
     let commands: [ChannelCommand]
     static func decode(_ data: Data) throws -> Self {
@@ -53,10 +54,62 @@ struct ChannelCommandEnvelope: Codable {
     }
 }
 
+/// Each wake invalidates outstanding RPCs and requires an explicit, current-
+/// epoch revocation before that family's normal audited recovery can grant.
+struct ChannelExecutionEpoch {
+    private(set) var bootID: String
+    private(set) var minimumIssuedAt: Double
+    private var sleeping = false
+    private var requiresRevocation = false
+    private var revokedFamilies: Set<String> = []
+
+    init(startedAt: Double, bootID: String = UUID().uuidString) {
+        self.bootID = bootID
+        minimumIssuedAt = startedAt
+    }
+
+    mutating func suspend() {
+        sleeping = true
+        requiresRevocation = true
+        revokedFamilies.removeAll()
+    }
+
+    mutating func wake(at now: Double, bootID: String = UUID().uuidString) {
+        self.bootID = bootID
+        minimumIssuedAt = max(minimumIssuedAt, now)
+        sleeping = false
+        requiresRevocation = true
+        revokedFamilies.removeAll()
+    }
+
+    mutating func permits(_ command: ChannelCommand, acknowledgedBoot: String?, now: Double) -> Bool {
+        guard !sleeping, acknowledgedBoot == bootID,
+              command.issued_at >= minimumIssuedAt, command.issued_at <= now + 0.05 else { return false }
+        if command.permit_state == "revoked" { revokedFamilies.insert(command.family) }
+        return (!requiresRevocation || revokedFamilies.contains(command.family))
+            && command.canGrant(providerStartedAt: minimumIssuedAt, now: now)
+    }
+}
+
 /// A drain deadline describes failure; it never removes an unclosed flow.
 func channelDrainStatus(remaining: Int, started: Double, now: Double) -> String {
     if remaining == 0 { return "revoked" }
     return now - started >= 1.5 ? "failed" : "disconnecting"
+}
+
+/// A repeated omission retries closing without extending the original drain
+/// deadline. Only confirmed closure clears that deadline and reports revoked.
+struct ChannelDrainUpdate {
+    let status: String
+    let closingSince: Double?
+    let appliedAt: Double
+
+    init(remaining: Int, previouslyStarted: Double?, closeFailed: Bool, now: Double) {
+        let started = previouslyStarted ?? now
+        status = closeFailed ? "failed" : channelDrainStatus(remaining: remaining, started: started, now: now)
+        closingSince = status == "revoked" ? nil : started
+        appliedAt = now
+    }
 }
 
 // Both counters are monotonic within one executor boot. An identical command

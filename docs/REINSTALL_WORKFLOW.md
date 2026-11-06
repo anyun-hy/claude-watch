@@ -62,8 +62,9 @@ bash /Users/anyun/Desktop/bash/monitor/reinstall.sh 3.0.0 314
 | `CW_SIGNING_IDENTITY` | 本机可用的 Developer ID Application 签名身份；默认 `-` 表示开发签名。 |
 | `CW_HOST_PROVISION_PROFILE` | `io.local.watchpanel` 的有效 Developer ID profile，须含 Network Extension 与 System Extension 安装能力。 |
 | `CW_EXTENSION_PROVISION_PROFILE` | `io.local.watchpanel.network-extension` 的有效 Developer ID profile，须含 `app-proxy-provider-systemextension`。 |
+| `CW_REQUIRE_ENTITLED_NETWORK_EXTENSION` | 设为 `1` 时要求正式权限构建；签名身份缺失或为 `-` 时立即失败，不能降级为开发产物。默认 `0`，只接受 `0/1`。 |
 
-兼容远程版本的变量名 `CW_CODESIGN_IDENTITY`、`CW_HOST_PROFILE`、`CW_EXTENSION_PROFILE`；与上表对应变量同时设置且值不一致时停止构建。Entitlement 模板统一位于 `monitor/Signing/`，构建时生成带 Team ID 的签名输入。
+兼容变量名 `CW_CODESIGN_IDENTITY`、`CW_HOST_PROFILE`、`CW_EXTENSION_PROFILE`，以及旧版本的 `CW_SIGN_IDENTITY`、`CW_APP_PROVISIONING_PROFILE`、`CW_EXTENSION_PROVISIONING_PROFILE`；同一用途的变量同时设置且值不一致时停止构建。Entitlement 模板统一位于 `monitor/Signing/`，构建时生成带 Team ID 的签名输入。
 
 构建时检查两个 profile 的应用标识、有效期、同一 Team ID 与所需 entitlement，签名内部组件、扩展与宿主，再核验签名。宿主显式配置当前用户的控制目录，Rust 不从 UI 状态缓存认定接管生效。能力和 profile 的平台要求参见 [Apple 的 Network Extensions entitlement 文档](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.networking.networkextension)。
 

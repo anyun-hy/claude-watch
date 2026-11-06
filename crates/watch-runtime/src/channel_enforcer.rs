@@ -408,7 +408,9 @@ impl LocalTunnelEnforcer {
                     "reason": cmd.permit.reason_code,
                 }))
             }).collect::<Vec<_>>();
-            json!({"executor_boot_id": guard.boot_id, "gateway_socket": guard.extension_socket_path,
+            json!({"executor_boot_id": guard.boot_id,
+                "extension_boot_id": guard.extension_heartbeat.as_ref().map(|h| h.extension_boot_id.as_str()),
+                "gateway_socket": guard.extension_socket_path,
                 "control_home": self.storage.as_ref().map(|s| &s.paths.home), "commands": commands})
         })
     }
