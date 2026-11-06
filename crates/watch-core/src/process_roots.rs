@@ -56,6 +56,18 @@ pub struct TrustedCliPaths {
     pub claude: BTreeSet<String>,
     pub codex: BTreeSet<String>,
 }
+/// Supported installation aliases. Capture and inventory parity checks consume
+/// this list; an arbitrary same-named executable is not an AI root.
+pub fn cli_aliases(home: &Path) -> Vec<(PathBuf, bool)> {
+    vec![
+        (home.join(".local/bin/claude"), true),
+        (home.join(".claude/local/claude"), true),
+        ("/opt/homebrew/bin/claude".into(), true),
+        ("/usr/local/bin/claude".into(), true),
+        ("/opt/homebrew/bin/codex".into(), false),
+        ("/usr/local/bin/codex".into(), false),
+    ]
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Classification {
     Root(Kind),

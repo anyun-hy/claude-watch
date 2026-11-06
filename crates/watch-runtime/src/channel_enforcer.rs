@@ -21,7 +21,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
-    os::unix::net::UnixStream,
+    os::unix::{net::{UnixStream, UnixListener}, fs::{DirBuilderExt, PermissionsExt}},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -165,6 +165,8 @@ struct ActiveSocketFlow {
 
 struct FamilyEnforcerState {
     command: Option<ChannelEnforcementCommand>,
+    local_revoke_reason: Option<String>,
+    requires_supervisor_revocation: bool,
     last_permit_generation: u64,
     last_command_seq: u64,
     enforcement_state: ChannelEnforcementState,
@@ -178,6 +180,8 @@ impl FamilyEnforcerState {
     fn new(now: f64) -> Self {
         Self {
             command: None,
+            local_revoke_reason: None,
+            requires_supervisor_revocation: false,
             last_permit_generation: 0,
             last_command_seq: 0,
             enforcement_state: ChannelEnforcementState::PendingVerification,
@@ -221,8 +225,10 @@ struct EnforcerInner {
     families: BTreeMap<String, FamilyEnforcerState>,
     traces: Vec<ConnectionTraceEvent>,
     next_trace_seq: u64,
-    extension_secret: String,
     strict_peer_verification: bool,
+    extension_socket_path: Option<String>,
+    extension_receipts: BTreeMap<String, claude_watch_core::channel::SystemExtensionReceipt>,
+    extension_heartbeat: Option<claude_watch_core::channel::SystemExtensionHeartbeat>,
 }
 
 pub struct LocalTunnelEnforcer {
@@ -242,11 +248,6 @@ impl LocalTunnelEnforcer {
         let mut local_control_endpoints = BTreeSet::new();
         local_control_endpoints.insert("127.0.0.1:ipc".into());
         local_control_endpoints.insert("localhost:ipc".into());
-        let extension_secret = uuid::Uuid::new_v4().simple().to_string();
-        if let Some(ref st) = storage {
-            let secret_path = st.paths.watch().join("state/.extension-secret");
-            let _ = st.atomic_bytes(&secret_path, extension_secret.as_bytes(), 0o600);
-        }
         Self {
             inner: Arc::new(Mutex::new(EnforcerInner {
                 boot_id: boot_id.into(),
@@ -272,8 +273,10 @@ impl LocalTunnelEnforcer {
                 families: BTreeMap::new(),
                 traces: Vec::new(),
                 next_trace_seq: 1,
-                extension_secret,
                 strict_peer_verification: false,
+                extension_socket_path: None,
+                extension_receipts: BTreeMap::new(),
+                extension_heartbeat: None,
             })),
             next_flow_id: Arc::new(AtomicU64::new(1)),
             storage,
@@ -286,88 +289,138 @@ impl LocalTunnelEnforcer {
         }
     }
 
-    pub fn verify_peer_is_system_extension(&self, peer_addr: SocketAddr) -> bool {
-        let is_strict = self
-            .lock()
-            .map(|g| g.strict_peer_verification)
-            .unwrap_or(false);
-        if !is_strict {
-            return true;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let port = peer_addr.port();
-            // Step 1: Query the peer process PID owning this TCP loopback connection
-            let output = std::process::Command::new("/usr/sbin/lsof")
-                .args(["-n", "-P", "-i", &format!("TCP@127.0.0.1:{}", port), "-F", "p"])
-                .output();
-            let mut peer_pid: Option<u32> = None;
-            if let Ok(out) = output {
-                if out.status.success() {
-                    let text = String::from_utf8_lossy(&out.stdout);
-                    for line in text.lines() {
-                        if let Some(p_str) = line.strip_prefix('p') {
-                            if let Ok(p) = p_str.parse::<u32>() {
-                                peer_pid = Some(p);
-                                break;
+    pub fn start_extension_gateway(self: &Arc<Self>, stop: Arc<AtomicBool>) -> Result<()> {
+        let dir = std::path::PathBuf::from("/tmp")
+            .join(format!("cw-channel-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)
+            .map_err(|_| CoreError::new("extension_gateway_unavailable", "扩展网关目录创建失败"))?;
+        let path = dir.join("gateway.sock");
+        let listener = UnixListener::bind(&path)
+            .map_err(|_| CoreError::new("extension_gateway_unavailable", "扩展网关绑定失败"))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| CoreError::new("extension_gateway_unavailable", "扩展网关权限设置失败"))?;
+        listener.set_nonblocking(true)
+            .map_err(|_| CoreError::new("extension_gateway_unavailable", "扩展网关监听设置失败"))?;
+        self.lock()?.extension_socket_path = Some(path.to_string_lossy().into_owned());
+        let enforcer = self.clone();
+        thread::Builder::new().name("channel-extension-gateway".into()).spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let enforcer = enforcer.clone();
+                        thread::spawn(move || {
+                            if crate::channel_extension::is_authenticated_extension(&stream) {
+                                Self::serve_gateway_connection(enforcer, TunnelStream::Unix(stream), None, true);
+                            } else {
+                                let _ = stream.shutdown(Shutdown::Both);
                             }
-                        }
+                        });
                     }
+                    Err(_) => thread::sleep(Duration::from_millis(25)),
                 }
             }
-            let Some(pid) = peer_pid else {
-                return false;
-            };
-
-            // Step 2: Query the true executable path of the peer PID
-            let ps_out = std::process::Command::new("/bin/ps")
-                .args(["-p", &pid.to_string(), "-o", "comm="])
-                .output();
-            let exec_path = match ps_out {
-                Ok(out) if out.status.success() => {
-                    String::from_utf8_lossy(&out.stdout).trim().to_string()
-                }
-                _ => return false,
-            };
-            if exec_path.is_empty() {
-                return false;
-            }
-
-            // Step 3: Verify system code signing requirement for the extension bundle identifier
-            // We verify both code validity and designated requirement matching our extension bundle ID.
-            // Under ad-hoc development/test mode, codesign -d -r- outputs the identifier.
-            let cs_out = std::process::Command::new("/usr/bin/codesign")
-                .args(["-d", "-r-", &exec_path])
-                .output();
-            if let Ok(out) = cs_out {
-                if out.status.success() {
-                    let req_text = String::from_utf8_lossy(&out.stdout);
-                    let err_text = String::from_utf8_lossy(&out.stderr);
-                    let combined = format!("{req_text}\n{err_text}");
-                    if combined.contains("io.local.watchpanel.network-extension")
-                        || combined.contains("WatchChannelExtension")
-                    {
-                        // Verified authentic system extension binary!
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            true
-        }
+            drop(listener);
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_dir(dir);
+        }).map_err(|_| CoreError::new("extension_gateway_unavailable", "扩展网关线程创建失败"))?;
+        Ok(())
     }
 
-    pub fn verify_extension_secret(&self, secret: Option<&str>) -> bool {
-        let Ok(guard) = self.lock() else { return false; };
-        let Some(s) = secret else { return false; };
-        !s.trim().is_empty() && s.trim() == guard.extension_secret.trim()
+    /// Read only root-authored observations. Every unavailable/invalid path
+    /// clears prior success; the UI's activation cache is never evidence here.
+    pub fn refresh_system_extension(&self, now: f64) -> Result<()> {
+        use claude_watch_core::channel::{SystemExtensionHeartbeat, SystemExtensionReceipt};
+        if !self.lock()?.strict_peer_verification { return Ok(()); }
+        let Some(store) = &self.storage else { return Ok(()); };
+        let heartbeat = crate::channel_extension::read_observation::<SystemExtensionHeartbeat>(store, "system-extension-heartbeat.json").ok();
+        let receipts = crate::channel_extension::read_observation::<Vec<SystemExtensionReceipt>>(store, "system-extension-receipt.json").unwrap_or_default();
+        self.observe_system_extension(heartbeat, receipts, now)
     }
 
-    pub fn extension_secret(&self) -> String {
-        self.lock().map(|g| g.extension_secret.clone()).unwrap_or_default()
+    pub fn observe_system_extension(
+        &self,
+        heartbeat: Option<claude_watch_core::channel::SystemExtensionHeartbeat>,
+        receipts: Vec<claude_watch_core::channel::SystemExtensionReceipt>,
+        now: f64,
+    ) -> Result<()> {
+        let (updates, sink) = {
+            let mut guard = self.lock()?;
+            let live = heartbeat.as_ref().is_some_and(|h| h.is_live(&guard.boot_id, now));
+            let receipt_map = receipts.into_iter().map(|r| (r.family.clone(), r)).collect::<BTreeMap<_, _>>();
+            if guard.extension_heartbeat == heartbeat && guard.extension_receipts == receipt_map
+                && guard.system_extension_active == live { return Ok(()); }
+            let lost = guard.system_extension_active && !live;
+            let changed = guard.extension_heartbeat.as_ref().map(|h| &h.extension_boot_id)
+                != heartbeat.as_ref().map(|h| &h.extension_boot_id);
+            guard.extension_heartbeat = heartbeat;
+            guard.extension_receipts = receipt_map;
+            guard.system_extension_active = live;
+            guard.interception_active = live && guard.local_proxy_ready;
+            guard.direct_fallback_blocked = live;
+            guard.activation_error_code = if live { None } else { Some("system_extension_liveness_unconfirmed".into()) };
+            let families: Vec<_> = guard.families.keys().cloned().collect();
+            if lost || changed {
+                for family in &families {
+                    Self::begin_autonomous_revoke_locked(&mut guard, family, "extension_control_lost_or_restarted", now);
+                }
+            }
+            for family in &families {
+                let reason = guard.families.get(family).filter(|s|
+                    s.command.as_ref().is_some_and(|c| c.permit.state == ChannelPermitState::Permitted)
+                        && s.local_revoke_reason.is_none())
+                    .and_then(|_| Self::matching_extension_receipt(&guard, family, now))
+                    .filter(|r| r.new_connections_blocked && (r.is_confirmed_revoked()
+                        || r.is_disconnecting() || r.status == "failed"))
+                    .map(|r| r.reason.clone().unwrap_or_else(|| "extension_autonomous_cutoff".into()));
+                if let Some(reason) = reason {
+                    // Mirror the extension's actual cutoff into our own relay
+                    // before reporting it; neither half can reopen on its own.
+                    Self::begin_autonomous_revoke_locked(&mut guard, family, &reason, now);
+                }
+            }
+            let updates = families.iter().filter_map(|f| Self::build_receipt_locked(&guard, f, now).ok()).collect::<Vec<_>>();
+            (updates, guard.receipt_sink.clone())
+        };
+        for receipt in updates {
+            self.persist_receipt(&receipt)?;
+            if let Some(sink) = &sink { sink(receipt); }
+        }
+        Ok(())
+    }
+
+    pub fn extension_commands(&self) -> Result<serde_json::Value> {
+        Ok({
+            let guard = self.lock()?;
+            let commands = guard.families.iter().filter_map(|(family, state)| {
+                let cmd = state.command.as_ref()?;
+                Some(json!({
+                    "family": family,
+                    "policy_version": cmd.policy_version,
+                    "command_seq": cmd.command_seq,
+                    "permit_generation": cmd.permit_generation,
+                    "issued_at": cmd.issued_at,
+                    "valid_until": cmd.permit.valid_until,
+                    "permit_state": cmd.permit.state,
+                    "allowed_pids": cmd.allowed_processes.iter().map(|p| p.pid).collect::<Vec<_>>(),
+                    "allowed_processes": cmd.allowed_processes,
+                    "session_id": cmd.session_id,
+                    "command_binding": crate::channel_extension::command_binding(cmd),
+                    "reason": cmd.permit.reason_code,
+                }))
+            }).collect::<Vec<_>>();
+            json!({"executor_boot_id": guard.boot_id, "gateway_socket": guard.extension_socket_path,
+                "control_home": self.storage.as_ref().map(|s| &s.paths.home), "commands": commands})
+        })
+    }
+
+    fn publish_extension_commands(&self) -> Result<()> {
+        let Some(store) = &self.storage else { return Ok(()); };
+        if !self.lock()?.strict_peer_verification { return Ok(()); }
+        let snapshot = self.extension_commands()?;
+        let value = json!({"gateway_socket": snapshot["gateway_socket"], "executor_boot_id": snapshot["executor_boot_id"]});
+        // Discovery and wakeup only. The extension obtains authority from our
+        // authenticated Unix CONTROL endpoint, never the contents of this file.
+        store.atomic_json(&store.paths.watch().join("state/system-extension-command.json"), &value)
     }
 
     /// Activates local tunnel interception and direct-fallback blocking,
@@ -628,7 +681,7 @@ impl LocalTunnelEnforcer {
         guard.last_wall_now = Some(now);
         let families: Vec<String> = guard.families.keys().cloned().collect();
         for family in families {
-            Self::begin_revoke_locked(
+            Self::begin_autonomous_revoke_locked(
                 &mut guard,
                 &family,
                 "executor_restarted_unverified",
@@ -656,7 +709,7 @@ impl LocalTunnelEnforcer {
             let mut receipts = Vec::new();
             for family in families {
                 let ids =
-                    Self::begin_revoke_locked(&mut guard, &family, "tag_upstream_unhealthy", now);
+                    Self::begin_autonomous_revoke_locked(&mut guard, &family, "tag_upstream_unhealthy", now);
                 closing_flows.extend(ids);
                 if let Ok(r) = Self::build_receipt_locked(&guard, &family, now) {
                     receipts.push(r);
@@ -827,10 +880,11 @@ impl LocalTunnelEnforcer {
     /// Only matches full `BoundProcessToken::matches_process` (`pid`, `uid > 0`,
     /// `start_seconds`, `start_microseconds`, and `audit_token`). Never falls
     /// back to matching `(pid, start_seconds, start_microseconds)` alone.
-    fn is_process_attributed(cmd: &ChannelEnforcementCommand, process: &BoundProcessToken) -> bool {
+    fn is_process_attributed(cmd: &ChannelEnforcementCommand, process: &BoundProcessToken, strict: bool) -> bool {
         process.has_valid_identity()
+            && (!strict || process.has_verified_audit_token())
             && cmd.allowed_processes.iter().any(|allowed| {
-                allowed.matches_process(
+                (!strict || allowed.has_verified_audit_token()) && allowed.matches_process(
                     process.pid,
                     process.uid,
                     process.start_seconds,
@@ -1027,165 +1081,10 @@ impl LocalTunnelEnforcer {
             .spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     match listener.accept() {
-                        Ok((mut incoming, peer_addr)) => {
+                        Ok((incoming, peer_addr)) => {
                             let enf = Arc::clone(&enforcer);
                             thread::spawn(move || {
-                                let _ = incoming.set_read_timeout(Some(Duration::from_secs(2)));
-                                let _ = incoming.set_write_timeout(Some(Duration::from_secs(2)));
-                                let mut req_buf = Vec::with_capacity(256);
-                                let mut byte = [0u8; 1];
-                                while req_buf.len() < 4096 {
-                                    match incoming.read(&mut byte) {
-                                        Ok(0) => break,
-                                        Ok(_) => {
-                                            req_buf.push(byte[0]);
-                                            if req_buf.ends_with(b"\r\n\r\n")
-                                                || req_buf.ends_with(b"\n\n")
-                                            {
-                                                break;
-                                            }
-                                        }
-                                        Err(_) => {
-                                            let _ = incoming.shutdown(Shutdown::Both);
-                                            return;
-                                        }
-                                    }
-                                }
-                                if req_buf.is_empty() {
-                                    let _ = incoming.shutdown(Shutdown::Both);
-                                    return;
-                                }
-                                let header = String::from_utf8_lossy(&req_buf);
-                                let first_line = header.lines().next().unwrap_or("");
-                                let parts: Vec<&str> = first_line.split_whitespace().collect();
-                                if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("CONNECT") {
-                                    let _ = incoming.write_all(
-                                        b"HTTP/1.1 400 Bad Request (CONNECT Required)\r\n\r\n",
-                                    );
-                                    let _ = incoming.shutdown(Shutdown::Both);
-                                    return;
-                                }
-                                let target_dest = parts[1].to_string();
-                                // Support both direct socket attribution (via OS/lsof) and
-                                // transparent proxy attribution from verified NetworkExtension with X-Watch identity headers.
-                                let mut resolved_identity = enf.resolve_peer_socket_identity(peer_addr).ok();
-                                if resolved_identity.is_none() && peer_addr.ip().is_loopback() {
-                                    let mut req_secret: Option<String> = None;
-                                    let mut x_pid: Option<u32> = None;
-                                    let mut x_uid: Option<u32> = None;
-                                    let mut x_audit_hex: Option<String> = None;
-                                    for line in header.lines() {
-                                        if let Some(v) = line.strip_prefix("X-Watch-PID:").or_else(|| line.strip_prefix("x-watch-pid:")) {
-                                            x_pid = v.trim().parse().ok();
-                                        } else if let Some(v) = line.strip_prefix("X-Watch-UID:").or_else(|| line.strip_prefix("x-watch-uid:")) {
-                                            x_uid = v.trim().parse().ok();
-                                        } else if let Some(v) = line.strip_prefix("X-Watch-Audit-Token:").or_else(|| line.strip_prefix("x-watch-audit-token:")) {
-                                            x_audit_hex = Some(v.trim().to_string());
-                                        } else if let Some(v) = line.strip_prefix("X-Watch-Extension-Secret:").or_else(|| line.strip_prefix("x-watch-extension-secret:")) {
-                                            req_secret = Some(v.trim().to_string());
-                                        }
-                                    }
-                                    // Security invariant: strictly authenticate that this loopback stream originates from
-                                    // our verified NetworkExtension by validating:
-                                    // 1. Peer process via system lsof
-                                    // 2. Shared extension secret
-                                    // 3. Kernel Mach audit token (X-Watch-Audit-Token)
-                                    let is_secret_valid = enf.verify_extension_secret(req_secret.as_deref());
-                                    let is_peer_sys_ext = enf.verify_peer_is_system_extension(peer_addr);
-                                    if is_secret_valid && is_peer_sys_ext {
-                                        if let (Some(pid), Some(uid)) = (x_pid, x_uid) {
-                                            // Hard requirement: MUST provide valid kernel Mach audit token (X-Watch-Audit-Token)
-                                            if let Some(parsed_audit) = x_audit_hex.as_deref().and_then(parse_audit_token_hex) {
-                                                if parsed_audit[5] == pid && (parsed_audit[1] == uid || parsed_audit[3] == uid) {
-                                                    if let Ok(guard) = enf.lock() {
-                                                        for (fam, st) in &guard.families {
-                                                            if let Some(cmd) = &st.command {
-                                                                for tok in &cmd.allowed_processes {
-                                                                    if tok.pid == pid && tok.uid == uid {
-                                                                        let matched_tok = if let Some(ref expected) = tok.audit_token {
-                                                                            if expected == &parsed_audit {
-                                                                                tok.clone()
-                                                                            } else {
-                                                                                continue;
-                                                                            }
-                                                                        } else {
-                                                                            tok.clone().with_audit_token(parsed_audit)
-                                                                        };
-                                                                        if matched_tok.has_valid_identity() {
-                                                                            resolved_identity = Some((fam.clone(), matched_tok));
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                            if resolved_identity.is_some() {
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                let Ok((family, proc_token)) = resolved_identity.ok_or_else(|| {
-                                    CoreError::new("unverified_peer_socket_identity", "未核验来源进程身份")
-                                }) else {
-                                    let _ = incoming.write_all(
-                                        b"HTTP/1.1 403 Forbidden (Unverified Process Identity)\r\n\r\n",
-                                    );
-                                    let _ = incoming.shutdown(Shutdown::Both);
-                                    return;
-                                };
-                                let now = enf
-                                    .lock()
-                                    .ok()
-                                    .and_then(|g| g.clock.as_ref().map(|c| c()))
-                                    .unwrap_or_else(crate::native::now);
-                                match enf.connect_supervised_tcp_to(
-                                    &family,
-                                    &proc_token,
-                                    &target_dest,
-                                    now,
-                                ) {
-                                    Ok((_flow_id, mut tunnel_stream)) => {
-                                        // Clear handshake timeouts before switching to long-lived tunnel relay!
-                                        let _ = incoming.set_read_timeout(None);
-                                        let _ = incoming.set_write_timeout(None);
-                                        let _ = tunnel_stream.set_read_timeout(None);
-                                        let _ = tunnel_stream.set_write_timeout(None);
-                                        if incoming
-                                            .write_all(
-                                                b"HTTP/1.1 200 Connection Established\r\n\r\n",
-                                            )
-                                            .is_err()
-                                        {
-                                            let _ = incoming.shutdown(Shutdown::Both);
-                                            let _ = tunnel_stream.shutdown(Shutdown::Both);
-                                            return;
-                                        }
-                                        let _ = incoming.flush();
-                                        let Ok(mut in_clone) = incoming.try_clone() else {
-                                            return;
-                                        };
-                                        let Ok(mut tun_clone) = tunnel_stream.try_clone() else {
-                                            return;
-                                        };
-                                        let t1 = thread::spawn(move || {
-                                            let _ = std::io::copy(&mut in_clone, &mut tun_clone);
-                                            let _ = tun_clone.shutdown(Shutdown::Both);
-                                        });
-                                        let _ = std::io::copy(&mut tunnel_stream, &mut incoming);
-                                        let _ = incoming.shutdown(Shutdown::Both);
-                                        let _ = t1.join();
-                                    }
-                                    Err(_) => {
-                                        let _ = incoming.write_all(
-                                            b"HTTP/1.1 502 Bad Gateway (Channel Or Upstream Blocked)\r\n\r\n",
-                                        );
-                                        let _ = incoming.shutdown(Shutdown::Both);
-                                    }
-                                }
+                                Self::serve_gateway_connection(enf, TunnelStream::Tcp(incoming), Some(peer_addr), false);
                             });
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1203,6 +1102,187 @@ impl LocalTunnelEnforcer {
                 CoreError::new("enforcer_listener_thread_failed", "受控通道监听线程启动失败")
             })?;
         Ok((addr, handle))
+    }
+
+    fn serve_gateway_connection(enf: Arc<Self>, mut incoming: TunnelStream, peer_addr: Option<SocketAddr>, authenticated_extension: bool) {
+        // Production identity comes from the authenticated extension socket.
+        // TCP/lsof attribution is retained only for isolated adapters/fixtures.
+        if !authenticated_extension && enf.lock().map_or(true, |g| g.strict_peer_verification) {
+            let _ = incoming.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+            let _ = incoming.shutdown(Shutdown::Both);
+            return;
+        }
+        let _ = incoming.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = incoming.set_write_timeout(Some(Duration::from_secs(2)));
+        let mut req_buf = Vec::with_capacity(256);
+        let mut byte = [0u8; 1];
+        while req_buf.len() < 4096 {
+            match incoming.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    req_buf.push(byte[0]);
+                    if req_buf.ends_with(b"\r\n\r\n")
+                        || req_buf.ends_with(b"\n\n")
+                    {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = incoming.shutdown(Shutdown::Both);
+                    return;
+                }
+            }
+        }
+        if req_buf.is_empty() {
+            let _ = incoming.shutdown(Shutdown::Both);
+            return;
+        }
+        let header = String::from_utf8_lossy(&req_buf);
+        let first_line = header.lines().next().unwrap_or("");
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        if parts.first() == Some(&"WATCH-CONTROL") {
+            if authenticated_extension && parts.len() == 3
+                && uuid::Uuid::parse_str(parts[1]).is_ok() && parts[2] == "HTTP/1.1"
+            {
+                if let Ok(envelope) = enf.extension_commands() {
+                    if let Ok(bytes) = serde_json::to_vec(&json!({"nonce": parts[1], "envelope": envelope})) {
+                        if bytes.len() <= 1_048_576 {
+                            let _ = incoming.write_all(&(bytes.len() as u32).to_be_bytes());
+                            let _ = incoming.write_all(&bytes);
+                        }
+                    }
+                }
+            }
+            let _ = incoming.shutdown(Shutdown::Both);
+            return;
+        }
+        if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("CONNECT") {
+            let _ = incoming.write_all(
+                b"HTTP/1.1 400 Bad Request (CONNECT Required)\r\n\r\n",
+            );
+            let _ = incoming.shutdown(Shutdown::Both);
+            return;
+        }
+        let target_dest = parts[1].to_string();
+        // Support both direct socket attribution (via OS/lsof) and
+        // transparent proxy attribution from verified NetworkExtension with X-Watch identity headers.
+        let mut resolved_identity = peer_addr.and_then(|peer| enf.resolve_peer_socket_identity(peer).ok());
+        if resolved_identity.is_none() && authenticated_extension {
+            let mut x_pid: Option<u32> = None;
+            let mut x_uid: Option<u32> = None;
+            let mut x_start: Option<u64> = None;
+            let mut x_micros: Option<u32> = None;
+            let mut x_audit_hex: Option<String> = None;
+            for line in header.lines() {
+                if let Some(v) = line.strip_prefix("X-Watch-PID:").or_else(|| line.strip_prefix("x-watch-pid:")) {
+                    x_pid = v.trim().parse().ok();
+                } else if let Some(v) = line.strip_prefix("X-Watch-UID:").or_else(|| line.strip_prefix("x-watch-uid:")) {
+                    x_uid = v.trim().parse().ok();
+                } else if let Some(v) = line.strip_prefix("X-Watch-Audit-Token:").or_else(|| line.strip_prefix("x-watch-audit-token:")) {
+                    x_audit_hex = Some(v.trim().to_string());
+                } else if let Some(v) = line.strip_prefix("X-Watch-Start-Seconds:") {
+                    x_start = v.trim().parse().ok();
+                } else if let Some(v) = line.strip_prefix("X-Watch-Start-Micros:") {
+                    x_micros = v.trim().parse().ok();
+                }
+            }
+            // Only the kernel-authenticated Unix peer may forward source identity.
+            {
+                if let (Some(pid), Some(uid)) = (x_pid, x_uid) {
+                    // Hard requirement: MUST provide valid kernel Mach audit token (X-Watch-Audit-Token)
+                    if let Some(parsed_audit) = x_audit_hex.as_deref().and_then(parse_audit_token_hex) {
+                        if parsed_audit[5] == pid && parsed_audit[1] == uid {
+                            if let Ok(guard) = enf.lock() {
+                                for (fam, st) in &guard.families {
+                                    if let Some(cmd) = &st.command {
+                                        for tok in &cmd.allowed_processes {
+                                            if tok.pid == pid && tok.uid == uid
+                                        && Some(tok.start_seconds) == x_start
+                                        && Some(tok.start_microseconds) == x_micros {
+                                                let matched_tok = if let Some(ref expected) = tok.audit_token {
+                                                    if expected == &parsed_audit {
+                                                        tok.clone()
+                                                    } else {
+                                                        continue;
+                                                    }
+                                                } else {
+                                                    tok.clone().with_audit_token(parsed_audit)
+                                                };
+                                                if matched_tok.has_valid_identity() {
+                                                    resolved_identity = Some((fam.clone(), matched_tok));
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if resolved_identity.is_some() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let Ok((family, proc_token)) = resolved_identity.ok_or_else(|| {
+            CoreError::new("unverified_peer_socket_identity", "未核验来源进程身份")
+        }) else {
+            let _ = incoming.write_all(
+                b"HTTP/1.1 403 Forbidden (Unverified Process Identity)\r\n\r\n",
+            );
+            let _ = incoming.shutdown(Shutdown::Both);
+            return;
+        };
+        let now = enf
+            .lock()
+            .ok()
+            .and_then(|g| g.clock.as_ref().map(|c| c()))
+            .unwrap_or_else(crate::native::now);
+        match enf.connect_supervised_tcp_to(
+            &family,
+            &proc_token,
+            &target_dest,
+            now,
+        ) {
+            Ok((_flow_id, mut tunnel_stream)) => {
+                // Clear handshake timeouts before switching to long-lived tunnel relay!
+                let _ = incoming.set_read_timeout(None);
+                let _ = incoming.set_write_timeout(None);
+                let _ = tunnel_stream.set_read_timeout(None);
+                let _ = tunnel_stream.set_write_timeout(None);
+                if incoming
+                    .write_all(
+                        b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                    )
+                    .is_err()
+                {
+                    let _ = incoming.shutdown(Shutdown::Both);
+                    let _ = tunnel_stream.shutdown(Shutdown::Both);
+                    return;
+                }
+                let _ = incoming.flush();
+                let Ok(mut in_clone) = incoming.try_clone() else {
+                    return;
+                };
+                let Ok(mut tun_clone) = tunnel_stream.try_clone() else {
+                    return;
+                };
+                let t1 = thread::spawn(move || {
+                    let _ = std::io::copy(&mut in_clone, &mut tun_clone);
+                    let _ = tun_clone.shutdown(Shutdown::Both);
+                });
+                let _ = std::io::copy(&mut tunnel_stream, &mut incoming);
+                let _ = incoming.shutdown(Shutdown::Both);
+                let _ = t1.join();
+            }
+            Err(_) => {
+                let _ = incoming.write_all(
+                    b"HTTP/1.1 502 Bad Gateway (Channel Or Upstream Blocked)\r\n\r\n",
+                );
+                let _ = incoming.shutdown(Shutdown::Both);
+            }
+        }
     }
 
     /// Unified multi-protocol flow gate covering TCP (IPv4/IPv6), UDP/QUIC,
@@ -1351,14 +1431,25 @@ impl LocalTunnelEnforcer {
             }
             (cmd.upstream_endpoint.clone(), cmd.policy_version.clone())
         };
+        let started = std::time::Instant::now();
         let output = probe_fn(&upstream_endpoint)?;
+        let observed_at = now + started.elapsed().as_secs_f64();
+        let evidence_family = {
+            let guard = self.lock()?;
+            let unchanged = guard.interception_active && guard.direct_fallback_blocked && guard.upstream_healthy
+                && guard.families.get(family).and_then(|s| s.command.as_ref()).is_some_and(|c|
+                    c.policy_version == policy_version && c.upstream_endpoint == upstream_endpoint);
+            if !unchanged { return Err(CoreError::new("diagnostic_path_changed", "探针期间策略或受控通道变化，结果作废")); }
+            if guard.families.values().filter_map(|s| s.command.as_ref()).all(|c|
+                c.policy_version == policy_version && c.upstream_endpoint == upstream_endpoint) { "*" } else { family }
+        };
         let evidence = ControlledPathEvidence {
-            family: family.into(),
+            family: evidence_family.into(),
             upstream_endpoint,
             policy_version,
             context_id: context_id.into(),
             via_controlled_path: true,
-            observed_at: now,
+            observed_at,
         };
         Ok((output, evidence))
     }
@@ -1420,6 +1511,9 @@ impl LocalTunnelEnforcer {
             defer_confirm,
         ) = {
             let mut guard = self.lock()?;
+            if guard.strict_peer_verification && Self::build_receipt_locked(&guard, family, now)?.enforcement_state != ChannelEnforcementState::Forwarding {
+                return Err(CoreError::new("extension_permit_unconfirmed", "系统扩展尚未确认当前许可，连接保持阻断"));
+            }
             let defer_confirm = guard.defer_auto_flow_confirm;
             let upstream_connector = guard.upstream_connector.clone();
             let require_connect_handshake = guard.require_upstream_connect_handshake;
@@ -1428,6 +1522,7 @@ impl LocalTunnelEnforcer {
             let direct_fallback_blocked = guard.direct_fallback_blocked;
             let upstream_healthy = guard.upstream_healthy;
             let last_wall = guard.last_wall_now;
+            let strict = guard.strict_peer_verification;
             let Some(state) = guard.families.get_mut(family) else {
                 return Err(CoreError::new(
                     "channel_unconfigured_blocked",
@@ -1441,7 +1536,7 @@ impl LocalTunnelEnforcer {
                     "缺少有效通道租约，已拦截并阻断连接",
                 ));
             };
-            if !Self::is_process_attributed(&cmd, process) {
+            if !Self::is_process_attributed(&cmd, process, strict) {
                 state.blocked_new_connections = state.blocked_new_connections.saturating_add(1);
                 let current_enf_state = state.enforcement_state;
                 Self::push_trace_locked(
@@ -1471,6 +1566,8 @@ impl LocalTunnelEnforcer {
             if !interception_active
                 || !direct_fallback_blocked
                 || !upstream_healthy
+                || state.local_revoke_reason.is_some()
+                || state.enforcement_state != ChannelEnforcementState::Forwarding
                 || effective_state != ChannelPermitState::Permitted
             {
                 state.blocked_new_connections = state.blocked_new_connections.saturating_add(1);
@@ -1557,7 +1654,17 @@ impl LocalTunnelEnforcer {
             (TunnelStream::Tcp(s), true)
         };
 
-        if perform_handshake {
+        // Clients already configured for TAG speak CONNECT themselves. Their
+        // intercepted connection still belongs to this managed relay; avoid
+        // asking TAG to tunnel back to its own proxy port.
+        let is_explicit_proxy_connection = {
+            let url = if upstream_endpoint.contains("://") { upstream_endpoint.clone() } else { format!("http://{upstream_endpoint}") };
+            url::Url::parse(&url).ok().is_some_and(|u| {
+                u.host_str().zip(u.port_or_known_default()).is_some_and(|(host, port)|
+                    target_destination == format!("{host}:{port}"))
+            })
+        };
+        if perform_handshake && !is_explicit_proxy_connection {
             if let Err(err) =
                 Self::perform_upstream_connect_handshake(&mut upstream_stream, target_destination)
             {
@@ -1628,9 +1735,12 @@ impl LocalTunnelEnforcer {
             let post_dial_now = clock_now
                 .max(now + dial_elapsed)
                 .max(guard.last_wall_now.unwrap_or(now));
-            let interception_ok = guard.interception_active && guard.direct_fallback_blocked;
+            let interception_ok = guard.interception_active && guard.direct_fallback_blocked
+                && (!guard.strict_peer_verification || Self::build_receipt_locked(&guard, family, post_dial_now)
+                    .is_ok_and(|r| r.enforcement_state == ChannelEnforcementState::Forwarding));
             let upstream_ok = guard.upstream_healthy;
             let last_wall = guard.last_wall_now;
+            let strict = guard.strict_peer_verification;
 
             let Some(state) = guard.families.get_mut(family) else {
                 let _ = enforcer_client_stream.shutdown(Shutdown::Both);
@@ -1665,7 +1775,7 @@ impl LocalTunnelEnforcer {
                 && cmd.policy_version == dial_policy_version
                 && active_policy == dial_policy_version
                 && cmd.upstream_endpoint == upstream_endpoint
-                && Self::is_process_attributed(&cmd, process);
+                && Self::is_process_attributed(&cmd, process, strict);
 
             if !dial_invariant_ok {
                 state.blocked_new_connections = state.blocked_new_connections.saturating_add(1);
@@ -1933,6 +2043,13 @@ impl LocalTunnelEnforcer {
         Ok(())
     }
 
+    fn begin_autonomous_revoke_locked(guard: &mut EnforcerInner, family: &str, reason: &str, now: f64) -> Vec<String> {
+        if let Some(state) = guard.families.get_mut(family) {
+            state.requires_supervisor_revocation = true;
+        }
+        Self::begin_revoke_locked(guard, family, reason, now)
+    }
+
     fn begin_revoke_locked(
         guard: &mut EnforcerInner,
         family: &str,
@@ -1942,10 +2059,9 @@ impl LocalTunnelEnforcer {
         let Some(state) = guard.families.get_mut(family) else {
             return Vec::new();
         };
-        if let Some(cmd) = state.command.as_mut() {
-            cmd.permit.state = ChannelPermitState::Revoked;
-            cmd.permit.reason_code = reason.into();
-        }
+        // The executor may tighten enforcement but cannot rewrite the
+        // supervisor's versioned command under an unchanged sequence.
+        state.local_revoke_reason = Some(reason.into());
         state.last_updated_at = now;
         let mut closing_ids = Vec::new();
         let mut trace_items = Vec::new();
@@ -1997,6 +2113,19 @@ impl LocalTunnelEnforcer {
         closing_ids
     }
 
+    fn matching_extension_receipt<'a>(
+        guard: &'a EnforcerInner, family: &str, now: f64,
+    ) -> Option<&'a claude_watch_core::channel::SystemExtensionReceipt> {
+        let cmd = guard.families.get(family)?.command.as_ref()?;
+        let live = guard.extension_heartbeat.as_ref().filter(|h| h.is_live(&guard.boot_id, now))?;
+        guard.extension_receipts.get(family).filter(|r|
+            r.matches_supervision(&cmd.policy_version, cmd.command_seq, cmd.permit_generation,
+                &guard.boot_id, &live.extension_boot_id, cmd.issued_at, now)
+                && r.allowed_pids.iter().copied().collect::<BTreeSet<_>>()
+                    == cmd.allowed_processes.iter().map(|p| p.pid).collect::<BTreeSet<_>>()
+                && crate::channel_extension::command_binding(cmd).as_ref() == Some(&r.command_binding))
+    }
+
     fn build_receipt_locked(
         guard: &EnforcerInner,
         family: &str,
@@ -2017,14 +2146,14 @@ impl LocalTunnelEnforcer {
             && guard.direct_fallback_blocked
             && (cmd.permit.state != ChannelPermitState::Permitted
                 || state.enforcement_state != ChannelEnforcementState::Forwarding);
-        Ok(ChannelEnforcementReceipt {
+        let mut receipt = ChannelEnforcementReceipt {
             family: family.into(),
             session_id: cmd.session_id.clone(),
             policy_version: cmd.policy_version.clone(),
             permit_generation: state.last_permit_generation,
             command_seq: state.last_command_seq,
             executor_boot_id: guard.boot_id.clone(),
-            permit_state: cmd.permit.state,
+            permit_state: if state.local_revoke_reason.is_some() { ChannelPermitState::Revoked } else { cmd.permit.state },
             enforcement_state: state.enforcement_state,
             interception_active: guard.interception_active,
             local_proxy_ready: guard.local_proxy_ready,
@@ -2039,6 +2168,7 @@ impl LocalTunnelEnforcer {
             error_code: state
                 .last_error_code
                 .clone()
+                .or_else(|| state.local_revoke_reason.clone())
                 .or_else(|| {
                     if cmd.permit.state == ChannelPermitState::Revoked
                         && !cmd.permit.reason_code.is_empty()
@@ -2048,7 +2178,45 @@ impl LocalTunnelEnforcer {
                         guard.activation_error_code.clone()
                     }
                 }),
-        })
+        };
+        if guard.strict_peer_verification {
+            let live = guard.extension_heartbeat.as_ref().filter(|h| h.is_live(&guard.boot_id, now));
+            let extension = Self::matching_extension_receipt(guard, family, now);
+            receipt.system_extension_active = live.is_some();
+            receipt.interception_active = live.is_some() && guard.local_proxy_ready;
+            receipt.direct_fallback_blocked = live.is_some();
+            // Rust closes its relay, the extension closes the application's flow.
+            // Neither half alone is a successful isolation receipt.
+            match extension {
+                Some(ext) if ext.status == "failed" => {
+                    receipt.enforcement_state = ChannelEnforcementState::Failed;
+                    receipt.error_code = Some(ext.reason.clone().unwrap_or_else(|| "extension_execution_failed".into()));
+                    receipt.active_flows_closed = false;
+                }
+                Some(ext) => {
+                    receipt.active_flows_count = receipt.active_flows_count.max(ext.active_flows.min(u32::MAX as usize) as u32);
+                    receipt.new_connections_blocked &= ext.new_connections_blocked;
+                    receipt.active_flows_closed &= ext.is_confirmed_revoked();
+                    if receipt.permit_state == ChannelPermitState::Permitted {
+                        if ext.status != "ok" || ext.permit_state != "permitted" {
+                            receipt.enforcement_state = ChannelEnforcementState::Failed;
+                            receipt.error_code = Some("extension_permit_not_applied".into());
+                        }
+                    } else if ext.is_disconnecting() || !receipt.active_flows_closed {
+                        receipt.enforcement_state = ChannelEnforcementState::Disconnecting;
+                    } else if receipt.new_connections_blocked && receipt.interception_active {
+                        receipt.enforcement_state = ChannelEnforcementState::Blocked;
+                    }
+                }
+                None => {
+                    receipt.enforcement_state = ChannelEnforcementState::Failed;
+                    receipt.new_connections_blocked = false;
+                    receipt.active_flows_closed = false;
+                    receipt.error_code = Some(if live.is_some() { "extension_receipt_pending_or_invalid" } else { "system_extension_liveness_unconfirmed" }.into());
+                }
+            }
+        }
+        Ok(receipt)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2107,17 +2275,7 @@ impl LocalTunnelEnforcer {
         a: &ChannelEnforcementCommand,
         b: &ChannelEnforcementCommand,
     ) -> bool {
-        a.family == b.family
-            && a.session_id == b.session_id
-            && a.policy_version == b.policy_version
-            && a.permit_generation == b.permit_generation
-            && a.command_seq == b.command_seq
-            && a.permit.state == b.permit.state
-            && a.permit.reason_code == b.permit.reason_code
-            && (a.permit.valid_until - b.permit.valid_until).abs() < 1e-6
-            && a.permit.members == b.permit.members
-            && a.allowed_processes == b.allowed_processes
-            && a.upstream_endpoint == b.upstream_endpoint
+        a == b
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, EnforcerInner>> {
@@ -2159,8 +2317,9 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
             // BEFORE modifying `last_wall_now`, `current_policy`, or family state!
             if let Some(existing) = guard.families.get(&command.family) {
                 if command.permit_generation < existing.last_permit_generation
-                    || (command.permit_generation == existing.last_permit_generation
-                        && command.command_seq < existing.last_command_seq)
+                    || command.command_seq < existing.last_command_seq
+                    || (command.permit_generation > existing.last_permit_generation
+                        && command.command_seq == existing.last_command_seq)
                 {
                     return Err(CoreError::new(
                         "stale_or_out_of_order_command",
@@ -2216,7 +2375,7 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
                 if now + claude_watch_core::channel::CLOCK_ROLLBACK_TOLERANCE_SECONDS < prev_wall {
                     let families: Vec<String> = guard.families.keys().cloned().collect();
                     for fam in families {
-                        Self::begin_revoke_locked(&mut guard, &fam, "clock_rollback_detected", now);
+                        Self::begin_autonomous_revoke_locked(&mut guard, &fam, "clock_rollback_detected", now);
                     }
                 }
             }
@@ -2244,6 +2403,10 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
                 state.last_permit_generation = command.permit_generation;
                 state.last_command_seq = command.command_seq;
                 state.command = Some(command.clone());
+                if command.permit.state == ChannelPermitState::Revoked {
+                    state.requires_supervisor_revocation = false;
+                }
+                if !state.requires_supervisor_revocation { state.local_revoke_reason = None; }
                 state.last_updated_at = now;
                 (
                     policy_changed,
@@ -2266,8 +2429,12 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
                     state.enforcement_state = ChannelEnforcementState::Failed;
                     state.last_error_code = Some(activation_error);
                 }
+            } else if guard.families.get(&command.family).is_some_and(|s| s.requires_supervisor_revocation) {
+                let reason = guard.families[&command.family].local_revoke_reason.clone()
+                    .unwrap_or_else(|| "executor_autonomous_cutoff".into());
+                Self::begin_revoke_locked(&mut guard, &command.family, &reason, now);
             } else if !upstream_healthy {
-                Self::begin_revoke_locked(
+                Self::begin_autonomous_revoke_locked(
                     &mut guard,
                     &command.family,
                     "tag_upstream_unhealthy",
@@ -2338,6 +2505,7 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
                 &json!(command),
             )?;
         }
+        self.publish_extension_commands()?;
         self.persist_receipt(&receipt)?;
         if let Some(s) = &sink {
             s(receipt.clone());
@@ -2380,7 +2548,7 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
                         policy,
                     );
                     if eff_state == ChannelPermitState::Revoked
-                        && (cmd.permit.state != ChannelPermitState::Revoked
+                        && (state.local_revoke_reason.is_none()
                             || state.enforcement_state == ChannelEnforcementState::Forwarding
                             || !state.active_flows.is_empty())
                     {
@@ -2390,7 +2558,7 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
                     }
                 });
                 if let Some(reason) = should_revoke {
-                    Self::begin_revoke_locked(&mut guard, &family, reason, now);
+                    Self::begin_autonomous_revoke_locked(&mut guard, &family, reason, now);
                     updated.push(Self::build_receipt_locked(&guard, &family, now)?);
                 }
             }
@@ -2506,4 +2674,36 @@ fn parse_audit_token_hex(hex: &str) -> Option<[u32; 8]> {
         ]);
     }
     Some(words)
+}
+
+#[cfg(test)]
+mod control_rpc_contracts {
+    use super::*;
+    #[test]
+    fn control_rpc_requires_authentication_and_returns_a_fresh_bound_memory_snapshot() {
+        fn exchange(authenticated: bool, nonce: &str) -> Vec<u8> {
+            let enforcer = Arc::new(LocalTunnelEnforcer::new("live-boot", None));
+            enforcer.set_strict_peer_verification(true);
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            // Fixture exercises the transport AFTER the OS authentication
+            // decision; it does not claim a genuine signed extension login.
+            let worker = thread::spawn(move || LocalTunnelEnforcer::serve_gateway_connection(
+                enforcer, TunnelStream::Unix(server), None, authenticated));
+            client.write_all(format!("WATCH-CONTROL {nonce} HTTP/1.1\r\n\r\n").as_bytes()).unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).unwrap();
+            worker.join().unwrap();
+            response
+        }
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let bytes = exchange(true, &nonce);
+        let size = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+        assert_eq!(size, bytes.len() - 4);
+        let value: serde_json::Value = serde_json::from_slice(&bytes[4..]).unwrap();
+        assert_eq!(value["nonce"], nonce);
+        assert_eq!(value["envelope"]["executor_boot_id"], "live-boot");
+        assert!(exchange(false, &nonce).starts_with(b"HTTP/1.1 403"));
+        assert!(exchange(true, "invalid").is_empty());
+    }
 }

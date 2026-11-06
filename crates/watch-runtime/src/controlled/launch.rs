@@ -82,7 +82,10 @@ impl Controller {
         // instead of re-binding to Claude: ChatGPT/Codex route through the
         // observation path below, Claude through the protected session path.
         let _launch = self.storage.lock("launch", None)?;
-        if !system.launch_target().protected() {
+        if system.channel_mode() || !system.launch_target().protected() {
+            // Launching is not a second authority for the family's network
+            // session. Discovery joins the new desktop just like a new CLI,
+            // including when this command runs outside the daemon process.
             return self.launch_observation(system);
         }
         if !system.desktops()?.is_empty() {
@@ -322,7 +325,7 @@ impl Controller {
                 let logging_error = self.record_launch(target, root.identity.pid, system.now());
                 return Ok(
                     json!({"status":"ok","target":target,"provider":root.kind.provider(),"authorization_scope":"observation","pid":root.identity.pid,"audit":audit,"logging_error":logging_error,
-                    "message":"已登记目标主进程的观察关联；不创建Claude保护会话，不代表应用专属代理或账号服务已验证"}),
+                    "message":"已启动并登记目标进程，联网状态以监管执行回执为准"}),
                 );
             }
             system.wait(Duration::from_millis(200));

@@ -1,9 +1,8 @@
 use claude_watch_core::{
-    channel::{BoundProcessToken, ChannelMonitorSnapshot, PolicyVersion, SystemExtensionReceipt},
+    channel::{ChannelMonitorSnapshot, PolicyVersion},
     cli::Request,
     error::{CoreError, Result},
     policy::PolicyCatalog,
-    processes::ProcessRole,
 };
 use claude_watch_runtime::{
     alert_gate::AlertGate,
@@ -35,11 +34,13 @@ use std::{
 };
 
 pub struct ProductionChannelStack {
+    stop: Arc<AtomicBool>,
     pub enforcer: Arc<LocalTunnelEnforcer>,
     pub supervisor: ChannelSupervisor,
     pub event_rx: Receiver<SupervisionEvent>,
     pub lease_watchdog: thread::JoinHandle<()>,
     pub async_audit_worker: thread::JoinHandle<()>,
+    pub extension_watcher: Option<thread::JoinHandle<()>>,
     pub last_policy_version: Option<PolicyVersion>,
 }
 
@@ -58,7 +59,7 @@ where
         &uuid::Uuid::new_v4().simple().to_string()[..12]
     );
     let enforcer = Arc::new(LocalTunnelEnforcer::new(boot_id, Some(storage.clone())));
-    enforcer.set_strict_peer_verification(true);
+    enforcer.set_strict_peer_verification(activate_local_interception);
     if activate_local_interception {
         let now_ts = native::now();
         // Production: starts local proxy listener, keeping system_extension_active as false
@@ -76,6 +77,9 @@ where
     );
     register_production_enforcer(&storage.paths.watch(), enforcer.clone());
 
+    if activate_local_interception {
+        enforcer.start_extension_gateway(stop.clone())?;
+    }
     let (event_tx, event_rx) = std::sync::mpsc::channel();
 
     // Wire receipt sink: Active and closed flows immediately emit events to supervisor
@@ -104,8 +108,20 @@ where
         },
     )?;
 
+    let extension_watcher = if activate_local_interception {
+        let enforcer = enforcer.clone();
+        let stop = stop.clone();
+        Some(thread::Builder::new().name("channel-extension-observations".into()).spawn(move || {
+            let mut notification = claude_watch_runtime::channel_extension::ObservationSignal::new();
+            while !stop.load(Ordering::Acquire) {
+                let _ = enforcer.refresh_system_extension(native::now());
+                notification.wait(Duration::from_millis(250));
+            }
+        }).map_err(|_| CoreError::new("extension_observer_failed", "扩展回执订阅线程启动失败"))?)
+    } else { None };
+
     let (audit_req_tx, async_audit_worker) =
-        ChannelSupervisor::spawn_async_audit_worker(stop, event_tx, run_audit)?;
+        ChannelSupervisor::spawn_async_audit_worker(stop.clone(), event_tx, run_audit)?;
 
     let supervisor = ChannelSupervisor::new(
         storage,
@@ -114,11 +130,13 @@ where
     )?;
 
     Ok(ProductionChannelStack {
+        stop,
         enforcer,
         supervisor,
         event_rx,
         lease_watchdog,
         async_audit_worker,
+        extension_watcher,
         last_policy_version: None,
     })
 }
@@ -126,7 +144,12 @@ where
 impl ProductionChannelStack {
     pub fn drain_background_events(&mut self) -> Result<()> {
         while let Ok(ev) = self.event_rx.try_recv() {
-            self.supervisor.handle_event(ev)?;
+            let event = match ev {
+                SupervisionEvent::EnforcementReceiptArrived { receipt, .. } =>
+                    SupervisionEvent::EnforcementReceiptArrived { receipt, received_at: native::now() },
+                other => other,
+            };
+            self.supervisor.handle_event(event)?;
         }
         Ok(())
     }
@@ -138,56 +161,7 @@ impl ProductionChannelStack {
         self.drain_background_events()?;
         let now = system.now();
 
-        // A fresh heartbeat proves liveness, NOT execution of the newest
-        // permit/revoke command. The two signals must match independently.
-        let heartbeat_path = self.supervisor.storage.paths.watch()
-            .join("state/system-extension-heartbeat.json");
-        let heartbeat = self.supervisor.storage
-            .read_json(&heartbeat_path, Value::Null)
-            .unwrap_or(Value::Null);
-        let heartbeat_boot_id = heartbeat["executor_boot_id"]
-            .as_str().unwrap_or("").to_string();
-        let hb_at = heartbeat["heartbeat_at"].as_f64().unwrap_or(0.0);
-        let heartbeat_active = !heartbeat_boot_id.is_empty()
-            && hb_at > 0.0 && hb_at <= now + 1.0 && now - hb_at <= 8.0
-            && heartbeat["interception_active"].as_bool() == Some(true)
-            && heartbeat["direct_fallback_blocked"].as_bool() == Some(true);
-
-        let receipt_path = self.supervisor.storage.paths.watch()
-            .join("state/system-extension-receipt.json");
-        let receipt_confirmed = self.supervisor.storage
-            .read_json(&receipt_path, Value::Null)
-            .ok()
-            .and_then(|value| serde_json::from_value::<SystemExtensionReceipt>(value).ok())
-            .and_then(|receipt| {
-                self.supervisor.authoritative_state_for_family("claude")
-                    .map(|(policy, seq, generation, expected)| {
-                        let identity_fresh = !receipt.executor_boot_id.is_empty()
-                            && receipt.executor_boot_id == heartbeat_boot_id
-                            && receipt.is_fresh(now, 8.0)
-                            && receipt.policy_version == policy.policy_digest
-                            && receipt.command_seq == seq
-                            && receipt.permit_generation == generation;
-                        identity_fresh && match expected {
-                            Some(claude_watch_core::channel::ChannelPermitState::Permitted) =>
-                                receipt.matches_supervision(&policy.policy_digest, seq, generation),
-                            Some(claude_watch_core::channel::ChannelPermitState::Revoked) =>
-                                receipt.is_confirmed_revoked(seq, generation),
-                            _ => false,
-                        }
-                    })
-            })
-            .unwrap_or(false);
-
-        let extension_confirmed = heartbeat_active && receipt_confirmed;
-        // An absent, stale, failed, or merely disconnecting receipt must
-        // never be promoted to Blocked by a stale host status file.
-        let _ = self.enforcer.set_system_extension_active(
-            extension_confirmed,
-            if extension_confirmed { None }
-            else { Some("system_extension_execution_unconfirmed") },
-            now,
-        );
+        self.enforcer.refresh_system_extension(now)?;
 
         if let Ok(cfg) = (ConfigStore {
             storage: self.supervisor.storage.clone(),
@@ -212,7 +186,7 @@ impl ProductionChannelStack {
             .handle_event(SupervisionEvent::EnvironmentUpdated {
                 egress,
                 local_guard,
-                observed_at: now,
+                observed_at: system.now(),
             })?;
 
         for family in PolicyCatalog::families() {
@@ -220,27 +194,15 @@ impl ProductionChannelStack {
                 continue;
             }
             if system.set_family(family.id).is_ok() {
-                let desktops = system.desktops().unwrap_or_default();
-                let processes = system.supervised_processes().unwrap_or_else(|_| {
-                    desktops
-                        .iter()
-                        .map(|(d, main, _)| {
-                            let role = if *main {
-                                ProcessRole::DesktopMain
-                            } else {
-                                ProcessRole::DesktopHelper
-                            };
-                            let uid = claude_watch_runtime::controlled::read_process_real_uid(d.pid);
-                            BoundProcessToken::with_system_identity(
-                                d.pid,
-                                uid,
-                                d.start_seconds,
-                                d.start_microseconds,
-                                role,
-                            )
-                        })
-                        .collect()
-                });
+                let (desktops, processes) = match (system.desktops(), system.supervised_processes()) {
+                    (Ok(desktops), Ok(processes)) => (desktops, processes),
+                    _ => {
+                        self.supervisor.handle_event(SupervisionEvent::ProcessInventoryUnavailable {
+                            family: family.id.to_string(), observed_at: system.now(),
+                        })?;
+                        continue;
+                    }
+                };
                 self.supervisor
                     .handle_event(SupervisionEvent::ProcessInventoryUpdated {
                         family: family.id.to_string(),
@@ -251,103 +213,7 @@ impl ProductionChannelStack {
             }
         }
         self.drain_background_events()?;
-        // Process/policy events above can supersede the command checked at
-        // the beginning of this tick. Reconcile again before publication.
-        let still_current = self.supervisor.storage
-            .read_json(&receipt_path, Value::Null)
-            .ok()
-            .and_then(|value| serde_json::from_value::<SystemExtensionReceipt>(value).ok())
-            .and_then(|receipt| {
-                self.supervisor.authoritative_state_for_family("claude")
-                    .map(|(policy, seq, generation, expected)| {
-                        !receipt.executor_boot_id.is_empty()
-                            && receipt.executor_boot_id == heartbeat_boot_id
-                            && receipt.is_fresh(now, 8.0)
-                            && receipt.policy_version == policy.policy_digest
-                            && receipt.command_seq == seq
-                            && receipt.permit_generation == generation
-                            && match expected {
-                                Some(claude_watch_core::channel::ChannelPermitState::Permitted) =>
-                                    receipt.matches_supervision(&policy.policy_digest, seq, generation),
-                                Some(claude_watch_core::channel::ChannelPermitState::Revoked) =>
-                                    receipt.is_confirmed_revoked(seq, generation),
-                                _ => false,
-                            }
-                    })
-            })
-            .unwrap_or(false);
-        if extension_confirmed && !still_current {
-            let _ = self.enforcer.set_system_extension_active(
-                false, Some("system_extension_command_superseded"), now,
-            );
-            // Publish a failed executor receipt; flipping a boolean without
-            // an event can leave a stale successful supervisor snapshot.
-            let _ = self.enforcer.record_activation_failure(
-                "system_extension_command_superseded", now,
-            );
-            self.drain_background_events()?;
-        }
         let snapshot = self.supervisor.snapshot(system.now());
-
-        // Direct command issuance to system extension (operates independently even when UI is not running)
-        if let Some(claude_state) = snapshot.families.get("claude") {
-            let cmd_path = self
-                .supervisor
-                .storage
-                .paths
-                .watch()
-                .join("state/system-extension-command.json");
-            let secret_path = self
-                .supervisor
-                .storage
-                .paths
-                .watch()
-                .join("state/.extension-secret");
-            let secret = self
-                .supervisor
-                .storage
-                .read_bytes(&secret_path, 4096)
-                .ok()
-                .flatten()
-                .and_then(|b| String::from_utf8(b).ok())
-                .unwrap_or_default();
-            let policy_ver = claude_state
-                .applied_policy_version
-                .as_ref()
-                .map(|p| p.policy_digest.clone())
-                .unwrap_or_else(|| claude_state.saved_policy_version.policy_digest.clone());
-
-            if claude_state.permit_state == claude_watch_core::channel::ChannelPermitState::Permitted {
-                if let (Some(port), Some(deadline)) = (claude_state.local_proxy_port, claude_state.valid_until) {
-                    if deadline > claude_state.updated_at {
-                        let cmd = serde_json::json!({
-                            "action": "update_permit",
-                            "issued_at": system.now(),
-                            "policy_version": policy_ver,
-                            "command_seq": claude_state.command_seq,
-                            "permit_generation": claude_state.permit_generation,
-                            "valid_until": deadline as i64,
-                            "permit_state": "permitted",
-                            "allowed_pids": claude_state.active_member_pids,
-                            "local_proxy_port": port,
-                            "extension_secret": secret.trim(),
-                        });
-                        let _ = self.supervisor.storage.atomic_json(&cmd_path, &cmd);
-                    }
-                }
-            } else {
-                let cmd = serde_json::json!({
-                    "action": "revoke_channel",
-                    "issued_at": system.now(),
-                    "policy_version": policy_ver,
-                    "command_seq": claude_state.command_seq,
-                    "permit_generation": claude_state.permit_generation,
-                    "reason": claude_state.reason_code,
-                    "extension_secret": secret.trim(),
-                });
-                let _ = self.supervisor.storage.atomic_json(&cmd_path, &cmd);
-            }
-        }
 
         Ok(snapshot)
     }
@@ -359,7 +225,12 @@ impl ProductionChannelStack {
                 .min(Duration::from_millis(100));
             match self.event_rx.recv_timeout(wait_for) {
                 Ok(ev) => {
-                    let _ = self.supervisor.handle_event(ev);
+                    let event = match ev {
+                        SupervisionEvent::EnforcementReceiptArrived { receipt, .. } =>
+                            SupervisionEvent::EnforcementReceiptArrived { receipt, received_at: native::now() },
+                        other => other,
+                    };
+                    let _ = self.supervisor.handle_event(event);
                     let _ = self.drain_background_events();
                     break;
                 }
@@ -372,9 +243,13 @@ impl ProductionChannelStack {
     }
 
     pub fn shutdown(self) {
+        // The guard loop can leave on error while the daemon is still alive.
+        // Signal the owned workers before joining; callers need not do it first.
+        self.stop.store(true, Ordering::Release);
         unregister_production_enforcer(&self.supervisor.storage.paths.watch());
         let _ = self.lease_watchdog.join();
         let _ = self.async_audit_worker.join();
+        if let Some(worker) = self.extension_watcher { let _ = worker.join(); }
     }
 }
 
@@ -519,96 +394,14 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
             thread::Builder::new()
                 .name("claude-session-guard".into())
                 .spawn(move || -> Result<()> {
-                    let audit_store_state = store.clone();
                     let mut channel_stack = assemble_production_channel_stack(
                         store.clone(),
                         stop.clone(),
                         true,
                         move |req| {
-                            let mut audit_host = super::runtime::host(
-                                audit_paths.clone(),
-                                Authority::ExplicitPermit,
-                            )?;
-                            let target = PolicyCatalog::family(&req.family)
-                                .and_then(PolicyCatalog::guard_target)
-                                .unwrap_or(
-                                    claude_watch_core::processes::LaunchTarget::ClaudeDesktop,
-                                );
-                            let audit = claude_watch_runtime::audit_store::AuditStore::new(
-                                audit_store_state.clone(),
-                            )
-                            .collect_target(
-                                &mut audit_host,
-                                &claude_watch_runtime::region_catalog::load_system_catalog(),
-                                target,
-                                claude_watch_runtime::audit_store::AuditOptions {
-                                    online: true,
-                                    persist: true,
-                                    launch: true,
-                                },
-                            )?;
-                            if req.is_cancelled() {
-                                return Err(CoreError::new("audit_cancelled", "慢审计已超时取消，立即释放资源"));
-                            }
-                            let probe_context = match req.context_id.as_deref().filter(|s| !s.trim().is_empty()) {
-                                Some(ctx) => ctx,
-                                None => {
-                                    return Err(CoreError::new("missing_context_id", "慢审计缺少环境上下文标识，保持待验证"));
-                                }
-                            };
-                            let enforcer = claude_watch_runtime::channel_enforcer::registered_production_enforcer(
-                                &audit_paths.watch(),
-                            );
-                            let now_ts = native::now();
-                            let egress = if let Some(ref enf) = enforcer {
-                                if req.is_cancelled() {
-                                    return Err(CoreError::new("audit_cancelled", "慢审计已超时取消，立即释放资源"));
-                                }
-                                let probe_res = enf.probe_via_controlled_diagnostic_channel(
-                                    &req.family,
-                                    probe_context,
-                                    now_ts,
-                                    |proxy_endpoint| {
-                                        let receipt = audit_host.network.fast_egress_via(Some(proxy_endpoint));
-                                        receipt.data.ok_or_else(|| {
-                                            let msg = receipt.error.unwrap_or_else(|| "慢审计受控诊断通道探测无返回".into());
-                                            CoreError::new("controlled_diagnostic_probe_failed", &msg)
-                                        })
-                                    },
-                                );
-                                if req.is_cancelled() {
-                                    return Err(CoreError::new("audit_cancelled", "慢审计已超时取消，迟到探测结果废弃"));
-                                }
-                                match probe_res {
-                                    Ok((mut data, evidence)) => {
-                                        data["via_controlled_path"] = serde_json::json!(true);
-                                        data["family"] = serde_json::json!(evidence.family);
-                                        data["upstream_endpoint"] = serde_json::json!(evidence.upstream_endpoint);
-                                        data["context_id"] = serde_json::json!(evidence.context_id);
-                                        data["policy_version"] = serde_json::to_value(&evidence.policy_version)
-                                            .unwrap_or(serde_json::Value::Null);
-                                        data["observed_at"] = serde_json::json!(evidence.observed_at);
-                                        data
-                                    }
-                                    Err(e) => {
-                                        serde_json::json!({
-                                            "state": "unknown",
-                                            "error": e.to_string(),
-                                            "via_controlled_path": false,
-                                            "observed_at": now_ts,
-                                        })
-                                    }
-                                }
-                            } else {
-                                let mut data = audit_host
-                                    .network
-                                    .fast_egress()
-                                    .data
-                                    .unwrap_or_else(|| serde_json::json!({"state":"unknown","observed_at": now_ts}));
-                                data["via_controlled_path"] = serde_json::json!(false);
-                                data
-                            };
-                            Ok((audit, egress, now_ts))
+                            let enforcer = claude_watch_runtime::channel_enforcer::registered_production_enforcer(&audit_paths.watch())
+                                .ok_or_else(|| CoreError::new("controlled_channel_missing", "受控诊断执行器不可用，保持待验证"))?;
+                            super::channel_audit::run(&audit_paths, &enforcer, req)
                         },
                     )?;
                     let controller = Controller::new(store.clone());
@@ -635,7 +428,9 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                     let loop_result: Result<()> = (|| {
                         while !stop.load(Ordering::Acquire) {
                             let started = Instant::now();
-                            let _ = channel_stack.step_with_system(&mut runtime);
+                            if let Err(error) = channel_stack.step_with_system(&mut runtime) {
+                                channel_stack.enforcer.record_activation_failure(&error.code, native::now())?;
+                            }
                             let receipt = controller.guard_tick(&mut runtime)?;
                             guard_history.observe(&guard_diagnostics, &receipt, native::now());
                             if let Some(alerts) = &guard_alerts {
@@ -984,7 +779,7 @@ mod tests {
         let mut stack = assemble_production_channel_stack(
             store.clone(),
             stop.clone(),
-            true,
+            false,
             move |req| {
                 let _ = rx.lock().unwrap().recv_timeout(Duration::from_secs(2));
                 Ok((
@@ -1021,6 +816,9 @@ mod tests {
         )
         .unwrap();
 
+        // Isolated orchestration fixture: inject kernel observations separately
+        // from the production authenticated observation tests.
+        stack.enforcer.start_local_proxy_listener("127.0.0.1:0", stop.clone(), now).unwrap();
         // The enforcer requires both local proxy and system extension to be active.
         // Local proxy is ready, but system extension is not yet confirmed -> not ready!
         assert!(!stack.enforcer.is_ready().unwrap());
@@ -1068,8 +866,8 @@ mod tests {
         );
         assert!(snap3.families["claude"].process_preserved);
 
-        stop.store(true, Ordering::Release);
         stack.shutdown();
+        assert!(stop.load(Ordering::Acquire));
         assert!(registered_production_enforcer(&store.paths.watch()).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }

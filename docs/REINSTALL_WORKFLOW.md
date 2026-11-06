@@ -53,6 +53,22 @@ bash /Users/anyun/Desktop/bash/monitor/reinstall.sh 3.0.0 314
 
 打包脚本在支持时使用 `diskutil image`，其他系统回退到 `hdiutil`；出现警告时保留原始输出并检查具体原因。DMG 内的 `安装或更新后台.command` 是保留现有 Watch 数据的普通安装入口，不能代替完整重置。
 
+### 系统网络扩展的正式构建条件
+
+默认 `monitor/build.sh` 仍生成临时签名的开发产物，适合编译与隔离验证，不能视为系统网络接管可用。正式构建支持以下环境变量；重装入口会向构建进程继承这些变量，但设置变量本身不授权安装：
+
+| 变量 | 用途 |
+|---|---|
+| `CW_SIGNING_IDENTITY` | 本机可用的 Developer ID Application 签名身份；默认 `-` 表示开发签名。 |
+| `CW_HOST_PROVISION_PROFILE` | `io.local.watchpanel` 的有效 Developer ID profile，须含 Network Extension 与 System Extension 安装能力。 |
+| `CW_EXTENSION_PROVISION_PROFILE` | `io.local.watchpanel.network-extension` 的有效 Developer ID profile，须含 `app-proxy-provider-systemextension`。 |
+
+兼容远程版本的变量名 `CW_CODESIGN_IDENTITY`、`CW_HOST_PROFILE`、`CW_EXTENSION_PROFILE`；与上表对应变量同时设置且值不一致时停止构建。Entitlement 模板统一位于 `monitor/Signing/`，构建时生成带 Team ID 的签名输入。
+
+构建时检查两个 profile 的应用标识、有效期、同一 Team ID 与所需 entitlement，签名内部组件、扩展与宿主，再核验签名。宿主显式配置当前用户的控制目录，Rust 不从 UI 状态缓存认定接管生效。能力和 profile 的平台要求参见 [Apple 的 Network Extensions entitlement 文档](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.networking.networkextension)。
+
+这条正式签名构建路径不自动执行公证或系统批准，也不证明扩展已运行。实际交付仍须具备相应证书、profile、必要公证和用户批准，并核验扩展新鲜心跳、匹配命令的执行回执及真实应用流量。本轮只完成源码与静态构建入口核对，未执行正式签名、安装或激活。
+
 ## 5. 安装后核验
 
 完整重置后首次打开新版，先进入初始化向导。Claude Watch 保镖和时区守护起初关闭；向导先核对组件、代理、环境、权限、DNS 和 WebRTC，再展示自有守护启用预览，由用户确认并按 macOS 提示授权。向导中的检查全部真实通过且联合复核有效后，才能进入主界面；未知、超时、权限不足和失败均不能跳过。

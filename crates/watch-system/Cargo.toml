@@ -1,0 +1,10 @@
+[package]
+name = "claude-watch-system"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Small OS identity and cancellation boundary for Claude Watch"
+
+[dependencies]
+libc = "0.2"

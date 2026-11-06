@@ -75,6 +75,11 @@ impl EvidenceSystem for NativeEvidence {
             .iter()
             .any(|(actual, main, _)| *main && actual == expected))
     }
+    fn channel_process_matches(&mut self, process: &claude_watch_core::channel::BoundProcessToken) -> Result<bool> {
+        Ok(process.audit_token.as_ref().is_some_and(|token|
+            claude_watch_system::process_audit_token_matches(process.pid, process.uid,
+                process.start_seconds, process.start_microseconds, token)))
+    }
     fn desktop_unique_stamp(&mut self, expected: &Desktop) -> Result<Option<String>> {
         let processes = self.desktop.desktops()?;
         let mut mains = processes.iter().filter(|(_, main, _)| *main);

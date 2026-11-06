@@ -33,6 +33,16 @@ use subprocess::{Exec, Job, Redirection};
 
 mod close_receipt;
 
+fn channel_process_tokens(targets: &[Target], provider: Provider) -> Vec<claude_watch_core::channel::BoundProcessToken> {
+    use claude_watch_core::{channel::BoundProcessToken, processes::ProcessRole};
+    let family = PolicyCatalog::family_for(provider).map(|f| f.id);
+    targets.iter().filter(|t| t.identity.valid() && t.identity.uid > 0
+        && t.kind.role() != ProcessRole::Launcher
+        && PolicyCatalog::family_for(t.kind.provider()).map(|f| f.id) == family)
+        .map(|t| BoundProcessToken::with_system_identity(t.identity.pid, t.identity.uid,
+            t.identity.start_seconds, t.identity.start_microseconds, t.kind.role())).collect()
+}
+
 fn execute_output(program: &Path, args: &[&str], timeout: Duration) -> Result<Vec<u8>> {
     let started = Instant::now();
     let mut job = Exec::cmd(program)
@@ -96,6 +106,7 @@ pub struct NativeDesktop<R: ReadRunner> {
     applications: PathBuf,
     cask_roots: Vec<PathBuf>,
     cli: Option<SelectedCli>,
+    channel_tracked: Vec<Target>,
 }
 #[derive(Clone, PartialEq, Eq)]
 struct SelectedApplication {
@@ -245,6 +256,7 @@ impl<R: ReadRunner> NativeDesktop<R> {
                 "/usr/local/Caskroom".into(),
             ],
             cli: None,
+            channel_tracked: Vec::new(),
         })
     }
     pub fn target(&self) -> LaunchTarget {
@@ -915,6 +927,26 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
     fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
         self.desktop.desktops()
     }
+    fn supervised_processes(&mut self) -> Result<Vec<claude_watch_core::channel::BoundProcessToken>> {
+        // Reuse the monitor's native root/CLI/descendant classification. A
+        // desktop-only fallback would silently lose Code and orphan children.
+        let mut sampler = crate::sampler::Sampler::new(&self.desktop.runner, self.storage.paths.clone());
+        sampler.retain_channel_targets(&self.desktop.channel_tracked);
+        let round = sampler.processes()?;
+        if !round.complete {
+            return Err(CoreError::new("channel_inventory_incomplete", "通道进程归属尚未完整确认"));
+        }
+        self.desktop.channel_tracked = round.targets.clone();
+        let mut tokens = channel_process_tokens(&round.targets, self.desktop.target.provider());
+        for token in &mut tokens {
+            let target = round.targets.iter().find(|t| t.identity.pid == token.pid)
+                .ok_or_else(|| CoreError::new("channel_identity_unavailable", "通道进程身份丢失"))?;
+            token.audit_token = Some(claude_watch_system::process_audit_token(token.pid, token.uid,
+                token.start_seconds, token.start_microseconds, &target.identity.executable)
+                .ok_or_else(|| CoreError::new("channel_identity_unavailable", "未取得当前进程的原始系统身份，通道保持阻断"))?);
+        }
+        Ok(tokens)
+    }
     fn desktop_alive(&mut self, desktop: &Desktop) -> Result<bool> {
         self.desktop.desktop_alive(desktop)
     }
@@ -952,29 +984,35 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
             .map(|f| f.id)
             .unwrap_or("claude");
 
-        // If a production enforcer is registered, route through the verified diagnostic channel
+        // Bind fast diagnostics to the environment actually sampled this round.
+        // Failure on a controlled path must not turn into a direct fallback.
         if let Some(ref enf) = enforcer {
-            let probe_res = enf.probe_via_controlled_diagnostic_channel(
-                family_id,
-                "diag-egress-ctx",
-                now,
-                |proxy_endpoint| {
-                    let receipt = self.network.fast_egress_via(Some(proxy_endpoint));
-                    receipt.data.ok_or_else(|| {
-                        let msg = receipt.error.unwrap_or_else(|| "诊断通道探测无返回".into());
-                        CoreError::new("controlled_diagnostic_probe_failed", &msg)
-                    })
-                },
-            );
-            if let Ok((mut data, evidence)) = probe_res {
+            let probe: Result<Value> = (|| {
+                let configs = ConfigStore { storage: self.storage.clone() };
+                let config = configs.load()?;
+                let local = self.system.local_for_target(&config, self.desktop.target())?;
+                let context = local["context_id"].as_str().filter(|s| !s.is_empty())
+                    .ok_or_else(|| CoreError::new("missing_context_id", "当前环境上下文无法确认"))?;
+                let (mut data, evidence) = enf.probe_via_controlled_diagnostic_channel(family_id, context, now, |proxy| {
+                    self.network.fast_egress_via(Some(proxy)).data
+                        .ok_or_else(|| CoreError::new("controlled_probe_failed", "受控出口采样失败"))
+                })?;
+                let latest = configs.load()?;
+                let after = self.system.local_for_target(&latest, self.desktop.target())?;
+                if config.value()? != latest.value()? || after["context_id"].as_str() != Some(context) {
+                    return Err(CoreError::new("audit_context_changed", "出口采样期间环境变化"));
+                }
                 data["via_controlled_path"] = serde_json::json!(true);
                 data["family"] = serde_json::json!(evidence.family);
                 data["upstream_endpoint"] = serde_json::json!(evidence.upstream_endpoint);
                 data["context_id"] = serde_json::json!(evidence.context_id);
-                data["policy_version"] = serde_json::to_value(&evidence.policy_version).unwrap_or(serde_json::Value::Null);
+                data["policy_version"] = serde_json::json!(evidence.policy_version);
                 data["observed_at"] = serde_json::json!(evidence.observed_at);
-                return data;
-            }
+                Ok(data)
+            })();
+            return probe.unwrap_or_else(|error| serde_json::json!({
+                "state":"unknown", "error":error.code, "via_controlled_path":false, "observed_at":native::now()
+            }));
         }
 
         // Direct proxy fallback for CLI or direct config without active enforcer.
@@ -1094,6 +1132,22 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
 mod target_contracts {
     use super::*;
     use crate::commands::{Output, ReadCommand};
+    #[test]
+    fn channel_inventory_includes_cli_and_children_without_cross_family_or_launcher() {
+        use claude_watch_core::processes::ProcessRole;
+        let target = |pid, kind| Target { kind, identity: ProcessIdentity {
+            pid, parent: 1, uid: 501, executable: format!("/fixture/{pid}"),
+            start_seconds: 100, start_microseconds: pid, start_stamp: String::new(),
+        }};
+        let targets = vec![target(10, Kind::ClaudeCode), target(11, Kind::ClaudeChild),
+            target(12, Kind::ClaudeLauncher), target(13, Kind::CodexCli), target(14, Kind::ChatgptMain)];
+        let claude = channel_process_tokens(&targets, Provider::Claude);
+        assert_eq!(claude.iter().map(|p| p.pid).collect::<Vec<_>>(), [10, 11]);
+        assert_eq!(claude[0].role, ProcessRole::Cli);
+        assert_eq!(claude[1].role, ProcessRole::Child);
+        assert_eq!(claude[0].start_microseconds, 10);
+        assert_eq!(channel_process_tokens(&targets, Provider::Openai).iter().map(|p| p.pid).collect::<Vec<_>>(), [13, 14]);
+    }
     struct Reader;
     impl ReadRunner for Reader {
         fn run(&self, command: ReadCommand, _: &[u8], _: Duration, _: usize) -> Result<Output> {

@@ -264,9 +264,8 @@ final class MonitorStore: ObservableObject {
         } else if let channelSnap = value.channelSupervision, (value.channelEvents ?? []).isEmpty {
             channelSubscription.applySnapshot(channelSnap)
         }
-        if let channelSnap = value.channelSupervision {
-            NetworkExtensionHostManager.shared.syncWithChannelPermits(snapshot: channelSnap)
-        }
+        // The UI observes authoritative receipts; it never reissues permits.
+        _ = NetworkExtensionHostManager.shared
         // Re-evaluate only after both the tracker and snapshot describe this
         // observation. Otherwise a recovered sampler can leave a fresh
         // receipt marked incomplete until an unrelated later clock tick.

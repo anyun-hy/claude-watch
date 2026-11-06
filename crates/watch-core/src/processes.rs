@@ -28,11 +28,15 @@ impl Identity {
             && !self.executable.chars().any(char::is_control)
     }
     pub fn same_process(&self, other: &Self) -> bool {
+        self.same_lifetime(other) && self.executable == other.executable
+    }
+    /// Ownership survives exec. This must never substitute for an executable
+    /// or audit-token comparison when authorizing an operation.
+    pub fn same_lifetime(&self, other: &Self) -> bool {
         self.valid()
             && other.valid()
             && self.pid == other.pid
             && self.uid == other.uid
-            && self.executable == other.executable
             && self.start_seconds == other.start_seconds
             && self.start_microseconds == other.start_microseconds
     }
@@ -279,10 +283,17 @@ pub fn targets(
         .collect();
     let mut kinds = BTreeMap::new();
     // A stale tracked record must never overwrite a fresh independently classified root.
-    for seed in seeds.iter().chain(tracked) {
+    for seed in seeds {
         if let Some(current) = owned.get(&seed.identity.pid) {
             if current.same_process(&seed.identity) {
                 kinds.entry(seed.identity.pid).or_insert(seed.kind);
+            }
+        }
+    }
+    for retained in tracked {
+        if let Some(current) = owned.get(&retained.identity.pid) {
+            if current.same_lifetime(&retained.identity) {
+                kinds.entry(retained.identity.pid).or_insert(retained.kind);
             }
         }
     }

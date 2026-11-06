@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/watch-core", "crates/watch-shadow", "crates/watch-runtime", "crates/watch-engine", "crates/watch-installer"]
+members = ["crates/watch-core", "crates/watch-system", "crates/watch-shadow", "crates/watch-runtime", "crates/watch-engine", "crates/watch-installer"]
 resolver = "2"
 
 [workspace.package]

@@ -624,20 +624,22 @@ pub fn evaluate_channel_supervision_with_boot_id(
 /// System extension execution receipt produced by WatchChannelExtension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SystemExtensionReceipt {
+    pub family: String,
     #[serde(default)]
+    pub command_binding: String,
     pub executor_boot_id: String,
-    pub policy_version: String,
+    pub extension_boot_id: String,
+    pub policy_version: PolicyVersion,
     pub command_seq: u64,
     pub permit_generation: u64,
     pub applied_at: f64,
-    #[serde(default)]
     pub allowed_pids: Vec<u32>,
     #[serde(default)]
     pub local_proxy_port: u16,
     pub permit_state: String,
     pub status: String,
-    #[serde(default)]
     pub active_flows: usize,
+    pub new_connections_blocked: bool,
     pub reason: Option<String>,
 }
 
@@ -654,24 +656,48 @@ impl SystemExtensionReceipt {
             || (self.status == "revoked" && self.active_flows > 0)
     }
 
-    pub fn is_confirmed_revoked(&self, min_command_seq: u64, min_generation: u64) -> bool {
+    pub fn is_confirmed_revoked(&self) -> bool {
         self.status == "revoked" && self.permit_state == "revoked"
             && self.active_flows == 0
-            && self.permit_generation == min_generation
-            && self.command_seq == min_command_seq
+            && self.new_connections_blocked
     }
 
     pub fn matches_supervision(
         &self,
-        expected_policy_version: &str,
+        expected_policy_version: &PolicyVersion,
         expected_command_seq: u64,
         expected_generation: u64,
+        expected_boot: &str,
+        extension_boot: &str,
+        issued_at: f64,
+        now: f64,
     ) -> bool {
-        self.status == "ok"
-            && self.permit_state == "permitted"
-            && self.policy_version == expected_policy_version
+        self.executor_boot_id == expected_boot
+            && !extension_boot.is_empty()
+            && self.extension_boot_id == extension_boot
+            && &self.policy_version == expected_policy_version
             && self.command_seq == expected_command_seq
             && self.permit_generation == expected_generation
+            && self.applied_at.is_finite()
+            && self.applied_at >= issued_at - CLOCK_ROLLBACK_TOLERANCE_SECONDS
+            && self.applied_at <= now + CLOCK_ROLLBACK_TOLERANCE_SECONDS
+    }
+}
+
+/// Liveness is refreshed independently; an acknowledgement keeps its execution time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SystemExtensionHeartbeat {
+    pub executor_boot_id: String,
+    pub extension_boot_id: String,
+    pub heartbeat_at: f64,
+    pub interception_active: bool,
+}
+impl SystemExtensionHeartbeat {
+    pub fn is_live(&self, executor_boot: &str, now: f64) -> bool {
+        self.executor_boot_id == executor_boot && !self.extension_boot_id.is_empty()
+            && self.interception_active && self.heartbeat_at.is_finite() && now.is_finite()
+            && self.heartbeat_at <= now + CLOCK_ROLLBACK_TOLERANCE_SECONDS
+            && now - self.heartbeat_at < 8.0
     }
 }
 
@@ -1434,36 +1460,50 @@ mod tests {
         assert!(!placeholder_token.has_valid_identity());
         assert!(!placeholder_token.matches_process(4100, 0, 900, 1, None));
     }
+
     #[test]
     fn system_extension_receipt_requires_exact_confirmed_execution() {
+        let version = policy("extension");
         let mut receipt = SystemExtensionReceipt {
-            executor_boot_id: "extension-test-boot".into(),
-            policy_version: "policy".into(),
+            family: "claude".into(),
+            command_binding: "fixture".into(),
+            executor_boot_id: "rust-boot".into(),
+            extension_boot_id: "extension-boot".into(),
+            policy_version: version.clone(),
             command_seq: 14,
             permit_generation: 5,
             applied_at: 100.0,
-            allowed_pids: vec![],
-            local_proxy_port: 7890,
+            allowed_pids: vec![4100],
+            local_proxy_port: 0,
             permit_state: "revoked".into(),
             status: "revoked".into(),
             active_flows: 0,
+            new_connections_blocked: true,
             reason: None,
         };
-        assert!(receipt.is_confirmed_revoked(14, 5));
+        let matches = |r: &SystemExtensionReceipt, seq, generation, boot: &str| {
+            r.matches_supervision(&version, seq, generation, "rust-boot", boot, 99.0, 105.0)
+                && r.is_confirmed_revoked()
+        };
+        assert!(matches(&receipt, 14, 5, "extension-boot"));
         assert!(receipt.is_fresh(105.0, 8.0));
-        receipt.status = "drain_timeout_unconfirmed".into();
-        assert!(!receipt.is_confirmed_revoked(14, 5));
+        assert!(!matches(&receipt, 13, 5, "extension-boot"));
+        assert!(!matches(&receipt, 14, 4, "extension-boot"));
+        assert!(!matches(&receipt, 14, 5, "previous-boot"));
+        receipt.status = "failed".into();
+        assert!(!matches(&receipt, 14, 5, "extension-boot"));
         receipt.status = "revoked".into();
         receipt.permit_state = "disconnecting".into();
-        assert!(!receipt.is_confirmed_revoked(14, 5));
+        assert!(!receipt.is_confirmed_revoked());
         receipt.permit_state = "revoked".into();
-        assert!(!receipt.is_confirmed_revoked(13, 5));
-        assert!(!receipt.is_confirmed_revoked(14, 4));
         receipt.active_flows = 1;
-        assert!(!receipt.is_confirmed_revoked(14, 5));
+        assert!(!receipt.is_confirmed_revoked());
         receipt.active_flows = 0;
+        receipt.new_connections_blocked = false;
+        assert!(!receipt.is_confirmed_revoked());
         receipt.applied_at = 110.0;
         assert!(!receipt.is_fresh(100.0, 8.0));
+        receipt.applied_at = f64::NAN;
+        assert!(!receipt.is_fresh(100.0, 8.0));
     }
-
 }

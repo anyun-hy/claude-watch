@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import NetworkExtension
 import SystemExtensions
 import Combine
@@ -38,13 +39,18 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
 
     private var targetProviderManager: NETransparentProxyManager?
     private var isSettingUpConfiguration: Bool = false
+    private var statusObserver: NSObjectProtocol?
 
     public override init() {
         super.init()
+        statusObserver = NotificationCenter.default.addObserver(forName: .NEVPNStatusDidChange, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshStatus()
+        }
         startAndActivateIfNeeded()
     }
+    deinit { if let observer = statusObserver { NotificationCenter.default.removeObserver(observer) } }
 
-    /// Do not request installation with ad-hoc signing or absent host entitlement.
+    /// Check the signed host's entitlement before requesting OS activation.
     private func canInstallSystemExtension() -> Bool {
         guard let task = SecTaskCreateFromSelf(nil) else { return false }
         return SecTaskCopyValueForEntitlement(
@@ -66,7 +72,11 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
         }
         refreshStatus { [weak self] ready in
             guard let self = self else { return }
-            if !ready { self.requestActivation() }
+            if !ready {
+                // First obtain the OS activation result, then configure/start
+                // the provider in the successful activation callback.
+                self.requestActivation()
+            }
         }
     }
 
@@ -99,30 +109,33 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
 
             let isEnabled = manager?.isEnabled ?? false
             let isConnected = isEnabled && manager?.connection.status == .connected
+            let configured = (manager?.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
+            let matchesControlUser = configured?["control_home"] as? String == NSHomeDirectory()
+                && (configured?["control_uid"] as? NSNumber)?.uint32Value == getuid()
 
             // If configured and enabled but tunnel is disconnected, attempt to connect
-            if isEnabled && !isConnected, let session = manager?.connection as? NETunnelProviderSession {
+            if isEnabled && matchesControlUser && !isConnected, let session = manager?.connection as? NETunnelProviderSession {
                 if session.status == .disconnected || session.status == .invalid {
-                    do {
-                        try session.startTunnel(options: nil)
-                    } catch {
+                    do { try session.startTunnel(options: nil) }
+                    catch {
                         self.recordExtensionFailure(reason: "start_tunnel_failed: \(error.localizedDescription)")
+                        completion?(false)
+                        return
                     }
                 }
             }
 
             DispatchQueue.main.async {
                 let newState = NetworkExtensionActivationState(
-                    // Preferences enabled does not prove the provider is running.
-                    isSystemExtensionActive: isConnected,
-                    isTunnelActive: isConnected,
-                    detail: isConnected ? "透明代理已连接（待执行回执确认保护）" : (isEnabled ? "配置存在，尚未确认网络接管" : "网络扩展未启用"),
+                    isSystemExtensionActive: isConnected && matchesControlUser,
+                    isTunnelActive: isConnected && matchesControlUser,
+                    detail: isConnected && matchesControlUser ? "透明代理已连接（待执行回执确认保护）" : (isEnabled ? "扩展已配置，尚未确认通道生效" : "网络扩展未启用"),
                     lastErrorCode: nil
                 )
                 self.activationState = newState
                 self.persistActivationStatus(state: newState)
             }
-            completion?(isEnabled && isConnected)
+            completion?(isEnabled && isConnected && matchesControlUser)
         }
     }
 
@@ -139,13 +152,24 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
                 completion?(false)
                 return
             }
+            if let error = error {
+                self.isSettingUpConfiguration = false
+                self.recordExtensionFailure(reason: "preferences_load_failed: \(error.localizedDescription)")
+                completion?(false)
+                return
+            }
             let manager = managers?.first { mgr in
                 (mgr.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == Self.extensionBundleIdentifier
             } ?? NETransparentProxyManager()
 
             let proto = (manager.protocolConfiguration as? NETunnelProviderProtocol) ?? NETunnelProviderProtocol()
+            let prior = proto.providerConfiguration
+            let controlChanged = prior?["control_home"] as? String != NSHomeDirectory()
+                || (prior?["control_uid"] as? NSNumber)?.uint32Value != getuid()
+            if controlChanged { manager.connection.stopVPNTunnel() }
             proto.providerBundleIdentifier = Self.extensionBundleIdentifier
             proto.serverAddress = "127.0.0.1"
+            proto.providerConfiguration = ["control_home": NSHomeDirectory(), "control_uid": NSNumber(value: getuid())]
 
             manager.protocolConfiguration = proto
             manager.localizedDescription = "Claude Watch Transparent Proxy"
@@ -165,20 +189,31 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
                 }
 
                 // Reload to acquire system-assigned session
-                NETransparentProxyManager.loadAllFromPreferences { reloadedManagers, _ in
+                NETransparentProxyManager.loadAllFromPreferences { reloadedManagers, reloadError in
+                    if let reloadError = reloadError {
+                        self.recordExtensionFailure(reason: "preferences_reload_failed: \(reloadError.localizedDescription)")
+                        completion?(false)
+                        return
+                    }
                     let readyMgr = reloadedManagers?.first {
                         ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == Self.extensionBundleIdentifier
                     }
                     self.targetProviderManager = readyMgr
-                    if let session = readyMgr?.connection as? NETunnelProviderSession, readyMgr?.isEnabled == true {
-                        do {
-                            try session.startTunnel(options: nil)
-                        } catch {
-                            NSLog("[NetworkExtensionHostManager] Failed to start transparent proxy tunnel: %@", error.localizedDescription)
-                        }
+                    guard let session = readyMgr?.connection as? NETunnelProviderSession, readyMgr?.isEnabled == true else {
+                        self.recordExtensionFailure(reason: "configured_tunnel_missing")
+                        completion?(false)
+                        return
+                    }
+                    do {
+                        try session.startTunnel(options: nil)
+                    } catch {
+                        NSLog("[NetworkExtensionHostManager] Failed to start transparent proxy tunnel: %@", error.localizedDescription)
+                        self.recordExtensionFailure(reason: "start_tunnel_failed: \(error.localizedDescription)")
+                        completion?(false)
+                        return
                     }
                     self.refreshStatus()
-                    completion?(readyMgr != nil && readyMgr?.isEnabled == true)
+                    completion?(true)
                 }
             }
         }
@@ -215,7 +250,7 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
             self.activationState = NetworkExtensionActivationState(
                 isSystemExtensionActive: false,
                 isTunnelActive: false,
-                detail: "等待主公在系统偏好设置中允许扩展",
+                detail: "等待在系统设置中允许扩展",
                 lastErrorCode: "needs_user_approval"
             )
         }
@@ -230,11 +265,10 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
                 detail: active ? "系统扩展安装成功，正在启动透明代理" : "系统扩展安装待重启",
                 lastErrorCode: nil
             )
-            // Immediately configure and start tunnel once extension activation succeeds
-            if active {
-                self.setupAndEnableTransparentProxyConfiguration { _ in
-                    self.refreshStatus()
-                }
+            // A reboot-pending result has not activated the provider yet.
+            guard active else { return }
+            self.setupAndEnableTransparentProxyConfiguration { success in
+                if success { self.refreshStatus() }
             }
         }
     }
@@ -279,122 +313,7 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
         }
     }
 
-    /// Pushes a permit update to the extension.
-    public func pushPermit(
-        validUntil: Int64,
-        permitState: String,
-        allowedPids: [UInt32],
-        localProxyPort: UInt16,
-        policyVersion: String = "",
-        commandSeq: UInt64 = 0,
-        permitGeneration: UInt64 = 0,
-        completion: @escaping (Bool) -> Void
-    ) {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let secretFile = home.appendingPathComponent("Library/Application Support/ClaudeWatch/state/.extension-secret")
-        let secret = (try? String(contentsOf: secretFile, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-        var msg: [String: Any] = [
-            "action": "update_permit",
-            "valid_until": validUntil,
-            "permit_state": permitState,
-            "allowed_pids": allowedPids,
-            "local_proxy_port": localProxyPort,
-            "policy_version": policyVersion,
-            "command_seq": commandSeq,
-            "permit_generation": permitGeneration
-        ]
-        if !secret.isEmpty {
-            msg["extension_secret"] = secret
-        }
-        sendProviderMessage(msg) { result in
-            switch result {
-            case .success(let resp):
-                completion(resp["status"] as? String == "ok")
-            case .failure:
-                completion(false)
-            }
-        }
-    }
-
-    /// Revokes channel access in the extension.
-    public func revokeChannel(
-        reason: String,
-        policyVersion: String = "",
-        commandSeq: UInt64 = 0,
-        permitGeneration: UInt64 = 0,
-        completion: @escaping (Bool) -> Void
-    ) {
-        let msg: [String: Any] = [
-            "action": "revoke_channel",
-            "reason": reason,
-            "policy_version": policyVersion,
-            "command_seq": commandSeq,
-            "permit_generation": permitGeneration
-        ]
-        sendProviderMessage(msg) { result in
-            switch result {
-            case .success(let resp):
-                let status = resp["status"] as? String
-                // Both "revoked" (immediate) and "disconnecting" (async drain in progress) indicate
-                // that the extension has accepted and is enforcing revocation without bypass.
-                completion(status == "revoked" || status == "disconnecting")
-            case .failure:
-                completion(false)
-            }
-        }
-    }
-
-    /// Synchronizes channel supervision permits and revocation with the network extension.
-    func syncWithChannelPermits(snapshot: ChannelMonitorSnapshot) {
-        for (family, state) in snapshot.families {
-            guard family == "claude" else { continue }
-            let policyVersion = state.applied_policy_version?.policy_digest ?? state.saved_policy_version.policy_digest
-            let commandSeq = state.command_seq
-            let permitGeneration = state.permit_generation
-
-            if state.isPermitted {
-                guard let port = state.local_proxy_port, port > 0 else {
-                    NSLog("[NetworkExtensionHostManager] Gateway port not yet assigned for family %@", family)
-                    continue
-                }
-                guard let deadline = state.valid_until, deadline > state.updated_at else {
-                    NSLog("[NetworkExtensionHostManager] Authoritative lease deadline missing or expired for family %@", family)
-                    continue
-                }
-                let validUntil = Int64(deadline)
-                let allowed = state.active_member_pids
-                self.pushPermit(
-                    validUntil: validUntil,
-                    permitState: "permitted",
-                    allowedPids: allowed,
-                    localProxyPort: port,
-                    policyVersion: policyVersion,
-                    commandSeq: commandSeq,
-                    permitGeneration: permitGeneration
-                ) { [weak self] success in
-                    if !success {
-                        NSLog("[NetworkExtensionHostManager] Failed to push permit to extension for family %@", family)
-                        self?.recordExtensionFailure(reason: "push_permit_rejected_by_extension")
-                    }
-                }
-            } else {
-                self.revokeChannel(
-                    reason: state.reason_code,
-                    policyVersion: policyVersion,
-                    commandSeq: commandSeq,
-                    permitGeneration: permitGeneration
-                ) { [weak self] success in
-                    if !success {
-                        NSLog("[NetworkExtensionHostManager] Failed to revoke channel in extension for family %@", family)
-                        self?.recordExtensionFailure(reason: "revoke_channel_rejected_by_extension")
-                    }
-                }
-            }
-        }
-    }
-
-    /// Records an execution failure back to the shared status file to immediately inform Rust supervisor.
+    /// UI lifecycle status only. Rust authorizes traffic from root executor observations.
     public func recordExtensionFailure(reason: String) {
         DispatchQueue.main.async {
             let failedState = NetworkExtensionActivationState(

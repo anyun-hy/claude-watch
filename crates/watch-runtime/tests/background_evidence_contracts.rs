@@ -251,6 +251,9 @@ impl EvidenceSystem for Fake {
     fn desktop_matches(&mut self, _: &Desktop) -> Result<bool> {
         Ok(self.running)
     }
+    fn channel_process_matches(&mut self, process: &claude_watch_core::channel::BoundProcessToken) -> Result<bool> {
+        Ok(self.running && process.has_verified_audit_token())
+    }
     fn desktop_unique_stamp(&mut self, _: &Desktop) -> Result<Option<String>> {
         Ok(self.running.then(|| "fixture".to_owned()))
     }
@@ -804,6 +807,30 @@ fn gui_fresh_receipts_are_reused_without_duplicate_requests_or_renewing_timestam
     );
     assert_eq!(system.calls, 0);
     assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn channel_sessions_refresh_probes_for_cli_and_desktop_without_a_window_identity() {
+    use claude_watch_core::{channel::BoundProcessToken, processes::ProcessRole};
+    for role in [ProcessRole::Cli, ProcessRole::DesktopMain] {
+        let fixture = Fixture::new(); fixture.active(1000.);
+        let sessions = SessionStore::new(fixture.store.clone());
+        let mut session = sessions.load(1001.).unwrap().unwrap();
+        let token = BoundProcessToken::with_system_identity(7200, 501, 900, 1, role)
+            .with_audit_token([501, 501, 20, 501, 20, 7200, 0, 9]);
+        session.desktop = None; session.launcher = None;
+        session.extra.insert("channel_processes_v1".into(), json!([token]));
+        fixture.store.atomic_json(&fixture.store.paths.session(), &serde_json::to_value(&session).unwrap()).unwrap();
+        let mut system = Fake::default(); system.now = 1065.;
+        let refreshed = background_evidence::refresh_active_session(&fixture.store, &mut system).unwrap();
+        assert_eq!(refreshed["count"], 2, "CLI and desktop channel sessions both need periodic DNS/WebRTC evidence");
+        assert_eq!(refreshed["status"], "ok");
+        assert_eq!(system.calls, 2);
+        system.now = 1130.; system.running = false;
+        let stopped = background_evidence::refresh_active_session(&fixture.store, &mut system).unwrap();
+        assert_eq!(stopped["count"], 0);
+        assert_eq!(system.calls, 2, "unconfirmed or exited member cannot initiate background collection");
+    }
 }
 
 #[test]

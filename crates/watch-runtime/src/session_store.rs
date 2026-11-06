@@ -1,4 +1,5 @@
 use crate::storage::StateStore;
+use claude_watch_core::channel::BoundProcessToken;
 use claude_watch_core::error::{CoreError, Result};
 use claude_watch_core::policy::PolicyCatalog;
 use claude_watch_core::processes::{LaunchTarget, Provider};
@@ -8,6 +9,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub mod desktop_groups;
+const CHANNEL_PROCESSES_KEY: &str = "channel_processes_v1";
 
 pub struct SessionStore {
     pub storage: StateStore,
@@ -48,6 +50,7 @@ impl SessionStore {
             .map_err(|_| CoreError::new("invalid_session", "受控会话记录格式无效"))?;
         session.validate(now)?;
         desktop_groups::desktop_members(&session)?;
+        Self::channel_processes(&session)?;
         if desktop_groups::has_desktop_group(&session) && self.family != "openai" {
             return Err(CoreError::new("invalid_session", "多桌面集合不属于此策略服务"));
         }
@@ -79,6 +82,80 @@ impl SessionStore {
         current: &Value,
         now: f64,
     ) -> Result<Session> {
+        self.begin_verified_inner(receipts, audit, current, now, None)
+    }
+    /// Every discovered family member needs the same fresh evidence, without
+    /// inventing a desktop/launcher or requiring a controlled launch.
+    pub(crate) fn begin_channel_verified(
+        &self,
+        receipts: &crate::receipt_store::ReceiptStore,
+        audit: &Value,
+        current: &Value,
+        processes: &[BoundProcessToken],
+        now: f64,
+    ) -> Result<Session> {
+        if processes.is_empty() || processes.len() > 2048
+            || processes.iter().any(|p| !p.has_verified_audit_token()) {
+            return Err(CoreError::new("channel_identity_unavailable", "通道缺少已验证进程身份"));
+        }
+        self.begin_verified_inner(receipts, audit, current, now, Some(processes))
+    }
+    pub(crate) fn channel_processes(value: &Session) -> Result<Option<Vec<BoundProcessToken>>> {
+        let Some(raw) = value.extra.get(CHANNEL_PROCESSES_KEY) else { return Ok(None); };
+        let processes: Vec<BoundProcessToken> = serde_json::from_value(raw.clone())
+            .map_err(|_| CoreError::new("invalid_session", "通道进程集合无效"))?;
+        if processes.is_empty()
+            || processes.len() > 2048 || processes.iter().any(|p| !p.has_verified_audit_token()) {
+            return Err(CoreError::new("invalid_session", "通道进程身份无效"));
+        }
+        Ok(Some(processes))
+    }
+    pub(crate) fn reconcile_channel_processes(&self, processes: &[BoundProcessToken], now: f64) -> Result<()> {
+        let _lock = self.storage.lock(&self.lock_name(), None)?;
+        let Some(mut value) = self.load(now)? else { return Ok(()); };
+        if value.state == Phase::Ended { return Ok(()); }
+        let bound = match Self::channel_processes(&value)? {
+            Some(bound) => bound,
+            None if matches!(value.state, Phase::Active | Phase::Locked) => {
+                let desktops = value.desktop_members()?;
+                let bound: Vec<_> = processes.iter().filter(|p| desktops.iter().any(|d|
+                    d.pid == p.pid && d.start_seconds == p.start_seconds && d.start_microseconds == p.start_microseconds))
+                    .cloned().collect();
+                if bound.is_empty() { return Ok(()); }
+                bound
+            }
+            None => return Ok(()),
+        };
+        if processes.iter().any(|p| !p.has_verified_audit_token()) { return Ok(()); }
+        if !bound.iter().any(|p| processes.contains(p)) {
+            // This ends only the stale permission record, never a process.
+            value.state = Phase::Ended;
+            value.extra.insert("ended_at".into(), json!(now));
+        } else {
+            if value.extra.contains_key(CHANNEL_PROCESSES_KEY) && bound == processes
+                && value.desktop.is_none() && value.launcher.is_none()
+                && !value.extra.contains_key(session::GROUP_KEY) {
+                return Ok(());
+            }
+            value.extra.insert(CHANNEL_PROCESSES_KEY.into(), json!(processes));
+            // These fields describe the old desktop lifecycle. Channel
+            // continuity and UI membership now use the observed process set.
+            value.desktop = None;
+            value.launcher = None;
+            for key in [session::GROUP_KEY, session::GROUP_RECHECK_KEY, session::GROUP_CONTINUITY_KEY] {
+                value.extra.remove(key);
+            }
+        }
+        self.save(&value)
+    }
+    fn begin_verified_inner(
+        &self,
+        receipts: &crate::receipt_store::ReceiptStore,
+        audit: &Value,
+        current: &Value,
+        now: f64,
+        channel_processes: Option<&[BoundProcessToken]>,
+    ) -> Result<Session> {
         if audit["grants_launch_permission"] == false
             || audit
                 .get("purpose")
@@ -95,7 +172,7 @@ impl SessionStore {
                 "展示结果不能授予启动许可，必须重新执行完整预检",
             ));
         }
-        self.require_audit_family(audit, None)?;
+        self.require_audit_family_scope(audit, None, channel_processes.is_some())?;
         let context = audit
             .get("context_id")
             .and_then(Value::as_str)
@@ -109,10 +186,19 @@ impl SessionStore {
         let _lock = self.storage.lock(&self.lock_name(), None)?;
         let mut session = session::begin(audit, current, &risk, &Uuid::new_v4().to_string(), now)?;
         Self::anchor_probe_baseline(&mut session, receipts, now);
+        if let Some(processes) = channel_processes {
+            session.state = Phase::Active;
+            session.bound_at = Some(now);
+            session.extra.insert(CHANNEL_PROCESSES_KEY.into(), json!(processes));
+            session.extra.insert("adopted_from".into(), json!("running_processes"));
+        }
         self.save(&session)?;
         Ok(session)
     }
     fn require_audit_family(&self, audit: &Value, provider: Option<Provider>) -> Result<()> {
+        self.require_audit_family_scope(audit, provider, false)
+    }
+    fn require_audit_family_scope(&self, audit: &Value, provider: Option<Provider>, allow_cli: bool) -> Result<()> {
         let mismatch = || CoreError::new("launch_target_mismatch", "启动审计、会话服务与授权范围不一致");
         // Only a genuinely absent target has the legacy Claude meaning.
         // Invalid, unknown or CLI targets cannot create a desktop session.
@@ -120,7 +206,7 @@ impl SessionStore {
             None => LaunchTarget::ClaudeDesktop,
             Some(value) => value.as_str().and_then(LaunchTarget::parse).ok_or_else(mismatch)?,
         };
-        if target.cli()
+        if (target.cli() && !allow_cli)
             || PolicyCatalog::family_for(target.provider()).map(|f| f.id) != Some(self.family)
             || provider.is_some_and(|p| PolicyCatalog::family_for(p).map(|f| f.id) != Some(self.family))
         {

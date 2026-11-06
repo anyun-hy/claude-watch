@@ -342,6 +342,13 @@ impl Controller {
         let result: Result<()> = (|| {
             let mut desktops = system.desktops()?;
             let mut current = sessions.load(system.now())?;
+            if system.delegates_slow_audit_to_worker()
+                && current.as_ref().is_some_and(|s| s.extra.contains_key("channel_processes_v1")) {
+                // CLI channel sessions belong to the supervisor. Desktop
+                // lifecycle handling must not end or replace them on its own.
+                receipt["session"] = json!(current);
+                return Ok(());
+            }
             let mut identity_unconfirmed = false;
             let mut exit_pending = false;
             let group_round = self.prepare_desktop_group(
@@ -948,7 +955,7 @@ impl Controller {
                 let context_id = candidate
                     .context_id
                     .clone()
-                    .unwrap_or_else(|| "recovered-ctx".into());
+                    .unwrap_or_default();
                 match verify_channel_recovery(
                     prev,
                     prev_revoked_at.unwrap_or(prev.issued_at),
@@ -1088,6 +1095,24 @@ impl Controller {
         }
         if let Ok(value) = serde_json::to_value(&verdict) {
             receipt["channel_supervision"] = value;
+        }
+        if system.delegates_slow_audit_to_worker()
+            && latest_session.is_some_and(|s| s.extra.contains_key("channel_processes_v1")) {
+            let (status, guard_state) = match &verdict {
+                ChannelSupervisionVerdict::ForwardingVerified => ("ok", "safe"),
+                ChannelSupervisionVerdict::IsolatedKeepProcess => ("protection_triggered", "locked"),
+                ChannelSupervisionVerdict::PendingIsolation { .. } => ("protection_triggered", "pending"),
+                ChannelSupervisionVerdict::PendingVerification { .. } if effective_permit.reason_code == "idle_no_process" => ("ok", "idle"),
+                ChannelSupervisionVerdict::PendingVerification { .. } => ("pending", "pending"),
+                ChannelSupervisionVerdict::EnforcementFailed { .. } => ("protection_unavailable", "unknown"),
+            };
+            receipt["status"] = json!(status);
+            receipt["session_id"] = json!(effective_permit.session_id);
+            receipt["session_guard"] = json!({"state":guard_state,
+                "phase":latest_session.map(|s| s.state), "baseline":latest_session.map(|s| &s.baseline),
+                "reason":{"code":effective_permit.reason_code,"detail":verdict.display_state().label_zh()}});
+            receipt["channel_state"] = json!(verdict.display_state());
+            receipt["channel_status_label"] = json!(verdict.display_state().label_zh());
         }
 
         if system.channel_mode() {

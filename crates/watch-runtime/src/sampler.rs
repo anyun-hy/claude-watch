@@ -40,14 +40,7 @@ fn command_path(command: &str, cwd: Option<&str>) -> Option<String> {
 }
 pub(crate) fn cli_paths(paths: &Paths) -> TrustedCliPaths {
     let mut known = TrustedCliPaths::default();
-    for (file, claude) in [
-        (paths.home.join(".local/bin/claude"), true),
-        (paths.home.join(".claude/local/claude"), true),
-        (PathBuf::from("/opt/homebrew/bin/claude"), true),
-        (PathBuf::from("/usr/local/bin/claude"), true),
-        (PathBuf::from("/opt/homebrew/bin/codex"), false),
-        (PathBuf::from("/usr/local/bin/codex"), false),
-    ] {
+    for (file, claude) in process_roots::cli_aliases(&paths.home) {
         if let Some(path) = canonical(&file) {
             let path = path.to_string_lossy().into_owned();
             if claude {
@@ -371,6 +364,9 @@ impl<R: ReadRunner> Sampler<R> {
             complete,
             observed_at: native::now(),
         })
+    }
+    pub(crate) fn retain_channel_targets(&mut self, tracked: &[Target]) {
+        self.tracked = tracked.to_vec();
     }
     pub fn sockets(&self, round: &ProcessRound) -> Result<SocketRound> {
         if round.targets.is_empty() {

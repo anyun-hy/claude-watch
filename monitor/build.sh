@@ -8,16 +8,51 @@ CW_BUILD_ARCH="${CW_BUILD_ARCH:-arm64}"
 CW_BACKEND_VARIANT="${CW_BACKEND_VARIANT:-rust-candidate}"
 BACKGROUND_EVIDENCE_SCHEMA=0
 CW_TARGETS="$CW_BUILD_ARCH"
-# Production extension deployment requires a Developer ID, two approved
-# provisioning profiles, and entitlements. Ad-hoc builds are development-only.
-CW_CODESIGN_IDENTITY="${CW_CODESIGN_IDENTITY:--}"
-if [[ "$CW_CODESIGN_IDENTITY" != "-" ]]; then
-  : "${CW_HOST_PROFILE:?Set CW_HOST_PROFILE for the signed host app}"
-  : "${CW_EXTENSION_PROFILE:?Set CW_EXTENSION_PROFILE for the signed system extension}"
-  [[ -f "$CW_HOST_PROFILE" && -f "$CW_EXTENSION_PROFILE" ]] || {
-    echo 'Both provisioning profiles must exist for a signed NetworkExtension build.' >&2
-    exit 1
-  }
+# Accept both published spellings, but never silently select conflicting inputs.
+if [[ -n "${CW_SIGNING_IDENTITY:-}" && -n "${CW_CODESIGN_IDENTITY:-}" && "$CW_SIGNING_IDENTITY" != "$CW_CODESIGN_IDENTITY" ]] ||
+   [[ -n "${CW_HOST_PROVISION_PROFILE:-}" && -n "${CW_HOST_PROFILE:-}" && "$CW_HOST_PROVISION_PROFILE" != "$CW_HOST_PROFILE" ]] ||
+   [[ -n "${CW_EXTENSION_PROVISION_PROFILE:-}" && -n "${CW_EXTENSION_PROFILE:-}" && "$CW_EXTENSION_PROVISION_PROFILE" != "$CW_EXTENSION_PROFILE" ]]; then
+  echo 'Conflicting signing identity/profile aliases.' >&2
+  exit 1
+fi
+CW_SIGNING_IDENTITY="${CW_SIGNING_IDENTITY:-${CW_CODESIGN_IDENTITY:--}}"
+CW_HOST_PROVISION_PROFILE="${CW_HOST_PROVISION_PROFILE:-${CW_HOST_PROFILE:-}}"
+CW_EXTENSION_PROVISION_PROFILE="${CW_EXTENSION_PROVISION_PROFILE:-${CW_EXTENSION_PROFILE:-}}"
+CW_SIGN_OPTIONS=()
+CW_EXTENSION_MACH_SERVICE=io.local.watchpanel.network-extension
+if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
+  : "${CW_HOST_PROVISION_PROFILE:?Set the Developer ID profile for io.local.watchpanel}"
+  : "${CW_EXTENSION_PROVISION_PROFILE:?Set the Developer ID profile for io.local.watchpanel.network-extension}"
+  [[ -f "$CW_HOST_PROVISION_PROFILE" && -f "$CW_EXTENSION_PROVISION_PROFILE" ]] || { echo 'Signing profiles are unavailable.' >&2; exit 1; }
+  mkdir -p "$ROOT/build/channel-signing"
+  CW_EXTENSION_MACH_SERVICE=$(python3 - "$ROOT" "$CW_HOST_PROVISION_PROFILE" "$CW_EXTENSION_PROVISION_PROFILE" <<'PY'
+import datetime, pathlib, plistlib, subprocess, sys
+root = pathlib.Path(sys.argv[1])
+teams = set()
+for kind, bundle, profile_path in zip(('Host', 'Extension'), ('io.local.watchpanel', 'io.local.watchpanel.network-extension'), sys.argv[2:]):
+    decoded = subprocess.run(['/usr/bin/security', 'cms', '-D', '-i', profile_path], check=True, capture_output=True).stdout
+    profile = plistlib.loads(decoded)
+    permitted = profile['Entitlements']
+    team = permitted['com.apple.developer.team-identifier']
+    if not team.isalnum() or len(team) != 10:
+        raise SystemExit('Invalid signing team')
+    teams.add(team)
+    app_id = permitted.get('com.apple.application-identifier')
+    if app_id != f'{team}.{bundle}' or profile['ExpirationDate'].replace(tzinfo=datetime.timezone.utc) <= datetime.datetime.now(datetime.timezone.utc):
+        raise SystemExit('Wrong or expired NetworkExtension provisioning profile')
+    requested = plistlib.loads((root / 'Signing' / f'{kind}.entitlements').read_bytes())
+    for key, value in requested.items():
+        if isinstance(value, list):
+            if not all(item in permitted.get(key, []) for item in value): raise SystemExit('Profile lacks the required NetworkExtension entitlement')
+        elif permitted.get(key) != value: raise SystemExit('Profile lacks system-extension installation entitlement')
+    requested['com.apple.application-identifier'] = app_id
+    requested['com.apple.developer.team-identifier'] = team
+    (root / 'build/channel-signing' / f'{kind}.entitlements').write_bytes(plistlib.dumps(requested))
+if len(teams) != 1: raise SystemExit('Host and extension must use the same signing team')
+print(f'{teams.pop()}.io.local.watchpanel.network-extension')
+PY
+)
+  CW_SIGN_OPTIONS=(--timestamp --options runtime)
 fi
 # The Python backend is retired: the app ships the Rust engine only. A build
 # that asks for anything else is a stale command line, not a supported target.
@@ -99,7 +134,7 @@ for CW_TARGET_ARCH in $CW_TARGETS; do
   # Build the NetworkExtension system extension target
   "$SWIFTC" -swift-version 5 -O -parse-as-library \
     -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
-    -framework NetworkExtension "$ROOT/SystemExtension/WatchChannelExtension.swift" \
+    -framework NetworkExtension "$ROOT"/SystemExtension/*.swift \
     -o "$ROOT/build/WatchChannelExtension.$CW_TARGET_ARCH"
 done
 cp "$ROOT/build/ClaudeWatchMonitor.$CW_BUILD_ARCH" "$APP/Contents/MacOS/ClaudeWatchMonitor"
@@ -120,7 +155,7 @@ cat > "$SYSEXT_DIR/Contents/Info.plist" <<PLIST
 <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
 <key>NetworkExtension</key>
 <dict>
-    <key>NEMachServiceName</key><string>io.local.watchpanel.network-extension</string>
+    <key>NEMachServiceName</key><string>$CW_EXTENSION_MACH_SERVICE</string>
     <key>NEProviderClasses</key>
     <dict>
         <key>com.apple.networkextension.app-proxy</key><string>WatchChannelExtension</string>
@@ -128,14 +163,11 @@ cat > "$SYSEXT_DIR/Contents/Info.plist" <<PLIST
 </dict>
 </dict></plist>
 PLIST
-if [[ "$CW_CODESIGN_IDENTITY" != "-" ]]; then
-  cp "$CW_EXTENSION_PROFILE" "$SYSEXT_DIR/Contents/embedded.provisionprofile"
-  /usr/bin/codesign --force --options runtime --sign "$CW_CODESIGN_IDENTITY" \
-    --entitlements "$ROOT/Signing/Extension.entitlements" "$SYSEXT_DIR"
-  /usr/bin/codesign --verify --strict --verbose=2 "$SYSEXT_DIR"
+if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
+  cp "$CW_EXTENSION_PROVISION_PROFILE" "$SYSEXT_DIR/Contents/embedded.provisionprofile"
+  /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" "${CW_SIGN_OPTIONS[@]}" --entitlements "$ROOT/build/channel-signing/Extension.entitlements" "$SYSEXT_DIR"
 else
   /usr/bin/codesign --force --sign - "$SYSEXT_DIR"
-  echo 'WARNING: ad-hoc system extension is not eligible for production activation.' >&2
 fi
 cp "$ROOT/Resources/webrtc_probe.html" "$ROOT/Resources/webrtc_probe.js" "$APP/Contents/Resources/"
 cp "$ROOT/Resources/netcoffee_probe.html" "$ROOT/Resources/netcoffee_probe.js" "$ROOT/Resources/netcoffee_probe.css" "$ROOT/Resources/watch-admin.sh" "$APP/Contents/Resources/"
@@ -158,8 +190,17 @@ for key in ("engine", "native_observer", "process_control"):
     destination.chmod(0o700)
 PY
 chmod 700 "$APP/Contents/Resources/watch-process-control" "$APP/Contents/Resources/watch-admin.sh" "$APP/Contents/Resources/watch-leak-worker"
-/usr/bin/codesign --force --sign "$CW_CODESIGN_IDENTITY" "$APP/Contents/Resources/watch-process-control"
-/usr/bin/codesign --force --sign "$CW_CODESIGN_IDENTITY" "$APP/Contents/Resources/watch-leak-worker"
+if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
+  for CW_COMPONENT in watch-engine watch-native-observer watch-process-control watch-leak-worker; do
+    CW_COMPONENT_ID="io.local.watchpanel.$CW_COMPONENT"
+    if [[ "$CW_COMPONENT" == watch-engine ]]; then CW_COMPONENT_ID=io.local.watchpanel.engine; fi
+    /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" "${CW_SIGN_OPTIONS[@]}" --identifier "$CW_COMPONENT_ID" "$APP/Contents/Resources/$CW_COMPONENT"
+  done
+  BACKEND_SHA256=$(/usr/bin/shasum -a 256 "$APP/Contents/Resources/watch-engine" | /usr/bin/awk '{print $1}')
+else
+  /usr/bin/codesign --force --sign - "$APP/Contents/Resources/watch-process-control"
+  /usr/bin/codesign --force --sign - "$APP/Contents/Resources/watch-leak-worker"
+fi
 cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/"
 mkdir -p "$APP/Contents/Resources/Icons"
 mkdir -p "$APP/Contents/Resources/Identity"
@@ -208,13 +249,13 @@ files = [root / n for n in ("watch-engine", "watch-native-observer", "watch-admi
 value["RuntimeHashes"] = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
 manifest.write_bytes(plistlib.dumps(value))
 PY
-if [[ "$CW_CODESIGN_IDENTITY" != "-" ]]; then
-  cp "$CW_HOST_PROFILE" "$APP/Contents/embedded.provisionprofile"
-  /usr/bin/codesign --force --options runtime --sign "$CW_CODESIGN_IDENTITY" \
-    --entitlements "$ROOT/Signing/Host.entitlements" "$APP"
-  /usr/bin/codesign --verify --strict --deep --verbose=2 "$APP"
-  /usr/bin/codesign -d --entitlements :- "$APP" >/dev/null
+if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
+  cp "$CW_HOST_PROVISION_PROFILE" "$APP/Contents/embedded.provisionprofile"
+  /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" "${CW_SIGN_OPTIONS[@]}" --entitlements "$ROOT/build/channel-signing/Host.entitlements" "$APP"
+  /usr/bin/codesign --verify --strict "$SYSEXT_DIR"
+  /usr/bin/codesign --verify --strict "$APP"
 else
   /usr/bin/codesign --force --sign - "$APP"
+  echo 'Development signature only: system interception is unavailable until signed, provisioned and activated.' >&2
 fi
 printf 'Built: %s (app %s; backend %s)\n' "$APP" "$APP_VERSION" "$BACKEND_VERSION"

@@ -96,6 +96,9 @@ pub trait EvidenceSystem {
     fn local(&mut self, config: &Config) -> Result<Value>;
     fn desktop_matches(&mut self, desktop: &Desktop) -> Result<bool>;
     fn desktop_unique_stamp(&mut self, desktop: &Desktop) -> Result<Option<String>>;
+    fn channel_process_matches(&mut self, _process: &claude_watch_core::channel::BoundProcessToken) -> Result<bool> {
+        Ok(false)
+    }
     /// Complete native membership, not just the representative PID. Adapters
     /// which cannot enumerate a group must explicitly decline it.
     fn desktop_group_stamps(&mut self, members: &[Desktop]) -> Result<Option<Vec<(Desktop, String)>>> {
@@ -182,6 +185,12 @@ fn refreshable(session: &Session, config: &Config, provider: Provider) -> bool {
 }
 
 fn matching_desktops<S: EvidenceSystem>(system: &mut S, session: &Session) -> Result<bool> {
+    if let Some(processes) = SessionStore::channel_processes(session)? {
+        for process in &processes {
+            if system.channel_process_matches(process)? { return Ok(true); }
+        }
+        return Ok(false);
+    }
     if has_desktop_group(session) {
         let members = desktop_members(session)?;
         let Some(bindings) = system.desktop_group_stamps(&members)? else { return Ok(false) };
@@ -254,8 +263,15 @@ pub fn refresh_active_session<S: EvidenceSystem>(
     else {
         return Ok(json!({"status":"idle","count":0}));
     };
-    let Some(desktop) = session.desktop.as_ref() else {
+    let channel_bound = SessionStore::channel_processes(&session)?.is_some();
+    let desktop = session.desktop.as_ref();
+    if !channel_bound && desktop.is_none() {
         return Err(err("evidence_identity_unknown", "受控会话缺少主进程身份"));
+    }
+    let binding_matches = |s: &Session| if channel_bound {
+        SessionStore::channel_processes(s).ok().flatten().is_some()
+    } else {
+        s.desktop.as_ref() == desktop && s.extra.get("desktop_group_v1") == session.extra.get("desktop_group_v1")
     };
     let grouped = has_desktop_group(&session);
     let rechecking = session.state == Phase::Rechecking || group_rechecking(&session);
@@ -280,7 +296,7 @@ pub fn refresh_active_session<S: EvidenceSystem>(
             .to_owned();
         if !sessions.recheck_context(
             &session.session_id,
-            desktop,
+            desktop.ok_or_else(|| err("evidence_identity_unknown", "复核会话缺少主进程身份"))?,
             &current_context,
             system.now(),
         )? {
@@ -328,9 +344,8 @@ pub fn refresh_active_session<S: EvidenceSystem>(
             refreshable(s, &current, provider)
                 && s.context_id == evidence_context
                 && s.session_id == session.session_id
-                && s.desktop.as_ref() == Some(desktop)
-                && s.extra.get("desktop_group_v1") == session.extra.get("desktop_group_v1")
-        }) || !matching_desktops(system, &session)?
+                && binding_matches(s)
+        }) || !matching_desktops(system, active.as_ref().unwrap_or(&session))?
         {
             return Err(err(
                 "evidence_session_changed",
@@ -352,12 +367,12 @@ pub fn refresh_active_session<S: EvidenceSystem>(
                 if !latest.enabled || !latest.guard_enabled || guard_policy_digest(&latest)? != policy {
                     return Err(err("evidence_policy_changed", "采集期间保护策略已变化"));
                 }
-                if !sessions.load(system.now())?.as_ref().is_some_and(|s| {
+                let current_session = sessions.load(system.now())?;
+                if !current_session.as_ref().is_some_and(|s| {
                     refreshable(s, &latest, provider)
                         && s.context_id == evidence_context
-                        && s.desktop.as_ref() == Some(desktop)
-                        && s.extra.get("desktop_group_v1") == session.extra.get("desktop_group_v1")
-                }) {
+                        && binding_matches(s)
+                }) || (channel_bound && !matching_desktops(system, current_session.as_ref().unwrap_or(&session))?) {
                     return Err(err("evidence_session_changed", "采集期间受控会话已变化"));
                 }
                 let receipts = ReceiptStore { storage: store.clone() };
@@ -407,6 +422,7 @@ pub fn refresh_active_session<S: EvidenceSystem>(
             sessions.complete_group_recheck(&session, &bindings, &audit, &egress,
                 system.now(), system.supervised_provider())?
         } else {
+            let desktop = desktop.ok_or_else(|| err("evidence_identity_unknown", "复核会话缺少主进程身份"))?;
             let Some(stamp) = system.desktop_unique_stamp(desktop)? else {
                 return Err(err("evidence_session_changed", "重新校验期间进程已变化"));
             };

@@ -1,4 +1,5 @@
 mod ai_dispatch;
+mod channel_audit;
 mod coffee_dispatch;
 mod daemon_run;
 mod evidence_run;
@@ -204,6 +205,11 @@ fn run() -> Result<EngineOutput> {
             })
         })
         .collect::<Result<_>>()?;
+    if args.first().map(String::as_str) == Some("--channel-audit-worker") {
+        if args.len() != 2 { return Err(CoreError::new("invalid_audit_request", "审计组件参数无效")); }
+        let value = channel_audit::worker(&args[1], bounded_input(4096)?)?;
+        return Ok(EngineOutput::json(value, 0));
+    }
     if args == ["--version"] {
         return Ok(EngineOutput::json(
             json!({"schema":1,"status":"ok","engine":"rust","version":env!("CARGO_PKG_VERSION"),"backend_version":claude_watch_runtime::monitor_snapshot::VERSION,"runtime_schema":2,"migration_complete":false}),

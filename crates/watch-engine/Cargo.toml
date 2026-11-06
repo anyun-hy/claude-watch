@@ -12,6 +12,7 @@ claude-watch-runtime = { path = "../watch-runtime" }
 claude-watch-installer = { path = "../watch-installer" }
 serde_json.workspace = true
 uuid = { version = "1", features = ["v4"] }
+claude-watch-system = { path = "../watch-system" }
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }

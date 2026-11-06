@@ -26,6 +26,7 @@ use claude_watch_core::{
     config::Config,
     error::{CoreError, Result},
     policy::PolicyCatalog,
+    processes::LaunchTarget,
     session::{self, Desktop, Egress, Phase},
 };
 use serde_json::{json, Value};
@@ -73,6 +74,10 @@ pub enum SupervisionEvent {
         processes: Vec<BoundProcessToken>,
         observed_at: f64,
     },
+    ProcessInventoryUnavailable {
+        family: String,
+        observed_at: f64,
+    },
     PolicyUpdated {
         config: Config,
         observed_at: f64,
@@ -108,6 +113,7 @@ pub enum SupervisionEvent {
 pub struct AsyncAuditRequest {
     pub request_id: u64,
     pub family: String,
+    pub target: LaunchTarget,
     pub session_id: Option<String>,
     pub context_id: Option<String>,
     pub policy_version: PolicyVersion,
@@ -120,6 +126,7 @@ impl PartialEq for AsyncAuditRequest {
     fn eq(&self, other: &Self) -> bool {
         self.request_id == other.request_id
             && self.family == other.family
+            && self.target == other.target
             && self.session_id == other.session_id
             && self.context_id == other.context_id
             && self.policy_version == other.policy_version
@@ -144,6 +151,8 @@ struct FamilyRuntimeTrack {
     command_seq: u64,
     desktops: Vec<(Desktop, bool, String)>,
     processes: Vec<BoundProcessToken>,
+    inventory_failed: bool,
+    commanded_processes: Vec<BoundProcessToken>,
     current_permit: Option<ChannelPermit>,
     latest_receipt: Option<ChannelEnforcementReceipt>,
     applied_policy_version: Option<PolicyVersion>,
@@ -164,6 +173,8 @@ impl FamilyRuntimeTrack {
             command_seq: 0,
             desktops: Vec::new(),
             processes: Vec::new(),
+            inventory_failed: false,
+            commanded_processes: Vec::new(),
             current_permit: None,
             latest_receipt: None,
             applied_policy_version: None,
@@ -188,7 +199,7 @@ pub struct ChannelSupervisor {
     next_audit_request_id: u64,
     config: Config,
     saved_policy_version: PolicyVersion,
-    latest_egress: Value,
+    latest_egress: BTreeMap<String, Value>,
     latest_local_guard: Value,
     upstream_endpoint: String,
     tracks: BTreeMap<String, FamilyRuntimeTrack>,
@@ -235,7 +246,7 @@ impl ChannelSupervisor {
             next_audit_request_id: 0,
             config,
             saved_policy_version,
-            latest_egress: json!({"state": "unknown"}),
+            latest_egress: BTreeMap::new(),
             latest_local_guard: json!({"proxy": "ok", "tun": "ok"}),
             upstream_endpoint,
             tracks,
@@ -307,112 +318,81 @@ impl ChannelSupervisor {
         let handle = thread::Builder::new()
             .name("channel-async-audit-worker".into())
             .spawn(move || {
-                let mut detached_runners: Vec<(Arc<AtomicBool>, thread::JoinHandle<()>)> = Vec::new();
+                let mut retiring: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)> = None;
                 while !stop.load(Ordering::Acquire) {
-                    let mut idx = 0;
-                    while idx < detached_runners.len() {
-                        if detached_runners[idx].1.is_finished() {
-                            let (_, handle) = detached_runners.swap_remove(idx);
-                            let _ = handle.join();
-                        } else {
-                            idx += 1;
-                        }
+                    if retiring.as_ref().is_some_and(|(_, h)| h.is_finished()) {
+                        let (_, handle) = retiring.take().unwrap();
+                        let _ = handle.join();
                     }
-
-                    let Ok(req) = req_rx.recv_timeout(std::time::Duration::from_millis(50)) else {
-                        continue;
+                    let Ok(req) = req_rx.recv_timeout(std::time::Duration::from_millis(50)) else { continue; };
+                    if stop.load(Ordering::Acquire) { break; }
+                    let send = |outcome, completed_at| {
+                        let _ = event_tx.send(SupervisionEvent::AsyncAuditCompleted {
+                            request_id: req.request_id, family: req.family.clone(), session_id: req.session_id.clone(),
+                            policy_version: req.policy_version.clone(), requested_at: req.requested_at, outcome, completed_at,
+                        });
                     };
-                    if stop.load(Ordering::Acquire) {
-                        break;
+                    // Never accumulate abandoned runners. The production runner
+                    // cancels and reaps its subprocess group before returning.
+                    if retiring.is_some() {
+                        send(AsyncAuditOutcome::Failed { code: "audit_cleanup_pending".into(),
+                            detail: "前次审计尚未回收，保持断流".into() }, crate::native::now());
+                        continue;
                     }
                     let runner = Arc::clone(&run_audit);
                     let (result_tx, result_rx) = mpsc::channel();
                     let cancellation = Arc::new(AtomicBool::new(false));
                     let mut req_clone = req.clone();
                     req_clone.cancellation = Some(cancellation.clone());
-                    let start_instant = std::time::Instant::now();
-                    let runner_thread = thread::Builder::new()
-                        .name("channel-audit-runner".into())
-                        .spawn(move || {
-                            let res = runner(&req_clone);
-                            let _ = result_tx.send(res);
-                        });
-
-                    let timeout = if req.timeout_seconds > 0.0 {
-                        std::time::Duration::from_secs_f64(req.timeout_seconds)
-                    } else {
-                        std::time::Duration::from_secs(30)
+                    let started = std::time::Instant::now();
+                    let timeout = std::time::Duration::from_secs_f64(
+                        if req.timeout_seconds.is_finite() && req.timeout_seconds > 0.0 { req.timeout_seconds } else { 30.0 });
+                    let runner_thread = match thread::Builder::new().name("channel-audit-runner".into()).spawn(move || {
+                        let _ = result_tx.send(runner(&req_clone));
+                    }) {
+                        Ok(handle) => handle,
+                        Err(_) => { send(AsyncAuditOutcome::Failed { code: "audit_runner_start_failed".into(),
+                            detail: "审计工作线程启动失败".into() }, crate::native::now()); continue; }
                     };
-
-                    match result_rx.recv_timeout(timeout) {
-                        Ok(Ok((audit, egress, completed_at))) => {
-                            let elapsed = (completed_at - req.requested_at).max(0.0);
-                            let outcome = if req.timeout_seconds > 0.0
-                                && elapsed >= req.timeout_seconds
-                            {
-                                AsyncAuditOutcome::TimedOut {
-                                    elapsed_seconds: elapsed,
-                                }
-                            } else {
-                                AsyncAuditOutcome::Succeeded { audit, egress }
-                            };
-                            let _ = event_tx.send(SupervisionEvent::AsyncAuditCompleted {
-                                request_id: req.request_id,
-                                family: req.family,
-                                session_id: req.session_id,
-                                policy_version: req.policy_version,
-                                requested_at: req.requested_at,
-                                outcome,
-                                completed_at,
-                            });
-                            if let Ok(handle) = runner_thread {
-                                let _ = handle.join();
-                            }
-                        }
-                        Ok(Err(err)) => {
-                            let elapsed = start_instant.elapsed().as_secs_f64();
-                            let completed_at = req.requested_at + elapsed;
-                            let _ = event_tx.send(SupervisionEvent::AsyncAuditCompleted {
-                                request_id: req.request_id,
-                                family: req.family,
-                                session_id: req.session_id,
-                                policy_version: req.policy_version,
-                                requested_at: req.requested_at,
-                                outcome: AsyncAuditOutcome::Failed {
-                                    code: err.code,
-                                    detail: err.message,
-                                },
-                                completed_at,
-                            });
-                            if let Ok(handle) = runner_thread {
-                                let _ = handle.join();
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // Immediate timeout: signal cancellation to underlying task and track runner
+                    loop {
+                        if stop.load(Ordering::Acquire) || started.elapsed() >= timeout {
                             cancellation.store(true, Ordering::Release);
-                            let completed_at = req.requested_at + req.timeout_seconds;
-                            let _ = event_tx.send(SupervisionEvent::AsyncAuditCompleted {
-                                request_id: req.request_id,
-                                family: req.family,
-                                session_id: req.session_id,
-                                policy_version: req.policy_version,
-                                requested_at: req.requested_at,
-                                outcome: AsyncAuditOutcome::TimedOut {
-                                    elapsed_seconds: req.timeout_seconds,
-                                },
-                                completed_at,
-                            });
-                            if let Ok(handle) = runner_thread {
-                                detached_runners.push((cancellation, handle));
+                            if !stop.load(Ordering::Acquire) {
+                                send(AsyncAuditOutcome::TimedOut { elapsed_seconds: started.elapsed().as_secs_f64() }, crate::native::now());
+                            }
+                            break;
+                        }
+                        match result_rx.recv_timeout(std::time::Duration::from_millis(20).min(timeout.saturating_sub(started.elapsed()))) {
+                            Ok(Ok((audit, egress, completed_at))) => {
+                                if completed_at - req.requested_at >= req.timeout_seconds {
+                                    send(AsyncAuditOutcome::TimedOut { elapsed_seconds: (completed_at - req.requested_at).max(0.0) }, completed_at);
+                                } else { send(AsyncAuditOutcome::Succeeded { audit, egress }, completed_at); }
+                                break;
+                            }
+                            Ok(Err(err)) => {
+                                let outcome = if err.code == "audit_cancelled" {
+                                    AsyncAuditOutcome::TimedOut { elapsed_seconds: started.elapsed().as_secs_f64() }
+                                } else { AsyncAuditOutcome::Failed { code: err.code, detail: err.message } };
+                                send(outcome, crate::native::now());
+                                break;
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                send(AsyncAuditOutcome::Failed { code: "audit_runner_disconnected".into(), detail: "审计工作线程异常结束".into() }, crate::native::now());
+                                break;
                             }
                         }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {}
                     }
+                    if runner_thread.is_finished() { let _ = runner_thread.join(); }
+                    else { retiring = Some((cancellation, runner_thread)); }
                 }
-                for (cancel, _handle) in detached_runners {
+                if let Some((cancel, handle)) = retiring {
                     cancel.store(true, Ordering::Release);
-                    let _ = thread::yield_now();
+                    let cleanup_until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                    while !handle.is_finished() && std::time::Instant::now() < cleanup_until {
+                        thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    if handle.is_finished() { let _ = handle.join(); }
                 }
             })
             .map_err(|_| CoreError::new("async_audit_worker_failed", "异步审计工作线程无法启动"))?;
@@ -455,6 +435,7 @@ impl ChannelSupervisor {
         let now = match &event {
             SupervisionEvent::EnvironmentUpdated { observed_at, .. } => *observed_at,
             SupervisionEvent::ProcessInventoryUpdated { observed_at, .. } => *observed_at,
+            SupervisionEvent::ProcessInventoryUnavailable { observed_at, .. } => *observed_at,
             SupervisionEvent::PolicyUpdated { observed_at, .. } => *observed_at,
             SupervisionEvent::NetworkContextChanged { observed_at, .. } => *observed_at,
             SupervisionEvent::ExecutorRestarted { observed_at, .. } => *observed_at,
@@ -500,7 +481,12 @@ impl ChannelSupervisor {
             } => {
                 let fresh_egress =
                     Egress::fresh(&egress, observed_at, session::GUARD_EGRESS_TTL).is_some();
-                self.latest_egress = egress;
+                let measured_family = egress["family"].as_str().unwrap_or("*");
+                if measured_family == "*" {
+                    for family in self.tracks.keys() { self.latest_egress.insert(family.clone(), egress.clone()); }
+                } else {
+                    self.latest_egress.insert(measured_family.to_string(), egress);
+                }
                 self.latest_local_guard = local_guard;
                 let family_ids: Vec<String> = self.tracks.keys().cloned().collect();
                 for family in family_ids {
@@ -524,9 +510,29 @@ impl ChannelSupervisor {
                 processes,
                 observed_at,
             } => {
+                if let Some(spec) = PolicyCatalog::family(&family) {
+                    SessionStore::for_family(self.storage.clone(), spec.id)
+                        .reconcile_channel_processes(&processes, observed_at)?;
+                }
                 if let Some(track) = self.tracks.get_mut(&family) {
+                    if !track.processes.iter().any(|p| processes.contains(p)) && track.processes != processes {
+                        // An audit of a replaced/execed process cannot authorize
+                        // the new instance, even if its PID was reused.
+                        track.audit_in_flight = None;
+                        track.audit_retry_count = 0;
+                        track.audit_retry_not_before = None;
+                    }
                     track.desktops = desktops;
                     track.processes = processes;
+                    track.inventory_failed = false;
+                }
+                self.evaluate_family(&family, observed_at)?;
+            }
+            SupervisionEvent::ProcessInventoryUnavailable { family, observed_at } => {
+                if let Some(track) = self.tracks.get_mut(&family) {
+                    // Retain managed membership; uncertainty revokes permission.
+                    track.inventory_failed = true;
+                    track.audit_in_flight = None;
                 }
                 self.evaluate_family(&family, observed_at)?;
             }
@@ -635,6 +641,27 @@ impl ChannelSupervisor {
         Ok(snap)
     }
 
+    fn load_channel_session(&self, family: &'static str, now: f64) -> Result<Option<session::Session>> {
+        let current = SessionStore::for_family(self.storage.clone(), family).load(now)?;
+        let Some(track) = self.tracks.get(family) else { return Ok(current); };
+        if track.inventory_failed { return Ok(current); }
+        if let Some(session) = current.as_ref() {
+            if session.state == Phase::Ended { return Ok(None); }
+            if let Some(bound) = SessionStore::channel_processes(session)? {
+                if !bound.iter().any(|p| track.processes.contains(p)) {
+                    return Ok(None);
+                }
+            } else if !track.processes.is_empty() && !session.desktop_members()?.iter().any(|d|
+                track.processes.iter().any(|p| p.pid == d.pid && p.start_seconds == d.start_seconds
+                    && p.start_microseconds == d.start_microseconds)) {
+                // A previous desktop's session is not a newly discovered CLI's
+                // permission; establish its own current identity and evidence.
+                return Ok(None);
+            }
+        }
+        Ok(current)
+    }
+
     fn evaluate_family(&mut self, family: &str, now: f64) -> Result<()> {
         let Some(family_spec) = PolicyCatalog::family(family) else {
             return Ok(());
@@ -643,7 +670,11 @@ impl ChannelSupervisor {
         let receipts_store = ReceiptStore {
             storage: self.storage.clone(),
         };
-        let mut session = sessions.load(now)?;
+        let mut session = self.load_channel_session(family_spec.id, now)?;
+        if self.tracks.get(family).is_some_and(|t| t.inventory_failed) {
+            return self.issue_family_command(family, session.as_ref(), ChannelPermitState::Revoked,
+                "channel_inventory_incomplete", now);
+        }
         let provider = family_spec
             .providers
             .first()
@@ -658,17 +689,19 @@ impl ChannelSupervisor {
 
         let local_guard_ok =
             self.latest_local_guard["proxy"] == "ok" && self.latest_local_guard["tun"] == "ok";
-        let fresh_exit = Egress::fresh(&self.latest_egress, now, session::GUARD_EGRESS_TTL);
+        let latest_egress = self.latest_egress.get(family).cloned().unwrap_or(Value::Null);
+        let fresh_exit = Egress::fresh(&latest_egress, now, session::GUARD_EGRESS_TTL);
         let evidence_valid = fresh_exit
             .as_ref()
             .is_some_and(|exit| exit.observed_at + session::GUARD_EGRESS_TTL > now);
-        let path_evidence = serde_json::from_value::<claude_watch_core::channel::ControlledPathEvidence>(self.latest_egress.clone());
+        let path_evidence = serde_json::from_value::<claude_watch_core::channel::ControlledPathEvidence>(latest_egress.clone());
         let path_matches_err = match path_evidence {
             Ok(ref ev) => ev.matches_path(
                 family,
                 &self.upstream_endpoint,
                 &self.saved_policy_version,
-                None,
+                session.as_ref().filter(|s| s.state == Phase::Active).map(|s| s.context_id.as_str())
+                    .or_else(|| self.latest_local_guard["context_id"].as_str()),
                 now,
                 session::GUARD_EGRESS_TTL,
             ).err(),
@@ -678,8 +711,7 @@ impl ChannelSupervisor {
             .as_ref()
             .map(|s| s.context_id.clone())
             .or_else(|| {
-                self.latest_egress
-                    .get("context_id")
+                latest_egress.get("context_id")
                     .and_then(Value::as_str)
                     .map(|s| s.to_string())
             });
@@ -759,7 +791,7 @@ impl ChannelSupervisor {
                 }
                 (ChannelPermitState::Revoked, code)
             }
-        } else if desktops.is_empty() {
+        } else if desktops.is_empty() && self.tracks.get(family).is_none_or(|t| t.processes.is_empty()) {
             (ChannelPermitState::PendingVerification, "idle_no_process".into())
         } else if let Some(s) = session.as_ref() {
             if s.state == Phase::Active && !s.group_rechecking() {
@@ -892,6 +924,11 @@ impl ChannelSupervisor {
         let req = AsyncAuditRequest {
             request_id: self.next_audit_request_id,
             family: family.into(),
+            target: if track.desktops.is_empty() && !track.processes.is_empty() {
+                if family == "claude" { LaunchTarget::ClaudeCli } else { LaunchTarget::CodexCli }
+            } else {
+                PolicyCatalog::family(family).and_then(PolicyCatalog::guard_target).unwrap_or_default()
+            },
             session_id,
             context_id,
             policy_version: self.saved_policy_version.clone(),
@@ -935,12 +972,12 @@ impl ChannelSupervisor {
         let receipts_store = ReceiptStore {
             storage: self.storage.clone(),
         };
-        let current_session = sessions.load(completed_at)?;
+        let current_session = self.load_channel_session(family_spec.id, completed_at)?;
         let current_session_id = current_session.as_ref().map(|s| s.session_id.clone());
 
         // Logic Fix 4: Match `request_id` against `track.audit_in_flight` before
         // clearing `audit_in_flight` or applying the outcome.
-        let (matched_in_flight, stale, timeout_limit) = {
+        let (matched_in_flight, stale, timeout_limit, audit_target) = {
             let Some(track) = self.tracks.get_mut(family) else {
                 return Ok(());
             };
@@ -951,14 +988,15 @@ impl ChannelSupervisor {
                 return Ok(());
             }
             let timeout_limit = in_flight.timeout_seconds;
+            let audit_target = in_flight.target;
             track.audit_in_flight = None;
             let risk_since_request = track
                 .last_risk_at
-                .is_some_and(|risk_at| risk_at >= requested_at);
+                .is_some_and(|risk_at| risk_at > requested_at);
             let is_stale = audit_policy != self.saved_policy_version
-                || (audit_session_id.is_some() && audit_session_id != current_session_id)
+                || audit_session_id != current_session_id
                 || risk_since_request;
-            (true, is_stale, timeout_limit)
+            (true, is_stale, timeout_limit, audit_target)
         };
         if !matched_in_flight || stale {
             return Ok(());
@@ -966,6 +1004,10 @@ impl ChannelSupervisor {
 
         let (audit, egress) = match outcome {
             AsyncAuditOutcome::Succeeded { audit, egress } => {
+                if session::audit_target(&audit) != audit_target {
+                    return self.record_async_audit_failure(family, current_session.as_ref(),
+                        "audit_target_changed", completed_at);
+                }
                 if timeout_limit > 0.0 && (completed_at - requested_at) >= timeout_limit {
                     return self.record_async_audit_failure(
                         family,
@@ -980,7 +1022,7 @@ impl ChannelSupervisor {
                     track.audit_last_failure_code = None;
                 }
                 if Egress::fresh(&egress, completed_at, session::GUARD_EGRESS_TTL).is_some() {
-                    self.latest_egress = egress.clone();
+                    self.latest_egress.insert(family.to_string(), egress.clone());
                 }
                 (audit, egress)
             }
@@ -1012,7 +1054,7 @@ impl ChannelSupervisor {
             .tracks
             .get(family)
             .and_then(|t| t.current_permit.clone())
-            .filter(|p| p.state == ChannelPermitState::Revoked);
+            .filter(|p| p.state == ChannelPermitState::Revoked && current_session.is_some());
 
         if let Some(previous_permit) = was_revoked {
             let revoked_at = self
@@ -1030,12 +1072,17 @@ impl ChannelSupervisor {
                 .get(family)
                 .map(|t| t.command_seq + 1)
                 .unwrap_or(2);
-            let audit_ready = audit["ready"] == true && audit["grants_launch_permission"] == true;
+            // Full AuditStore receipts omit grants_launch_permission; display
+            // receipts explicitly set it false. Match the existing launch
+            // contract instead of requiring a field the producer never emits.
+            let audit_ready = audit["ready"] == true
+                && audit["grants_launch_permission"] != false
+                && audit["policy"].as_str() == Some(audit_policy.policy_digest.as_str())
+                && !matches!(audit["purpose"].as_str(),
+                    Some("environment_detection" | "launch_requirements_preview" | "scoped_detection"))
+                && audit.pointer("/context_transition/state").and_then(Value::as_str) == Some("stable");
             let audit_observed_at = audit["observed_at"].as_f64().unwrap_or(completed_at);
-            let context_id = audit["context_id"]
-                .as_str()
-                .or_else(|| previous_permit.context_id.as_deref())
-                .unwrap_or("recovered-ctx");
+            let context_id = audit["context_id"].as_str().filter(|s| !s.is_empty()).unwrap_or("");
 
             match verify_channel_recovery(
                 &previous_permit,
@@ -1060,6 +1107,7 @@ impl ChannelSupervisor {
                         {
                             let mut restored = s.clone();
                             restored.state = Phase::Active;
+                            restored.context_id = context_id.to_string();
                             restored.baseline = exit;
                             restored.reason = None;
                             let _ = self.storage.atomic_json(
@@ -1085,70 +1133,17 @@ impl ChannelSupervisor {
             return Ok(());
         }
 
-        // Case 2: Initial adoption of newly opened desktop(s)
-        let desktops = self
-            .tracks
-            .get(family)
-            .map(|t| t.desktops.clone())
-            .unwrap_or_default();
-        let mains: Vec<_> = desktops
-            .iter()
-            .filter(|(_, main, _)| *main)
-            .map(|(d, _, _)| d.clone())
-            .collect();
+        // Case 2: One adoption path for desktops, CLIs and retained children.
         if current_session.is_none() {
-            if mains.len() == 1 {
-                let desktop = &mains[0];
-                if let Ok(pending) =
-                    sessions.begin_verified(&receipts_store, &audit, &egress, completed_at)
-                {
-                    let id = pending.session_id.clone();
-                    if sessions
-                        .bind_desktop(&id, desktop.clone(), completed_at)
-                        .is_ok()
-                    {
-                        let _ = sessions.mark_adopted(&id, completed_at);
-                        let adopted_session = sessions.load(completed_at)?;
-                        self.issue_family_command(
-                            family,
-                            adopted_session.as_ref(),
-                            ChannelPermitState::Permitted,
-                            "session_adopted",
-                            completed_at,
-                        )?;
-                        return Ok(());
-                    }
-                }
-                return self.record_async_audit_failure(
-                    family,
-                    None,
-                    "initial_audit_rejected",
-                    completed_at,
-                );
-            } else if mains.len() >= 2 && family == "openai" {
-                if let Ok(Some(adopted_group)) = sessions.adopt_desktop_group(
-                    &receipts_store,
-                    &audit,
-                    &egress,
-                    mains,
-                    &self.config,
-                    completed_at,
-                ) {
-                    self.issue_family_command(
-                        family,
-                        Some(&adopted_group),
-                        ChannelPermitState::Permitted,
-                        "session_adopted",
-                        completed_at,
-                    )?;
+            let processes = self.tracks.get(family).map(|t| t.processes.clone()).unwrap_or_default();
+            if processes.is_empty() { return Ok(()); }
+            match sessions.begin_channel_verified(&receipts_store, &audit, &egress, &processes, completed_at) {
+                Ok(adopted) => {
+                    self.issue_family_command(family, Some(&adopted), ChannelPermitState::Permitted,
+                        "session_adopted", completed_at)?;
                     return Ok(());
                 }
-                return self.record_async_audit_failure(
-                    family,
-                    None,
-                    "initial_group_audit_rejected",
-                    completed_at,
-                );
+                Err(_) => return self.record_async_audit_failure(family, None, "initial_audit_rejected", completed_at),
             }
         }
 
@@ -1199,9 +1194,7 @@ impl ChannelSupervisor {
         reason_code: &str,
         now: f64,
     ) -> Result<()> {
-        let members = match session {
-            Some(s) => s.desktop_members()?,
-            None => self
+        let members = self
                 .tracks
                 .get(family)
                 .map(|t| {
@@ -1211,15 +1204,16 @@ impl ChannelSupervisor {
                         .map(|(d, _, _)| d.clone())
                         .collect()
                 })
-                .unwrap_or_default(),
-        };
+                .unwrap_or_default();
         let session_id = session.map(|s| s.session_id.clone());
+        let context_id = session.map(|s| s.context_id.clone()).filter(|s| !s.is_empty());
+        let baseline_ip = session.map(|s| s.baseline.ip.clone()).filter(|s| !s.is_empty());
 
         // Logic Fix 1: Cap `valid_until` by key evidence expiration time, and
         // refuse to issue `Permitted` if egress evidence has already expired!
         let (effective_desired_state, effective_reason, valid_until) =
             if desired_state == ChannelPermitState::Permitted {
-                match Egress::fresh(&self.latest_egress, now, session::GUARD_EGRESS_TTL) {
+                match Egress::fresh(self.latest_egress.get(family).unwrap_or(&Value::Null), now, session::GUARD_EGRESS_TTL) {
                     Some(exit) if exit.observed_at + session::GUARD_EGRESS_TTL > now => {
                         let evidence_expires_at = exit.observed_at + session::GUARD_EGRESS_TTL;
                         (
@@ -1241,6 +1235,19 @@ impl ChannelSupervisor {
                     now + DEFAULT_PERMIT_TTL,
                 )
             };
+
+        // Do not replace a command on every observation tick: the extension
+        // needs a stable sequence to acknowledge. Renew only near lease expiry.
+        if self.tracks.get(family).is_some_and(|track| {
+            track.current_permit.as_ref().is_some_and(|p| {
+                p.state == effective_desired_state && p.reason_code == effective_reason
+                    && p.session_id == session_id && p.policy_version == self.saved_policy_version
+                    && p.context_id == context_id && p.baseline_ip == baseline_ip
+                    && p.members == members && track.processes == track.commanded_processes
+                    && now >= p.issued_at && (p.state != ChannelPermitState::Permitted
+                        || (p.valid_until > now + DEFAULT_PERMIT_TTL / 2.0 && p.valid_until <= valid_until))
+            })
+        }) { return Ok(()); }
 
         let (permit_generation, command_seq) = {
             let track = self
@@ -1274,12 +1281,8 @@ impl ChannelSupervisor {
             reason_code: effective_reason,
             issued_at: now,
             valid_until,
-            context_id: session
-                .map(|s| s.context_id.clone())
-                .filter(|s| !s.is_empty()),
-            baseline_ip: session
-                .map(|s| s.baseline.ip.clone())
-                .filter(|s| !s.is_empty()),
+            context_id,
+            baseline_ip,
             members,
         };
         self.apply_permit_to_enforcer(family, permit, now)
@@ -1308,6 +1311,7 @@ impl ChannelSupervisor {
             issued_at: now,
         };
         if let Some(track) = self.tracks.get_mut(family) {
+            track.commanded_processes = command.allowed_processes.clone();
             track.session_id = permit.session_id.clone();
             track.permit_generation = permit.permit_generation;
             track.command_seq = permit.command_seq;
@@ -1344,6 +1348,7 @@ impl ChannelSupervisor {
     fn ingest_receipt(&mut self, receipt: ChannelEnforcementReceipt, receiver_now: f64) -> Result<()> {
         let family = receipt.family.clone();
         let expected_boot_id = self.expected_executor_boot_id.clone();
+        let mut autonomous_cutoff = None;
         let accepted = {
             let Some(track) = self.tracks.get_mut(&family) else {
                 return Ok(());
@@ -1366,6 +1371,13 @@ impl ChannelSupervisor {
                     >= permit.issued_at
                     && receipt.observed_at <= receiver_now + CLOCK_ROLLBACK_TOLERANCE_SECONDS
                     && (receiver_now - receipt.observed_at) < MAX_ENFORCEMENT_RECEIPT_AGE;
+                if boot_id_valid && timing_valid && receipt.policy_version == self.saved_policy_version
+                    && receipt.policy_version == permit.policy_version
+                    && receipt.command_seq == permit.command_seq && receipt.permit_generation == permit.permit_generation
+                    && permit.state == ChannelPermitState::Permitted && receipt.permit_state == ChannelPermitState::Revoked {
+                    autonomous_cutoff = Some(receipt.error_code.clone().unwrap_or_else(|| "executor_autonomous_cutoff".into()));
+                    track.audit_in_flight = None;
+                }
                 if receipt.policy_version == self.saved_policy_version
                     && receipt.command_seq == permit.command_seq
                 {
@@ -1383,6 +1395,15 @@ impl ChannelSupervisor {
                 true
             }
         };
+        if let Some(reason) = autonomous_cutoff {
+            if let Some(spec) = PolicyCatalog::family(&family) {
+                let session = self.load_channel_session(spec.id, receiver_now)?;
+                // Issue a new authority command and recovery fence. The
+                // executor's immutable old command is never edited in place.
+                self.issue_family_command(&family, session.as_ref(), ChannelPermitState::Revoked, &reason, receiver_now)?;
+                return Ok(());
+            }
+        }
         if accepted {
             self.refresh_verdict_and_emit(&family, receiver_now);
         }

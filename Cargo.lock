@@ -82,6 +82,7 @@ dependencies = [
  "claude-watch-core",
  "claude-watch-installer",
  "claude-watch-runtime",
+ "claude-watch-system",
  "serde_json",
  "uuid",
 ]
@@ -103,7 +104,9 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "claude-watch-core",
+ "claude-watch-system",
  "getrandom 0.4.3",
+ "libc",
  "rsa",
  "serde",
  "serde_json",
@@ -124,6 +127,13 @@ dependencies = [
  "claude-watch-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "claude-watch-system"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

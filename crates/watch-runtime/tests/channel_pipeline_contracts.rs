@@ -53,6 +53,338 @@ fn fixture_local() -> Value {
     })
 }
 
+fn bound(pid: u32, role: ProcessRole) -> BoundProcessToken {
+    BoundProcessToken::with_system_identity(pid, 501, 900 + pid as u64, 1, role)
+        .with_audit_token([501, 501, 20, 501, 20, pid, 0, 9])
+}
+fn inventory_event(family: &str, processes: Vec<BoundProcessToken>, at: f64) -> SupervisionEvent {
+    let desktops = processes.iter().filter(|p| p.role == ProcessRole::DesktopMain).map(|p|
+        (Desktop { pid: p.pid, start_seconds: p.start_seconds, start_microseconds: p.start_microseconds }, true, "fixture".into())).collect();
+    SupervisionEvent::ProcessInventoryUpdated { family: family.into(), desktops, processes, observed_at: at }
+}
+fn audit_completion(store: &StateStore, req: AsyncAuditRequest, at: f64) -> SupervisionEvent {
+    let mut audit = fixture_audit(store, at, req.family == "openai", "1.1.1.1", "JP");
+    audit["launch_target"] = json!(req.target);
+    audit["authorization_scope"] = json!(if req.target.protected() { "protected-desktop" } else { "observation" });
+    SupervisionEvent::AsyncAuditCompleted { request_id: req.request_id, family: req.family,
+        session_id: req.session_id, policy_version: req.policy_version, requested_at: req.requested_at,
+        outcome: claude_watch_runtime::channel_supervisor::AsyncAuditOutcome::Succeeded {
+            audit, egress: fixture_egress(at, "1.1.1.1", "JP") }, completed_at: at }
+}
+fn environment(at: f64) -> SupervisionEvent {
+    SupervisionEvent::EnvironmentUpdated { egress: fixture_egress(at, "1.1.1.1", "JP"), local_guard: fixture_local(), observed_at: at }
+}
+
+#[test]
+fn desktop_and_cli_share_continuity_baseline_and_risk_in_both_start_orders() {
+    use claude_watch_core::{channel::ChannelPermitState, session::Phase};
+    for family in ["claude", "openai"] {
+        for desktop_first in [false, true] {
+            let (_dir, store) = setup_store(); let now = 1_710_000_000.;
+            seed_receipts(&store, now, "JP");
+            let enforcer = Arc::new(LocalTunnelEnforcer::new("mixed", Some(store.clone())));
+            enforcer.activate_interception(now).unwrap();
+            let (tx, rx) = mpsc::channel();
+            let mut supervisor = ChannelSupervisor::new(store.clone(), Some(enforcer.clone()), Some(tx)).unwrap();
+            supervisor.handle_event(environment(now)).unwrap();
+            let cli = bound(7200, ProcessRole::Cli); let desktop = bound(7210, ProcessRole::DesktopMain);
+            let first = if desktop_first { desktop.clone() } else { cli.clone() };
+            supervisor.handle_event(inventory_event(family, vec![first], now)).unwrap();
+            let req = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let root = if desktop_first { desktop.clone() } else { cli.clone() };
+            supervisor.handle_event(inventory_event(family, vec![root, bound(7202, ProcessRole::Child)], now + 0.05)).unwrap();
+            assert!(rx.try_recv().is_err(), "a discovered child must not continually cancel the environment audit");
+            supervisor.handle_event(audit_completion(&store, req, now + 0.1)).unwrap();
+            let sessions = SessionStore::for_family(store.clone(), family);
+            let original = sessions.load(now + 0.1).unwrap().unwrap();
+
+            // Also exercise the real Controller launch path in a process that
+            // has no daemon registry: it must not replace a running CLI session.
+            if family == "claude" && !desktop_first {
+                let mut launcher = ChannelSystem::new(store.clone(), Some(enforcer.clone()), true);
+                launcher.claude_mains.clear(); launcher.open_adds_desktop = true;
+                assert_eq!(Controller::new(store.clone()).launch(&mut launcher).unwrap()["status"], "ok");
+                assert_eq!(sessions.load(now + 0.1).unwrap().unwrap().session_id, original.session_id);
+                assert_eq!((launcher.closes, launcher.forces), (0, 0));
+            }
+            let mixed = supervisor.handle_event(inventory_event(family, vec![desktop.clone(), cli.clone()], now + 0.2)).unwrap();
+            assert_eq!(mixed.families[family].permit_state, ChannelPermitState::Permitted);
+            let continuing = sessions.load(now + 0.2).unwrap().unwrap();
+            assert_eq!(continuing.session_id, original.session_id);
+            assert_eq!(continuing.baseline, original.baseline);
+            assert!(rx.try_recv().is_err(), "a normal member joining is not a new environmental audit");
+            let cli_only = supervisor.handle_event(inventory_event(family, vec![cli.clone()], now + 0.3)).unwrap();
+            assert_eq!(cli_only.families[family].permit_state, ChannelPermitState::Permitted);
+            assert_eq!(sessions.load(now + 0.3).unwrap().unwrap().session_id, original.session_id);
+            assert!(rx.try_recv().is_err());
+            sessions.mark_failure(Some(&original.session_id), now + 0.4, "egress_ip_changed", "fixture", true).unwrap();
+            let locked = supervisor.handle_event(inventory_event(family, vec![cli, desktop], now + 0.5)).unwrap();
+            assert_eq!(locked.families[family].permit_state, ChannelPermitState::Revoked);
+            let stored = sessions.load(now + 0.5).unwrap().unwrap();
+            assert_eq!(stored.state, Phase::Locked); assert_eq!(stored.session_id, original.session_id);
+            assert_eq!(stored.baseline, original.baseline, "member changes cannot erase a latched risk");
+            let mut monitor = ChannelSystem::new(store.clone(), Some(enforcer.clone()), true);
+            monitor.delegated = true; monitor.claude_mains.clear(); monitor.openai_mains.clear(); monitor.now = now + 0.5;
+            let heartbeat = Controller::new(store.clone()).guard_tick(&mut monitor).unwrap();
+            let family_status = heartbeat["families"].as_array().unwrap().iter().find(|v| v["family"] == family).unwrap();
+            assert_eq!(family_status["status"], "protection_triggered");
+            assert_eq!(family_status["channel_state"], "blocked");
+            monitor.enforcer = None;
+            let missing = Controller::new(store.clone()).guard_tick(&mut monitor).unwrap();
+            let family_status = missing["families"].as_array().unwrap().iter().find(|v| v["family"] == family).unwrap();
+            assert_eq!(family_status["status"], "protection_unavailable", "only actual execution receipts can promote status");
+        }
+    }
+}
+
+#[test]
+fn autonomous_rust_and_extension_cutoffs_require_supervisor_recovery() {
+    use claude_watch_core::channel::{ChannelPermitState, SystemExtensionHeartbeat, SystemExtensionReceipt};
+    for extension_cutoff in [false, true] {
+        let (_dir, store) = setup_store(); let now = 1_710_000_000.; seed_receipts(&store, now, "JP");
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("autonomous", Some(store.clone())));
+        enforcer.activate_interception(now).unwrap();
+        let heartbeat = |at| SystemExtensionHeartbeat { executor_boot_id: "autonomous".into(), extension_boot_id: "extension".into(), heartbeat_at: at, interception_active: true };
+        if extension_cutoff {
+            enforcer.set_strict_peer_verification(true);
+            enforcer.observe_system_extension(Some(heartbeat(now)), vec![], now).unwrap();
+        }
+        let (tx, rx) = mpsc::channel();
+        let mut supervisor = ChannelSupervisor::new(store.clone(), Some(enforcer.clone()), Some(tx)).unwrap();
+        supervisor.handle_event(environment(now)).unwrap();
+        supervisor.handle_event(inventory_event("claude", vec![bound(7200, ProcessRole::Cli)], now)).unwrap();
+        let initial_request = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let active = supervisor.handle_event(audit_completion(&store, initial_request.clone(), now + 0.1)).unwrap();
+        assert_eq!(active.families["claude"].permit_state, ChannelPermitState::Permitted,
+            "awaiting a normal first acknowledgement is not an autonomous cutoff");
+        let before = enforcer.receipt_for("claude", now + 0.1).unwrap().unwrap();
+        let mut bogus = before.clone(); bogus.permit_state = ChannelPermitState::Revoked; bogus.permit_generation += 1;
+        let unchanged = supervisor.handle_event(SupervisionEvent::EnforcementReceiptArrived { receipt: bogus, received_at: now + 0.1 }).unwrap();
+        assert_eq!(unchanged.families["claude"].permit_state, ChannelPermitState::Permitted, "future/wrong identity cannot establish a recovery fence");
+        let cutoff_at = if extension_cutoff { now + 6. } else { now + 11. };
+        if extension_cutoff {
+            let envelope = enforcer.extension_commands().unwrap();
+            let command = envelope["commands"].as_array().unwrap().iter().find(|c| c["family"] == "claude").unwrap();
+            let receipt = SystemExtensionReceipt { family: "claude".into(), executor_boot_id: "autonomous".into(), extension_boot_id: "extension".into(),
+                command_binding: command["command_binding"].as_str().unwrap().into(), policy_version: serde_json::from_value(command["policy_version"].clone()).unwrap(),
+                command_seq: command["command_seq"].as_u64().unwrap(), permit_generation: command["permit_generation"].as_u64().unwrap(),
+                applied_at: cutoff_at, allowed_pids: vec![7200], local_proxy_port: 0, permit_state: "revoked".into(), status: "revoked".into(),
+                active_flows: 0, new_connections_blocked: true, reason: Some("extension_control_failure".into()) };
+            let mut forged = receipt.clone(); forged.command_binding = "f".repeat(64);
+            enforcer.observe_system_extension(Some(heartbeat(cutoff_at)), vec![forged], cutoff_at).unwrap();
+            assert_eq!(enforcer.receipt_for("claude", cutoff_at).unwrap().unwrap().permit_state, ChannelPermitState::Permitted,
+                "wrong extension command binding cannot revoke a different authority");
+            enforcer.observe_system_extension(Some(heartbeat(cutoff_at)), vec![receipt], cutoff_at).unwrap();
+        } else {
+            enforcer.enforce_active_deadlines(cutoff_at, false).unwrap();
+        }
+        let receipt = enforcer.receipt_for("claude", cutoff_at).unwrap().unwrap();
+        assert_eq!(receipt.permit_state, ChannelPermitState::Revoked);
+        // Deliberately deliver sampling/renewal before the queued cutoff receipt.
+        let raced = supervisor.handle_event(environment(cutoff_at + 0.01)).unwrap();
+        assert_eq!(raced.families["claude"].permit_state, ChannelPermitState::Revoked);
+        assert_ne!(enforcer.receipt_for("claude", cutoff_at + 0.01).unwrap().unwrap().enforcement_state,
+            ChannelEnforcementState::Forwarding, "renewal cannot erase an unacknowledged cutoff");
+        let revoked = supervisor.handle_event(SupervisionEvent::EnforcementReceiptArrived { receipt, received_at: cutoff_at }).unwrap();
+        assert_eq!(revoked.families["claude"].permit_state, ChannelPermitState::Revoked);
+        assert!(revoked.families["claude"].command_seq > before.command_seq);
+        let held = supervisor.handle_event(environment(cutoff_at + 0.1)).unwrap();
+        assert_eq!(held.families["claude"].permit_state, ChannelPermitState::Revoked,
+            "fresh fast sampling must not silently renew after autonomous cutoff");
+        let recovery = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let stale = supervisor.handle_event(audit_completion(&store, initial_request, cutoff_at + 0.2)).unwrap();
+        assert_eq!(stale.families["claude"].permit_state, ChannelPermitState::Revoked);
+        seed_receipts(&store, cutoff_at + 0.3, "JP");
+        let recovered = supervisor.handle_event(audit_completion(&store, recovery, cutoff_at + 0.3)).unwrap();
+        assert_eq!(recovered.families["claude"].permit_state, ChannelPermitState::Permitted);
+        assert_eq!(recovered.families["claude"].session_id, active.families["claude"].session_id);
+    }
+}
+
+#[test]
+fn standalone_cli_is_discovered_audited_and_rebound_after_exec_without_a_launcher() {
+    use claude_watch_core::channel::ChannelPermitState;
+    use claude_watch_runtime::channel_supervisor::AsyncAuditOutcome;
+    for (family, target) in [("claude", LaunchTarget::ClaudeCli), ("openai", LaunchTarget::CodexCli)] {
+        let (_dir, store) = setup_store();
+        let now = 1_710_000_000.;
+        seed_receipts(&store, now, "JP");
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("cli-adoption", Some(store.clone())));
+        enforcer.activate_interception(now).unwrap(); // In-memory executor fixture only.
+        let (tx, rx) = mpsc::channel();
+        let mut supervisor = ChannelSupervisor::new(store.clone(), Some(enforcer.clone()), Some(tx)).unwrap();
+        supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+            egress: fixture_egress(now, "1.1.1.1", "JP"), local_guard: fixture_local(), observed_at: now,
+        }).unwrap();
+        let token = BoundProcessToken::with_system_identity(7200, 501, 900, 1, ProcessRole::Cli)
+            .with_audit_token([501, 501, 20, 501, 20, 7200, 0, 9]);
+        let inventory = |process: BoundProcessToken, at| SupervisionEvent::ProcessInventoryUpdated {
+            family: family.into(), desktops: vec![], processes: vec![process], observed_at: at,
+        };
+        let pending = supervisor.handle_event(inventory(token.clone(), now)).unwrap();
+        assert_eq!(pending.families[family].permit_state, ChannelPermitState::PendingVerification);
+        let request = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(request.target, target);
+        assert_eq!(request.session_id, None);
+        let complete = |req: AsyncAuditRequest, at| {
+            let mut audit = fixture_audit(&store, at, family == "openai", "1.1.1.1", "JP");
+            audit["launch_target"] = json!(target);
+            audit["authorization_scope"] = json!("observation");
+            SupervisionEvent::AsyncAuditCompleted {
+                request_id: req.request_id, family: req.family, session_id: req.session_id,
+                policy_version: req.policy_version, requested_at: req.requested_at,
+                outcome: AsyncAuditOutcome::Succeeded { audit, egress: fixture_egress(at, "1.1.1.1", "JP") },
+                completed_at: at,
+            }
+        };
+        let active = supervisor.handle_event(complete(request.clone(), now + 0.1)).unwrap();
+        assert_eq!(active.families[family].permit_state, ChannelPermitState::Permitted);
+        let sessions = SessionStore::for_family(store.clone(), family);
+        let adopted = sessions.load(now + 0.1).unwrap().unwrap();
+        assert!(adopted.desktop.is_none() && adopted.launcher.is_none());
+        assert_eq!(adopted.extra["adopted_from"], "running_processes");
+        let commands = enforcer.extension_commands().unwrap();
+        let cmd = commands["commands"].as_array().unwrap().iter().find(|c| c["family"] == family).unwrap();
+        assert_eq!(cmd["allowed_processes"][0]["audit_token"], json!(token.audit_token.unwrap()));
+        let mut controller_system = ChannelSystem::new(store.clone(), Some(enforcer.clone()), true);
+        controller_system.delegated = true;
+        controller_system.claude_mains.clear(); controller_system.openai_mains.clear();
+        controller_system.now = now + 0.1;
+        let heartbeat = Controller::new(store.clone()).guard_tick(&mut controller_system).unwrap();
+        let family_heartbeat = heartbeat["families"].as_array().unwrap().iter().find(|v| v["family"] == family).unwrap();
+        assert_eq!(family_heartbeat["status"], "ok", "verified channel must not become a sampling-unknown alert");
+        assert_eq!(family_heartbeat["session_guard"]["state"], "safe");
+        assert_eq!(sessions.load(now + 0.1).unwrap().unwrap().session_id, adopted.session_id);
+        assert_eq!(sessions.load(now + 0.1).unwrap().unwrap().state, claude_watch_core::session::Phase::Active);
+        assert_eq!(enforcer.extension_commands().unwrap(), commands, "Desktop controller cannot issue a second CLI authority");
+        assert_eq!((controller_system.closes, controller_system.forces), (0, 0));
+
+        // Same PID and birth after exec is still managed, but old permission
+        // and an old audit completion cannot authorize the new image.
+        let mut execed = token.clone(); execed.audit_token.as_mut().unwrap()[7] += 1;
+        let pending = supervisor.handle_event(inventory(execed, now + 0.2)).unwrap();
+        assert_ne!(pending.families[family].permit_state, ChannelPermitState::Permitted);
+        let new_request = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_ne!(new_request.request_id, request.request_id);
+        let stale = supervisor.handle_event(complete(request, now + 0.3)).unwrap();
+        assert_ne!(stale.families[family].permit_state, ChannelPermitState::Permitted);
+        let renewed = supervisor.handle_event(complete(new_request, now + 0.4)).unwrap();
+        assert_eq!(renewed.families[family].permit_state, ChannelPermitState::Permitted);
+        let rebound = sessions.load(now + 0.4).unwrap().unwrap();
+        assert_ne!(rebound.session_id, adopted.session_id);
+        let ended = supervisor.handle_event(SupervisionEvent::ProcessInventoryUpdated {
+            family: family.into(), desktops: vec![], processes: vec![], observed_at: now + 0.5,
+        }).unwrap();
+        assert_ne!(ended.families[family].permit_state, ChannelPermitState::Permitted);
+        assert_eq!(sessions.load(now + 0.5).unwrap().unwrap().state, claude_watch_core::session::Phase::Ended);
+        assert!(rx.try_recv().is_err(), "No targets means no new adoption audit");
+    }
+}
+
+#[test]
+fn fresh_audit_context_recovers_after_network_change_and_next_event_stays_permitted() {
+    let (_dir, store) = setup_store();
+    let now = 1_710_000_000.;
+    let enforcer = Arc::new(LocalTunnelEnforcer::new(
+        "context-recovery",
+        Some(store.clone()),
+    ));
+    enforcer.activate_interception(now).unwrap();
+    seed_receipts(&store, now, "JP");
+    let sessions = SessionStore::for_family(store.clone(), "claude");
+    let pending = sessions
+        .begin_verified(
+            &ReceiptStore {
+                storage: store.clone(),
+            },
+            &fixture_audit(&store, now, false, "1.1.1.1", "JP"),
+            &fixture_egress(now, "1.1.1.1", "JP"),
+            now,
+        )
+        .unwrap();
+    let desktop = Desktop {
+        pid: 4100,
+        start_seconds: 900,
+        start_microseconds: 1,
+    };
+    sessions
+        .bind_desktop(&pending.session_id, desktop.clone(), now)
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    let mut supervisor = ChannelSupervisor::new(store.clone(), Some(enforcer), Some(tx)).unwrap();
+    supervisor
+        .handle_event(SupervisionEvent::EnvironmentUpdated {
+            egress: fixture_egress(now, "1.1.1.1", "JP"),
+            local_guard: fixture_local(),
+            observed_at: now,
+        })
+        .unwrap();
+    let inventory = |time| SupervisionEvent::ProcessInventoryUpdated {
+        family: "claude".into(),
+        desktops: vec![(desktop.clone(), true, "u501:900:1".into())],
+        processes: vec![],
+        observed_at: time,
+    };
+    supervisor.handle_event(inventory(now + 0.1)).unwrap();
+    let mut changed = fixture_egress(now + 1., "1.1.1.1", "JP");
+    changed["context_id"] = json!("new-network");
+    let mut local = fixture_local();
+    local["context_id"] = json!("new-network");
+    local["context"] = json!("new-network");
+    let blocked = supervisor
+        .handle_event(SupervisionEvent::EnvironmentUpdated {
+            egress: changed.clone(),
+            local_guard: local.clone(),
+            observed_at: now + 1.,
+        })
+        .unwrap();
+    assert_eq!(
+        blocked.families["claude"].permit_state,
+        claude_watch_core::channel::ChannelPermitState::Revoked
+    );
+    let req = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let mut audit = fixture_audit(&store, now + 2., false, "1.1.1.1", "JP");
+    audit["context_id"] = json!("new-network");
+    assert!(
+        audit.get("grants_launch_permission").is_none(),
+        "match the actual full audit producer"
+    );
+    changed["observed_at"] = json!(now + 2.);
+    let recovered = supervisor
+        .handle_event(SupervisionEvent::AsyncAuditCompleted {
+            request_id: req.request_id,
+            family: req.family,
+            session_id: req.session_id,
+            policy_version: req.policy_version,
+            requested_at: req.requested_at,
+            completed_at: now + 2.,
+            outcome: claude_watch_runtime::channel_supervisor::AsyncAuditOutcome::Succeeded {
+                audit,
+                egress: changed.clone(),
+            },
+        })
+        .unwrap();
+    assert_eq!(
+        recovered.families["claude"].permit_state,
+        claude_watch_core::channel::ChannelPermitState::Permitted
+    );
+    assert_eq!(
+        sessions.load(now + 2.).unwrap().unwrap().context_id,
+        "new-network"
+    );
+    let next = supervisor
+        .handle_event(SupervisionEvent::EnvironmentUpdated {
+            egress: changed,
+            local_guard: local,
+            observed_at: now + 2.1,
+        })
+        .unwrap();
+    assert_eq!(
+        next.families["claude"].permit_state,
+        claude_watch_core::channel::ChannelPermitState::Permitted
+    );
+}
+
 fn fixture_egress(now: f64, ip: &str, country: &str) -> Value {
     let mut dummy_config = claude_watch_core::config::Config::default();
     dummy_config.enabled = true;
@@ -138,6 +470,8 @@ struct ChannelSystem {
     store: StateStore,
     enforcer: Option<Arc<LocalTunnelEnforcer>>,
     channel_mode: bool,
+    delegated: bool,
+    open_adds_desktop: bool,
     family: &'static str,
     now: f64,
     monotonic: Duration,
@@ -155,6 +489,8 @@ impl ChannelSystem {
             store,
             enforcer,
             channel_mode,
+            delegated: false,
+            open_adds_desktop: false,
             family: "claude",
             now: 1_710_000_000.0,
             monotonic: Duration::from_secs(10),
@@ -264,7 +600,23 @@ impl DesktopSystem for ChannelSystem {
     }
 
     fn open_desktop(&mut self) -> Result<()> {
+        if self.open_adds_desktop {
+            self.claude_mains.push(Desktop { pid: 8100, start_seconds: 901, start_microseconds: 1 });
+        }
         Ok(())
+    }
+    fn observation_owner(&mut self) -> Result<claude_watch_core::processes::Identity> {
+        Ok(claude_watch_core::processes::Identity { pid: 8000, parent: 1, uid: 501,
+            executable: "/fixture/watch-engine".into(), start_seconds: 900, start_microseconds: 1,
+            start_stamp: "u501:900:1".into() })
+    }
+    fn observation_roots(&mut self) -> Result<Vec<claude_watch_core::processes::Target>> {
+        use claude_watch_core::processes::{Identity, Kind, Target};
+        Ok(self.desktops()?.into_iter().filter(|(_, main, _)| *main).map(|(d, _, stamp)| Target {
+            identity: Identity { pid: d.pid, parent: 8000, uid: 501, executable: "/Applications/Claude.app/Contents/MacOS/Claude".into(),
+                start_seconds: d.start_seconds, start_microseconds: d.start_microseconds, start_stamp: stamp },
+            kind: if self.family == "claude" { Kind::ClaudeMain } else { Kind::CodexMain },
+        }).collect())
     }
 
     fn quit_desktop(&mut self) -> Result<()> {
@@ -281,6 +633,7 @@ impl DesktopSystem for ChannelSystem {
     fn channel_mode(&self) -> bool {
         self.channel_mode
     }
+    fn delegates_slow_audit_to_worker(&self) -> bool { self.delegated }
 
     fn enforce_channel(
         &mut self,
@@ -453,6 +806,10 @@ fn real_tcp_connection_traces_permit_forwarding_revocation_disconnecting_and_con
     assert_eq!(families2[0]["stop_state"], "disconnecting");
     assert_eq!(families2[0]["channel_state"], "disconnecting");
     assert_eq!(families2[0]["channel_status_label"], "正在断开");
+    assert!(
+        !store.paths.base().join("last-guard-stop.json").exists(),
+        "requesting a channel cutoff must not persist a successful process stop"
+    );
 
     // Verify the existing TCP stream was actively shut down by `Shutdown::Both`
     // (explicitly excluding TimedOut / WouldBlock, and verifying upstream EOF!)
@@ -504,6 +861,10 @@ fn real_tcp_connection_traces_permit_forwarding_revocation_disconnecting_and_con
     assert_eq!(families3[0]["stop_state"], "channel_blocked");
     assert_eq!(families3[0]["channel_state"], "blocked");
     assert_eq!(families3[0]["channel_status_label"], "已阻断");
+    assert!(
+        !store.paths.base().join("last-guard-stop.json").exists(),
+        "confirmed network isolation is still not a process exit"
+    );
     assert_eq!(
         families3[0]["channel_supervision"]["verdict"],
         "isolated_keep_process"
@@ -1301,9 +1662,15 @@ fn async_audit_failure_timeout_and_request_id_mismatch_recover_and_respect_bound
             })
             .unwrap();
 
-        let failed_ev = event_rx
+        let mut failed_ev = event_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("worker must emit AsyncAuditCompleted even when run_audit returns Err");
+        if let SupervisionEvent::AsyncAuditCompleted { completed_at, .. } = &mut failed_ev {
+            // Worker completion uses real wall time, independent of request time.
+            assert!((*completed_at - claude_watch_runtime::native::now()).abs() < 2.0);
+            // This supervisor fixture deliberately advances a synthetic clock.
+            *completed_at = current_time + 0.1;
+        }
         let after_fail = supervisor.handle_event(failed_ev).unwrap();
         if attempt < MAX_ASYNC_AUDIT_RETRIES {
             assert_eq!(
@@ -1627,7 +1994,7 @@ fn daemon_restart_resync_with_producer_boot_id() {
 }
 
 #[test]
-fn launch_failure_in_channel_mode_revokes_channel_and_preserves_process_without_quit() {
+fn launch_failure_in_channel_mode_preserves_process_without_inventing_permission() {
     let (_dir, store) = setup_store();
     let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-lnch-1", Some(store.clone())));
     enforcer.activate_interception(1_710_000_000.0).unwrap();
@@ -1640,19 +2007,15 @@ fn launch_failure_in_channel_mode_revokes_channel_and_preserves_process_without_
     // Launch will fail because desktops remains empty during post-open wait
     let result = controller.launch(&mut system);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().code, "desktop_identity_unavailable");
+    assert_eq!(result.unwrap_err().code, "target_start_unconfirmed");
 
     // Channel mode must preserve the process and NEVER call quit_desktop!
     assert_eq!(system.closes, 0);
     assert_eq!(system.forces, 0);
 
-    // Channel must be revoked with reason launch_failed
-    let receipt = system.channel_receipt("claude").unwrap().unwrap();
-    assert_eq!(
-        receipt.permit_state,
-        claude_watch_core::channel::ChannelPermitState::Revoked
-    );
-    assert_eq!(receipt.error_code.as_deref(), Some("launch_failed"));
+    // A failed launch cannot invent a permit or a successful cutoff receipt.
+    // The extension holds newly discovered sources until the supervisor binds them.
+    assert!(system.channel_receipt("claude").unwrap().is_none());
 }
 
 #[test]
