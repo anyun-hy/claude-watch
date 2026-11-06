@@ -655,9 +655,9 @@ mod tests {
     #[test]
     fn production_daemon_channel_stack_wires_enforcer_supervisor_async_audit_and_lease_watchdog() {
         use claude_watch_core::{
-            channel::{ChannelMonitorDisplayState, ChannelPermitState},
+            channel::{BoundProcessToken, ChannelMonitorDisplayState, ChannelPermitState},
             config::Config,
-            processes::LaunchTarget,
+            processes::{LaunchTarget, ProcessRole},
             session::{Desktop, Launcher},
         };
         use claude_watch_runtime::channel_enforcer::{registered_production_enforcer, ChannelEnforcer};
@@ -700,6 +700,27 @@ mod tests {
                 } else {
                     Ok(vec![])
                 }
+            }
+            fn supervised_processes(&mut self) -> Result<Vec<BoundProcessToken>> {
+                // Explicit fixture identities avoid querying real host PIDs/UIDs.
+                Ok(self
+                    .desktops()?
+                    .into_iter()
+                    .map(|(desktop, main, _)| {
+                        BoundProcessToken::with_system_identity(
+                            desktop.pid,
+                            501,
+                            desktop.start_seconds,
+                            desktop.start_microseconds,
+                            if main {
+                                ProcessRole::DesktopMain
+                            } else {
+                                ProcessRole::DesktopHelper
+                            },
+                        )
+                        .with_audit_token([501, 501, 20, 501, 20, desktop.pid, 0, 9])
+                    })
+                    .collect())
             }
             fn desktop_alive(&mut self, _: &Desktop) -> Result<bool> {
                 Ok(true)
@@ -781,12 +802,18 @@ mod tests {
             stop.clone(),
             false,
             move |req| {
-                let _ = rx.lock().unwrap().recv_timeout(Duration::from_secs(2));
+                rx.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|_| {
+                        CoreError::new("fixture_audit_barrier_timeout", "审计测试未收到释放信号")
+                    })?;
+                let completed_at = native::now();
                 Ok((
                     json!({
                         "ready": true,
-                        "observed_at": req.requested_at + 0.1,
-                        "expires_at": req.requested_at + 30.1,
+                        "observed_at": completed_at,
+                        "expires_at": completed_at + 30.0,
                         "context_id": "ctx",
                         "observation_id": "fixture",
                         "context_transition": {"state": "stable"},
@@ -794,7 +821,7 @@ mod tests {
                         "egress_reference": {
                             "ip": "1.1.1.1",
                             "country": "JP",
-                            "checked_at": req.requested_at + 0.1,
+                            "checked_at": completed_at,
                             "context": "ctx",
                             "source": "fixture"
                         }
@@ -802,7 +829,7 @@ mod tests {
                     json!({
                         "ip": "1.1.1.1",
                         "country": "JP",
-                        "observed_at": req.requested_at + 0.1,
+                        "observed_at": completed_at,
                         "source": "fixture",
                         "family": "claude",
                         "upstream_endpoint": "127.0.0.1:7890",
@@ -810,7 +837,7 @@ mod tests {
                         "context_id": "ctx",
                         "via_controlled_path": true
                     }),
-                    req.requested_at + 0.1,
+                    completed_at,
                 ))
             },
         )
@@ -831,18 +858,36 @@ mod tests {
             now,
             country: "JP",
         };
+        assert!(sys
+            .supervised_processes()
+            .unwrap()
+            .iter()
+            .all(|p| p.has_verified_audit_token()));
         // Step 1: Running Claude without a session schedules async audit on the worker
+        sys.now = native::now();
         let snap1 = stack.step_with_system(&mut sys).unwrap();
         assert_eq!(
             snap1.families["claude"].permit_state,
             ChannelPermitState::PendingVerification
         );
 
-        // Wait for async audit completion via `wait_or_drain`
-        let _ = release_audit_tx.send(());
-        stack.wait_or_drain(Instant::now() + Duration::from_secs(2), &stop);
-        sys.now += 0.2;
-        let snap2 = stack.step_with_system(&mut sys).unwrap();
+        // wait_or_drain wakes for any event, including unrelated receipts.
+        // Wait for the audited state, using the workers' clock and a real deadline.
+        release_audit_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let snap2 = loop {
+            sys.now = native::now();
+            let snapshot = stack.step_with_system(&mut sys).unwrap();
+            if snapshot.families["claude"].permit_state == ChannelPermitState::Permitted {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "async audit did not reach Permitted: {:?}",
+                snapshot.families["claude"]
+            );
+            stack.wait_or_drain(deadline, &stop);
+        };
         assert_eq!(
             snap2.families["claude"].permit_state,
             ChannelPermitState::Permitted
@@ -853,7 +898,7 @@ mod tests {
         );
 
         // Step 2: Trigger CN exit risk -> cuts off channel while preserving process
-        sys.now += 1.0;
+        sys.now = native::now();
         sys.country = "CN";
         let snap3 = stack.step_with_system(&mut sys).unwrap();
         assert_eq!(

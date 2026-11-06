@@ -94,6 +94,13 @@ def production_models() -> str:
         (MODELS, "Flow"),
         (MODELS, "ProxySnapshot"),
         (MODELS, "ConnectionObservation"),
+        (MODELS, "ChannelPolicyVersionModel"),
+        (MODELS, "ChannelMonitorDisplayState"),
+        (MODELS, "PolicySyncState"),
+        (MODELS, "BoundProcessTokenModel"),
+        (MODELS, "FamilyChannelMonitorState"),
+        (MODELS, "ChannelMonitorSnapshot"),
+        (MODELS, "ChannelMonitorEvent"),
         (MODELS, "MonitorSnapshot"),
     )
     return "\n\n".join(declaration(path, name) for path, name in requested)

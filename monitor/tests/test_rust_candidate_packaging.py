@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BUILD = ROOT / "monitor" / "build.sh"
 COMPONENTS = ROOT / "tools" / "build-rust-components.sh"
 MONITOR_STORE = ROOT / "monitor" / "Sources" / "MonitorStore.swift"
+SNAPSHOT_READER = ROOT / "monitor" / "Sources" / "MonitorSnapshotReader.swift"
 SWITCHER_STORE = ROOT / "monitor" / "Sources" / "SwitcherStore.swift"
 
 
@@ -84,16 +85,20 @@ class RustCandidatePackagingTests(unittest.TestCase):
 
     def test_gui_runners_only_accept_the_rust_backend(self):
         monitor = MONITOR_STORE.read_text(encoding="utf-8")
+        snapshot_reader = SNAPSHOT_READER.read_text(encoding="utf-8")
         switcher = SWITCHER_STORE.read_text(encoding="utf-8")
         variant = (ROOT / "monitor/Sources/BundledBackendVariant.swift").read_text(encoding="utf-8")
         self.assertIn('values["BackendVariant"]', variant)
         self.assertIn('raw == "rust-candidate"', variant)
         # The Python backend is retired: no runner may keep a branch for it.
         self.assertNotIn('case "stable"', variant)
-        self.assertIn('case .rustCandidate:', monitor)
-        self.assertIn('forResource: "watch-engine"', monitor)
-        self.assertIn('case .rustCandidate:', switcher)
-        for source in (monitor, switcher):
+        self.assertIn('SnapshotRunner.run(full: full)', monitor)
+        self.assertIn('SnapshotProcessTransport.run(', snapshot_reader)
+        for runner in (snapshot_reader, switcher):
+            self.assertIn('guard let variant = BundledBackendVariant.current() else {', runner)
+            self.assertIn('case .rustCandidate:', runner)
+            self.assertIn('forResource: "watch-engine"', runner)
+        for source in (monitor, snapshot_reader, switcher):
             self.assertNotIn('case .stable:', source)
             self.assertNotIn('python3', source)
 

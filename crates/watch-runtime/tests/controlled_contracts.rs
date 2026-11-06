@@ -332,6 +332,17 @@ impl DesktopSystem for Fake {
     fn desktop_alive(&mut self, expected: &Desktop) -> Result<bool> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if self.native_liveness {
+            // A wait receipt for this exact owned child proves its exit without
+            // depending on whether unrelated host processes are readable.
+            if self.native_start == Some((expected.start_seconds, expected.start_microseconds)) {
+                if let Some(child) = self.test_child.as_mut().filter(|c| c.id() == expected.pid) {
+                    if child.try_wait().map_err(|_| {
+                        CoreError::new("fixture_child_wait_failed", "无法确认自有测试进程的退出状态")
+                    })?.is_some() {
+                        return Ok(false);
+                    }
+                }
+            }
             let runner = claude_watch_runtime::commands::SystemRunner::development()?;
             let helper = claude_watch_runtime::native::built_process_control_path().unwrap();
             let desktop = claude_watch_runtime::desktop_native::NativeDesktop::new(
@@ -727,13 +738,14 @@ fn native_identity_and_owned_process_drive_the_guard_lifecycle() {
         ..Fake::default()
     };
     controller.launch(&mut system).unwrap();
-    let mut old = system.test_child.take().unwrap();
+    let old = system.test_child.as_mut().unwrap();
     old.kill().unwrap();
     old.wait().unwrap();
     system.running = false;
+    let mut last_tick = Value::Null;
     for _ in 0..5 {
         system.now += 1.0;
-        controller.guard_tick(&mut system).unwrap();
+        last_tick = controller.guard_tick(&mut system).unwrap();
         if SessionStore::new(fixture.storage.clone())
             .load(system.now)
             .unwrap()
@@ -751,7 +763,8 @@ fn native_identity_and_owned_process_drive_the_guard_lifecycle() {
             .unwrap()
             .unwrap()
             .state,
-        Phase::Ended
+        Phase::Ended,
+        "owned process was reaped but guard did not end the session: {last_tick}"
     );
     assert_eq!(system.closes, 0);
     system.test_child = Some(TestChild(

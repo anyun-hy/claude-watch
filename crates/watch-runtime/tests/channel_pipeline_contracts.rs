@@ -2028,6 +2028,19 @@ fn controlled_path_evidence_and_authoritative_permit_are_hard_requirements() {
     let now = 1_710_000_100.0;
 
     // 1. Establish an Active session in store
+    let claude_desktop = Desktop {
+        pid: 1234,
+        start_seconds: (now - 10.0) as u64,
+        start_microseconds: 0,
+    };
+    let claude_process = BoundProcessToken::with_system_identity(
+        claude_desktop.pid,
+        501,
+        claude_desktop.start_seconds,
+        claude_desktop.start_microseconds,
+        ProcessRole::DesktopMain,
+    )
+    .with_audit_token([501, 501, 20, 501, 20, claude_desktop.pid, 0, 9]);
     let active_session = json!({
         "schema": 1,
         "state": "active",
@@ -2041,38 +2054,14 @@ fn controlled_path_evidence_and_authoritative_permit_are_hard_requirements() {
         },
         "created_at": now - 10.0,
         "pending_deadline": now + 60.0,
-        "desktop": {
-            "pid": 1234,
-            "start_seconds": (now - 10.0) as u64,
-            "start_microseconds": 0,
-            "app_name": "Claude"
-        },
+        "desktop": claude_desktop,
         "bound_at": now - 5.0
     });
     store.atomic_json(&store.paths.session_for("claude"), &active_session).unwrap();
 
-    // Inject managed process inventory
-    let claude_desktop = Desktop {
-        pid: 1234,
-        start_seconds: (now - 10.0) as u64,
-        start_microseconds: 0,
-    };
-    supervisor
-        .handle_event(SupervisionEvent::ProcessInventoryUpdated {
-            family: "claude".into(),
-            desktops: vec![(claude_desktop, true, "desktop-1".into())],
-            processes: vec![BoundProcessToken::with_system_identity(
-                1234,
-                501,
-                (now - 10.0) as u64,
-                1,
-                ProcessRole::DesktopMain,
-            )],
-            observed_at: now,
-        })
-        .unwrap();
-
-    // 2. Inject valid controlled-path evidence: Must issue Permitted
+    // 2. Seed valid controlled-path evidence before reporting managed processes.
+    // Missing evidence would revoke this active session and require a recovery
+    // audit; a later fast observation must not silently restore that permission.
     let policy_ver = supervisor.saved_policy_version().clone();
     let upstream_endpoint = supervisor.upstream_endpoint().to_string();
     let valid_controlled_egress = json!({
@@ -2092,13 +2081,24 @@ fn controlled_path_evidence_and_authoritative_permit_are_hard_requirements() {
             observed_at: now,
         })
         .unwrap();
+    supervisor
+        .handle_event(SupervisionEvent::ProcessInventoryUpdated {
+            family: "claude".into(),
+            desktops: vec![(claude_desktop, true, "desktop-1".into())],
+            processes: vec![claude_process.clone()],
+            observed_at: now,
+        })
+        .unwrap();
 
     let snap1 = supervisor.snapshot(now);
     let claude_state1 = snap1.families.get("claude").unwrap();
     assert_eq!(
         claude_state1.permit_state,
-        claude_watch_core::channel::ChannelPermitState::Permitted
+        claude_watch_core::channel::ChannelPermitState::Permitted,
+        "valid current identity, session and controlled-path evidence must permit: {}",
+        claude_state1.reason_code,
     );
+    assert_eq!(claude_state1.active_members, vec![claude_process]);
     assert!(claude_state1.valid_until.is_some_and(|u| u > now));
 
     // Check authoritative permit file on disk
