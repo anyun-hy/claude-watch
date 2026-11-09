@@ -16,18 +16,20 @@ use crate::{
 };
 use claude_watch_core::{
     channel::{
-        evaluate_channel_supervision_with_boot_id, verify_channel_recovery, BoundProcessToken,
-        ChannelEnforcementCommand, ChannelEnforcementReceipt, ChannelEnforcementState,
-        ChannelMonitorDisplayState, ChannelMonitorEvent, ChannelMonitorSnapshot, ChannelPermit,
-        ChannelPermitState, ChannelSupervisionVerdict, FamilyChannelMonitorState, PolicySyncState,
-        PolicyVersion, CLOCK_ROLLBACK_TOLERANCE_SECONDS, DEFAULT_PERMIT_TTL,
-        MAX_ENFORCEMENT_RECEIPT_AGE,
+        evaluate_channel_supervision_with_boot_id, verify_channel_recovery_with_vpn_epoch,
+        BackendCoverageScope, BoundProcessToken, ChannelEnforcementCommand,
+        ChannelEnforcementReceipt, ChannelEnforcementState, ChannelMonitorDisplayState,
+        ChannelMonitorEvent, ChannelMonitorSnapshot, ChannelPermit, ChannelPermitState,
+        ChannelSupervisionVerdict, ControlledPathEvidence, FamilyChannelMonitorState,
+        NetworkBackendKind, PolicySyncState, PolicyVersion, CLOCK_ROLLBACK_TOLERANCE_SECONDS,
+        DEFAULT_PERMIT_TTL, MAX_ENFORCEMENT_RECEIPT_AGE,
     },
     config::Config,
     error::{CoreError, Result},
     policy::PolicyCatalog,
     processes::LaunchTarget,
     session::{self, Desktop, Egress, Phase},
+    vpn::{compare_vpn, VpnEpoch, VpnExpectation, VpnMatch, VpnObservation},
 };
 use serde_json::{json, Value};
 use std::{
@@ -66,6 +68,14 @@ pub enum SupervisionEvent {
     EnvironmentUpdated {
         egress: Value,
         local_guard: Value,
+        observed_at: f64,
+    },
+    VpnObservationUpdated {
+        observation: VpnObservation,
+        observed_at: f64,
+    },
+    VpnObservationUnavailable {
+        reason: String,
         observed_at: f64,
     },
     ProcessInventoryUpdated {
@@ -117,6 +127,8 @@ pub struct AsyncAuditRequest {
     pub session_id: Option<String>,
     pub context_id: Option<String>,
     pub policy_version: PolicyVersion,
+    pub vpn_epoch: Option<VpnEpoch>,
+    pub upstream_endpoint: String,
     pub requested_at: f64,
     pub timeout_seconds: f64,
     pub cancellation: Option<Arc<AtomicBool>>,
@@ -130,6 +142,8 @@ impl PartialEq for AsyncAuditRequest {
             && self.session_id == other.session_id
             && self.context_id == other.context_id
             && self.policy_version == other.policy_version
+            && self.vpn_epoch == other.vpn_epoch
+            && self.upstream_endpoint == other.upstream_endpoint
             && self.requested_at == other.requested_at
             && self.timeout_seconds == other.timeout_seconds
     }
@@ -198,9 +212,15 @@ pub struct ChannelSupervisor {
     audit_tx: Option<Sender<AsyncAuditRequest>>,
     next_audit_request_id: u64,
     config: Config,
+    config_blocking_reason: Option<String>,
     saved_policy_version: PolicyVersion,
     latest_egress: BTreeMap<String, Value>,
     latest_local_guard: Value,
+    latest_vpn_observation: Option<VpnObservation>,
+    latest_vpn_match: Option<VpnMatch>,
+    latest_vpn_unavailable_reason: Option<String>,
+    unmanaged_member_pids: BTreeMap<String, Vec<u32>>,
+    coverage_scopes: BTreeMap<String, BackendCoverageScope>,
     upstream_endpoint: String,
     tracks: BTreeMap<String, FamilyRuntimeTrack>,
     event_seq: u64,
@@ -214,16 +234,40 @@ impl ChannelSupervisor {
         enforcer: Option<Arc<dyn ChannelEnforcer>>,
         audit_tx: Option<Sender<AsyncAuditRequest>>,
     ) -> Result<Self> {
-        let config = ConfigStore {
+        let store = ConfigStore {
             storage: storage.clone(),
-        }
-        .load()
-        .unwrap_or_default();
-        let saved_policy_version = Self::compute_policy_version(&config)?;
-        let upstream_endpoint = if config.proxy_url.trim().is_empty() {
-            "127.0.0.1:7890".to_string()
+        };
+        let (config, config_blocking_reason) = if storage.paths.config().exists() {
+            match store.load() {
+                Ok(cfg) => (cfg, None),
+                Err(err) => (
+                    Config::default_for_new_install(),
+                    Some(format!("config_invalid:{}", err.code)),
+                ),
+            }
         } else {
-            config.proxy_url.clone()
+            (Config::default(), None)
+        };
+        Self::new_with_config(storage, config, config_blocking_reason, enforcer, audit_tx)
+    }
+
+    pub fn new_with_config(
+        storage: StateStore,
+        config: Config,
+        config_blocking_reason: Option<String>,
+        enforcer: Option<Arc<dyn ChannelEnforcer>>,
+        audit_tx: Option<Sender<AsyncAuditRequest>>,
+    ) -> Result<Self> {
+        let saved_policy_version = Self::compute_policy_version(&config)?;
+        let upstream_endpoint = if let Some(ep) = config
+            .vpn_expectation
+            .as_ref()
+            .filter(|e| e.configured && !e.proxy_url.trim().is_empty())
+            .map(|e| &e.proxy_url)
+        {
+            ep.clone()
+        } else {
+            config.proxy_url.trim().to_string()
         };
         let expected_executor_boot_id = enforcer
             .as_ref()
@@ -245,9 +289,15 @@ impl ChannelSupervisor {
             audit_tx,
             next_audit_request_id: 0,
             config,
+            config_blocking_reason,
             saved_policy_version,
             latest_egress: BTreeMap::new(),
-            latest_local_guard: json!({"proxy": "ok", "tun": "ok"}),
+            latest_local_guard: Value::Null,
+            latest_vpn_observation: None,
+            latest_vpn_match: None,
+            latest_vpn_unavailable_reason: None,
+            unmanaged_member_pids: BTreeMap::new(),
+            coverage_scopes: BTreeMap::new(),
             upstream_endpoint,
             tracks,
             event_seq: 0,
@@ -256,12 +306,62 @@ impl ChannelSupervisor {
         })
     }
 
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub fn config_blocking_reason(&self) -> Option<&str> {
+        self.config_blocking_reason.as_deref()
+    }
+
+    pub fn set_config_blocking_reason(
+        &mut self,
+        reason: Option<String>,
+        now: f64,
+    ) -> Result<()> {
+        if self.config_blocking_reason != reason {
+            self.config_blocking_reason = reason;
+            let family_ids: Vec<String> = self.tracks.keys().cloned().collect();
+            for family in family_ids {
+                self.evaluate_family(&family, now)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn saved_policy_version(&self) -> &PolicyVersion {
         &self.saved_policy_version
     }
 
     pub fn upstream_endpoint(&self) -> &str {
         &self.upstream_endpoint
+    }
+
+    pub fn latest_vpn_observation(&self) -> Option<&VpnObservation> {
+        self.latest_vpn_observation.as_ref()
+    }
+
+    pub fn latest_vpn_match(&self) -> Option<&VpnMatch> {
+        self.latest_vpn_match.as_ref()
+    }
+
+    pub fn set_family_unmanaged_pids(&mut self, family: &str, pids: Vec<u32>, now: f64) {
+        self.unmanaged_member_pids.insert(family.to_string(), pids);
+        self.refresh_verdict_and_emit(family, now);
+    }
+
+    pub fn set_family_coverage_scope(
+        &mut self,
+        family: &str,
+        scope: Option<BackendCoverageScope>,
+        now: f64,
+    ) {
+        if let Some(scope) = scope {
+            self.coverage_scopes.insert(family.to_string(), scope);
+        } else {
+            self.coverage_scopes.remove(family);
+        }
+        self.refresh_verdict_and_emit(family, now);
     }
 
     /// Handshakes or updates the expected executor `boot_id`. When an executor
@@ -434,6 +534,8 @@ impl ChannelSupervisor {
     pub fn handle_event(&mut self, event: SupervisionEvent) -> Result<ChannelMonitorSnapshot> {
         let now = match &event {
             SupervisionEvent::EnvironmentUpdated { observed_at, .. } => *observed_at,
+            SupervisionEvent::VpnObservationUpdated { observed_at, .. } => *observed_at,
+            SupervisionEvent::VpnObservationUnavailable { observed_at, .. } => *observed_at,
             SupervisionEvent::ProcessInventoryUpdated { observed_at, .. } => *observed_at,
             SupervisionEvent::ProcessInventoryUnavailable { observed_at, .. } => *observed_at,
             SupervisionEvent::PolicyUpdated { observed_at, .. } => *observed_at,
@@ -445,6 +547,83 @@ impl ChannelSupervisor {
         };
 
         match event {
+            SupervisionEvent::VpnObservationUpdated {
+                observation,
+                observed_at,
+            } => {
+                if !observation.epoch.is_valid() || observation.sample_seq == 0 {
+                    return Ok(self.snapshot(observed_at));
+                }
+                if let Some(prev) = self.latest_vpn_observation.as_ref() {
+                    if prev.epoch.observer_boot_id != observation.epoch.observer_boot_id {
+                        return Ok(self.snapshot(observed_at));
+                    }
+                    if observation.sample_seq <= prev.sample_seq
+                        || observation.epoch.change_generation < prev.epoch.change_generation
+                    {
+                        return Ok(self.snapshot(observed_at));
+                    }
+                }
+                let epoch_changed = match self.latest_vpn_observation.as_ref() {
+                    Some(prev) => {
+                        prev.epoch != observation.epoch
+                            || prev.source_revision != observation.source_revision
+                            || !prev.is_fresh(observation.sample_started_at)
+                    }
+                    None => self.latest_vpn_unavailable_reason.is_some(),
+                };
+                let matched_now = self
+                    .config
+                    .vpn_expectation
+                    .as_ref()
+                    .is_some_and(|exp| compare_vpn(exp, &observation, observed_at).is_matched());
+                if matched_now {
+                    if let Some(ep) = observation
+                        .upstream_endpoint
+                        .as_ref()
+                        .filter(|ep| !ep.trim().is_empty())
+                    {
+                        self.upstream_endpoint = ep.clone();
+                    }
+                }
+                self.latest_vpn_observation = Some(observation);
+                self.latest_vpn_unavailable_reason = None;
+                let family_ids: Vec<String> = self.tracks.keys().cloned().collect();
+                for family in family_ids {
+                    if let Some(track) = self.tracks.get_mut(&family) {
+                        if epoch_changed {
+                            track.audit_in_flight = None;
+                            track.audit_retry_count = 0;
+                            track.audit_retry_not_before = None;
+                            track.audit_last_failure_code = None;
+                            track.last_risk_at = Some(observed_at);
+                        } else if matched_now
+                            && track.audit_last_failure_code.as_deref()
+                                == Some("async_audit_retries_exhausted")
+                        {
+                            track.audit_retry_count = 0;
+                            track.audit_retry_not_before = None;
+                            track.audit_last_failure_code = None;
+                        }
+                    }
+                    self.evaluate_family(&family, observed_at)?;
+                }
+            }
+            SupervisionEvent::VpnObservationUnavailable {
+                reason,
+                observed_at,
+            } => {
+                self.latest_vpn_observation = None;
+                self.latest_vpn_unavailable_reason = Some(reason);
+                let family_ids: Vec<String> = self.tracks.keys().cloned().collect();
+                for family in family_ids {
+                    if let Some(track) = self.tracks.get_mut(&family) {
+                        track.audit_in_flight = None;
+                        track.last_risk_at = Some(observed_at);
+                    }
+                    self.evaluate_family(&family, observed_at)?;
+                }
+            }
             SupervisionEvent::NetworkContextChanged {
                 context_id,
                 observed_at,
@@ -541,7 +720,14 @@ impl ChannelSupervisor {
                 observed_at,
             } => {
                 let new_version = Self::compute_policy_version(&config)?;
-                if !config.proxy_url.trim().is_empty() {
+                if let Some(ep) = config
+                    .vpn_expectation
+                    .as_ref()
+                    .filter(|e| e.configured && !e.proxy_url.trim().is_empty())
+                    .map(|e| &e.proxy_url)
+                {
+                    self.upstream_endpoint = ep.clone();
+                } else if !config.proxy_url.trim().is_empty() {
                     self.upstream_endpoint = config.proxy_url.clone();
                 }
                 let version_changed = new_version != self.saved_policy_version;
@@ -574,8 +760,16 @@ impl ChannelSupervisor {
                         self.ingest_receipt(receipt, observed_at)?;
                     }
                 }
+                let vpn_stale_at_deadline = self
+                    .latest_vpn_observation
+                    .as_ref()
+                    .is_some_and(|obs| !obs.is_fresh(observed_at));
                 let family_ids: Vec<String> = self.tracks.keys().cloned().collect();
                 for family in family_ids {
+                    if vpn_stale_at_deadline {
+                        self.evaluate_family(&family, observed_at)?;
+                        continue;
+                    }
                     if let Some(track) = self.tracks.get_mut(&family) {
                         if let Some(permit) = track.current_permit.as_mut() {
                             let (eff, reason) = permit.effective_state_with_clock(
@@ -629,13 +823,35 @@ impl ChannelSupervisor {
         let snap = self.snapshot(now);
         // Secondary persistence never blocks or rolls back the channel command
         // already executed by the enforcer.
+        let mut published = json!(snap);
+        published["executor_boot_id"] = json!(self.expected_executor_boot_id);
+        published["producer_identity"] = crate::channel_policy_status::current_producer_identity();
+        published["authoritative_permits"] = json!(self.tracks.iter()
+            .filter_map(|(family, track)| track.current_permit.as_ref().map(|p| (family.clone(), p.clone())))
+            .collect::<BTreeMap<_, _>>());
+        published["enforcement_receipts"] = json!(self.tracks.iter()
+            .filter_map(|(family, track)| track.latest_receipt.as_ref().map(|r| (family.clone(), r.clone())))
+            .collect::<BTreeMap<_, _>>());
         let _ = self.storage.atomic_json(
             &self.storage.paths.watch().join("state/channel-supervision.json"),
-            &json!(snap),
+            &published,
         );
         let _ = self.storage.atomic_json(
             &self.storage.paths.watch().join("state/channel-events.json"),
             &json!(self.persisted_events),
+        );
+        let vpn_supervision = json!({
+            "captured_at": now,
+            "network_backend": self.config.effective_network_backend(),
+            "requires_migration": self.config.requires_backend_migration_setup(),
+            "expectation": self.config.vpn_expectation,
+            "observation": self.latest_vpn_observation,
+            "unavailable_reason": self.latest_vpn_unavailable_reason,
+            "vpn_match": self.compute_vpn_match(now),
+        });
+        let _ = self.storage.atomic_json(
+            &self.storage.paths.watch().join("state/vpn-supervision.json"),
+            &vpn_supervision,
         );
         crate::native::notify_channel_update();
         Ok(snap)
@@ -660,6 +876,70 @@ impl ChannelSupervisor {
             }
         }
         Ok(current)
+    }
+
+    fn compute_vpn_match(&self, now: f64) -> Option<VpnMatch> {
+        if let Some(ref reason) = self.config_blocking_reason {
+            return Some(VpnMatch::Unknown {
+                reasons: vec![reason.clone()],
+            });
+        }
+        let is_sandbox_backend = self.config.effective_network_backend().is_sandbox();
+        let vpn_gate_active = is_sandbox_backend
+            || self.config.vpn_expectation.is_some()
+            || self.latest_vpn_observation.is_some()
+            || self.latest_vpn_unavailable_reason.is_some();
+        if !vpn_gate_active {
+            return None;
+        }
+        match (
+            self.config.vpn_expectation.as_ref(),
+            self.latest_vpn_observation.as_ref(),
+        ) {
+            (Some(exp), Some(obs)) => Some(compare_vpn(exp, obs, now)),
+            (None, Some(obs)) => {
+                let unconfigured = VpnExpectation::unconfigured();
+                Some(compare_vpn(&unconfigured, obs, now))
+            }
+            (Some(exp), None) => {
+                if !exp.configured {
+                    let mut reasons = vec!["vpn_expectation_unconfigured".into()];
+                    if let Some(ref r) = self.latest_vpn_unavailable_reason {
+                        if r != "vpn_expectation_unconfigured" {
+                            reasons.push(r.clone());
+                        }
+                    }
+                    Some(VpnMatch::Unknown { reasons })
+                } else {
+                    let reason = self
+                        .latest_vpn_unavailable_reason
+                        .clone()
+                        .unwrap_or_else(|| "vpn_observation_missing".into());
+                    Some(VpnMatch::Unknown {
+                        reasons: vec![reason],
+                    })
+                }
+            }
+            (None, None) => {
+                if is_sandbox_backend {
+                    let mut reasons = vec!["vpn_expectation_unconfigured".into()];
+                    if let Some(ref r) = self.latest_vpn_unavailable_reason {
+                        if r != "vpn_expectation_unconfigured" {
+                            reasons.push(r.clone());
+                        }
+                    }
+                    Some(VpnMatch::Unknown { reasons })
+                } else {
+                    let reason = self
+                        .latest_vpn_unavailable_reason
+                        .clone()
+                        .unwrap_or_else(|| "vpn_observation_unavailable".into());
+                    Some(VpnMatch::Unknown {
+                        reasons: vec![reason],
+                    })
+                }
+            }
+        }
     }
 
     fn evaluate_family(&mut self, family: &str, now: f64) -> Result<()> {
@@ -687,21 +967,65 @@ impl ChannelSupervisor {
             .map(|t| t.desktops.clone())
             .unwrap_or_default();
 
-        let local_guard_ok =
-            self.latest_local_guard["proxy"] == "ok" && self.latest_local_guard["tun"] == "ok";
+        let vpn_match = self.compute_vpn_match(now);
+        self.latest_vpn_match = vpn_match.clone();
+
+        // Hard VPN Gate: When VPN expectation/observation is active and not Matched,
+        // immediately revoke the AI network permit without waiting for egress IP change
+        // and without allowing any `warn` policy exemption.
+        if let Some(ref vm) = vpn_match {
+            if !vm.is_matched() {
+                let code = vm.reason_code().to_string();
+                if let Some(track) = self.tracks.get_mut(family) {
+                    track.audit_in_flight = None;
+                    track.audit_retry_count = 0;
+                    track.audit_retry_not_before = None;
+                    track.last_risk_at = Some(now);
+                }
+                if let Some(s) = session.as_ref() {
+                    let _ = sessions.mark_failure(
+                        Some(&s.session_id),
+                        now,
+                        &code,
+                        "VPN 实际状态与保存预期不符或观测证据失效，已立即撤销通道放行并保留进程",
+                        true,
+                    );
+                    session = sessions.load(now)?;
+                }
+                return self.issue_family_command(
+                    family,
+                    session.as_ref(),
+                    ChannelPermitState::Revoked,
+                    &code,
+                    now,
+                );
+            }
+        }
+
+        let tun_required_by_guard = match self.config.vpn_expectation.as_ref() {
+            Some(exp) if exp.configured => exp.require_tun == Some(true),
+            _ => true,
+        };
+        let local_guard_ok = self.latest_local_guard["proxy"] == "ok"
+            && (!tun_required_by_guard || self.latest_local_guard["tun"] == "ok");
         let latest_egress = self.latest_egress.get(family).cloned().unwrap_or(Value::Null);
         let fresh_exit = Egress::fresh(&latest_egress, now, session::GUARD_EGRESS_TTL);
         let evidence_valid = fresh_exit
             .as_ref()
             .is_some_and(|exit| exit.observed_at + session::GUARD_EGRESS_TTL > now);
         let path_evidence = serde_json::from_value::<claude_watch_core::channel::ControlledPathEvidence>(latest_egress.clone());
+        let expected_vpn_epoch = self
+            .latest_vpn_observation
+            .as_ref()
+            .map(|o| &o.epoch);
         let path_matches_err = match path_evidence {
-            Ok(ref ev) => ev.matches_path(
+            Ok(ref ev) => ev.matches_path_with_vpn(
                 family,
                 &self.upstream_endpoint,
                 &self.saved_policy_version,
                 session.as_ref().filter(|s| s.state == Phase::Active).map(|s| s.context_id.as_str())
                     .or_else(|| self.latest_local_guard["context_id"].as_str()),
+                expected_vpn_epoch,
                 now,
                 session::GUARD_EGRESS_TTL,
             ).err(),
@@ -729,7 +1053,9 @@ impl ChannelSupervisor {
         // or if key evidence (egress / local_guard / path) has expired while a session is active.
         let mut risk_code: Option<String> = None;
         let mut evidence_expired_or_missing = false;
-        if self.latest_local_guard["proxy"] == "fail" || self.latest_local_guard["tun"] == "fail" {
+        if self.latest_local_guard["proxy"] == "fail"
+            || (tun_required_by_guard && self.latest_local_guard["tun"] == "fail")
+        {
             risk_code = Some("proxy_or_tun_failed".into());
         } else if !local_guard_ok && had_active_or_permitted {
             risk_code = Some("local_guard_unverified".into());
@@ -767,7 +1093,7 @@ impl ChannelSupervisor {
 
         // Determine desired permit state without blocking on slow audits
         let (desired_state, reason_code) = if let Some(code) = risk_code {
-            let action = if evidence_expired_or_missing {
+            let action = if evidence_expired_or_missing || code.starts_with("vpn_") {
                 "close".to_string()
             } else {
                 self.config.close_action(&code, provider)
@@ -794,14 +1120,14 @@ impl ChannelSupervisor {
         } else if desktops.is_empty() && self.tracks.get(family).is_none_or(|t| t.processes.is_empty()) {
             (ChannelPermitState::PendingVerification, "idle_no_process".into())
         } else if let Some(s) = session.as_ref() {
+            let was_revoked = self
+                .tracks
+                .get(family)
+                .and_then(|t| t.current_permit.as_ref())
+                .is_some_and(|p| p.state == ChannelPermitState::Revoked);
             if s.state == Phase::Active && !s.group_rechecking() {
                 // If previously revoked, do NOT automatically transition back to
                 // Permitted without fresh post-revocation recovery verification!
-                let was_revoked = self
-                    .tracks
-                    .get(family)
-                    .and_then(|t| t.current_permit.as_ref())
-                    .is_some_and(|p| p.state == ChannelPermitState::Revoked);
                 if was_revoked {
                     self.request_async_audit_if_needed(family, Some(s.session_id.clone()), audit_context_id.clone(), now);
                     (
@@ -824,7 +1150,9 @@ impl ChannelSupervisor {
                     .as_ref()
                     .map(|r| r.code.clone())
                     .unwrap_or_else(|| "session_locked".into());
-                if self.config.close_action(&code, provider) == "warn"
+                if !was_revoked
+                    && !code.starts_with("vpn_")
+                    && self.config.close_action(&code, provider) == "warn"
                     && local_guard_ok
                     && evidence_valid
                     && path_matches_err.is_none()
@@ -883,6 +1211,7 @@ impl ChannelSupervisor {
         context_id: Option<String>,
         now: f64,
     ) {
+        let current_vpn_epoch = self.latest_vpn_observation.as_ref().map(|o| o.epoch.clone());
         let Some(track) = self.tracks.get_mut(family) else {
             return;
         };
@@ -890,6 +1219,7 @@ impl ChannelSupervisor {
             if in_flight.session_id != session_id
                 || in_flight.context_id != context_id
                 || in_flight.policy_version != self.saved_policy_version
+                || in_flight.vpn_epoch != current_vpn_epoch
             {
                 track.audit_in_flight = None;
                 track.audit_retry_count = 0;
@@ -932,6 +1262,8 @@ impl ChannelSupervisor {
             session_id,
             context_id,
             policy_version: self.saved_policy_version.clone(),
+            vpn_epoch: current_vpn_epoch,
+            upstream_endpoint: self.upstream_endpoint.clone(),
             requested_at: now,
             timeout_seconds: DEFAULT_ASYNC_AUDIT_TIMEOUT_SECONDS,
             cancellation: None,
@@ -974,10 +1306,11 @@ impl ChannelSupervisor {
         };
         let current_session = self.load_channel_session(family_spec.id, completed_at)?;
         let current_session_id = current_session.as_ref().map(|s| s.session_id.clone());
+        let current_vpn_epoch = self.latest_vpn_observation.as_ref().map(|o| o.epoch.clone());
 
         // Logic Fix 4: Match `request_id` against `track.audit_in_flight` before
         // clearing `audit_in_flight` or applying the outcome.
-        let (matched_in_flight, stale, timeout_limit, audit_target) = {
+        let (matched_in_flight, stale, timeout_limit, audit_target, audit_vpn_epoch) = {
             let Some(track) = self.tracks.get_mut(family) else {
                 return Ok(());
             };
@@ -989,17 +1322,35 @@ impl ChannelSupervisor {
             }
             let timeout_limit = in_flight.timeout_seconds;
             let audit_target = in_flight.target;
+            let audit_vpn_epoch = in_flight.vpn_epoch.clone();
             track.audit_in_flight = None;
             let risk_since_request = track
                 .last_risk_at
                 .is_some_and(|risk_at| risk_at > requested_at);
+            let vpn_epoch_changed = current_vpn_epoch.is_some()
+                && audit_vpn_epoch != current_vpn_epoch;
             let is_stale = audit_policy != self.saved_policy_version
                 || audit_session_id != current_session_id
-                || risk_since_request;
-            (true, is_stale, timeout_limit, audit_target)
+                || risk_since_request
+                || vpn_epoch_changed;
+            (true, is_stale, timeout_limit, audit_target, audit_vpn_epoch)
         };
         if !matched_in_flight || stale {
             return Ok(());
+        }
+
+        let vpn_match = self.compute_vpn_match(completed_at);
+        self.latest_vpn_match = vpn_match.clone();
+        if let Some(ref vm) = vpn_match {
+            if !vm.is_matched() {
+                return self.issue_family_command(
+                    family,
+                    current_session.as_ref(),
+                    ChannelPermitState::Revoked,
+                    vm.reason_code(),
+                    completed_at,
+                );
+            }
         }
 
         let (audit, egress) = match outcome {
@@ -1020,9 +1371,6 @@ impl ChannelSupervisor {
                     track.audit_retry_count = 0;
                     track.audit_retry_not_before = None;
                     track.audit_last_failure_code = None;
-                }
-                if Egress::fresh(&egress, completed_at, session::GUARD_EGRESS_TTL).is_some() {
-                    self.latest_egress.insert(family.to_string(), egress.clone());
                 }
                 (audit, egress)
             }
@@ -1049,7 +1397,27 @@ impl ChannelSupervisor {
             }
         };
 
-        // Case 1: Recovering an existing revoked channel via `verify_channel_recovery`
+        // When VPN supervision is active (`current_vpn_epoch` is Some), the audit egress
+        // evidence MUST already carry the actual sampled `vpn_epoch` matching both the
+        // request epoch and current epoch; never backfill `vpn_epoch` from the request.
+        if let Some(ref expected_epoch) = current_vpn_epoch {
+            let sampled_epoch = ControlledPathEvidence::parse(&egress).and_then(|ev| ev.vpn_epoch);
+            if sampled_epoch.as_ref() != Some(expected_epoch)
+                || (audit_vpn_epoch.is_some() && sampled_epoch != audit_vpn_epoch)
+            {
+                return self.record_async_audit_failure(
+                    family,
+                    current_session.as_ref(),
+                    "recovery_vpn_epoch_mismatch",
+                    completed_at,
+                );
+            }
+        }
+        if Egress::fresh(&egress, completed_at, session::GUARD_EGRESS_TTL).is_some() {
+            self.latest_egress.insert(family.to_string(), egress.clone());
+        }
+
+        // Case 1: Recovering an existing revoked channel via `verify_channel_recovery_with_vpn_epoch`
         let was_revoked = self
             .tracks
             .get(family)
@@ -1084,7 +1452,7 @@ impl ChannelSupervisor {
             let audit_observed_at = audit["observed_at"].as_f64().unwrap_or(completed_at);
             let context_id = audit["context_id"].as_str().filter(|s| !s.is_empty()).unwrap_or("");
 
-            match verify_channel_recovery(
+            match verify_channel_recovery_with_vpn_epoch(
                 &previous_permit,
                 revoked_at,
                 audit_session_id.as_deref(),
@@ -1094,13 +1462,20 @@ impl ChannelSupervisor {
                 &egress,
                 current_session_id.as_deref(),
                 &self.saved_policy_version,
+                current_vpn_epoch.as_ref(),
                 context_id,
                 next_gen,
                 next_seq,
                 completed_at,
                 DEFAULT_PERMIT_TTL,
             ) {
-                Ok(recovered_permit) => {
+                Ok(mut recovered_permit) => {
+                    recovered_permit.backend = self.config.effective_network_backend();
+                    recovered_permit.coverage_scope = self.coverage_scopes.get(family).cloned();
+                    if let Some(obs) = self.latest_vpn_observation.as_ref() {
+                        recovered_permit.valid_until =
+                            recovered_permit.valid_until.min(obs.valid_until);
+                    }
                     if let Some(s) = current_session.as_ref() {
                         if let Some(exit) =
                             Egress::fresh(&egress, completed_at, session::GUARD_EGRESS_TTL)
@@ -1208,19 +1583,35 @@ impl ChannelSupervisor {
         let session_id = session.map(|s| s.session_id.clone());
         let context_id = session.map(|s| s.context_id.clone()).filter(|s| !s.is_empty());
         let baseline_ip = session.map(|s| s.baseline.ip.clone()).filter(|s| !s.is_empty());
+        let backend = self.config.effective_network_backend();
+        let vpn_epoch = self.latest_vpn_observation.as_ref().map(|o| o.epoch.clone());
+        let coverage_scope = self.coverage_scopes.get(family).cloned();
 
-        // Logic Fix 1: Cap `valid_until` by key evidence expiration time, and
-        // refuse to issue `Permitted` if egress evidence has already expired!
+        // Logic Fix 1: Cap `valid_until` by key evidence expiration time (and VPN
+        // observation expiration when present), and refuse to issue `Permitted` if
+        // egress evidence has already expired!
         let (effective_desired_state, effective_reason, valid_until) =
             if desired_state == ChannelPermitState::Permitted {
                 match Egress::fresh(self.latest_egress.get(family).unwrap_or(&Value::Null), now, session::GUARD_EGRESS_TTL) {
                     Some(exit) if exit.observed_at + session::GUARD_EGRESS_TTL > now => {
                         let evidence_expires_at = exit.observed_at + session::GUARD_EGRESS_TTL;
-                        (
-                            ChannelPermitState::Permitted,
-                            reason_code.to_string(),
-                            (now + DEFAULT_PERMIT_TTL).min(evidence_expires_at),
-                        )
+                        let mut capped = (now + DEFAULT_PERMIT_TTL).min(evidence_expires_at);
+                        if let Some(obs) = self.latest_vpn_observation.as_ref() {
+                            capped = capped.min(obs.valid_until);
+                        }
+                        if capped <= now {
+                            (
+                                ChannelPermitState::Revoked,
+                                "vpn_observation_stale".to_string(),
+                                now + DEFAULT_PERMIT_TTL,
+                            )
+                        } else {
+                            (
+                                ChannelPermitState::Permitted,
+                                reason_code.to_string(),
+                                capped,
+                            )
+                        }
                     }
                     _ => (
                         ChannelPermitState::Revoked,
@@ -1244,6 +1635,8 @@ impl ChannelSupervisor {
                     && p.session_id == session_id && p.policy_version == self.saved_policy_version
                     && p.context_id == context_id && p.baseline_ip == baseline_ip
                     && p.members == members && track.processes == track.commanded_processes
+                    && p.backend == backend && p.coverage_scope == coverage_scope
+                    && (p.state != ChannelPermitState::Permitted || p.vpn_epoch == vpn_epoch)
                     && now >= p.issued_at && (p.state != ChannelPermitState::Permitted
                         || (p.valid_until > now + DEFAULT_PERMIT_TTL / 2.0 && p.valid_until <= valid_until))
             })
@@ -1284,6 +1677,9 @@ impl ChannelSupervisor {
             context_id,
             baseline_ip,
             members,
+            backend,
+            vpn_epoch,
+            coverage_scope,
         };
         self.apply_permit_to_enforcer(family, permit, now)
     }
@@ -1305,6 +1701,7 @@ impl ChannelSupervisor {
             policy_version: permit.policy_version.clone(),
             permit_generation: permit.permit_generation,
             command_seq: permit.command_seq,
+            target_executor_boot_id: self.expected_executor_boot_id.clone(),
             permit: permit.clone(),
             allowed_processes,
             upstream_endpoint: self.upstream_endpoint.clone(),
@@ -1429,12 +1826,26 @@ impl ChannelSupervisor {
         }
         track.verdict = Some(verdict);
         let local_proxy_port = self.enforcer.as_ref().and_then(|e| e.local_proxy_port());
+        let default_backend = self.config.effective_network_backend();
+        let latest_vpn_epoch = self.latest_vpn_observation.as_ref().map(|o| o.epoch.clone());
+        let latest_vpn_match = self.latest_vpn_match.clone();
+        let coverage_scope = self.coverage_scopes.get(family).cloned();
+        let unmanaged_pids = self
+            .unmanaged_member_pids
+            .get(family)
+            .cloned()
+            .unwrap_or_default();
         let family_state = Self::build_family_monitor_state_from_track(
             &self.producer_boot_id,
             &self.saved_policy_version,
             family,
             track,
             local_proxy_port,
+            default_backend,
+            latest_vpn_epoch,
+            latest_vpn_match,
+            coverage_scope,
+            unmanaged_pids,
             now,
         );
         self.event_seq = self.event_seq.saturating_add(1);
@@ -1462,22 +1873,42 @@ impl ChannelSupervisor {
         now: f64,
     ) -> FamilyChannelMonitorState {
         let local_proxy_port = self.enforcer.as_ref().and_then(|e| e.local_proxy_port());
+        let default_backend = self.config.effective_network_backend();
+        let latest_vpn_epoch = self.latest_vpn_observation.as_ref().map(|o| o.epoch.clone());
+        let latest_vpn_match = self.latest_vpn_match.clone();
+        let coverage_scope = self.coverage_scopes.get(family).cloned();
+        let unmanaged_pids = self
+            .unmanaged_member_pids
+            .get(family)
+            .cloned()
+            .unwrap_or_default();
         Self::build_family_monitor_state_from_track(
             &self.producer_boot_id,
             &self.saved_policy_version,
             family,
             track,
             local_proxy_port,
+            default_backend,
+            latest_vpn_epoch,
+            latest_vpn_match,
+            coverage_scope,
+            unmanaged_pids,
             now,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_family_monitor_state_from_track(
         producer_boot_id: &str,
         saved_policy_version: &PolicyVersion,
         family: &str,
         track: &FamilyRuntimeTrack,
         local_proxy_port: Option<u16>,
+        default_backend: NetworkBackendKind,
+        latest_vpn_epoch: Option<VpnEpoch>,
+        latest_vpn_match: Option<VpnMatch>,
+        coverage_scope: Option<BackendCoverageScope>,
+        unmanaged_member_pids: Vec<u32>,
         now: f64,
     ) -> FamilyChannelMonitorState {
         let permit_state = track
@@ -1519,6 +1950,7 @@ impl ChannelSupervisor {
             blocked_new_connections,
             local_proxy_ready,
             system_extension_active,
+            sandbox_ready,
         ) = track
             .latest_receipt
             .as_ref()
@@ -1529,9 +1961,25 @@ impl ChannelSupervisor {
                     r.blocked_new_connections,
                     r.local_proxy_ready,
                     r.system_extension_active,
+                    r.sandbox_ready,
                 )
             })
-            .unwrap_or((0, 0, 0, false, false));
+            .unwrap_or((0, 0, 0, false, false, false));
+        let backend = track
+            .current_permit
+            .as_ref()
+            .map(|p| p.backend)
+            .unwrap_or(default_backend);
+        let vpn_epoch = track
+            .current_permit
+            .as_ref()
+            .and_then(|p| p.vpn_epoch.clone())
+            .or(latest_vpn_epoch);
+        let effective_coverage_scope = track
+            .current_permit
+            .as_ref()
+            .and_then(|p| p.coverage_scope.clone())
+            .or(coverage_scope);
 
         FamilyChannelMonitorState {
             producer_boot_id: producer_boot_id.into(),
@@ -1558,6 +2006,12 @@ impl ChannelSupervisor {
             local_proxy_port,
             valid_until: track.current_permit.as_ref().map(|p| p.valid_until),
             updated_at: now,
+            backend,
+            vpn_epoch,
+            vpn_match: latest_vpn_match,
+            coverage_scope: effective_coverage_scope.unwrap_or_default(),
+            unmanaged_member_pids,
+            sandbox_ready,
         }
     }
 }

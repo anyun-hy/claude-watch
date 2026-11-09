@@ -45,20 +45,21 @@ bash monitor/package-dmg.sh
 
 打包完成会生成带 SHA-256 校验文件的 DMG；脚本拒绝覆盖同名安装包。**打包不会安装**；安装、删除数据或调整系统权限必须单独授权。
 
-离线 Python 回归测试：
+统一自动测试入口（在已登录桌面的 macOS 终端执行，不加 `sudo`）：
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s monitor/tests -v
+bash tools/test-all.sh
 ```
 
-完整源码修复收尾使用以下**无真实进程信号、无账号操作、无安装**的回归入口；它覆盖 Rust 会话/账号/更新隔离测试、Python 构建及策略目录契约、Swift 进程策略用例、生产 SwiftUI 类型检查与 UI_REVIEW 模拟断言：
+覆盖 Rust 工作区、Python/JS 契约、全部独立 Swift 测试文件的显式配方，以及有专门准备的三个 ignored 用例。逐项日志、退出码与汇总保存在新的 `.agent/test-runs/` 目录；失败后继续独立项目，前置失败和排除项不计通过。会打开临时夹具窗口并清理自建进程，不启动真实 AI、不改 VPN、不安装服务。范围、前置依赖和排除项见 [统一测试说明](docs/TESTING.md)。
+
+只需运行原有选定回归时，仍可使用：
 
 ```sh
 bash tools/test-final-no-signal.sh
 ```
 
-此脚本特意**不执行未经挑选的 `cargo test --workspace`**，因为项目部分历史集成夹具会向自行创建的子进程发送信号；这不属于本轮无信号验收范围。测试全部通过不等同于安装、真实后台保护或真实界面验收。
+该旧脚本只覆盖选定集合，不是全工作区测试；其中也会终止自建的测试子进程。测试通过不等同于安装、真实后台保护或真实界面验收。
 
 Swift 测试、隔离界面与真实界面验收说明见 [原生应用开发说明](monitor/README.md)。
 
@@ -71,7 +72,7 @@ Swift 测试、隔离界面与真实界面验收说明见 [原生应用开发说
 | `monitor/Resources/` | WebView 检测页面、辅助脚本、图标资产（不携带已退役的 Python 后台） |
 | `monitor/Packaging/` | 完整安装、卸载与权限处理 |
 | `monitor/ThirdParty/` | 固定版本的上游源码、来源清单和许可证 |
-| `tests/`、`monitor/tests/` | 后台、原生界面和集成测试 |
+| `crates/*/tests/`、`tools/tests/`、`monitor/tests/` | Rust、工具契约、原生界面和集成测试 |
 | `monitor/tools/` | 构建与维护辅助工具 |
 | `crates/`、`Cargo.toml` | 已接入的 Rust 策略核心、运行时、原生引擎和安装组件 |
 | `tools/rust_shadow.py` | 新旧实现的同输入对照与回放验证 |

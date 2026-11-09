@@ -422,3 +422,72 @@ fn reused_app_pid_is_not_signalled() {
         .iter()
         .all(|c| c.program != Path::new("/bin/kill")));
 }
+
+#[test]
+fn seatbelt_bundle_requires_hashed_arm64_sandbox_launcher_and_gateway_broker() {
+    let app = std::env::temp_dir().join(format!("cw-seatbelt-release-{}.app", Uuid::new_v4()));
+    let resources = app.join("Contents/Resources");
+    fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+    fs::create_dir_all(&resources).unwrap();
+    fs::write(app.join("Contents/MacOS/ClaudeWatchMonitor"), []).unwrap();
+    let required = [
+        "watch-engine",
+        "watch-native-observer",
+        "watch-process-control",
+        "watch-admin.sh",
+        "watch-native-collector.zsh",
+        "watch-sandbox-launcher",
+        "watch-gateway-broker",
+    ];
+    for name in required {
+        fs::write(resources.join(name), []).unwrap();
+    }
+    let empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let hashes = required
+        .into_iter()
+        .map(|name| (name.to_owned(), serde_json::json!(empty_hash)))
+        .collect::<serde_json::Map<_, _>>();
+    let info = r#"{"CFBundleIdentifier":"io.local.watchpanel","CFBundleExecutable":"ClaudeWatchMonitor","CFBundleShortVersionString":"2.5.0","CFBundleVersion":"250"}"#;
+    let manifest = serde_json::json!({
+        "Architecture":"arm64", "ProductVersion":"2.5.0", "BackendVariant":"rust-candidate",
+        "NetworkBackend":"seatbelt", "RuntimeSchema":2, "RuntimeHashes":hashes,
+    })
+    .to_string();
+    let replies = vec![
+        ok(info),
+        ok(""),
+        ok("arm64"),
+        ok("arm64"),
+        ok("arm64"),
+        ok("arm64"),
+        ok(&manifest),
+        ok("arm64"),
+        ok("arm64"),
+    ];
+    let mut release = native(replies.clone());
+    assert_eq!(release.validate_bundle(&app).unwrap().version, "2.5.0");
+    assert!(release.executor.calls.iter().any(|call| {
+        call.program == Path::new("/usr/bin/lipo")
+            && call
+                .args
+                .last()
+                .is_some_and(|path| path.ends_with("watch-sandbox-launcher"))
+    }));
+    assert!(release.executor.calls.iter().any(|call| {
+        call.program == Path::new("/usr/bin/lipo")
+            && call.args.last().is_some_and(|path| path.ends_with("watch-gateway-broker"))
+    }));
+    // The extra runtime hash is accepted only when the actual broker matches.
+    fs::write(resources.join("watch-gateway-broker"), b"changed").unwrap();
+    assert_eq!(native(replies.clone()).validate_bundle(&app).unwrap_err().code, "release_identity_mismatch");
+    fs::write(resources.join("watch-gateway-broker"), []).unwrap();
+    let mut wrong_arch = replies.clone();
+    *wrong_arch.last_mut().unwrap() = ok("x86_64");
+    assert_eq!(native(wrong_arch).validate_bundle(&app).unwrap_err().code, "release_identity_mismatch");
+    let mut missing_manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    missing_manifest["RuntimeHashes"].as_object_mut().unwrap().remove("watch-gateway-broker");
+    let mut missing = replies;
+    missing[6] = ok(&missing_manifest.to_string());
+    assert_eq!(native(missing).validate_bundle(&app).unwrap_err().code, "release_identity_mismatch");
+    fs::remove_dir_all(app).unwrap();
+}

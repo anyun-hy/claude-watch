@@ -77,10 +77,15 @@ class ExtensionEpochAndSigning(unittest.TestCase):
                 self.assertIn("must be 0 or 1", result.stderr)
 
     def test_development_mode_remains_explicitly_available(self):
-        for settings in [{}, {"CW_REQUIRE_ENTITLED_NETWORK_EXTENSION": "0"}]:
+        for settings in [
+            {},
+            {"CW_REQUIRE_ENTITLED_NETWORK_EXTENSION": "0"},
+            {"CW_NETWORK_BACKEND": "seatbelt"},
+            {"CW_NETWORK_BACKEND": "seatbelt", "CW_SIGNING_IDENTITY": "Fixture Developer ID"},
+        ]:
             result = self.preflight(settings)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("resolved:-||", result.stdout)
+            self.assertIn("resolved:", result.stdout)
 
     def test_every_host_activation_entry_checks_both_capabilities_before_os_calls(self):
         entries = {

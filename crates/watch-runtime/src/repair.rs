@@ -84,66 +84,68 @@ pub fn make_plan(config: &Config, local: &Value, merge_text: Option<&str>) -> Re
     } else {
         observed_mode
     };
-    if text(local, "proxy") == "fail"
-        && matches!(
-            mode,
-            "tag" | "clash-verge" | "shadowrocket" | "sing-box" | "clashx" | "surge"
-        )
-    {
-        add(
-            &mut actions,
-            "start_proxy",
-            "启动选定代理客户端",
-            "application",
-            json!(false),
-            json!(mode),
-        );
-    }
-    if mode == "clash-verge" {
-        let verge = text(local, "clash_verge_config");
-        if text(local, "tun") != "ok"
-            && verge.lines().any(|line| {
-                line.trim_start().starts_with("enable_tun_mode:")
-                    && line.trim_end().ends_with("false")
-            })
+    if !config.vpn_is_read_only() {
+        if text(local, "proxy") == "fail"
+            && matches!(
+                mode,
+                "tag" | "clash-verge" | "shadowrocket" | "sing-box" | "clashx" | "surge"
+            )
         {
             add(
                 &mut actions,
-                "enable_tun",
-                "启用 Clash Verge TUN",
-                "proxy",
-                json!(sha256(verge.as_bytes())),
-                json!(true),
+                "start_proxy",
+                "启动选定代理客户端",
+                "application",
+                json!(false),
+                json!(mode),
             );
         }
-        if let Some(old) = merge_text
-            .or_else(|| local["merge_text"].as_str())
-            .filter(|_| !config.proxy_group.is_empty())
-        {
-            let new = rules::render_rules(old, &config.proxy_group, false)?;
-            if new != old {
+        if mode == "clash-verge" {
+            let verge = text(local, "clash_verge_config");
+            if text(local, "tun") != "ok"
+                && verge.lines().any(|line| {
+                    line.trim_start().starts_with("enable_tun_mode:")
+                        && line.trim_end().ends_with("false")
+                })
+            {
                 add(
                     &mut actions,
-                    "rules",
-                    "合并 13 项域名置顶规则",
+                    "enable_tun",
+                    "启用 Clash Verge TUN",
                     "proxy",
-                    json!(sha256(old.as_bytes())),
-                    json!(config.proxy_group),
+                    json!(sha256(verge.as_bytes())),
+                    json!(true),
                 );
             }
-        }
-        if actions
-            .iter()
-            .any(|x| matches!(text(x, "id"), "enable_tun" | "rules"))
-        {
-            add(
-                &mut actions,
-                "reload_proxy",
-                "重启 Clash Verge 使配置生效（会短暂影响代理）",
-                "application",
-                json!(mode),
-                json!(mode),
-            );
+            if let Some(old) = merge_text
+                .or_else(|| local["merge_text"].as_str())
+                .filter(|_| !config.proxy_group.is_empty())
+            {
+                let new = rules::render_rules(old, &config.proxy_group, false)?;
+                if new != old {
+                    add(
+                        &mut actions,
+                        "rules",
+                        "合并 13 项域名置顶规则",
+                        "proxy",
+                        json!(sha256(old.as_bytes())),
+                        json!(config.proxy_group),
+                    );
+                }
+            }
+            if actions
+                .iter()
+                .any(|x| matches!(text(x, "id"), "enable_tun" | "rules"))
+            {
+                add(
+                    &mut actions,
+                    "reload_proxy",
+                    "重启 Clash Verge 使配置生效（会短暂影响代理）",
+                    "application",
+                    json!(mode),
+                    json!(mode),
+                );
+            }
         }
     }
     if !config.timezone.is_empty() && text(local, "timezone") != config.timezone {
@@ -284,7 +286,12 @@ pub fn region_plan<S: RepairSystem>(
         return Err(err("online_disabled", "请先明确启用在线检查"));
     }
     let local = system.local(config)?;
-    if text(&local, "proxy") != "ok" || text(&local, "tun") != "ok" {
+    let tun_required = config
+        .vpn_expectation
+        .as_ref()
+        .and_then(|e| e.require_tun)
+        .unwrap_or(!config.vpn_is_read_only());
+    if text(&local, "proxy") != "ok" || (tun_required && text(&local, "tun") != "ok") {
         return Err(err("proxy_unverified", "代理与 TUN 未确认；未发起地区探测"));
     }
     let mut probe = config.clone();

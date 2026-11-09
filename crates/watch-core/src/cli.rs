@@ -61,7 +61,17 @@ impl Request {
             "check" | "checkdetail" => {
                 (&[], &["online", "require-ready", "no-report"], &["target"])
             }
-            "config" => (&["show", "set", "enabled"], &["apply"], &["confirm-force"]),
+            "config" => (
+                &[
+                    "show",
+                    "set",
+                    "enabled",
+                    "vpn-expectation-preview",
+                    "vpn-expectation-save",
+                ],
+                &["apply"],
+                &["confirm-force"],
+            ),
             "account" => (
                 &["status", "switch", "recover", "import"],
                 &["apply", "ack-unverified-version"],

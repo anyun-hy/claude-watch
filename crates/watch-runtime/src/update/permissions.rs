@@ -20,7 +20,7 @@ fn executable(name: &str) -> bool {
     let component = name.strip_prefix("runtime/")
         .or_else(|| name.strip_prefix("app/Claude Watch Monitor.app/Contents/Resources/"));
     matches!(component, Some("watch-engine" | "watch-native-observer" | "watch-process-control"
-        | "watch-admin.sh" | "watch-leak-worker" | "watch-native-collector.zsh"))
+        | "watch-sandbox-launcher" | "watch-gateway-broker" | "ControlledEntry" | "watch-admin.sh" | "watch-leak-worker" | "watch-native-collector.zsh"))
 }
 
 /// Only traverse normal directories inside the extraction destination. An
@@ -92,15 +92,19 @@ mod tests {
 
     #[test]
     fn execution_roles_are_exact_paths_not_names_or_extensions() {
-        for name in ["runtime/watch-engine", "runtime/watch-leak-worker",
+        for name in ["runtime/watch-engine", "runtime/watch-leak-worker", "runtime/watch-sandbox-launcher", "runtime/watch-gateway-broker",
             "app/Claude Watch Monitor.app/Contents/MacOS/ClaudeWatchMonitor",
+            "app/Claude Watch Monitor.app/Contents/Resources/watch-sandbox-launcher",
+            "app/Claude Watch Monitor.app/Contents/Resources/watch-gateway-broker",
             "app/Claude Watch Monitor.app/Contents/Resources/watch-admin.sh"] {
             assert!(executable(name), "{name}");
         }
         for name in ["runtime/extra/watch-engine", "runtime/arbitrary.sh", "runtime/BuildInfo.plist",
+            "runtime/extra/watch-gateway-broker", "runtime/watch-gateway-broker.sh",
             "app/Other.app/Contents/MacOS/ClaudeWatchMonitor",
             "app/Claude Watch Monitor.app/Contents/MacOS/Other",
-            "app/Claude Watch Monitor.app/Contents/Resources/nested/watch-admin.sh"] {
+            "app/Claude Watch Monitor.app/Contents/Resources/nested/watch-admin.sh",
+            "app/Claude Watch Monitor.app/Contents/Resources/nested/watch-gateway-broker"] {
             assert!(!executable(name), "{name}");
         }
     }

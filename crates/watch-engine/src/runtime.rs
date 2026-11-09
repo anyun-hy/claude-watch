@@ -274,6 +274,14 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
                     &manifest,
                 )?);
             }
+            if manifest["NetworkBackend"] == "seatbelt"
+                || manifest["RuntimeHashes"]["watch-sandbox-launcher"].is_string()
+            {
+                required.push("watch-sandbox-launcher");
+            }
+            if manifest["RuntimeHashes"]["ControlledEntry"].is_string() {
+                required.push("ControlledEntry");
+            }
             for name in required {
                 let path = resources.join(name);
                 let metadata = std::fs::symlink_metadata(&path)
@@ -328,8 +336,12 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
                 .status()?
                 .value();
             let env = host.environment().ok();
+            let policy_sync_state = claude_watch_runtime::channel_policy_status::read_policy_sync_state(
+                &host.storage, &config, native::now(),
+            );
             Ok(Some(
                 json!({"status":"ok","config":config.value()?,"legacy_openai_force_review":legacy_openai_force_review,"accounts":accounts,"audit":audit,"service_status":background(&host)?,"netcoffee_lookup":audit["netcoffee_lookup"],"source_notices":audit.get("source_notices").unwrap_or(&json!([])),
+                "policy_sync_state": policy_sync_state,
                 "repair":host.storage.read_json(&host.storage.paths.base().join("last-repair.json"),Value::Null)?,"guard":host.storage.read_json(&host.storage.paths.base().join("guard-heartbeat.json"),Value::Null)?,
                 "update_recovery_required":host.storage.paths.base().join("update-transaction.json").exists(),"setup_recovery_required":host.storage.paths.base().join("setup-transaction.json").exists()||host.storage.paths.base().join("service-transaction.json").exists()||host.storage.paths.watch().join("agent-install-transaction.json").exists(),"proxy_groups":[],
                 "claude_version":env.as_ref().and_then(|v|v.pointer("/claude_app/version")).and_then(Value::as_str).unwrap_or("")}),
@@ -469,6 +481,10 @@ pub fn recover_maintenance(request: &Request, paths: Paths) -> Result<Value> {
 pub enum OperationOutcome {
     Receipt(Value),
     CliExit(claude_watch_runtime::controlled::CliOutcome),
+}
+#[allow(dead_code)]
+pub fn managed_entry_bundle_id(target: claude_watch_core::processes::LaunchTarget) -> &'static str {
+    claude_watch_runtime::managed_entry::DesktopManagedEntrySpec::entry_bundle_id_for(target)
 }
 pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<OperationOutcome>> {
     use claude_watch_runtime::{

@@ -40,7 +40,7 @@ if [[ -e "$DMG" || -e "$SHA_FILE" ]]; then
   exit 1
 fi
 
-APP_VERSION="$APP_VERSION" BUILD_NUMBER="$BUILD_NUMBER" /bin/bash "$ROOT/build.sh"
+APP_VERSION="$APP_VERSION" BUILD_NUMBER="$BUILD_NUMBER" CW_NETWORK_BACKEND="${CW_NETWORK_BACKEND:-seatbelt}" /bin/bash "$ROOT/build.sh"
 [[ -d "$APP" ]] || { printf 'Build did not produce: %s\n' "$APP" >&2; exit 1; }
 ACTUAL_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
 ACTUAL_BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist")

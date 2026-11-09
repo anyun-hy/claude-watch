@@ -21,7 +21,7 @@ fn local() -> Value {
 fn probe(kind: &str, now: f64) -> Value {
     let candidates = if kind == "dns" { "resolver" } else { "srflx" };
     let address = if kind == "dns" { "8.8.8.8" } else { "1.1.1.1" };
-    let evidence = if kind == "dns" {
+    let mut evidence = if kind == "dns" {
         json!({"session":"a".repeat(40), "dns_servers":{"8.8.8.8":5},
                "http":{"address":"1.1.1.1","country":"JP"},
                "geoip":[{"ip":"8.8.8.8","country_code":"JP"}]})
@@ -31,6 +31,9 @@ fn probe(kind: &str, now: f64) -> Value {
             {"kind":"geoip","status":"complete","query":address,"data":{"country_code":"jp"}}
         ])
     };
+    // This JSON is embedded as a string in the recorded input. Preserve the
+    // original fixture bytes even when the workspace enables preserve_order.
+    evidence.sort_all_objects();
     json!({"kind":kind,"status":"complete","startedAt":now-2.0,"finishedAt":now,"contextChanged":false,"errors":[],
         "observations":[{"kind":"http","address":"1.1.1.1","country":"Japan","source":"fixture"},
                         {"kind":candidates,"address":address,"country":"Japan","source":"fixture"}],
@@ -79,7 +82,7 @@ fn receipt_generation_matches_mature_dns_and_webrtc_behavior() {
             cases.push(case);
         }
         let mut cn = good.clone();
-        let cn_evidence = if kind == "dns" {
+        let mut cn_evidence = if kind == "dns" {
             json!({"session":"a".repeat(40),"dns_servers":{"8.8.8.8":5},"http":{"address":"1.1.1.1","country":"JP"},"geoip":[{"ip":"8.8.8.8","country_code":"CN"}]})
         } else {
             json!([
@@ -87,6 +90,7 @@ fn receipt_generation_matches_mature_dns_and_webrtc_behavior() {
                 {"kind":"geoip","status":"complete","query":if kind=="dns"{"8.8.8.8"}else{"1.1.1.1"},"data":{"country_code":"CN"}}
             ])
         };
+        cn_evidence.sort_all_objects();
         cn["probe"]["externalJSON"] = json!(serde_json::to_string(&cn_evidence).unwrap());
         cases.push(cn);
         let mut expected = good.clone();

@@ -1,10 +1,11 @@
 use claude_watch_core::{
     error::{CoreError, Result},
     policy::PolicyCatalog,
+    vpn::VpnObservation,
 };
 use claude_watch_runtime::{
     audit_store::{AuditOptions, AuditStore, AuditSystem},
-    channel_enforcer::LocalTunnelEnforcer,
+    channel_enforcer::{ChannelEnforcer, LocalTunnelEnforcer},
     channel_supervisor::AsyncAuditRequest,
     config_store::ConfigStore,
     macos::Authority,
@@ -18,6 +19,46 @@ use std::{
     sync::atomic::AtomicBool,
     time::{Duration, Instant},
 };
+
+fn read_verified_vpn_epoch(
+    paths: &Paths,
+    enforcer: &LocalTunnelEnforcer,
+    family: &str,
+    now: f64,
+) -> Option<claude_watch_core::vpn::VpnEpoch> {
+    let obs_path = paths.base().join("vpn-observation.json");
+    let store = StateStore::new(paths.clone());
+    if let Ok(raw) = store.read_json(&obs_path, Value::Null) {
+        if !raw.is_null() {
+            if let Ok(obs) = serde_json::from_value::<VpnObservation>(raw) {
+                if obs.is_fresh(now) && obs.epoch.is_valid() {
+                    return Some(obs.epoch);
+                }
+            }
+        }
+    }
+    enforcer
+        .receipt_for(family, now)
+        .ok()
+        .flatten()
+        .and_then(|r| r.vpn_epoch)
+        .filter(|e| e.is_valid())
+}
+
+fn verify_audit_vpn_epoch_consistency(
+    req: &AsyncAuditRequest,
+    actual_epoch: Option<&claude_watch_core::vpn::VpnEpoch>,
+) -> Result<()> {
+    if let Some(ref expected) = req.vpn_epoch {
+        if !expected.is_valid() || actual_epoch != Some(expected) {
+            return Err(CoreError::new(
+                "audit_vpn_epoch_changed",
+                "审计期间 VPN epoch 缺失或已变化，保持待验证或阻断",
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn audit_context(audit: &Value) -> Result<&str> {
     if audit["context_changed"] == true
@@ -42,10 +83,13 @@ pub fn run(
     enforcer: &LocalTunnelEnforcer,
     req: &AsyncAuditRequest,
 ) -> Result<(Value, Value, f64)> {
-    let remaining = req.requested_at + req.timeout_seconds - native::now();
+    let start_now = native::now();
+    let remaining = req.requested_at + req.timeout_seconds - start_now;
     if !remaining.is_finite() || remaining <= 0.0 {
         return Err(CoreError::new("audit_cancelled", "审计已经超时"));
     }
+    let epoch_before = read_verified_vpn_epoch(paths, enforcer, &req.family, start_now);
+    verify_audit_vpn_epoch_consistency(req, epoch_before.as_ref())?;
     let deadline = Instant::now() + Duration::from_secs_f64(remaining);
     let fallback = AtomicBool::new(false);
     let cancel = req.cancellation.as_deref().unwrap_or(&fallback);
@@ -64,21 +108,47 @@ pub fn run(
         )
     };
     let audit = invoke("audit", json!({}))?;
+    let mid_now = native::now();
+    let epoch_mid = read_verified_vpn_epoch(paths, enforcer, &req.family, mid_now);
+    verify_audit_vpn_epoch_consistency(req, epoch_mid.as_ref())?;
+    if epoch_before.is_some() && epoch_mid != epoch_before {
+        return Err(CoreError::new(
+            "audit_vpn_epoch_changed",
+            "审计期间 VPN epoch 发生变化，结果作废",
+        ));
+    }
     // This context comes from this audit, never from an old session/request.
     let context = audit_context(&audit)?;
     let (mut egress, evidence) = enforcer.probe_via_controlled_diagnostic_channel(
         &req.family,
         context,
-        native::now(),
+        mid_now,
         |proxy| invoke("egress", json!({"proxy":proxy,"context_id":context})),
     )?;
+    let end_now = native::now();
+    let epoch_after = read_verified_vpn_epoch(paths, enforcer, &req.family, end_now)
+        .or_else(|| evidence.vpn_epoch.clone());
+    verify_audit_vpn_epoch_consistency(req, epoch_after.as_ref())?;
+    if epoch_before.is_some() && epoch_after != epoch_before {
+        return Err(CoreError::new(
+            "audit_vpn_epoch_changed",
+            "探针完成后 VPN epoch 发生变化，结果作废",
+        ));
+    }
     egress["via_controlled_path"] = json!(true);
     egress["family"] = json!(evidence.family);
     egress["upstream_endpoint"] = json!(evidence.upstream_endpoint);
     egress["context_id"] = json!(evidence.context_id);
     egress["policy_version"] = serde_json::to_value(evidence.policy_version).unwrap();
     egress["observed_at"] = json!(evidence.observed_at);
-    Ok((audit, egress, native::now()))
+    egress["backend"] = json!(evidence.backend);
+    if let Some(ref verified_epoch) = epoch_after {
+        egress["vpn_epoch"] = json!(verified_epoch);
+    }
+    if let Some(ref boot_id) = evidence.executor_boot_id {
+        egress["executor_boot_id"] = json!(boot_id);
+    }
+    Ok((audit, egress, end_now))
 }
 
 /// Private process entrypoint. No application lifecycle or installation actions.

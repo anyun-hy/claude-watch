@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 ENGINE = ROOT / "target" / "debug" / "claude-watch-engine"
 SWITCHER = ROOT / "monitor" / "Sources" / "SwitcherStore.swift"
 MODELS = ROOT / "monitor" / "Sources" / "MonitorModels.swift"
+BACKEND_CAP = ROOT / "monitor" / "Sources" / "NetworkBackendCapabilities.swift"
 COFFEE = ROOT / "monitor" / "Sources" / "NetCoffeeModels.swift"
 LEAK = ROOT / "monitor" / "Sources" / "LeakCheckModels.swift"
 INIT_LOG = ROOT / "monitor" / "Sources" / "InitializationConnectionLog.swift"
@@ -98,9 +99,18 @@ def production_models() -> str:
         (MODELS, "ChannelMonitorDisplayState"),
         (MODELS, "PolicySyncState"),
         (MODELS, "BoundProcessTokenModel"),
+        (MODELS, "VpnEpochModel"),
+        (MODELS, "BackendCoverageScopeModel"),
         (MODELS, "FamilyChannelMonitorState"),
         (MODELS, "ChannelMonitorSnapshot"),
         (MODELS, "ChannelMonitorEvent"),
+        (MODELS, "ChannelSubscriptionApplyOutcome"),
+        (MODELS, "ChannelMonitorSubscriptionStore"),
+        (MODELS, "VpnFieldDiffModel"),
+        (MODELS, "VpnExpectationModel"),
+        (MODELS, "VpnMatchModel"),
+        (MODELS, "VpnSupervisionSnapshotModel"),
+        (BACKEND_CAP, "NetworkBackendCapabilities"),
         (MODELS, "MonitorSnapshot"),
     )
     return "\n\n".join(declaration(path, name) for path, name in requested)
@@ -157,6 +167,137 @@ struct RustSwiftReceiptContract {
         require(lookup.sourceURL.hasPrefix("https://"), "Rust online lookup sourceURL was not decoded")
         require(lookup.queriedAt > 0 && lookup.finishedAt >= lookup.queriedAt, "Rust online lookup timestamps were not decoded")
         require(lookup.httpStatus == 200, "Rust online lookup httpStatus was not decoded")
+
+        // U01: Out-of-order/late receipts, unknown/disconnected state degradation,
+        // snapshot resync, unmanaged member visibility, and saved vs applied policy version distinction.
+        let pv1 = ChannelPolicyVersionModel(policy_digest: "p1", guard_policy_digest: "g1")
+        let pv2 = ChannelPolicyVersionModel(policy_digest: "p2", guard_policy_digest: "g1")
+        let famState1 = FamilyChannelMonitorState(
+            producer_boot_id: "boot-1",
+            family: "claude",
+            session_id: "sess-1",
+            saved_policy_version: pv2,
+            applied_policy_version: pv1,
+            policy_sync_state: .pendingApply,
+            policy_sync_label_zh: "配置已保存（待执行器应用）",
+            permit_generation: 2,
+            command_seq: 5,
+            permit_state: "permitted",
+            display_state: .forwarding,
+            display_label_zh: "获准转发",
+            reason_code: "verified",
+            process_preserved: true,
+            active_member_pids: [1001],
+            active_flows_count: 1,
+            terminated_flows_count: 0,
+            blocked_new_connections: 0,
+            updated_at: 1000.0,
+            backend: "seatbelt",
+            vpn_epoch: VpnEpochModel(observer_boot_id: "vpn-1", change_generation: 3),
+            coverage_scope: BackendCoverageScopeModel(
+                backend: "seatbelt",
+                covers_controlled_desktop_launch: true,
+                covers_controlled_cli_launch: true,
+                covers_direct_fork_exec_children: true,
+                covers_unmanaged_external_launch: false,
+                unmanaged_processes_visible: true
+            ),
+            unmanaged_member_pids: [2002],
+            sandbox_ready: true
+        )
+        var subStore = ChannelMonitorSubscriptionStore()
+        let snap1 = ChannelMonitorSnapshot(
+            producer_boot_id: "boot-1",
+            snapshot_seq: 10,
+            captured_at: 1000.0,
+            saved_policy_version: pv2,
+            families: ["claude": famState1]
+        )
+        require(subStore.applySnapshot(snap1), "U01: initial snapshot apply failed")
+        require(subStore.families["claude"]?.saved_policy_version == pv2, "U01: saved_policy_version mismatch")
+        require(subStore.families["claude"]?.applied_policy_version == pv1, "U01: applied_policy_version mismatch")
+        require(subStore.families["claude"]?.hasUnmanagedMembers == true, "U01: unmanaged members must be visible")
+
+        // Stale event (seq <= 10) must be ignored
+        let staleEvent = ChannelMonitorEvent(producer_boot_id: "boot-1", event_seq: 9, family_state: famState1)
+        require(subStore.applyEvent(staleEvent) == .ignoredStaleEvent, "U01: stale event seq must be ignored")
+
+        // Gap event (seq == 12 when expecting 11) must trigger resync and degrade effectiveState to pendingVerification
+        let gapEvent = ChannelMonitorEvent(producer_boot_id: "boot-1", event_seq: 12, family_state: famState1)
+        if case .gapDetectedResyncRequired(let exp, let rec) = subStore.applyEvent(gapEvent) {
+            require(exp == 11 && rec == 12, "U01: unexpected gap seq numbers")
+        } else {
+            fail("U01: expected gapDetectedResyncRequired")
+        }
+        let degraded = subStore.effectiveState(for: "claude", now: 1005.0, live: true)
+        require(degraded?.display_state == .pendingVerification, "U01: resync-required store must degrade to pendingVerification, never false success")
+        require(degraded?.unmanaged_member_pids == [2002], "U01: degraded state must preserve unmanaged_member_pids visibility")
+        require(famState1.isConfirmedFlowBlocked == false, "U01: pendingApply / forwarding must never report isConfirmedFlowBlocked")
+
+        // Verify isConfirmedFlowBlocked requires both display_state == .blocked and policy_sync_state == .applied with 0 active flows
+        let blockedPending = FamilyChannelMonitorState(
+            producer_boot_id: "boot-1",
+            family: "claude",
+            session_id: "sess-1",
+            saved_policy_version: pv2,
+            applied_policy_version: pv1,
+            policy_sync_state: .pendingApply,
+            policy_sync_label_zh: "配置已保存（待执行器应用）",
+            permit_generation: 3,
+            command_seq: 6,
+            permit_state: "revoked",
+            display_state: .blocked,
+            display_label_zh: "已阻断",
+            reason_code: "vpn_node_mismatch",
+            process_preserved: true,
+            active_member_pids: [1001],
+            active_flows_count: 0,
+            terminated_flows_count: 4,
+            blocked_new_connections: 1,
+            updated_at: 1006.0
+        )
+        require(blockedPending.isConfirmedFlowBlocked == false, "U01: pending_apply must not report confirmed flow blocked")
+        let blockedConfirmed = FamilyChannelMonitorState(
+            producer_boot_id: "boot-1",
+            family: "claude",
+            session_id: "sess-1",
+            saved_policy_version: pv2,
+            applied_policy_version: pv2,
+            policy_sync_state: .applied,
+            policy_sync_label_zh: "执行器已应用",
+            permit_generation: 3,
+            command_seq: 6,
+            permit_state: "revoked",
+            display_state: .blocked,
+            display_label_zh: "已阻断",
+            reason_code: "vpn_node_mismatch",
+            process_preserved: true,
+            active_member_pids: [1001],
+            active_flows_count: 0,
+            terminated_flows_count: 4,
+            blocked_new_connections: 1,
+            updated_at: 1007.0
+        )
+        require(blockedConfirmed.isConfirmedFlowBlocked == true, "U01: applied blocked receipt with 0 active flows must report isConfirmedFlowBlocked")
+
+        // Verify VpnSupervisionSnapshotModel diffs & unknown/stale reasons and NetworkBackendCapabilities alignment
+        let vpnSnap = VpnSupervisionSnapshotModel(
+            captured_at: 1007.0,
+            network_backend: "seatbelt",
+            requires_migration: false,
+            expectation: VpnExpectationModel(configured: true, proxy_mode: "tag", proxy_url: "http://127.0.0.1:7890", proxy_group: "TAG", expected_node: "JP-01"),
+            unavailable_reason: nil,
+            vpn_match: VpnMatchModel(
+                state: "mismatched",
+                differences: [VpnFieldDiffModel(field: "selected_node", expected: "JP-01", observed: "SG-02")],
+                reasons: ["system_proxy_not_sampled"]
+            )
+        )
+        require(vpnSnap.differences.count == 1 && vpnSnap.differences[0].field == "selected_node", "U01: VpnSupervisionSnapshotModel differences mismatch")
+        require(vpnSnap.unknownOrStaleReasons == ["system_proxy_not_sampled"], "U01: VpnSupervisionSnapshotModel unknownOrStaleReasons mismatch")
+        require(NetworkBackendCapabilities.requiresLegacyMigration(from: ["schema": 1]) == true, "U01: legacy schema 1 must require migration under seatbelt package")
+        require(NetworkBackendCapabilities.isBackendAligned(with: ["schema": 2, "network_backend": "seatbelt"]) == true, "U01: schema 2 seatbelt must be aligned")
+
         print("RustSwiftReceiptContract: decoded status nested accounts/audit/service, checkdetail --no-report, service-status, environment, snapshot, and non-null Rust online lookup")
     }
 }

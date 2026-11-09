@@ -389,12 +389,9 @@ fn fixture_egress(now: f64, ip: &str, country: &str) -> Value {
     let mut dummy_config = claude_watch_core::config::Config::default();
     dummy_config.enabled = true;
     dummy_config.guard_enabled = true;
+    dummy_config.proxy_url = "http://127.0.0.1:17890".into();
     let policy_ver = ChannelSupervisor::compute_policy_version(&dummy_config).unwrap();
-    let upstream = if dummy_config.proxy_url.trim().is_empty() {
-        "127.0.0.1:7890".to_string()
-    } else {
-        dummy_config.proxy_url.clone()
-    };
+    let upstream = dummy_config.proxy_url.clone();
     json!({
         "ip": ip,
         "country": country,
@@ -664,6 +661,9 @@ fn setup_store() -> (TempRoot, StateStore) {
     let mut cfg = Config::default();
     cfg.enabled = true;
     cfg.guard_enabled = true;
+    // Path evidence must describe an explicitly configured upstream. An empty
+    // production setting is deliberately not an implicit 7890 permission.
+    cfg.proxy_url = "http://127.0.0.1:17890".into();
     store
         .atomic_json(&store.paths.config(), &cfg.value().unwrap())
         .unwrap();
@@ -1433,9 +1433,13 @@ fn mid_dial_policy_session_or_revocation_change_aborts_connection_and_shuts_down
                 start_seconds: 900,
                 start_microseconds: 1,
             }],
+            backend: claude_watch_core::channel::NetworkBackendKind::NetworkExtension,
+            vpn_epoch: None,
+            coverage_scope: None,
         },
         allowed_processes: vec![proc_token.clone()],
         upstream_endpoint: "127.0.0.1:7890".into(),
+        target_executor_boot_id: None,
         issued_at: now,
     };
     enforcer.apply_command(&cmd1, now).unwrap();
@@ -1471,9 +1475,13 @@ fn mid_dial_policy_session_or_revocation_change_aborts_connection_and_shuts_down
                         start_seconds: 900,
                         start_microseconds: 1,
                     }],
+                    backend: claude_watch_core::channel::NetworkBackendKind::NetworkExtension,
+                    vpn_epoch: None,
+                    coverage_scope: None,
                 },
                 allowed_processes: vec![proc_for_hook.clone()],
                 upstream_endpoint: "127.0.0.1:7890".into(),
+                target_executor_boot_id: None,
                 issued_at: now + 0.1,
             };
             enforcer_in_hook.apply_command(&cmd2, now + 0.1).unwrap();
@@ -1538,9 +1546,13 @@ fn out_of_order_or_conflicting_commands_do_not_mutate_state_and_duplicate_comman
                     context_id: Some("ctx".into()),
                     baseline_ip: Some("1.1.1.1".into()),
                     members: vec![],
+                    backend: claude_watch_core::channel::NetworkBackendKind::NetworkExtension,
+                    vpn_epoch: None,
+                    coverage_scope: None,
                 },
                 allowed_processes: vec![],
                 upstream_endpoint: "127.0.0.1:7890".into(),
+                target_executor_boot_id: None,
                 issued_at: at,
             }
         };
@@ -1777,6 +1789,10 @@ fn receiver_clock_and_executor_boot_id_handshake_reject_delayed_or_pre_restart_r
         error_code: None,
         executor_boot_id: "boot-old-0".into(),
         observed_at: now + 0.2,
+        backend: claude_watch_core::channel::NetworkBackendKind::NetworkExtension,
+        vpn_epoch: None,
+        coverage_scope: None,
+        sandbox_ready: false,
     };
     let snap_bad_boot = supervisor
         .handle_event(SupervisionEvent::EnforcementReceiptArrived {
@@ -1854,6 +1870,10 @@ impl DummyReceiptExt for claude_watch_core::channel::FamilyChannelMonitorState {
             error_code: None,
             executor_boot_id: "boot-current-1".into(),
             observed_at: self.updated_at,
+            backend: self.backend,
+            vpn_epoch: self.vpn_epoch,
+            coverage_scope: Some(self.coverage_scope),
+            sandbox_ready: self.sandbox_ready,
         }
     }
 }
@@ -1950,6 +1970,12 @@ fn daemon_restart_resync_with_producer_boot_id() {
         local_proxy_port: Some(7890),
         valid_until: Some(initial_now + 30.0),
         updated_at: initial_now,
+        backend: claude_watch_core::channel::NetworkBackendKind::NetworkExtension,
+        vpn_epoch: None,
+        vpn_match: None,
+        coverage_scope: claude_watch_core::channel::BackendCoverageScope::default(),
+        unmanaged_member_pids: vec![],
+        sandbox_ready: false,
     };
 
     let snap = claude_watch_core::channel::ChannelMonitorSnapshot {

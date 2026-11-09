@@ -98,7 +98,57 @@ fn local_command(request: &claude_watch_core::cli::Request, paths: Paths) -> Res
                 bounded_input(request.input_limit())?,
                 request.value("confirm-force"),
             )?;
-            Ok(Some(json!({"status":"ok","config":saved.value()?})))
+            claude_watch_runtime::native::notify_channel_update();
+            Ok(Some(json!({
+                "status": "ok",
+                "config": saved.value()?,
+                "policy_sync_state": "pending_apply",
+                "effective": false,
+                "message": "配置已保存（待执行器确认生效）"
+            })))
+        }
+        ("config", Some("vpn-expectation-preview")) => {
+            let current_cfg = config.load().unwrap_or_default();
+            let vpn_sup = storage
+                .read_json(
+                    &storage.paths.watch().join("state/vpn-supervision.json"),
+                    Value::Null,
+                )
+                .unwrap_or(Value::Null);
+            let candidate = vpn_sup
+                .get("observation")
+                .and_then(|v| {
+                    serde_json::from_value::<claude_watch_core::vpn::VpnObservation>(v.clone())
+                        .ok()
+                })
+                .and_then(|obs| obs.to_candidate_expectation().ok());
+            Ok(Some(json!({
+                "status": "ok",
+                "grants_launch_permission": false,
+                "effective": false,
+                "saved_expectation": current_cfg.vpn_expectation,
+                "candidate_expectation": candidate,
+                "vpn_supervision": vpn_sup,
+                "message": "只读 VPN 预期候选预览；确认保存后才会写入 Watch 配置并触发监督复核"
+            })))
+        }
+        ("config", Some("vpn-expectation-save")) => {
+            request.require_apply()?;
+            let raw = bounded_input(request.input_limit())?;
+            let expectation: claude_watch_core::vpn::VpnExpectation =
+                serde_json::from_value(raw)
+                    .map_err(|_| CoreError::new("invalid_config", "VPN 监督预期格式无效"))?;
+            let saved = config.save_vpn_expectation(expectation, true)?;
+            claude_watch_runtime::native::notify_channel_update();
+            Ok(Some(json!({
+                "status": "ok",
+                "config": saved.value()?,
+                "vpn_expectation": saved.vpn_expectation,
+                "policy_sync_state": "pending_apply",
+                "effective": false,
+                "grants_launch_permission": false,
+                "message": "VPN 监督预期已保存到 Watch 配置（待监督与执行器回执生效）"
+            })))
         }
         ("account", Some("status")) => Ok(Some(
             AccountStore::new(storage, ReadOnlyAccounts)
@@ -217,10 +267,19 @@ fn run() -> Result<EngineOutput> {
         ));
     }
     if args == ["--component-paths"] {
-        return Ok(EngineOutput::json(
-            json!({"native_observer":claude_watch_runtime::native::built_observer_path(),"process_control":claude_watch_runtime::native::built_process_control_path()}),
-            0,
-        ));
+        let mut paths = json!({
+            "native_observer": claude_watch_runtime::native::built_observer_path(),
+            "process_control": claude_watch_runtime::native::built_process_control_path(),
+        });
+        if let Some(sandbox_launcher) = claude_watch_runtime::native::built_sandbox_launcher_path() {
+            paths["sandbox_launcher"] = json!(sandbox_launcher);
+        }
+        if let Some(gateway_broker) = std::env::current_exe().ok()
+            .and_then(|path| path.parent().map(|parent| parent.join("watch-gateway-broker")))
+            .filter(|path| path.is_file()) {
+            paths["gateway_broker"] = json!(gateway_broker);
+        }
+        return Ok(EngineOutput::json(paths, 0));
     }
     let Some(_) = args.first().map(String::as_str) else {
         return Err(CoreError::new("command_required", "需要明确的命令"));

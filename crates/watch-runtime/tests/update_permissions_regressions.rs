@@ -69,6 +69,42 @@ fn signed_component_roles_get_execute_bits_even_when_zip_modes_lost_them() {
     for (name, bytes) in files { assert_eq!(fs::read(f.destination().join(name)).unwrap(), bytes); }
 }
 #[test]
+fn gateway_broker_update_requires_matching_pair_and_grants_only_exact_execution_roles() {
+    const RUNTIME: &str = "runtime/watch-gateway-broker";
+    const BUNDLED: &str = "app/Claude Watch Monitor.app/Contents/Resources/watch-gateway-broker";
+    const NESTED: &str = "app/Claude Watch Monitor.app/Contents/Resources/nested/watch-gateway-broker";
+    for case in ["absent", "matching", "runtime_only", "app_only", "mismatched"] {
+        let fixture = Fixture::new();
+        let mut files = contents();
+        files.insert(NESTED.into(), b"ordinary resource, never executed".to_vec());
+        if case != "absent" {
+            files.insert(RUNTIME.into(), b"broker fixture, never executed".to_vec());
+            files.insert(BUNDLED.into(), b"broker fixture, never executed".to_vec());
+        }
+        match case {
+            "runtime_only" => { files.remove(BUNDLED); }
+            "app_only" => { files.remove(RUNTIME); }
+            "mismatched" => { files.insert(BUNDLED.into(), b"different broker bytes".to_vec()); }
+            _ => {}
+        }
+        let (archive, release) = fixture.archive(&files, 0o755);
+        let result = verify_extract(&archive, &fixture.destination(), &release);
+        if matches!(case, "absent" | "matching") {
+            result.unwrap();
+            assert_eq!(mode(&fixture.destination().join(NESTED)), 0o600);
+            if case == "matching" {
+                for path in [RUNTIME, BUNDLED] {
+                    assert_eq!(mode(&fixture.destination().join(path)), 0o700);
+                    assert_eq!(fs::read(fixture.destination().join(path)).unwrap(), files[path]);
+                }
+            }
+        } else {
+            assert_eq!(result.unwrap_err().code, "release_component_mismatch", "{case}");
+            no_execute(&fixture.destination());
+        }
+    }
+}
+#[test]
 fn arbitrary_archive_execute_bits_do_not_turn_resources_into_programs() {
     let f = Fixture::new(); let (archive, release) = f.archive(&contents(), 0o777);
     verify_extract(&archive, &f.destination(), &release).unwrap();

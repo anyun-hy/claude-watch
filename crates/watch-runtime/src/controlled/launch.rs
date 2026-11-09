@@ -91,7 +91,7 @@ impl Controller {
         if !system.desktops()?.is_empty() {
             return Err(CoreError::new(
                 "claude_already_running",
-                "Claude 已在运行，不能补建受控启动会话",
+                "Claude 已在运行（未受控实例 running_unprotected），不能补建受控启动会话或伪造已保护状态",
             ));
         }
         // The audit is the slow stage: it measures the exit, DNS, WebRTC and
@@ -203,13 +203,13 @@ impl Controller {
                                     context_id: None,
                                     baseline_ip: None,
                                     members: vec![],
+                                    backend: config.effective_network_backend(),
+                                    vpn_epoch: None,
+                                    coverage_scope: None,
                                 },
                                 allowed_processes: vec![],
-                                upstream_endpoint: if config.proxy_url.trim().is_empty() {
-                                    "127.0.0.1:7890".to_string()
-                                } else {
-                                    config.proxy_url.clone()
-                                },
+                                upstream_endpoint: config.proxy_url.clone(),
+                                target_executor_boot_id: None,
                                 issued_at: now,
                             };
                             if let Err(e) = system.enforce_channel(&cmd) {
@@ -271,7 +271,7 @@ impl Controller {
         if !system.observation_roots()?.is_empty() {
             return Err(CoreError::new(
                 "target_already_running",
-                "目标已在运行，不能补登记观察会话",
+                "目标已在运行（未受控实例 running_unprotected），不能补登记观察或受控会话",
             ));
         }
         crate::setup_progress::emit(crate::setup_progress::Phase::CollectEvidence);

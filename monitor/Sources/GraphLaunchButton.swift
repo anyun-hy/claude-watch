@@ -125,7 +125,12 @@ struct GraphLaunchButton: View {
         // the common "already running" case without waiting for a full backend
         // snapshot. When the backend is absent or stale (e.g. during first-run),
         // fall back to the snapshot's desktop-main processes.
-        if monitor.desktopRunning[target == .claude ? .claude : .openAI] == true {
+        let product: MonitoredProduct = target == .claude ? .claude : .openAI
+        let unmanaged = monitor.unmanagedPids(for: product)
+        if monitor.desktopRunning[product] == true {
+            if !unmanaged.isEmpty {
+                return "\(target.title) 已在运行（检测到未受控实例 running_unprotected，未受保护）。"
+            }
             return "\(target.title) 已在运行。"
         }
         let sampleTime = switcher.isFixture ? monitor.now.timeIntervalSince1970 : now.timeIntervalSince1970
@@ -133,6 +138,9 @@ struct GraphLaunchButton: View {
            snapshot.health.state == "running",
            MonitorSnapshotTiming.isCurrent(capturedAt: snapshot.capturedAt, now: sampleTime),
            target.hasRunningDesktop(in: snapshot.processes) {
+            if !unmanaged.isEmpty {
+                return "\(target.title) 已在运行（检测到未受控实例 running_unprotected，未受保护）。"
+            }
             return "\(target.title) 已在运行。"
         }
         return nil

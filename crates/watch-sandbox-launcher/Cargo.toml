@@ -1,0 +1,23 @@
+[package]
+name = "claude-watch-sandbox-launcher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Dedicated Seatbelt (nono capability model) launcher helper for Claude Watch"
+
+[[bin]]
+name = "watch-sandbox-launcher"
+path = "src/main.rs"
+
+[dependencies]
+claude-watch-core = { path = "../watch-core" }
+claude-watch-runtime = { path = "../watch-runtime" }
+claude-watch-system = { path = "../watch-system" }
+serde.workspace = true
+serde_json.workspace = true
+nono = { git = "https://github.com/nolabs-ai/nono.git", rev = "e9796cca01eb863a9a83e96c18ae6120aa50beb1", default-features = false }
+
+[dev-dependencies]
+libc = "0.2"
+

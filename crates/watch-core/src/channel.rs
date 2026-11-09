@@ -10,6 +10,7 @@ use crate::{
     error::{CoreError, Result},
     processes::ProcessRole,
     session::{Desktop, Egress, Phase, Session, GUARD_EGRESS_TTL},
+    vpn::{VpnEpoch, VpnMatch},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,6 +19,68 @@ use std::collections::BTreeMap;
 pub const DEFAULT_PERMIT_TTL: f64 = 10.0;
 pub const MAX_ENFORCEMENT_RECEIPT_AGE: f64 = 10.0;
 pub const CLOCK_ROLLBACK_TOLERANCE_SECONDS: f64 = 0.05;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkBackendKind {
+    #[default]
+    #[serde(alias = "network-extension", alias = "ne", alias = "legacy_ne")]
+    NetworkExtension,
+    #[serde(rename = "seatbelt", alias = "sandbox", alias = "nono")]
+    Seatbelt,
+}
+
+impl NetworkBackendKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NetworkExtension => "network_extension",
+            Self::Seatbelt => "seatbelt",
+        }
+    }
+
+    pub fn is_sandbox(self) -> bool {
+        matches!(self, Self::Seatbelt)
+    }
+
+    pub fn is_network_extension(self) -> bool {
+        matches!(self, Self::NetworkExtension)
+    }
+
+    pub fn parse_wire(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "network_extension" | "network-extension" | "ne" | "legacy_ne" => {
+                Some(Self::NetworkExtension)
+            }
+            "seatbelt" | "sandbox" | "nono" => Some(Self::Seatbelt),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BackendCoverageScope {
+    pub backend: NetworkBackendKind,
+    pub configured_entries: Vec<String>,
+    pub protected_pids: Vec<u32>,
+    pub unprotected_pids: Vec<u32>,
+    pub uncovered_boundaries: Vec<String>,
+    pub server_identity_verified: bool,
+    #[serde(default)]
+    pub gateway_endpoint_protection_verified: bool,
+    #[serde(default)]
+    pub gateway_endpoint_protection_method: Option<String>,
+}
+
+impl BackendCoverageScope {
+    pub fn has_unprotected_processes(&self) -> bool {
+        !self.unprotected_pids.is_empty()
+    }
+
+    pub fn all_discovered_protected(&self) -> bool {
+        !self.protected_pids.is_empty() && self.unprotected_pids.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyVersion {
@@ -127,14 +190,46 @@ pub struct ControlledPathEvidence {
     pub context_id: String,
     pub via_controlled_path: bool,
     pub observed_at: f64,
+    #[serde(default)]
+    pub backend: NetworkBackendKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpn_epoch: Option<VpnEpoch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_boot_id: Option<String>,
 }
 impl ControlledPathEvidence {
+    pub fn parse(value: &Value) -> Option<Self> {
+        serde_json::from_value(value.clone()).ok()
+    }
+
     pub fn matches_path(
         &self,
         family: &str,
         expected_upstream: &str,
         current_policy: &PolicyVersion,
         expected_context_id: Option<&str>,
+        now: f64,
+        ttl: f64,
+    ) -> std::result::Result<(), &'static str> {
+        self.matches_path_with_vpn(
+            family,
+            expected_upstream,
+            current_policy,
+            expected_context_id,
+            None,
+            now,
+            ttl,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matches_path_with_vpn(
+        &self,
+        family: &str,
+        expected_upstream: &str,
+        current_policy: &PolicyVersion,
+        expected_context_id: Option<&str>,
+        expected_vpn_epoch: Option<&VpnEpoch>,
         now: f64,
         ttl: f64,
     ) -> std::result::Result<(), &'static str> {
@@ -151,6 +246,11 @@ impl ControlledPathEvidence {
         }
         if !current_policy.valid() || &self.policy_version != current_policy {
             return Err("evidence_policy_version_mismatch");
+        }
+        if let Some(expected_epoch) = expected_vpn_epoch {
+            if !expected_epoch.is_valid() || self.vpn_epoch.as_ref() != Some(expected_epoch) {
+                return Err("evidence_vpn_epoch_mismatch");
+            }
         }
         if let Some(ctx) = expected_context_id.filter(|s| !s.is_empty()) {
             if self.context_id != ctx {
@@ -262,6 +362,12 @@ pub struct ChannelPermit {
     pub context_id: Option<String>,
     pub baseline_ip: Option<String>,
     pub members: Vec<Desktop>,
+    #[serde(default)]
+    pub backend: NetworkBackendKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpn_epoch: Option<VpnEpoch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_scope: Option<BackendCoverageScope>,
 }
 impl ChannelPermit {
     /// Unified expiry and clock check shared across Rust and Swift:
@@ -276,8 +382,24 @@ impl ChannelPermit {
         woke_from_sleep: bool,
         current_policy: &PolicyVersion,
     ) -> (ChannelPermitState, &'static str) {
+        self.effective_state_with_vpn_epoch(now, last_wall_now, woke_from_sleep, current_policy, None)
+    }
+
+    pub fn effective_state_with_vpn_epoch(
+        &self,
+        now: f64,
+        last_wall_now: Option<f64>,
+        woke_from_sleep: bool,
+        current_policy: &PolicyVersion,
+        current_vpn_epoch: Option<&VpnEpoch>,
+    ) -> (ChannelPermitState, &'static str) {
         if !self.policy_version.valid() || &self.policy_version != current_policy {
             return (ChannelPermitState::Revoked, "policy_version_changed");
+        }
+        if let Some(expected_epoch) = current_vpn_epoch {
+            if !expected_epoch.is_valid() || self.vpn_epoch.as_ref() != Some(expected_epoch) {
+                return (ChannelPermitState::Revoked, "vpn_epoch_changed");
+            }
         }
         if woke_from_sleep {
             return (ChannelPermitState::Revoked, "sleep_wake_reverify_required");
@@ -370,6 +492,9 @@ impl ChannelPermit {
                 .map(|s| s.baseline.ip.clone())
                 .filter(|s| !s.is_empty()),
             members,
+            backend: NetworkBackendKind::NetworkExtension,
+            vpn_epoch: None,
+            coverage_scope: None,
         })
     }
 }
@@ -381,10 +506,53 @@ pub struct ChannelEnforcementCommand {
     pub policy_version: PolicyVersion,
     pub permit_generation: u64,
     pub command_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_executor_boot_id: Option<String>,
     pub permit: ChannelPermit,
     pub allowed_processes: Vec<BoundProcessToken>,
     pub upstream_endpoint: String,
     pub issued_at: f64,
+}
+
+/// Authenticated command envelope binding a `ChannelEnforcementCommand` to a specific
+/// `target_executor_boot_id`, backend kind, VPN epoch, and coverage scope at the
+/// trusted receiving boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthenticatedCommandEnvelope {
+    pub backend: NetworkBackendKind,
+    pub target_executor_boot_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpn_epoch: Option<VpnEpoch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_scope: Option<BackendCoverageScope>,
+    pub command: ChannelEnforcementCommand,
+}
+
+impl AuthenticatedCommandEnvelope {
+    pub fn verify_target_executor(&self, actual_executor_boot_id: &str) -> Result<()> {
+        if self.target_executor_boot_id.trim().is_empty()
+            || actual_executor_boot_id.trim().is_empty()
+            || self.target_executor_boot_id != actual_executor_boot_id
+        {
+            return Err(CoreError::new(
+                "executor_boot_id_mismatch",
+                "命令封套的目标执行器实例与当前执行器不匹配，已拒绝旧实例命令",
+            ));
+        }
+        if self.command.permit.backend != self.backend {
+            return Err(CoreError::new(
+                "backend_kind_mismatch",
+                "命令封套后端类型与许可后端类型不一致",
+            ));
+        }
+        if self.vpn_epoch.is_some() && self.command.permit.vpn_epoch != self.vpn_epoch {
+            return Err(CoreError::new(
+                "vpn_epoch_mismatch",
+                "命令封套 VPN epoch 与许可 VPN epoch 不一致",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn default_true() -> bool {
@@ -418,6 +586,14 @@ pub struct ChannelEnforcementReceipt {
     pub observed_at: f64,
     #[serde(default)]
     pub error_code: Option<String>,
+    #[serde(default)]
+    pub backend: NetworkBackendKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpn_epoch: Option<VpnEpoch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_scope: Option<BackendCoverageScope>,
+    #[serde(default)]
+    pub sandbox_ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -528,6 +704,24 @@ pub fn evaluate_channel_supervision_with_boot_id(
     if receipt.observed_at + 0.001 < permit.issued_at {
         return ChannelSupervisionVerdict::EnforcementFailed {
             code: "receipt_predates_permit".into(),
+            status_label_zh: "执行失败".into(),
+        };
+    }
+    if receipt.backend != permit.backend {
+        return ChannelSupervisionVerdict::EnforcementFailed {
+            code: "backend_kind_mismatch".into(),
+            status_label_zh: "执行失败".into(),
+        };
+    }
+    if permit.backend.is_sandbox() && receipt.system_extension_active {
+        return ChannelSupervisionVerdict::EnforcementFailed {
+            code: "sandbox_receipt_claims_system_extension".into(),
+            status_label_zh: "执行失败".into(),
+        };
+    }
+    if permit.vpn_epoch.is_some() && receipt.vpn_epoch != permit.vpn_epoch {
+        return ChannelSupervisionVerdict::EnforcementFailed {
+            code: "stale_vpn_epoch_receipt".into(),
             status_label_zh: "执行失败".into(),
         };
     }
@@ -815,7 +1009,64 @@ pub fn verify_channel_recovery(
         context_id: Some(context_id.into()),
         baseline_ip: Some(exit.ip),
         members: previous.members.clone(),
+        backend: previous.backend,
+        vpn_epoch: previous.vpn_epoch.clone(),
+        coverage_scope: previous.coverage_scope.clone(),
     })
+}
+
+pub fn verify_channel_recovery_with_vpn_epoch(
+    previous: &ChannelPermit,
+    revoked_at: f64,
+    audit_session_id: Option<&str>,
+    audit_passed: bool,
+    audit_completed_at: f64,
+    audit_policy: &PolicyVersion,
+    egress: &Value,
+    current_session_id: Option<&str>,
+    current_policy: &PolicyVersion,
+    current_vpn_epoch: Option<&VpnEpoch>,
+    context_id: &str,
+    next_permit_generation: u64,
+    next_command_seq: u64,
+    now: f64,
+    ttl: f64,
+) -> Result<ChannelPermit> {
+    let mut recovered = verify_channel_recovery(
+        previous,
+        revoked_at,
+        audit_session_id,
+        audit_passed,
+        audit_completed_at,
+        audit_policy,
+        egress,
+        current_session_id,
+        current_policy,
+        context_id,
+        next_permit_generation,
+        next_command_seq,
+        now,
+        ttl,
+    )?;
+    if let Some(expected_epoch) = current_vpn_epoch {
+        let controlled = ControlledPathEvidence::parse(egress).ok_or_else(|| {
+            CoreError::new("recovery_controlled_path_unconfirmed", "恢复证据缺少受控路径")
+        })?;
+        let Some(ref observed_epoch) = controlled.vpn_epoch else {
+            return Err(CoreError::new(
+                "recovery_vpn_epoch_missing",
+                "恢复证据缺少当前 VPN epoch 绑定",
+            ));
+        };
+        if observed_epoch != expected_epoch {
+            return Err(CoreError::new(
+                "recovery_vpn_epoch_mismatch",
+                "恢复证据的 VPN epoch 与当前观测不一致",
+            ));
+        }
+        recovered.vpn_epoch = Some(expected_epoch.clone());
+    }
+    Ok(recovered)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -850,6 +1101,18 @@ pub struct FamilyChannelMonitorState {
     #[serde(default)]
     pub valid_until: Option<f64>,
     pub updated_at: f64,
+    #[serde(default)]
+    pub backend: NetworkBackendKind,
+    #[serde(default)]
+    pub vpn_epoch: Option<VpnEpoch>,
+    #[serde(default)]
+    pub vpn_match: Option<VpnMatch>,
+    #[serde(default)]
+    pub coverage_scope: BackendCoverageScope,
+    #[serde(default)]
+    pub unmanaged_member_pids: Vec<u32>,
+    #[serde(default)]
+    pub sandbox_ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1034,6 +1297,9 @@ mod tests {
                 start_seconds: 900,
                 start_microseconds: 1,
             }],
+            backend: NetworkBackendKind::NetworkExtension,
+            vpn_epoch: None,
+            coverage_scope: None,
         }
     }
 
@@ -1054,7 +1320,7 @@ mod tests {
             enforcement_state,
             interception_active: true,
             local_proxy_ready: true,
-            system_extension_active: true,
+            system_extension_active: !permit.backend.is_sandbox(),
             new_connections_blocked: permit.state != ChannelPermitState::Permitted,
             active_flows_closed,
             direct_fallback_blocked: true,
@@ -1063,6 +1329,10 @@ mod tests {
             blocked_new_connections: 0,
             observed_at: 1002.0,
             error_code: None,
+            backend: permit.backend,
+            vpn_epoch: permit.vpn_epoch.clone(),
+            coverage_scope: permit.coverage_scope.clone(),
+            sandbox_ready: permit.backend.is_sandbox(),
         }
     }
 
@@ -1296,6 +1566,12 @@ mod tests {
             local_proxy_port: Some(7890),
             valid_until: Some(1030.0),
             updated_at: 1000.0,
+            backend: NetworkBackendKind::NetworkExtension,
+            vpn_epoch: None,
+            vpn_match: None,
+            coverage_scope: BackendCoverageScope::default(),
+            unmanaged_member_pids: Vec::new(),
+            sandbox_ready: false,
         };
         let mut families = BTreeMap::new();
         families.insert("claude".into(), state1.clone());

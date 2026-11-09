@@ -43,6 +43,15 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
 
     public override init() {
         super.init()
+        if NetworkBackendCapabilities.isSeatbeltBackend() {
+            activationState = NetworkExtensionActivationState(
+                isSystemExtensionActive: false,
+                isTunnelActive: false,
+                detail: "当前采用 nono/Seatbelt 受控启动后端，不激活系统网络扩展",
+                lastErrorCode: nil
+            )
+            return
+        }
         statusObserver = NotificationCenter.default.addObserver(forName: .NEVPNStatusDidChange, object: nil, queue: .main) { [weak self] _ in
             self?.refreshStatus()
         }
@@ -75,6 +84,9 @@ public final class NetworkExtensionHostManager: NSObject, OSSystemExtensionReque
     }
 
     public func startAndActivateIfNeeded() {
+        if NetworkBackendCapabilities.isSeatbeltBackend() {
+            return
+        }
         guard hasRequiredSigningEntitlements() else {
             failUnsignedActivation()
             return

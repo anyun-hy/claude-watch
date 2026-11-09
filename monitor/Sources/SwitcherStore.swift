@@ -504,6 +504,8 @@ final class SwitcherStore: ObservableObject {
     var onConfigUpdated: (() -> Void)?
     var onReceiptDiagnostic: ((LeakKind, String, UUID?, String?) -> Void)?
     var receiptCommandFixture: ((String, Data) async throws -> Data)?
+    /// Test-only transport; production configuration always uses the Rust command runner.
+    var configurationCommandFixture: (([String], Data) async throws -> Data)?
     var diagnosticContextProvider: (() -> String?)?
     private(set) var initializationDNSReceipt: (context: String, state: String, sampled: Double)?
     private(set) var initializationWebRTCReceipt: (context: String, state: String, sampled: Double)?
@@ -771,7 +773,11 @@ final class SwitcherStore: ObservableObject {
         settings[key.key] as? String ?? ""
     }
     func text(_ key: TextSetting) -> Binding<String> {
-        Binding(get: { self.value(key) }, set: { self.settings[key.key] = $0; self.markDraft() })
+        Binding(get: { self.value(key) }, set: {
+            self.settings[key.key] = $0
+            self.updateSharedVpnField(key.key, value: $0)
+            self.markDraft()
+        })
     }
     func flag(_ key: FlagSetting) -> Binding<Bool> {
         Binding(get: { self.isOn(key) }, set: { self.settings[key.key] = $0; self.markDraft() })
@@ -807,6 +813,7 @@ final class SwitcherStore: ObservableObject {
     func discardChanges() {
         settings = savedSettings
         pendingOpenAIForceKeys.removeAll()
+        syncVpnExpectationDraftFromSaved()
         hasUnsavedSettings = false; setupPlan = nil; plan = nil
     }
     func dismissMessage() { message = "" }
@@ -817,6 +824,141 @@ final class SwitcherStore: ObservableObject {
             items.append("历史 ChatGPT/Codex 强制结束设置已暂按普通关闭执行。若仍需要 Force，请在策略中逐项重新选择并保存。")
         }
         return items
+    }
+    var savedVpnExpectationSummary: String {
+        guard let exp = savedSettings["vpn_expectation"] as? [String: Any],
+              exp["configured"] as? Bool == true else {
+            return "未配置 VPN 状态基线（将在保存策略后按只读观测比对）"
+        }
+        let mode = exp["running_mode"] as? String ?? "未限定"
+        let node = exp["expected_node"] as? String ?? "未限定"
+        let group = exp["proxy_group"] as? String ?? "未限定"
+        return "只读 VPN 预期：模式 \(mode) · 分组 \(group) · 节点 \(node)（偏差立即断流保进程）"
+    }
+
+    @Published var vpnExpectationDraft = VpnExpectationModel()
+    @Published private(set) var policySyncState: PolicySyncState?
+    var policySyncPendingApply: Bool { policySyncState == .pendingApply }
+
+    func syncVpnExpectationDraftFromSaved() {
+        guard let raw = savedSettings["vpn_expectation"] as? [String: Any],
+              let data = try? JSONSerialization.data(withJSONObject: raw),
+              let decoded = try? JSONDecoder().decode(VpnExpectationModel.self, from: data) else {
+            vpnExpectationDraft = VpnExpectationModel(
+                configured: false,
+                proxy_mode: savedSettings["proxy_mode"] as? String ?? "auto",
+                proxy_url: savedSettings["proxy_url"] as? String ?? "",
+                proxy_group: savedSettings["proxy_group"] as? String ?? ""
+            )
+            return
+        }
+        vpnExpectationDraft = decoded
+    }
+
+    func updateVpnExpectationDraft(
+        proxyMode: String? = nil,
+        proxyUrl: String? = nil,
+        proxyGroup: String? = nil,
+        runningMode: String? = nil,
+        expectedNode: String? = nil,
+        requireTun: Bool?? = nil,
+        requireSystemProxy: Bool?? = nil
+    ) {
+        if let proxyMode {
+            vpnExpectationDraft.proxy_mode = proxyMode
+            settings["proxy_mode"] = proxyMode
+        }
+        if let proxyUrl {
+            vpnExpectationDraft.proxy_url = proxyUrl
+            settings["proxy_url"] = proxyUrl
+        }
+        if let proxyGroup {
+            vpnExpectationDraft.proxy_group = proxyGroup
+            settings["proxy_group"] = proxyGroup
+        }
+        if let runningMode { vpnExpectationDraft.running_mode = runningMode.isEmpty ? nil : runningMode }
+        if let expectedNode { vpnExpectationDraft.expected_node = expectedNode.isEmpty ? nil : expectedNode }
+        if let requireTun { vpnExpectationDraft.require_tun = requireTun }
+        if let requireSystemProxy { vpnExpectationDraft.require_system_proxy = requireSystemProxy }
+        vpnExpectationDraft.configured = true
+        markDraft()
+    }
+
+    private static let vpnSharedKeys: Set<String> = ["proxy_mode", "proxy_url", "proxy_group"]
+
+    private func updateSharedVpnField(_ key: String, value: String) {
+        switch key {
+        case "proxy_mode": vpnExpectationDraft.proxy_mode = value
+        case "proxy_url": vpnExpectationDraft.proxy_url = value
+        case "proxy_group": vpnExpectationDraft.proxy_group = value
+        default: break
+        }
+    }
+
+    /// Resolve both editors against their saved baseline; never silently pick an
+    /// unchanged old value over a newly edited draft. Simultaneous conflicting
+    /// programmatic edits are rejected rather than losing either edit.
+    private func mergedVpnConfiguration() throws -> [String: Any] {
+        var merged = settings
+        guard vpnExpectationDraft.configured else { return merged }
+        var draft = vpnExpectationDraft
+        let draftValues = ["proxy_mode": draft.proxy_mode, "proxy_url": draft.proxy_url,
+                           "proxy_group": draft.proxy_group]
+        for (key, draftValue) in draftValues {
+            let baseline = savedSettings[key] as? String ?? (key == "proxy_mode" ? "auto" : "")
+            let ordinary = settings[key] as? String ?? baseline
+            let chosen: String
+            if ordinary != baseline && draftValue != baseline && ordinary != draftValue {
+                throw NSError(domain: "Switcher", code: 8, userInfo: [NSLocalizedDescriptionKey:
+                    "代理共享字段 \(key) 存在两处未保存的不同修改，请统一后再保存；没有丢弃草稿。"])
+            }
+            chosen = draftValue != baseline ? draftValue : ordinary
+            merged[key] = chosen
+            switch key {
+            case "proxy_mode": draft.proxy_mode = chosen
+            case "proxy_url": draft.proxy_url = chosen
+            default: draft.proxy_group = chosen
+            }
+        }
+        merged["vpn_expectation"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(draft))
+        return merged
+    }
+
+    /// Commit only the acknowledged scope. A VPN-only save must retain ordinary
+    /// settings the user has edited but has not asked this action to save.
+    private func acceptConfigurationSave(_ raw: [String: Any], vpnOnly: Bool) {
+        guard let result = raw["config"] as? [String: Any] else { return }
+        var nextDraft = result
+        if vpnOnly {
+            for key in Set(settings.keys).union(savedSettings.keys)
+                where key != "vpn_expectation" && !Self.vpnSharedKeys.contains(key) {
+                let oldValue = savedSettings[key] as? NSObject
+                let draftValue = settings[key] as? NSObject
+                if oldValue != draftValue { nextDraft[key] = settings[key] }
+            }
+        }
+        savedSettings = result
+        settings = nextDraft
+        hasUnsavedSettings = !NSDictionary(dictionary: nextDraft).isEqual(to: result)
+        audit = nil
+        policySyncState = PolicySyncState(rawValue: raw["policy_sync_state"] as? String ?? "pending_apply") ?? .pendingApply
+        syncVpnExpectationDraftFromSaved()
+        onConfigUpdated?()
+    }
+
+    /// Only the user-confirmed VPN expectation is persisted by this action.
+    /// Failure preserves both drafts and the previous saved policy's sync state.
+    func confirmAndSaveVpnExpectation() async {
+        guard !busy else { return }
+        do {
+            var draft = vpnExpectationDraft
+            draft.configured = true
+            let payload = try JSONEncoder().encode(draft)
+            await perform(["config", "vpn-expectation-save", "--apply"], input: payload)
+        } catch {
+            failure = true
+            message = error.localizedDescription
+        }
     }
     func load(automaticCheck: Bool = false) async {
         guard !busy else { return }
@@ -833,14 +975,19 @@ final class SwitcherStore: ObservableObject {
         if automaticCheck { _ = await detectCurrentEnvironment() }
     }
     func save() async {
-        guard let data = try? JSONSerialization.data(withJSONObject: settings, options: [.sortedKeys]) else { return }
-        let approved = pendingOpenAIForceKeys.filter { settings[$0] as? String == "force" }.sorted()
-        var args = ["config", "set", "--apply"]
-        if !approved.isEmpty {
-            args += ["--confirm-force", approved.joined(separator: ",")]
+        guard !busy else { return }
+        do {
+            let mergedSettings = try mergedVpnConfiguration()
+            let data = try JSONSerialization.data(withJSONObject: mergedSettings, options: [.sortedKeys])
+            let approved = pendingOpenAIForceKeys.filter { settings[$0] as? String == "force" }.sorted()
+            var args = ["config", "set", "--apply"]
+            if !approved.isEmpty { args += ["--confirm-force", approved.joined(separator: ",")] }
+            await perform(args, input: data)
+            if !failure { pendingOpenAIForceKeys.removeAll() }
+        } catch {
+            failure = true
+            message = error.localizedDescription
         }
-        await perform(args, input: data)
-        if !failure { pendingOpenAIForceKeys.removeAll() }
     }
     func detectCurrentEnvironment() async -> Bool {
         guard !busy && !readingEnvironment else { return false }
@@ -1352,7 +1499,26 @@ final class SwitcherStore: ObservableObject {
         }
         updateActivity(args.first == "checkdetail" ? "按已接受策略检查启动条件…" : "正在核对并完成操作…", token: activityToken)
         do {
-            if isFixture {
+            if isFixture && (args.starts(with: ["config", "set"]) || args.starts(with: ["config", "vpn-expectation-save"])) {
+                guard let input else { throw NSError(domain: "Switcher", code: 8) }
+                let vpnOnly = args.starts(with: ["config", "vpn-expectation-save"])
+                let raw: [String: Any]
+                if let configurationCommandFixture {
+                    let data = try await configurationCommandFixture(args, input)
+                    raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+                } else {
+                    let submitted = try JSONSerialization.jsonObject(with: input) as? [String: Any] ?? [:]
+                    var result = vpnOnly ? savedSettings : submitted
+                    if vpnOnly {
+                        result["vpn_expectation"] = submitted
+                        for key in Self.vpnSharedKeys { result[key] = submitted[key] }
+                    }
+                    raw = ["status": "ok", "config": result, "policy_sync_state": "pending_apply"]
+                }
+                failure = raw["status"] as? String != "ok" || raw["config"] as? [String: Any] == nil
+                message = raw["message"] as? String ?? (failure ? "配置保存失败，草稿已保留。" : "隔离配置保存回执。")
+                if !failure { acceptConfigurationSave(raw, vpnOnly: vpnOnly) }
+            } else if isFixture {
                 if args.first == "checkdetail" {
                     audit = Self.fixtureAudit()
                     auditOperationMessage = audit?.message ?? ""
@@ -1364,7 +1530,6 @@ final class SwitcherStore: ObservableObject {
                 else if args == ["repair"] || args == ["set-region"] {
                     plan = .init(id: "fixture-plan", actions: [.init(id: "timezone", title: "设置时区（模拟）", scope: "administrator", detail: "Asia/Tokyo → Asia/Tokyo")])
                 }
-                else if args.starts(with: ["config", "set"]) { savedSettings = settings; hasUnsavedSettings = false; onConfigUpdated?() }
                 else if fullInitializationFixture && args.starts(with: ["setup", "apply"]) {
                     settings[Setting.enabled.key] = setupEnablePolicy
                     settings[Setting.guardEnabled.key] = setupGuard
@@ -1455,9 +1620,12 @@ final class SwitcherStore: ObservableObject {
                     }
                 }
                 if args.first == "logs" { operationLog = raw["message"] as? String ?? "暂无操作记录" }
-                if let result = raw["config"] as? [String: Any], args.first == "config", !failure {
-                    settings = result; savedSettings = result; hasUnsavedSettings = false; audit = nil
-                    onConfigUpdated?()
+                if (args.starts(with: ["config", "set"]) || args.starts(with: ["config", "vpn-expectation-save"])) && !failure {
+                    guard raw["config"] is [String: Any] else {
+                        throw NSError(domain: "Switcher", code: 8, userInfo: [NSLocalizedDescriptionKey:
+                            "保存回执缺少配置，未确认保存成功；草稿已保留。"])
+                    }
+                    acceptConfigurationSave(raw, vpnOnly: args.starts(with: ["config", "vpn-expectation-save"]))
                 }
                 if refresh && !(args.first == "config" && failure) {
                     setupProgress?(.verifySettings)
@@ -1492,9 +1660,13 @@ final class SwitcherStore: ObservableObject {
         let incoming = raw["config"] as? [String: Any] ?? [:]
         legacyOpenAIForceReview = raw["legacy_openai_force_review"] as? [String] ?? []
         savedSettings = incoming
+        if let syncState = raw["policy_sync_state"] as? String {
+            policySyncState = PolicySyncState(rawValue: syncState) ?? .pendingApply
+        }
         if !hasUnsavedSettings {
             settings = incoming
             pendingOpenAIForceKeys.removeAll()
+            syncVpnExpectationDraftFromSaved()
         }
         claudeVersion = raw["claude_version"] as? String ?? ""
         proxyGroups = raw["proxy_groups"] as? [String] ?? []

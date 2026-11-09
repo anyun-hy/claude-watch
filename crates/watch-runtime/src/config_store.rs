@@ -1,10 +1,36 @@
 use crate::storage::{sha256, StateStore};
 use claude_watch_core::{
+    channel::NetworkBackendKind,
     config::Config,
     error::{CoreError, Result},
+    vpn::VpnExpectation,
 };
 use serde_json::Value;
 use std::collections::BTreeSet;
+
+#[derive(Debug, Clone)]
+pub struct ResolvedRuntimeConfig {
+    pub config: Config,
+    pub packaged_backend: Option<NetworkBackendKind>,
+    pub legacy_migration_required: bool,
+    pub package_mismatch: bool,
+    pub config_error: Option<String>,
+}
+
+impl ResolvedRuntimeConfig {
+    pub fn blocking_reason(&self) -> Option<String> {
+        if let Some(ref code) = self.config_error {
+            return Some(format!("config_invalid:{code}"));
+        }
+        if self.legacy_migration_required {
+            return Some("legacy_config_migration_required".into());
+        }
+        if self.package_mismatch {
+            return Some("backend_package_config_mismatch".into());
+        }
+        None
+    }
+}
 
 pub struct ConfigStore {
     pub storage: StateStore,
@@ -16,8 +42,140 @@ impl ConfigStore {
                 .read_json(&self.storage.paths.config(), serde_json::json!({}))?,
         )
     }
+
+    /// Resolves the runtime configuration aligned with the packaged backend:
+    /// - New installation (no `config.json` on disk) on a `Seatbelt` package defaults to
+    ///   `Config::default_for_new_install()` (`schema: 2`, `network_backend: Some(Seatbelt)`).
+    /// - Existing `schema: 1` configuration on disk without explicit `network_backend` on a
+    ///   `Seatbelt` package returns `legacy_migration_required = true` until the user explicitly
+    ///   saves/migrates their `vpn_expectation` or `network_backend`.
+    pub fn resolve_runtime_config(
+        &self,
+        packaged_backend: Option<NetworkBackendKind>,
+    ) -> Result<(Config, bool)> {
+        if !self.storage.paths.config().exists() {
+            if packaged_backend == Some(NetworkBackendKind::Seatbelt) {
+                return Ok((Config::default_for_new_install(), false));
+            }
+            return Ok((Config::default(), false));
+        }
+        let config = self.load()?;
+        let legacy_migration_required = packaged_backend == Some(NetworkBackendKind::Seatbelt)
+            && config.requires_backend_migration_setup();
+        Ok((config, legacy_migration_required))
+    }
+
+    /// Fail-closed runtime configuration resolution that preserves parse/validation errors,
+    /// legacy `schema: 1` migration gating, and packaged vs configured backend mismatch
+    /// without silently falling back to an unrestricted `Config::default()`.
+    pub fn resolve_runtime_config_state(
+        &self,
+        packaged_backend: Option<NetworkBackendKind>,
+    ) -> ResolvedRuntimeConfig {
+        if !self.storage.paths.config().exists() {
+            let config = if packaged_backend == Some(NetworkBackendKind::Seatbelt) {
+                Config::default_for_new_install()
+            } else {
+                Config::default()
+            };
+            return ResolvedRuntimeConfig {
+                config,
+                packaged_backend,
+                legacy_migration_required: false,
+                package_mismatch: false,
+                config_error: None,
+            };
+        }
+        match self.load() {
+            Ok(config) => {
+                let legacy_migration_required =
+                    packaged_backend == Some(NetworkBackendKind::Seatbelt)
+                        && config.requires_backend_migration_setup();
+                let package_mismatch = !legacy_migration_required
+                    && packaged_backend
+                        .is_some_and(|pkg| pkg != config.effective_network_backend());
+                ResolvedRuntimeConfig {
+                    config,
+                    packaged_backend,
+                    legacy_migration_required,
+                    package_mismatch,
+                    config_error: None,
+                }
+            }
+            Err(err) => {
+                let fallback_config = if packaged_backend == Some(NetworkBackendKind::Seatbelt) {
+                    Config::default_for_new_install()
+                } else {
+                    Config::default()
+                };
+                ResolvedRuntimeConfig {
+                    config: fallback_config,
+                    packaged_backend,
+                    legacy_migration_required: false,
+                    package_mismatch: false,
+                    config_error: Some(err.code),
+                }
+            }
+        }
+    }
+
     pub fn save(&self, value: Value) -> Result<Config> {
         self.save_with_force_confirmation(value, None)
+    }
+
+    /// Save an explicitly user-confirmed `VpnExpectation` into `config.json`
+    /// and update `PolicyVersion` (`policy_digest` + `guard_policy_digest`).
+    /// Never overwrites `vpn_expectation` from background observations without
+    /// explicit user confirmation.
+    pub fn save_vpn_expectation(
+        &self,
+        mut expectation: VpnExpectation,
+        user_confirmed: bool,
+    ) -> Result<Config> {
+        if !user_confirmed {
+            return Err(CoreError::new(
+                "vpn_expectation_unconfirmed",
+                "VPN 预期只能由用户显式确认保存，观测结果不能静默覆盖预期",
+            ));
+        }
+        expectation.configured = true;
+        expectation.validate()?;
+        let _lock = self.storage.lock("operation", None)?;
+        let mut current = self.load().unwrap_or_default();
+        current.schema = current.schema.max(2);
+        if current.network_backend.is_none() {
+            current.network_backend = Some(NetworkBackendKind::Seatbelt);
+        }
+        if !expectation.proxy_mode.is_empty() {
+            current.proxy_mode = expectation.proxy_mode.clone();
+        }
+        if !expectation.proxy_url.is_empty() {
+            current.proxy_url = expectation.proxy_url.clone();
+        }
+        if !expectation.proxy_group.is_empty() {
+            current.proxy_group = expectation.proxy_group.clone();
+        }
+        expectation.bind_top_level_authority(
+            &current.proxy_mode,
+            &current.proxy_url,
+            &current.proxy_group,
+        )?;
+        current.vpn_expectation = Some(expectation);
+        let validated = Config::from_value(current.value()?)?;
+        self.storage
+            .atomic_json(&self.storage.paths.config(), &validated.value()?)?;
+        Ok(validated)
+    }
+
+    pub fn save_network_backend(&self, backend: NetworkBackendKind) -> Result<Config> {
+        let _lock = self.storage.lock("operation", None)?;
+        let mut current = self.load().unwrap_or_default();
+        current.schema = current.schema.max(2);
+        current.network_backend = Some(backend);
+        let validated = Config::from_value(current.value()?)?;
+        self.storage
+            .atomic_json(&self.storage.paths.config(), &validated.value()?)?;
+        Ok(validated)
     }
 
     /// Read-only migration disclosure for the UI. Loading never edits the

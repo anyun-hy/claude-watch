@@ -46,7 +46,8 @@ struct GraphModelTests {
         expect(codexProcess.product == .openAI && codexProcess.sourceRole == .cli, "codex cli belongs to unified page with CLI source")
         let managedProcess = WatchedProcess(id: "managed", pid: 52, started: "now", kind: "codex-cli", authorized: nil,
                                             runtimeRole: "codex_managed", serviceName: "Codex 托管后台", roleEvidence: "managed_app_server")
-        expect(managedProcess.sourceRole == .managed && managedProcess.name == "Codex 托管后台", "verified managed backend is distinct from independent CLI")
+        expect(managedProcess.sourceRole == .desktop && managedProcess.sourceDisplay == "桌面应用",
+               "verified app-server joins the desktop source rather than becoming an independent CLI or a third source")
         var unverifiedManaged = managedProcess; unverifiedManaged.roleEvidence = "unknown"
         expect(unverifiedManaged.sourceRole == .cli, "an unverified hint does not change the existing process classification")
         var missingArguments = managedProcess; missingArguments.runtimeRole = "codex_managed_unconfirmed"; missingArguments.roleEvidence = "managed_path_only"

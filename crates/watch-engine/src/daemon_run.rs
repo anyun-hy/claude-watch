@@ -1,13 +1,17 @@
 use claude_watch_core::{
-    channel::{ChannelMonitorSnapshot, PolicyVersion},
+    channel::{
+        BackendCoverageScope, ChannelMonitorSnapshot, NetworkBackendKind, PolicyVersion,
+    },
     cli::Request,
     error::{CoreError, Result},
     policy::PolicyCatalog,
+    vpn::VpnExpectation,
 };
 use claude_watch_runtime::{
     alert_gate::AlertGate,
     channel_enforcer::{
-        register_production_enforcer, unregister_production_enforcer, LocalTunnelEnforcer,
+        register_production_enforcer, unregister_production_enforcer, ChannelEnforcer,
+        LocalTunnelEnforcer,
     },
     channel_supervisor::{AsyncAuditRequest, ChannelSupervisor, SupervisionEvent},
     config_store::ConfigStore,
@@ -19,14 +23,23 @@ use claude_watch_runtime::{
     native::{self, Observer},
     native_notifications::{AlertDispatcher, NativeNotifier},
     sampler::{pinned_node, Sampler},
+    sandbox_launch::{
+        build_helper_verifier_from_manifest, default_registration_socket_path,
+        lookup_packaged_network_backend, SandboxLaunchRegistry,
+    },
     snapshot_publication::SnapshotPublisher,
     storage::{Paths, StateStore},
+    vpn_observer::{
+        resolve_vpn_controller_credentials, HttpControllerVpnReader, VpnObserver, VpnSourceReader,
+    },
 };
+use claude_watch_system::network_events::{NetworkEventKind, NetworkEventWatcher};
 use serde_json::{json, Value};
 use std::{
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::Receiver,
+        mpsc::{Receiver, Sender},
         Arc,
     },
     thread,
@@ -35,13 +48,456 @@ use std::{
 
 pub struct ProductionChannelStack {
     stop: Arc<AtomicBool>,
+    pub packaged_backend: Option<NetworkBackendKind>,
+    pub backend: NetworkBackendKind,
     pub enforcer: Arc<LocalTunnelEnforcer>,
+    pub sandbox_registry: Option<Arc<SandboxLaunchRegistry>>,
     pub supervisor: ChannelSupervisor,
+    #[allow(dead_code)]
+    pub event_tx: Sender<SupervisionEvent>,
     pub event_rx: Receiver<SupervisionEvent>,
+    pub vpn_wake_handle: Option<Arc<AtomicBool>>,
     pub lease_watchdog: thread::JoinHandle<()>,
     pub async_audit_worker: thread::JoinHandle<()>,
     pub extension_watcher: Option<thread::JoinHandle<()>>,
+    pub sandbox_registration_worker: Option<thread::JoinHandle<()>>,
+    pub vpn_observer_worker: Option<thread::JoinHandle<()>>,
     pub last_policy_version: Option<PolicyVersion>,
+    activate_local_interception: bool,
+    local_proxy_worker: Option<thread::JoinHandle<()>>,
+    target_refresh_worker: Option<thread::JoinHandle<()>>,
+}
+
+fn refresh_and_stage_production_targets(
+    storage: &StateStore,
+    resources_dir: Option<&std::path::Path>,
+    registry: &SandboxLaunchRegistry,
+    event_tx: &Sender<SupervisionEvent>,
+) -> Result<()> {
+    use claude_watch_core::processes::LaunchTarget;
+    use claude_watch_runtime::managed_entry::{
+        resolve_real_cli_skipping_shim, stage_deliverable_entries, DesktopManagedEntrySpec,
+    };
+
+    let is_isolated_temp_home = {
+        let home_str = storage.paths.home.to_string_lossy();
+        home_str.starts_with("/tmp/")
+            || home_str.starts_with("/private/tmp/")
+            || home_str.starts_with("/var/folders/")
+            || home_str.starts_with("/private/var/folders/")
+    };
+
+    let mut discovered_specs: Vec<DesktopManagedEntrySpec> = Vec::new();
+
+    // Resolve supported entries into a single manifest. Do not mutate approvals
+    // incrementally while a different thread is attributing live connections.
+    let mut app_dirs = Vec::new();
+    if let Some(env_dir) = std::env::var_os("CW_APPLICATIONS_DIR").map(PathBuf::from) {
+        if env_dir.is_dir() {
+            app_dirs.push(env_dir);
+        }
+    }
+    let home_apps = storage.paths.home.join("Applications");
+    if home_apps.is_dir() {
+        app_dirs.push(home_apps);
+    }
+    if !is_isolated_temp_home {
+        app_dirs.push(PathBuf::from("/Applications"));
+    }
+
+    let mut new_approved_targets = std::collections::BTreeMap::new();
+    let mut new_approved_children = std::collections::BTreeMap::new();
+
+    for app_dir in &app_dirs {
+        for (target, bundle_name, bundle_id, exe_name) in [
+            (
+                LaunchTarget::ClaudeDesktop,
+                "Claude.app",
+                "com.anthropic.claudefordesktop",
+                "Claude",
+            ),
+            (
+                LaunchTarget::CodexDesktop,
+                "Codex.app",
+                "com.openai.codex",
+                "Codex",
+            ),
+            (
+                LaunchTarget::ChatgptDesktop,
+                "ChatGPT.app",
+                "com.openai.chat",
+                "ChatGPT",
+            ),
+        ] {
+            let bundle_path = app_dir.join(bundle_name);
+            if let Ok(spec) = DesktopManagedEntrySpec::resolve_from_app_bundle(
+                target,
+                &bundle_path,
+                bundle_id,
+                exe_name,
+            ) {
+                let target_exe_str = spec.target_executable.to_string_lossy().into_owned();
+                new_approved_targets.insert(target_exe_str.clone(), spec.target_fingerprint.clone());
+                new_approved_children.insert(target_exe_str.clone(), spec.target_fingerprint.clone());
+                for (child_exe, child_sha) in
+                    NativeDesktop::<claude_watch_runtime::commands::SystemRunner>::discover_bundle_child_executables(&spec.target_bundle_path)
+                {
+                    let child_str = child_exe.to_string_lossy().into_owned();
+                    new_approved_children.insert(child_str.clone(), child_sha.clone());
+                }
+                if !discovered_specs.iter().any(|s| s.target == spec.target) {
+                    discovered_specs.push(spec);
+                }
+            }
+        }
+    }
+
+    let entries_root = storage.paths.watch().join("entries");
+    let entries_bin = entries_root.join("bin");
+    let watch_bin = storage.paths.watch().join("bin");
+    let mut search_paths: Vec<PathBuf> = if is_isolated_temp_home {
+        Vec::new()
+    } else {
+        std::env::var_os("PATH")
+            .map(|v| std::env::split_paths(&v).collect())
+            .unwrap_or_default()
+    };
+    search_paths.push(storage.paths.home.join(".local/bin"));
+    search_paths.push(storage.paths.home.join(".claude/local"));
+    if !is_isolated_temp_home {
+        search_paths.push(PathBuf::from("/opt/homebrew/bin"));
+        search_paths.push(PathBuf::from("/usr/local/bin"));
+    }
+    search_paths.retain(|p| p != &entries_bin && p != &watch_bin);
+
+    for (_cli_target, cli_name, override_env) in [
+        (LaunchTarget::ClaudeCli, "claude", "CLAUDE_CODE_BIN"),
+        (LaunchTarget::CodexCli, "codex", "CODEX_CLI_BIN"),
+    ] {
+        if let Some(override_path) = std::env::var_os(override_env).map(PathBuf::from) {
+            if let Ok(canon) = std::fs::canonicalize(&override_path) {
+                if let Some(sha) = claude_watch_system::sha256_file_hex(&canon) {
+                    let canon_str = canon.to_string_lossy().into_owned();
+                    new_approved_targets.insert(canon_str.clone(), sha.clone());
+                    new_approved_children.insert(canon_str.clone(), sha.clone());
+                }
+            }
+        }
+        let shim_exe = entries_bin.join(cli_name);
+        if let Ok((canon_cli, sha)) =
+            resolve_real_cli_skipping_shim(cli_name, &shim_exe, &search_paths)
+        {
+            let canon_str = canon_cli.to_string_lossy().into_owned();
+            new_approved_targets.insert(canon_str.clone(), sha.clone());
+            new_approved_children.insert(canon_str.clone(), sha.clone());
+        }
+    }
+    for family in registry.replace_approved_targets(new_approved_targets, new_approved_children) {
+        // Registry changes invalidate identities, but only Supervisor issues network commands.
+        // Send this before staging entries so disk IO cannot delay the revocation event.
+        let _ = event_tx.send(SupervisionEvent::ProcessInventoryUnavailable {
+            family, observed_at: native::now(),
+        });
+    }
+
+    let watch_engine_bin = resources_dir
+        .map(|d| d.join("watch-engine"))
+        .filter(|p| p.is_file())
+        .or_else(|| std::env::current_exe().ok())
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/true"));
+    let launcher_bin = resources_dir
+        .map(|d| d.join("watch-sandbox-launcher"))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| watch_engine_bin.with_file_name("watch-sandbox-launcher"));
+    let controlled_entry_macho = resources_dir
+        .map(|d| d.join("ControlledEntry"))
+        .filter(|p| p.is_file());
+    stage_deliverable_entries(
+        &entries_root,
+        &discovered_specs,
+        &watch_engine_bin,
+        &launcher_bin,
+        controlled_entry_macho.as_deref(),
+    )?;
+    Ok(())
+}
+
+/// Cheap metadata snapshot of only supported entry paths and discovered executable directories.
+/// Content hashing and entry staging run in the background only when this snapshot changes.
+fn target_metadata_signature(storage: &StateStore, resources_dir: Option<&std::path::Path>) -> Vec<(PathBuf, Vec<i128>)> {
+    use std::os::unix::fs::MetadataExt;
+    fn record(path: PathBuf, out: &mut std::collections::BTreeMap<PathBuf, Vec<i128>>) {
+        let mut values = Vec::new();
+        for result in [std::fs::symlink_metadata(&path), std::fs::metadata(&path)] {
+            if let Ok(m) = result {
+                values.extend([m.dev() as i128, m.ino() as i128, m.len() as i128,
+                    m.mtime() as i128, m.mtime_nsec() as i128, m.ctime() as i128,
+                    m.ctime_nsec() as i128, m.mode() as i128]);
+            } else { values.push(-1); }
+        }
+        out.insert(path, values);
+    }
+    fn executable_dir(path: PathBuf, out: &mut std::collections::BTreeMap<PathBuf, Vec<i128>>) {
+        record(path.clone(), out);
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() { record(entry.path(), out); }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    let isolated = ["/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/"]
+        .iter().any(|p| storage.paths.home.to_string_lossy().starts_with(p));
+    let mut app_dirs = vec![storage.paths.home.join("Applications")];
+    if let Some(path) = std::env::var_os("CW_APPLICATIONS_DIR") { app_dirs.push(path.into()); }
+    if !isolated { app_dirs.push("/Applications".into()); }
+    for root in app_dirs {
+        for name in ["Claude.app", "Codex.app", "ChatGPT.app"] {
+            let app = root.join(name);
+            record(app.clone(), &mut out);
+            record(app.join("Contents/Info.plist"), &mut out);
+            executable_dir(app.join("Contents/MacOS"), &mut out);
+            let frameworks = app.join("Contents/Frameworks");
+            record(frameworks.clone(), &mut out);
+            if let Ok(entries) = std::fs::read_dir(frameworks) {
+                for entry in entries.flatten() {
+                    if entry.path().extension().is_some_and(|e| e == "app") {
+                        record(entry.path(), &mut out);
+                        executable_dir(entry.path().join("Contents/MacOS"), &mut out);
+                    }
+                }
+            }
+            for rel in ["Contents/Resources/codex", "Contents/Resources/codex-cli/bin/codex",
+                "Contents/Resources/CodexCLI.app/Contents/MacOS/codex",
+                "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"] {
+                record(app.join(rel), &mut out);
+            }
+        }
+    }
+    let mut cli_dirs = vec![storage.paths.home.join(".local/bin"), storage.paths.home.join(".claude/local")];
+    if !isolated {
+        cli_dirs.extend(std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default());
+        cli_dirs.extend([PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")]);
+    }
+    for dir in cli_dirs {
+        if dir == storage.paths.watch().join("entries/bin") || dir == storage.paths.watch().join("bin") { continue; }
+        for name in ["claude", "codex"] { record(dir.join(name), &mut out); }
+    }
+    for key in ["CLAUDE_CODE_BIN", "CODEX_CLI_BIN"] {
+        if let Some(path) = std::env::var_os(key) { record(path.into(), &mut out); }
+    }
+    if let Some(resources) = resources_dir {
+        for name in ["watch-engine", "watch-sandbox-launcher", "ControlledEntry"] {
+            record(resources.join(name), &mut out);
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn spawn_target_refresh_worker(
+    storage: StateStore,
+    resources_dir: Option<PathBuf>,
+    registry: Arc<SandboxLaunchRegistry>,
+    stop: Arc<AtomicBool>,
+    event_tx: Sender<SupervisionEvent>,
+) -> Result<thread::JoinHandle<()>> {
+    thread::Builder::new().name("channel-target-refresh".into()).spawn(move || {
+        let mut previous = None;
+        while !stop.load(Ordering::Acquire) {
+            let current = target_metadata_signature(&storage, resources_dir.as_deref());
+            if previous.as_ref() != Some(&current) {
+                if refresh_and_stage_production_targets(&storage, resources_dir.as_deref(), &registry, &event_tx).is_ok() {
+                    previous = Some(current);
+                }
+            }
+            for _ in 0..4 {
+                if stop.load(Ordering::Acquire) { return; }
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }).map_err(|_| CoreError::new("target_refresh_worker_failed", "受控目标刷新线程启动失败"))
+}
+
+fn locate_runtime_resources_dir(storage: &StateStore) -> Option<PathBuf> {
+    for candidate in [
+        storage.paths.watch().join("runtime"),
+        storage.paths.base().join("bin"),
+    ] {
+        if candidate.join("BuildInfo.plist").is_file()
+            || candidate.join("components.json").is_file()
+            || candidate.join("watch-sandbox-launcher").is_file()
+        {
+            return Some(candidate);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            if parent.join("BuildInfo.plist").is_file()
+                || parent.join("components.json").is_file()
+                || parent.join("watch-sandbox-launcher").is_file()
+            {
+                return Some(parent.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
+fn spawn_vpn_observation_worker(
+    storage: StateStore,
+    packaged_backend: Option<NetworkBackendKind>,
+    stop: Arc<AtomicBool>,
+    event_tx: Sender<SupervisionEvent>,
+    custom_reader: Option<Arc<dyn VpnSourceReader>>,
+) -> Result<(thread::JoinHandle<()>, Arc<AtomicBool>)> {
+    let obs_boot_id = format!(
+        "vpn-obs-{}-{}",
+        std::process::id(),
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let watcher = NetworkEventWatcher::default();
+    let wake_handle = watcher.wake_handle();
+    let handle = thread::Builder::new()
+        .name("channel-vpn-observer".into())
+        .spawn(move || {
+            let mut observer = VpnObserver::new(obs_boot_id, Some(storage.clone()));
+            let mut watcher = watcher;
+            watcher.watch_file(storage.paths.config());
+            watcher.watch_file(
+                storage
+                    .paths
+                    .home
+                    .join("Library/Application Support/com.tag.lab/mihomo/runtime.yaml"),
+            );
+            let config_store = ConfigStore {
+                storage: storage.clone(),
+            };
+            while !stop.load(Ordering::Acquire) {
+                let now = native::now();
+                let resolved_cfg = config_store.resolve_runtime_config_state(packaged_backend);
+                let expectation = resolved_cfg
+                    .config
+                    .vpn_expectation
+                    .clone()
+                    .unwrap_or_else(VpnExpectation::unconfigured);
+
+                let mut invalidated_by_wake = false;
+                for sys_ev in watcher.wait(Duration::from_millis(250)) {
+                    match sys_ev {
+                        NetworkEventKind::DarwinNotification(name) => {
+                            let transition = observer.handle_invalidation_event(
+                                format!("darwin_notification:{name}"),
+                                &expectation,
+                                now,
+                            );
+                            let _ = event_tx.send(SupervisionEvent::VpnObservationUpdated {
+                                observation: transition.observation,
+                                observed_at: now,
+                            });
+                            if name.contains("wake") || name.contains("sleep") {
+                                invalidated_by_wake = true;
+                                let _ = event_tx.send(SupervisionEvent::LeaseExpired {
+                                    observed_at: now,
+                                    woke_from_sleep: true,
+                                });
+                            }
+                        }
+                        NetworkEventKind::WatchedFileChanged(path) => {
+                            let fname = path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("watched_file");
+                            if fname == "config.json" {
+                                let latest_resolved =
+                                    config_store.resolve_runtime_config_state(packaged_backend);
+                                if latest_resolved.blocking_reason().is_none() {
+                                    let _ = event_tx.send(SupervisionEvent::PolicyUpdated {
+                                        config: latest_resolved.config,
+                                        observed_at: now,
+                                    });
+                                }
+                            } else {
+                                let transition = observer.handle_invalidation_event(
+                                    format!("watched_file_changed:{fname}"),
+                                    &expectation,
+                                    now,
+                                );
+                                let _ = event_tx.send(SupervisionEvent::VpnObservationUpdated {
+                                    observation: transition.observation,
+                                    observed_at: now,
+                                });
+                            }
+                        }
+                        NetworkEventKind::WakeSignal => {
+                            invalidated_by_wake = true;
+                            let transition = observer.handle_invalidation_event(
+                                "system_wake",
+                                &expectation,
+                                now,
+                            );
+                            let _ = event_tx.send(SupervisionEvent::VpnObservationUpdated {
+                                observation: transition.observation,
+                                observed_at: now,
+                            });
+                            let _ = event_tx.send(SupervisionEvent::LeaseExpired {
+                                observed_at: now,
+                                woke_from_sleep: true,
+                            });
+                        }
+                        NetworkEventKind::Timeout => {}
+                    }
+                }
+                if invalidated_by_wake {
+                    continue;
+                }
+
+                if let Some(ref reader) = custom_reader {
+                    if let Ok(transition) =
+                        observer.observe_from_reader(reader.as_ref(), &expectation, false, now)
+                    {
+                        let _ = event_tx.send(SupervisionEvent::VpnObservationUpdated {
+                            observation: transition.observation,
+                            observed_at: now,
+                        });
+                    }
+                } else if expectation.configured {
+                    match resolve_vpn_controller_credentials(&storage, &expectation.proxy_mode) {
+                        Ok(creds) => {
+                            let reader = HttpControllerVpnReader::new_live(
+                                expectation.proxy_mode.clone(),
+                                creds,
+                            );
+                            if let Ok(transition) =
+                                observer.observe_from_reader(&reader, &expectation, false, now)
+                            {
+                                let _ = event_tx.send(SupervisionEvent::VpnObservationUpdated {
+                                    observation: transition.observation,
+                                    observed_at: now,
+                                });
+                            }
+                        }
+                        Err(err) => {
+                            let transition = observer.handle_invalidation_event(
+                                format!("vpn_controller_credentials_unavailable:{}", err.code),
+                                &expectation,
+                                now,
+                            );
+                            let _ = event_tx.send(SupervisionEvent::VpnObservationUpdated {
+                                observation: transition.observation,
+                                observed_at: now,
+                            });
+                        }
+                    }
+                } else if let Some(prev) = observer.state.current_observation() {
+                    if !prev.is_fresh(now) {
+                        let _ = event_tx.send(SupervisionEvent::VpnObservationUnavailable {
+                            reason: "vpn_observation_stale".into(),
+                            observed_at: now,
+                        });
+                    }
+                }
+            }
+        })
+        .map_err(|_| CoreError::new("vpn_observer_worker_failed", "VPN 状态只读观察线程启动失败"))?;
+    Ok((handle, wake_handle))
 }
 
 pub fn assemble_production_channel_stack<F>(
@@ -53,21 +509,89 @@ pub fn assemble_production_channel_stack<F>(
 where
     F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + 'static,
 {
+    assemble_production_channel_stack_with_vpn_reader(
+        storage,
+        stop,
+        activate_local_interception,
+        None,
+        run_audit,
+    )
+}
+
+pub fn assemble_production_channel_stack_with_vpn_reader<F>(
+    storage: StateStore,
+    stop: Arc<AtomicBool>,
+    activate_local_interception: bool,
+    custom_vpn_reader: Option<Arc<dyn VpnSourceReader>>,
+    run_audit: F,
+) -> Result<ProductionChannelStack>
+where
+    F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + 'static,
+{
+    let resources_dir = locate_runtime_resources_dir(&storage);
+    let packaged_backend = resources_dir
+        .as_deref()
+        .and_then(lookup_packaged_network_backend);
+    let resolved_cfg = ConfigStore {
+        storage: storage.clone(),
+    }
+    .resolve_runtime_config_state(packaged_backend);
+    let config = resolved_cfg.config.clone();
+    let legacy_migration_required = resolved_cfg.legacy_migration_required;
+    let package_mismatch = resolved_cfg.package_mismatch;
+    let config_blocking_reason = resolved_cfg.blocking_reason();
+    let backend = if legacy_migration_required || packaged_backend == Some(NetworkBackendKind::Seatbelt) {
+        NetworkBackendKind::Seatbelt
+    } else {
+        config.effective_network_backend()
+    };
+    let initial_policy_version = ChannelSupervisor::compute_policy_version(&config)?;
     let boot_id = format!(
         "daemon-{}-{}",
         std::process::id(),
         &uuid::Uuid::new_v4().simple().to_string()[..12]
     );
-    let enforcer = Arc::new(LocalTunnelEnforcer::new(boot_id, Some(storage.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new(boot_id.clone(), Some(storage.clone())));
+    enforcer.set_clock(native::now)?;
     enforcer.set_strict_peer_verification(activate_local_interception);
-    if activate_local_interception {
-        let now_ts = native::now();
-        // Production: starts local proxy listener, keeping system_extension_active as false
-        // until verified system extension activation is confirmed by the host manager.
+
+    let sandbox_registry: Option<Arc<SandboxLaunchRegistry>> = None;
+    let sandbox_registration_worker: Option<thread::JoinHandle<()>> = None;
+    let mut extension_watcher: Option<thread::JoinHandle<()>> = None;
+
+    let now_ts = native::now();
+    if let Some(ref cfg_err) = resolved_cfg.config_error {
+        let _ = enforcer.record_activation_failure(&format!("config_invalid:{cfg_err}"), now_ts);
+    } else if package_mismatch {
+        let _ = enforcer.record_activation_failure("backend_package_config_mismatch", now_ts);
+    } else if legacy_migration_required {
+        let _ = enforcer.record_activation_failure("legacy_config_migration_required", now_ts);
+    } else if backend.is_network_extension() && activate_local_interception {
+        // Legacy NetworkExtension branch: starts local proxy listener, extension gateway,
+        // and root-authored extension observation watcher.
         if let Err(e) = enforcer.start_local_proxy_listener("127.0.0.1:0", stop.clone(), now_ts) {
             let _ = enforcer.record_activation_failure(&e.code, now_ts);
         }
+        enforcer.start_extension_gateway(stop.clone())?;
+        let enforcer_ext = enforcer.clone();
+        let stop_ext = stop.clone();
+        extension_watcher = Some(
+            thread::Builder::new()
+                .name("channel-extension-observations".into())
+                .spawn(move || {
+                    let mut notification =
+                        claude_watch_runtime::channel_extension::ObservationSignal::new();
+                    while !stop_ext.load(Ordering::Acquire) {
+                        let _ = enforcer_ext.refresh_system_extension(native::now());
+                        notification.wait(Duration::from_millis(250));
+                    }
+                })
+                .map_err(|_| {
+                    CoreError::new("extension_observer_failed", "扩展回执订阅线程启动失败")
+                })?,
+        );
     }
+
     let _ = storage.atomic_json(
         &storage
             .paths
@@ -77,9 +601,6 @@ where
     );
     register_production_enforcer(&storage.paths.watch(), enforcer.clone());
 
-    if activate_local_interception {
-        enforcer.start_extension_gateway(stop.clone())?;
-    }
     let (event_tx, event_rx) = std::sync::mpsc::channel();
 
     // Wire receipt sink: Active and closed flows immediately emit events to supervisor
@@ -92,53 +613,63 @@ where
         });
     });
 
-    let lease_tx = event_tx.clone();
     let lease_watchdog = enforcer.spawn_lease_watchdog(
         stop.clone(),
         Duration::from_millis(250),
         native::now,
-        move |expired_receipts| {
-            let received_at = native::now();
-            for receipt in expired_receipts {
-                let _ = lease_tx.send(SupervisionEvent::EnforcementReceiptArrived {
-                    receipt,
-                    received_at,
-                });
-            }
-        },
+        // The ordered receipt sink above already publishes these changes.
+        // Re-sending this earlier snapshot here can overwrite a later relay
+        // closure confirmation from the same command and generation.
+        |_| {},
     )?;
 
-    let extension_watcher = if activate_local_interception {
-        let enforcer = enforcer.clone();
-        let stop = stop.clone();
-        Some(thread::Builder::new().name("channel-extension-observations".into()).spawn(move || {
-            let mut notification = claude_watch_runtime::channel_extension::ObservationSignal::new();
-            while !stop.load(Ordering::Acquire) {
-                let _ = enforcer.refresh_system_extension(native::now());
-                notification.wait(Duration::from_millis(250));
-            }
-        }).map_err(|_| CoreError::new("extension_observer_failed", "扩展回执订阅线程启动失败"))?)
-    } else { None };
+    let (vpn_observer_worker, vpn_wake_handle) =
+        if activate_local_interception || custom_vpn_reader.is_some() {
+            let (worker, wake) = spawn_vpn_observation_worker(
+                storage.clone(),
+                packaged_backend,
+                stop.clone(),
+                event_tx.clone(),
+                custom_vpn_reader,
+            )?;
+            (Some(worker), Some(wake))
+        } else {
+            (None, None)
+        };
 
     let (audit_req_tx, async_audit_worker) =
-        ChannelSupervisor::spawn_async_audit_worker(stop.clone(), event_tx, run_audit)?;
+        ChannelSupervisor::spawn_async_audit_worker(stop.clone(), event_tx.clone(), run_audit)?;
 
-    let supervisor = ChannelSupervisor::new(
+    let supervisor = ChannelSupervisor::new_with_config(
         storage,
+        config,
+        config_blocking_reason,
         Some(enforcer.clone()),
         Some(audit_req_tx),
     )?;
 
-    Ok(ProductionChannelStack {
+    let mut stack = ProductionChannelStack {
         stop,
+        packaged_backend,
+        backend,
         enforcer,
+        sandbox_registry,
         supervisor,
+        event_tx,
         event_rx,
+        vpn_wake_handle,
         lease_watchdog,
         async_audit_worker,
         extension_watcher,
-        last_policy_version: None,
-    })
+        sandbox_registration_worker,
+        vpn_observer_worker,
+        last_policy_version: Some(initial_policy_version),
+        activate_local_interception,
+        local_proxy_worker: None,
+        target_refresh_worker: None,
+    };
+    stack.reconcile_controlled_backend(now_ts)?;
+    Ok(stack)
 }
 
 impl ProductionChannelStack {
@@ -154,6 +685,104 @@ impl ProductionChannelStack {
         Ok(())
     }
 
+    /// Initial assembly and later recovery share one registry and independent component state.
+    pub fn reconcile_controlled_backend(&mut self, now: f64) -> Result<()> {
+        self.reconcile_controlled_backend_with_listeners(now,
+            |reg, path, stop| reg.start_registration_listener(path, stop),
+            |enforcer, stop, now| enforcer.start_launchd_proxy_listener(stop, now))
+    }
+
+    fn synchronize_runtime_policy(&mut self, config: claude_watch_core::config::Config, now: f64) -> Result<()> {
+        let version = ChannelSupervisor::compute_policy_version(&config)?;
+        if self.supervisor.saved_policy_version() != &version {
+            self.supervisor.handle_event(SupervisionEvent::PolicyUpdated { config, observed_at: now })?;
+        }
+        if let Some(reg) = &self.sandbox_registry { reg.update_policy_version(version.clone()); }
+        self.last_policy_version = Some(version);
+        Ok(())
+    }
+
+    fn reconcile_controlled_backend_with_listeners<R, P>(&mut self, now: f64, start_registration: R, start_proxy: P) -> Result<()>
+    where R: FnOnce(&Arc<SandboxLaunchRegistry>, &std::path::Path, Arc<AtomicBool>) -> Result<thread::JoinHandle<()>>,
+          P: FnOnce(&Arc<LocalTunnelEnforcer>, Arc<AtomicBool>, f64) -> Result<(std::net::SocketAddr, thread::JoinHandle<()>)>,
+    {
+        if !self.backend.is_sandbox() { return Ok(()); }
+        let resolved = (ConfigStore { storage: self.supervisor.storage.clone() })
+            .resolve_runtime_config_state(self.packaged_backend);
+        if let Some(reason) = resolved.blocking_reason() {
+            self.supervisor.set_config_blocking_reason(Some(reason), now)?;
+            return Ok(());
+        }
+        self.synchronize_runtime_policy(resolved.config, now)?;
+        self.supervisor.set_config_blocking_reason(None, now)?;
+        let resources = locate_runtime_resources_dir(&self.supervisor.storage);
+        if self.sandbox_registry.is_none() {
+            let verifier = resources.as_deref().ok_or_else(|| CoreError::new("helper_manifest_missing", "缺少受控运行组件目录"))
+                .and_then(|dir| build_helper_verifier_from_manifest(dir, &dir.join("watch-sandbox-launcher")));
+            let verifier = match verifier {
+                Ok(v) => v,
+                Err(err) => {
+                    self.enforcer.configure_seatbelt_backend(false, now)?;
+                    self.enforcer.record_activation_failure(&err.code, now)?;
+                    return Ok(());
+                }
+            };
+            let reg = Arc::new(SandboxLaunchRegistry::new(self.enforcer.boot_id()?,
+                self.supervisor.saved_policy_version().clone(), verifier, Some(self.supervisor.storage.clone())));
+            let attribution_registry = Arc::clone(&reg);
+            self.enforcer.set_accepted_connection_attributor(move |ctx| attribution_registry.attribute_accepted_connection(ctx, native::now()))?;
+            // Retain this exact Arc even when only one listener starts successfully.
+            self.sandbox_registry = Some(reg);
+        }
+        let reg = self.sandbox_registry.as_ref().unwrap().clone();
+        if self.target_refresh_worker.as_ref().is_some_and(|h| h.is_finished()) {
+            let _ = self.target_refresh_worker.take().unwrap().join();
+        }
+        if self.target_refresh_worker.is_none() {
+            self.target_refresh_worker = Some(spawn_target_refresh_worker(self.supervisor.storage.clone(), resources,
+                reg.clone(), self.stop.clone(), self.event_tx.clone())?);
+        }
+        let mut component_error = None;
+        if self.activate_local_interception {
+            if self.sandbox_registration_worker.as_ref().is_some_and(|h| h.is_finished()) {
+                let _ = self.sandbox_registration_worker.take().unwrap().join();
+            }
+            if self.local_proxy_worker.as_ref().is_some_and(|h| h.is_finished()) {
+                let _ = self.local_proxy_worker.take().unwrap().join();
+            }
+            if self.sandbox_registration_worker.is_none() {
+                match start_registration(&reg, &default_registration_socket_path(&self.supervisor.storage.paths.watch()), self.stop.clone()) {
+                    Ok(worker) => self.sandbox_registration_worker = Some(worker),
+                    Err(err) => component_error = Some(err.code),
+                }
+            }
+            if self.local_proxy_worker.is_none() {
+                match start_proxy(&self.enforcer, self.stop.clone(), now) {
+                    Ok((_, worker)) => self.local_proxy_worker = Some(worker),
+                    Err(err) => component_error = Some(err.code),
+                }
+            }
+        }
+        let components_ready = self.sandbox_registration_worker.is_some() && self.local_proxy_worker.is_some();
+        reg.set_gateway_endpoint_protection(self.enforcer.gateway_endpoint_protection()?);
+        // The kernel attribution callback was installed on this same registry
+        // above. Individual connections still require their own live evidence.
+        let report = reg.identity_report(true, components_ready, true);
+        self.enforcer.configure_seatbelt_backend_with_identity_gate(&report, now)?;
+        if let Some(code) = component_error { self.enforcer.record_activation_failure(&code, now)?; }
+        // Configuration/registration metadata is not an execution receipt or an applied policy.
+        self.supervisor.storage.atomic_json(&self.supervisor.storage.paths.watch().join("state/seatbelt-runtime.json"), &json!({
+            "backend": "seatbelt", "executor_boot_id": self.enforcer.boot_id()?,
+            "configured_policy_version": self.supervisor.saved_policy_version(),
+            "gateway_endpoint": self.enforcer.local_proxy_port().map(|p| format!("127.0.0.1:{p}")).unwrap_or_default(),
+            "registration_socket": default_registration_socket_path(&self.supervisor.storage.paths.watch()),
+            "components_ready": components_ready,
+            "sandbox_ready": components_ready && report.can_enable_production_backend() && self.enforcer.sandbox_ready()?,
+            "identity_report": report, "updated_at": now
+        }))?;
+        Ok(())
+    }
+
     pub fn step_with_system<S: DesktopSystem>(
         &mut self,
         system: &mut S,
@@ -161,22 +790,21 @@ impl ProductionChannelStack {
         self.drain_background_events()?;
         let now = system.now();
 
-        self.enforcer.refresh_system_extension(now)?;
+        if self.backend.is_network_extension() {
+            self.enforcer.refresh_system_extension(now)?;
+        }
 
-        if let Ok(cfg) = (ConfigStore {
+        let resolved_cfg = (ConfigStore {
             storage: self.supervisor.storage.clone(),
         })
-        .load()
-        {
-            if let Ok(ver) = ChannelSupervisor::compute_policy_version(&cfg) {
-                if self.last_policy_version.as_ref() != Some(&ver) {
-                    self.last_policy_version = Some(ver);
-                    self.supervisor.handle_event(SupervisionEvent::PolicyUpdated {
-                        config: cfg,
-                        observed_at: now,
-                    })?;
-                }
-            }
+        .resolve_runtime_config_state(self.packaged_backend);
+        let blocking_reason = resolved_cfg.blocking_reason();
+        if blocking_reason.is_none() {
+            self.synchronize_runtime_policy(resolved_cfg.config, now)?;
+            self.supervisor.set_config_blocking_reason(None, now)?;
+            if self.backend.is_sandbox() { self.reconcile_controlled_backend(now)?; }
+        } else {
+            self.supervisor.set_config_blocking_reason(blocking_reason, now)?;
         }
         let egress = system.egress();
         let local_guard = system
@@ -194,7 +822,7 @@ impl ProductionChannelStack {
                 continue;
             }
             if system.set_family(family.id).is_ok() {
-                let (desktops, processes) = match (system.desktops(), system.supervised_processes()) {
+                let (desktops, mut processes) = match (system.desktops(), system.supervised_processes()) {
                     (Ok(desktops), Ok(processes)) => (desktops, processes),
                     _ => {
                         self.supervisor.handle_event(SupervisionEvent::ProcessInventoryUnavailable {
@@ -203,6 +831,47 @@ impl ProductionChannelStack {
                         continue;
                     }
                 };
+                if let Some(ref reg) = self.sandbox_registry {
+                    let verified_tokens = reg.verified_family_tokens(family.id, now);
+                    let mut protected_pids: Vec<u32> =
+                        verified_tokens.iter().map(|t| t.pid).collect();
+                    protected_pids.sort_unstable();
+                    protected_pids.dedup();
+                    let mut unprotected_pids = Vec::new();
+                    for tok in &processes {
+                        if !protected_pids.contains(&tok.pid) {
+                            unprotected_pids.push(tok.pid);
+                        }
+                    }
+                    unprotected_pids.sort_unstable();
+                    unprotected_pids.dedup();
+                    // In Seatbelt mode, only verified sandboxed instances receive channel permits;
+                    // discovered processes outside the sandbox registry are reported as unmanaged!
+                    processes = verified_tokens;
+                    let id_report = reg.identity_report(true, true, true);
+                    self.supervisor.set_family_unmanaged_pids(
+                        family.id,
+                        unprotected_pids.clone(),
+                        now,
+                    );
+                    self.supervisor.set_family_coverage_scope(
+                        family.id,
+                        Some(BackendCoverageScope {
+                            backend: NetworkBackendKind::Seatbelt,
+                            configured_entries: vec![family.id.to_string()],
+                            protected_pids,
+                            unprotected_pids,
+                            uncovered_boundaries: vec![
+                                "unmanaged_existing_processes".into(),
+                                "direct_launch_outside_controlled_entry".into(),
+                            ],
+                            server_identity_verified: id_report.gateway_server_identity_verified,
+                            gateway_endpoint_protection_verified: id_report.gateway_endpoint_protection_verified,
+                            gateway_endpoint_protection_method: id_report.gateway_endpoint_protection_method,
+                        }),
+                        now,
+                    );
+                }
                 self.supervisor
                     .handle_event(SupervisionEvent::ProcessInventoryUpdated {
                         family: family.id.to_string(),
@@ -246,10 +915,21 @@ impl ProductionChannelStack {
         // The guard loop can leave on error while the daemon is still alive.
         // Signal the owned workers before joining; callers need not do it first.
         self.stop.store(true, Ordering::Release);
+        let now = native::now();
+        for family in PolicyCatalog::families() {
+            let _ = self.enforcer.revoke_family(family.id, "daemon_shutdown", now);
+        }
         unregister_production_enforcer(&self.supervisor.storage.paths.watch());
         let _ = self.lease_watchdog.join();
         let _ = self.async_audit_worker.join();
         if let Some(worker) = self.extension_watcher { let _ = worker.join(); }
+        if let Some(worker) = self.sandbox_registration_worker { let _ = worker.join(); }
+        if let Some(worker) = self.local_proxy_worker { let _ = worker.join(); }
+        if let Some(worker) = self.target_refresh_worker { let _ = worker.join(); }
+        if let Some(wake) = self.vpn_wake_handle {
+            wake.store(true, Ordering::Release);
+        }
+        if let Some(worker) = self.vpn_observer_worker { let _ = worker.join(); }
     }
 }
 
@@ -915,5 +1595,413 @@ mod tests {
         assert!(stop.load(Ordering::Acquire));
         assert!(registered_production_enforcer(&store.paths.watch()).is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seatbelt_production_assembly_wires_registry_vpn_observer_and_enforces_i03_gate() {
+        use claude_watch_core::{
+            channel::{BoundProcessToken, NetworkBackendKind},
+            config::Config,
+            processes::{LaunchTarget, ProcessRole},
+            session::{Desktop, Launcher},
+            vpn::{
+                ObservationConsistency, ObservedField, UpstreamProtocol, VpnEpoch, VpnExpectation,
+                VpnObservation,
+            },
+        };
+
+        struct SeatbeltFixtureSystem {
+            family: &'static str,
+            now: f64,
+        }
+        impl DesktopSystem for SeatbeltFixtureSystem {
+            fn launch_target(&self) -> LaunchTarget {
+                if self.family == "openai" {
+                    LaunchTarget::CodexDesktop
+                } else {
+                    LaunchTarget::ClaudeDesktop
+                }
+            }
+            fn set_family(&mut self, family_id: &str) -> Result<()> {
+                self.family = if family_id == "openai" { "openai" } else { "claude" };
+                Ok(())
+            }
+            fn now(&self) -> f64 {
+                self.now
+            }
+            fn monotonic(&self) -> Duration {
+                Duration::from_secs(1)
+            }
+            fn wait(&mut self, _: Duration) {}
+            fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
+                if self.family == "claude" {
+                    Ok(vec![(
+                        Desktop {
+                            pid: 4100,
+                            start_seconds: 900,
+                            start_microseconds: 1,
+                        },
+                        true,
+                        "u501:900:1".into(),
+                    )])
+                } else {
+                    Ok(vec![])
+                }
+            }
+            fn supervised_processes(&mut self) -> Result<Vec<BoundProcessToken>> {
+                if self.family == "claude" {
+                    Ok(vec![BoundProcessToken::with_system_identity(
+                        4100,
+                        501,
+                        900,
+                        1,
+                        ProcessRole::DesktopMain,
+                    )
+                    .with_audit_token([501, 501, 20, 501, 20, 4100, 0, 9])])
+                } else {
+                    Ok(vec![])
+                }
+            }
+            fn desktop_alive(&mut self, _: &Desktop) -> Result<bool> {
+                Ok(true)
+            }
+            fn desktop_tree_running(&mut self) -> Result<bool> {
+                Ok(self.family == "claude")
+            }
+            fn launcher(&mut self) -> Result<Launcher> {
+                Ok(Launcher {
+                    pid: 1,
+                    start: "init".into(),
+                })
+            }
+            fn full_audit(&mut self) -> Result<Value> {
+                panic!("guard loop must not call synchronous full_audit")
+            }
+            fn egress(&mut self) -> Value {
+                json!({
+                    "ip": "1.1.1.1",
+                    "country": "JP",
+                    "observed_at": self.now,
+                    "source": "fixture",
+                    "family": "*",
+                    "upstream_endpoint": "http://127.0.0.1:17890",
+                    "context_id": "ctx",
+                    "via_controlled_path": true
+                })
+            }
+            fn local_guard(&mut self) -> Result<Value> {
+                Ok(json!({
+                    "context": "ctx",
+                    "context_id": "ctx",
+                    "proxy": "ok",
+                    "tun": "disabled",
+                    "guard_backend_healthy": true,
+                    "observation_unavailable": []
+                }))
+            }
+            fn backend_healthy(&mut self) -> Result<bool> {
+                Ok(true)
+            }
+            fn launcher_matches(&mut self, _: &Launcher) -> Result<bool> {
+                Ok(true)
+            }
+            fn open_desktop(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn quit_desktop(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn quit_for_confirmed_ip_risk(&mut self, _: &mut Option<u32>) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let root = std::path::PathBuf::from("/tmp").join(format!("cwdsb-{short_id}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new(Paths::new(&root).unwrap());
+
+        // Save schema-2 seatbelt config first so `StateStore` initializes `watch/` with 0o700 permissions
+        let mut cfg = Config::default_for_new_install();
+        cfg.enabled = true;
+        cfg.guard_enabled = true;
+        cfg.proxy_mode = "tag".into();
+        cfg.proxy_url = "http://127.0.0.1:17890".into();
+        cfg.proxy_group = "TAG".into();
+        let mut exp = VpnExpectation::unconfigured();
+        exp.configured = true;
+        exp.proxy_mode = "tag".into();
+        exp.proxy_url = "http://127.0.0.1:17890".into();
+        exp.proxy_group = "TAG".into();
+        exp.running_mode = Some("rule".into());
+        exp.expected_node = Some("JP-01".into());
+        cfg.vpn_expectation = Some(exp);
+        ConfigStore {
+            storage: store.clone(),
+        }
+        .save(cfg.value().unwrap())
+        .unwrap();
+
+        let runtime_dir = store.paths.watch().join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        // Stage a manifest-bound helper binary (`watch-sandbox-launcher`) and `components.json`
+        let current_exe = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .unwrap();
+        let helper_path = runtime_dir.join("watch-sandbox-launcher");
+        std::fs::copy(&current_exe, &helper_path).unwrap();
+        let helper_sha = claude_watch_system::sha256_file_hex(&helper_path).unwrap();
+        std::fs::write(
+            runtime_dir.join("components.json"),
+            json!({
+                "network_backend": "seatbelt",
+                "hashes": {
+                    "watch-sandbox-launcher": helper_sha
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        struct MockLiveVpnReader;
+        impl VpnSourceReader for MockLiveVpnReader {
+            fn read_observation(
+                &self,
+                _expectation: &VpnExpectation,
+                _include_rules: bool,
+                sample_seq: u64,
+                epoch: VpnEpoch,
+                now: f64,
+            ) -> VpnObservation {
+                let me = claude_watch_system::inspect_process_identity(std::process::id()).unwrap();
+                VpnObservation {
+                    source: "tag".into(),
+                    source_instance: Some(format!(
+                        "pid:{}:{}:{}",
+                        me.pid, me.start_seconds, me.start_microseconds
+                    )),
+                    source_revision: Some("rev-prod-1".into()),
+                    upstream_endpoint: Some("http://127.0.0.1:17890".into()),
+                    upstream_protocol: ObservedField::Known(UpstreamProtocol::MixedHttp),
+                    running_mode: ObservedField::Known("rule".into()),
+                    tun_enabled: ObservedField::Known(false),
+                    system_proxy_enabled: ObservedField::Unknown("system_proxy_not_sampled".into()),
+                    selected_group: ObservedField::Known("TAG".into()),
+                    selected_node: ObservedField::Known("JP-01".into()),
+                    proxy_chain: ObservedField::Known(vec!["TAG".into(), "JP-01".into()]),
+                    rules_digest: ObservedField::Unknown("controller_rules_not_sampled".into()),
+                    sample_started_at: now,
+                    observed_at: now,
+                    valid_until: now + 5.0,
+                    consistency: ObservationConsistency::RevisionVerified,
+                    source_error: None,
+                    sample_seq,
+                    epoch,
+                }
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut stack = assemble_production_channel_stack_with_vpn_reader(
+            store.clone(),
+            stop.clone(),
+            false,
+            Some(Arc::new(MockLiveVpnReader)),
+            |_req| Err(CoreError::new("unused", "unused")),
+        )
+        .expect("assemble production seatbelt stack");
+
+        // 1. Verify Seatbelt registration service, staged deliverable entries, and VPN observer were wired in production assembly
+        assert!(
+            stack.sandbox_registry.is_some(),
+            "Seatbelt production assembly must initialize SandboxLaunchRegistry"
+        );
+        assert!(
+            stack.vpn_wake_handle.is_some(),
+            "Seatbelt production assembly must initialize VPN observer wake handle"
+        );
+        let entry_deadline = Instant::now() + Duration::from_secs(3);
+        while !store.paths.watch().join("entries/entries-manifest.json").is_file() {
+            assert!(Instant::now() < entry_deadline, "background entry staging did not finish");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            store.paths.watch().join("entries/bin/claude").is_file()
+                && store.paths.watch().join("entries/entries-manifest.json").is_file(),
+            "Production Seatbelt assembly must stage deliverable CLI shims and entries-manifest.json"
+        );
+        // 2. Verify I03 identity gate blocked production enablement (`sandbox_ready == false`)
+        assert!(
+            !stack.enforcer.sandbox_ready().unwrap(),
+            "Production Seatbelt assembly must keep sandbox_ready=false while I03 is unverified"
+        );
+        let rt_meta = store
+            .read_json(
+                &store.paths.watch().join("state/seatbelt-runtime.json"),
+                Value::Null,
+            )
+            .unwrap();
+        assert_eq!(rt_meta["backend"], "seatbelt");
+        assert_eq!(rt_meta["sandbox_ready"], false);
+        assert_eq!(
+            rt_meta["identity_report"]["blocker_code"],
+            "gateway_server_identity_unverified_i03"
+        );
+
+        // 3. Verify `step_with_system` ingests VPN observations from the background worker and classifies
+        //    unregistered processes as `unmanaged_member_pids` (never falsely claiming protected)
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut sys = SeatbeltFixtureSystem {
+            family: "claude",
+            now: native::now(),
+        };
+        let snap = loop {
+            sys.now = native::now();
+            let s = stack.step_with_system(&mut sys).unwrap();
+            if s.families["claude"].vpn_epoch.is_some() {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "VPN observation worker did not deliver sample");
+            stack.wait_or_drain(deadline, &stop);
+        };
+        assert_eq!(snap.families["claude"].backend, NetworkBackendKind::Seatbelt);
+        assert!(!snap.families["claude"].sandbox_ready);
+        assert!(
+            snap.families["claude"]
+                .unmanaged_member_pids
+                .contains(&4100),
+            "unregistered process must appear in unmanaged_member_pids"
+        );
+
+        stack.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod r1_tests {
+    use super::*;
+    use claude_watch_core::config::Config;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    struct Fixture { root: PathBuf, stack: Option<ProductionChannelStack>, store: StateStore }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Some(stack) = self.stack.take() { stack.shutdown(); }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+    fn fixture(invalid_config: bool) -> Fixture {
+        let root = PathBuf::from("/tmp").join(format!("cwr1-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new(Paths::new(&root).unwrap());
+        ConfigStore { storage: store.clone() }.save(Config::default_for_new_install().value().unwrap()).unwrap();
+        let runtime = store.paths.watch().join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let helper = runtime.join("watch-sandbox-launcher");
+        fs::copy("/usr/bin/true", &helper).unwrap();
+        fs::write(runtime.join("components.json"), json!({"network_backend":"seatbelt", "hashes":{
+            "watch-sandbox-launcher": claude_watch_system::sha256_file_hex(&helper).unwrap()
+        }}).to_string()).unwrap();
+        if invalid_config { fs::write(store.paths.config(), b"{").unwrap(); }
+        let stack = assemble_production_channel_stack(store.clone(), Arc::new(AtomicBool::new(false)), false,
+            |_| Err(CoreError::new("unused_fixture_audit", "unused"))).unwrap();
+        Fixture { root, stack: Some(stack), store }
+    }
+
+    #[test]
+    fn partial_listener_failures_retry_on_the_same_registry() {
+        for registration_fails_first in [true, false] {
+            let mut f = fixture(false);
+            let stack = f.stack.as_mut().unwrap();
+            stack.activate_local_interception = true;
+            let original = stack.sandbox_registry.as_ref().unwrap().clone();
+            stack.reconcile_controlled_backend_with_listeners(native::now(),
+                |reg, path, stop| {
+                    assert!(Arc::ptr_eq(reg, &original));
+                    if registration_fails_first { Err(CoreError::new("fixture_registration_failure", "injected")) }
+                    else { reg.start_registration_listener(path, stop) }
+                },
+                |enforcer, stop, now| {
+                    if !registration_fails_first { Err(CoreError::new("fixture_proxy_failure", "injected")) }
+                    else { enforcer.start_local_proxy_listener("127.0.0.1:0", stop, now) }
+                }).unwrap();
+            assert_eq!(stack.sandbox_registration_worker.is_none(), registration_fails_first);
+            assert_eq!(stack.local_proxy_worker.is_some(), registration_fails_first);
+            assert!(Arc::ptr_eq(stack.sandbox_registry.as_ref().unwrap(), &original));
+            // Retry the same injected component listeners. The production
+            // default now requires root launchd endpoint ownership and must
+            // not silently fall back to a local bind when no service exists.
+            stack.reconcile_controlled_backend_with_listeners(native::now(),
+                |reg, path, stop| reg.start_registration_listener(path, stop),
+                |enforcer, stop, now| enforcer.start_local_proxy_listener("127.0.0.1:0", stop, now)).unwrap();
+            assert!(Arc::ptr_eq(stack.sandbox_registry.as_ref().unwrap(), &original));
+            assert!(stack.sandbox_registration_worker.is_some());
+            assert!(stack.local_proxy_worker.is_some());
+            let port = stack.enforcer.local_proxy_port().unwrap();
+            stack.reconcile_controlled_backend_with_listeners(native::now(),
+                |_, _, _| panic!("must not duplicate a live registration listener"),
+                |_, _, _| panic!("must not duplicate a live proxy listener")).unwrap();
+            assert_eq!(stack.enforcer.local_proxy_port(), Some(port));
+            assert!(!stack.enforcer.sandbox_ready().unwrap(), "I03 stays closed");
+        }
+    }
+
+    #[test]
+    fn corrected_startup_config_updates_supervisor_before_registry_version() {
+        let mut f = fixture(true);
+        assert!(f.stack.as_ref().unwrap().sandbox_registry.is_none());
+        let mut cfg = Config::default_for_new_install();
+        cfg.proxy_url = "http://127.0.0.1:18765".into();
+        cfg.enabled = true;
+        // Simulate an explicit external repair; ConfigStore::save correctly refuses to
+        // merge into a corrupt file, and this test must not weaken that protection.
+        f.store.atomic_json(&f.store.paths.config(), &cfg.value().unwrap()).unwrap();
+        let saved = ConfigStore { storage: f.store.clone() }.load().unwrap();
+        let expected = ChannelSupervisor::compute_policy_version(&saved).unwrap();
+        let stack = f.stack.as_mut().unwrap();
+        // No VPN observer/file-change event exists in this fixture: the recovery path must apply it itself.
+        stack.reconcile_controlled_backend(native::now()).unwrap();
+        assert!(stack.sandbox_registry.is_some());
+        assert_eq!(stack.supervisor.saved_policy_version(), &expected);
+        assert_eq!(stack.last_policy_version.as_ref(), Some(&expected));
+        assert_eq!(stack.supervisor.config().proxy_url, saved.proxy_url);
+        assert!(stack.supervisor.config_blocking_reason().is_none());
+        assert!(!stack.enforcer.sandbox_ready().unwrap());
+    }
+
+    #[test]
+    fn metadata_refresh_preserves_unchanged_entries_and_observes_target_changes() {
+        let f = fixture(false);
+        let target = f.root.join("Applications/Claude.app/Contents/MacOS/Claude");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"fixture-a").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let signature = target_metadata_signature(&f.store, Some(&f.store.paths.watch().join("runtime")));
+        assert_eq!(signature, target_metadata_signature(&f.store, Some(&f.store.paths.watch().join("runtime"))));
+        let entry = f.store.paths.watch().join("entries/apps/Claude (Controlled).app/Contents/Info.plist");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !entry.is_file() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(20));
+        }
+        let modified = fs::metadata(&entry).unwrap().modified().unwrap();
+        thread::sleep(Duration::from_millis(1200));
+        assert_eq!(fs::metadata(&entry).unwrap().modified().unwrap(), modified,
+            "unchanged metadata must not recopy/rewrite entries on every poll");
+        fs::write(&target, b"fixture-b").unwrap();
+        assert_ne!(signature, target_metadata_signature(&f.store, Some(&f.store.paths.watch().join("runtime"))));
+        let sha = claude_watch_system::sha256_file_hex(&target).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !fs::read_to_string(&entry).unwrap().contains(&sha) {
+            assert!(Instant::now() < deadline, "changed target was not refreshed");
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }

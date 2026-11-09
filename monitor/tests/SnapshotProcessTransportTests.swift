@@ -76,15 +76,18 @@ struct SnapshotProcessTransportTests {
             .flatMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
         expect(isTimedOut(orphan), "descendant holding stdout yields timedOut, not success")
         expect(orphanElapsed < 1.2, "descendant holding stdout cannot block until its EOF")
-        if let pid = orphanPID, pid > 1 {
-            let cleanDeadline = Date().addingTimeInterval(3)
-            while kill(pid, 0) == 0 && Date() < cleanDeadline {
-                usleep(20_000)
-            }
-            if kill(pid, 0) == 0 {
-                _ = kill(pid, SIGKILL)
-            }
+        guard let pid = orphanPID, pid > 1 else {
+            fatalError("synthetic descendant did not report a valid PID")
         }
+        let cleanDeadline = Date().addingTimeInterval(3)
+        while kill(pid, 0) == 0 && Date() < cleanDeadline {
+            usleep(20_000)
+        }
+        // The orphan is no longer an owned Process object. Never signal this
+        // numeric PID: it could have been reused after the short sleep exits.
+        // A reused or unexpectedly persistent PID fails this bounded check.
+        expect(kill(pid, 0) == -1 && errno == ESRCH,
+               "synthetic descendant exits naturally without a signal")
 
         // Infinite stdout must stop as soon as the byte limit is crossed,
         // well before the time limit.

@@ -265,7 +265,9 @@ final class MonitorStore: ObservableObject {
             channelSubscription.applySnapshot(channelSnap)
         }
         // The UI observes authoritative receipts; it never reissues permits.
-        _ = NetworkExtensionHostManager.shared
+        if NetworkBackendCapabilities.requiresSystemExtensionActivation() {
+            _ = NetworkExtensionHostManager.shared
+        }
         // Re-evaluate only after both the tracker and snapshot describe this
         // observation. Otherwise a recovered sampler can leave a fresh
         // receipt marked incomplete until an unrelated later clock tick.
@@ -289,6 +291,30 @@ final class MonitorStore: ObservableObject {
             now: now.timeIntervalSince1970,
             live: live
         )
+    }
+    func unmanagedPids(for product: MonitoredProduct) -> [UInt32] {
+        channelState(for: product)?.unmanaged_member_pids ?? []
+    }
+    func isProcessUnmanaged(_ process: WatchedProcess) -> Bool {
+        guard let state = channelState(for: process.product) else { return false }
+        return state.isUnmanagedProcess(process)
+    }
+    var vpnSupervision: VpnSupervisionSnapshotModel? {
+        guard live else { return nil }
+        return snapshot?.vpnSupervision
+    }
+    var vpnExpectationDifferences: [VpnFieldDiffModel] {
+        vpnSupervision?.differences ?? []
+    }
+    var vpnUnknownOrStaleReasons: [String] {
+        guard let sup = snapshot?.vpnSupervision else {
+            return live ? ["vpn_supervision_unavailable"] : ["monitor_snapshot_stale_or_offline"]
+        }
+        return sup.unknownOrStaleReasons
+    }
+    func isConfirmedFlowBlocked(for product: MonitoredProduct) -> Bool {
+        guard let state = channelState(for: product) else { return false }
+        return state.isConfirmedFlowBlocked
     }
     private func refreshBackgroundIfNeeded(at date: Date, force: Bool = false) {
         guard !backgroundReadRunning, !switcher.busy,

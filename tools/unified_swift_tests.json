@@ -1,0 +1,1145 @@
+{
+  "schema_version": 1,
+  "description": "Explicitly reviewed independent Swift test recipes. Fixtures and owned test processes do not establish installed service, real AI, VPN or SystemExtension acceptance.",
+  "source_semantics": "sources contains production inputs only; append test_files for kind=swift. concat_sources preserves listed order, including test_files. Script entries document their internal compile inputs.",
+  "defaults": {
+    "swift_version": "5",
+    "optimization": "-Onone",
+    "parse_as_library": true,
+    "platform": "darwin",
+    "minimum_target_file": "monitor/macos-minimum.txt"
+  },
+  "entries": [
+    {
+      "id": "swift.AIProbeTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/AIProbeTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "AIProbeStore(isFixture: true); response, timeout and cancellation fixtures. No service requests."
+    },
+    {
+      "id": "swift.AIProcessControlTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/AIProcessControlTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/MonitorModels.swift",
+        "monitor/Sources/AIProcessControl.swift"
+      ],
+      "defines": [],
+      "args": [],
+      "frameworks": [
+        "AppKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Default invocation mocks all exit requests; live API checks read only this test process's cwd/argv. AIProcessControl(isFixture: true) never signals monitored apps.",
+      "unselected_modes": {
+        "--owned-force-child": "Excluded from automatic execution: this optional mode has cleanup signals by PID without a fresh identity check. Default policy fixtures and owned-child identity-checked TERM remain included.",
+        "--inspect": "Read-only host inventory mode is not an assertion suite and is not selected."
+      },
+      "additional_runs": [
+        [
+          "--owned-exec-identity"
+        ],
+        [
+          "--owned-child"
+        ]
+      ]
+    },
+    {
+      "id": "swift.AIProcessExitEvidenceTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/AIProcessExitEvidenceTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/AIProcessControl.swift"
+      ],
+      "defines": [
+        "PROCESS_POLICY_TESTS"
+      ],
+      "args": [],
+      "frameworks": [
+        "Foundation"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Synthetic identities and action closures only. PROCESS_POLICY_TESTS excludes live inventory/AppKit implementation and avoids the test's MonitoredProduct type conflict."
+    },
+    {
+      "id": "swift.BackendReceiptDecodeTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/BackendReceiptDecodeTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [
+        "{work_dir}/environment-receipt.json"
+      ],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "prepare": [
+        {
+          "kind": "json_extract",
+          "source": "monitor/tests/fixtures/review/normal.json",
+          "key_path": [
+            "environment"
+          ],
+          "destination": "{work_dir}/environment-receipt.json"
+        }
+      ],
+      "safety_notes": "Decodes only the committed normal review fixture extracted into this run's artifact directory; no installed status or live environment collection."
+    },
+    {
+      "id": "swift.BackgroundLeakWorkerTests",
+      "kind": "script",
+      "test_files": [
+        "monitor/tests/BackgroundLeakWorkerTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/IdentityPresentation.swift",
+        "monitor/Sources/BundledBackendVariant.swift",
+        "monitor/Sources/LeakCheckModels.swift",
+        "monitor/Sources/NetCoffeeModels.swift",
+        "monitor/Sources/NetCoffeeLeakRunner.swift",
+        "monitor/Sources/IPLeakDNSRunner.swift",
+        "monitor/Sources/IPLeakDNSRetryRunner.swift",
+        "monitor/tools/BackgroundLeakWorker.swift"
+      ],
+      "defines": [
+        "COFFEE_BRIDGE_TEST",
+        "IPLEAK_BRIDGE_TEST"
+      ],
+      "args": [
+        "--run"
+      ],
+      "frameworks": [
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [
+        "macos.gui_session"
+      ],
+      "fixture_only": true,
+      "script": "monitor/tests/run_background_leak_worker_test.sh",
+      "success_markers": [
+        "BackgroundLeakWorkerTests: fixed resource selection and injected DNS/WebRTC receipts passed"
+      ],
+      "safety_notes": "Builds/ad-hoc-signs an owned temporary .app and launches only that test app. Both JS run implementations are replaced with local receipts before execution. Require the completion marker and inspect combined stdout/stderr: open exit alone is insufficient.",
+      "recipe_ref": "monitor/tests/run_background_leak_worker_test.sh"
+    },
+    {
+      "id": "swift.ChannelEpochTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/ChannelEpochTests.swift"
+      ],
+      "sources": [
+        "monitor/SystemExtension/ChannelContract.swift",
+        "monitor/SystemExtension/ChannelIdentity.swift",
+        "monitor/SystemExtension/ChannelTransport.swift"
+      ],
+      "defines": [],
+      "args": [
+        "{run_dir}/artifacts/rust-command.json"
+      ],
+      "frameworks": [
+        "Security"
+      ],
+      "dependencies": [
+        "rust.extension_command_fixture"
+      ],
+      "fixture_only": true,
+      "safety_notes": "SystemExtension contract/identity/transport sources only; no provider construction or extension activation."
+    },
+    {
+      "id": "swift.ChannelRemovalReceiptTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/ChannelRemovalReceiptTests.swift"
+      ],
+      "sources": [
+        "monitor/SystemExtension/ChannelContract.swift",
+        "monitor/SystemExtension/ChannelIdentity.swift",
+        "monitor/SystemExtension/ChannelTransport.swift"
+      ],
+      "defines": [],
+      "args": [],
+      "frameworks": [
+        "Security"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "SystemExtension contract/identity/transport sources only; no provider construction or extension activation."
+    },
+    {
+      "id": "swift.ChannelSupervisionTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/ChannelSupervisionTests.swift"
+      ],
+      "sources": [
+        "monitor/SystemExtension/ChannelContract.swift",
+        "monitor/SystemExtension/ChannelIdentity.swift",
+        "monitor/SystemExtension/ChannelTransport.swift"
+      ],
+      "defines": [],
+      "args": [
+        "{run_dir}/artifacts/root-capture.json"
+      ],
+      "frameworks": [
+        "Security"
+      ],
+      "dependencies": [
+        "rust.extension_capture_fixture"
+      ],
+      "fixture_only": true,
+      "safety_notes": "Synthetic process identities plus owned temporary alias files; checks Rust-exported capture cases. No real app launch, network or configuration."
+    },
+    {
+      "id": "swift.ChannelTransportTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/ChannelTransportTests.swift"
+      ],
+      "sources": [
+        "monitor/SystemExtension/ChannelContract.swift",
+        "monitor/SystemExtension/ChannelIdentity.swift",
+        "monitor/SystemExtension/ChannelTransport.swift"
+      ],
+      "defines": [
+        "CHANNEL_TRANSPORT_TESTS"
+      ],
+      "args": [
+        "{run_dir}/artifacts/rust-command.json"
+      ],
+      "frameworks": [
+        "Security"
+      ],
+      "dependencies": [
+        "rust.extension_command_fixture"
+      ],
+      "fixture_only": true,
+      "safety_notes": "Synthetic command envelope plus owned AF_UNIX listener/socketpair under /tmp and current-process kernel identity. No TCP/UDP/external network or provider activation."
+    },
+    {
+      "id": "swift.ClaudeLoginProbeTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/ClaudeLoginProbeTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Synthetic ClaudeAXNode trees passed to classify; no live Accessibility query."
+    },
+    {
+      "id": "swift.CoffeeRequestDeadlineTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/CoffeeRequestDeadlineTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/IdentityPresentation.swift",
+        "monitor/Sources/BundledBackendVariant.swift",
+        "monitor/Sources/LeakCheckModels.swift",
+        "monitor/Sources/NetCoffeeModels.swift"
+      ],
+      "defines": [],
+      "args": [],
+      "frameworks": [
+        "Foundation"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Creates an owned temporary watch-engine shell that execs /bin/sleep; deadline cancellation terminates/reaps that child only. No network."
+    },
+    {
+      "id": "swift.ConnectionInventoryTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/ConnectionInventoryTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "In-memory process/flow fixtures only."
+    },
+    {
+      "id": "swift.DNSRefreshBridgeTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/DNSRefreshBridgeTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Creates and removes one owned temporary bridge directory; no installed bridge or service."
+    },
+    {
+      "id": "swift.EnvironmentDetailPresentationTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/EnvironmentDetailPresentationTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "In-memory hover, pin and dismissal state only."
+    },
+    {
+      "id": "swift.EnvironmentRefreshSchedulerTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/EnvironmentRefreshSchedulerTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Synthetic clock and context scheduler inputs only."
+    },
+    {
+      "id": "swift.EventDiagnosticsTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/EventDiagnosticsTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [
+        "{engine}"
+      ],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [
+        "rust.engine"
+      ],
+      "fixture_only": true,
+      "safety_notes": "event-diagnostic --apply writes only sanitized diagnostic rows under the test's explicit temporary --home; no daemon, launch, account, VPN or system settings command."
+    },
+    {
+      "id": "swift.EventHistoryTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/EventHistoryTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/MonitorModels.swift",
+        "monitor/Sources/EventHistory.swift"
+      ],
+      "defines": [],
+      "args": [
+        "{engine}"
+      ],
+      "frameworks": [
+        "Foundation"
+      ],
+      "dependencies": [
+        "rust.engine"
+      ],
+      "fixture_only": true,
+      "safety_notes": "Test defines its own SwitcherCommandRunner, so do not link SwitcherStore.swift. Runs the repo-built engine event-history with explicit --home pointing to owned temporary JSONL fixtures; that command reads EventStore.history only."
+    },
+    {
+      "id": "swift.GraphContinuityTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/GraphContinuityTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "In-memory snapshots and process/flow fixtures only; existing assertions remain unchanged."
+    },
+    {
+      "id": "swift.GraphModelTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/GraphModelTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "In-memory graph projection fixtures only; existing assertions remain unchanged."
+    },
+    {
+      "id": "swift.GuardDiagnosticsTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/GuardDiagnosticsTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [
+        "{engine}"
+      ],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [
+        "rust.engine"
+      ],
+      "fixture_only": true,
+      "safety_notes": "guard-diagnostic --apply writes only sanitized diagnostic rows under the test's explicit temporary --home; no daemon, launch, account, VPN or system settings command."
+    },
+    {
+      "id": "swift.IdentityPresentationTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/IdentityPresentationTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Pure branding, country and JSON parsing fixtures."
+    },
+    {
+      "id": "swift.InitializationConnectionLogTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/InitializationConnectionLogTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Owned temporary log directory; fixture stores, injected time and permission callbacks; no installed logs or completion writes."
+    },
+    {
+      "id": "swift.InitializationPreview",
+      "kind": "excluded",
+      "test_files": [
+        "monitor/tests/InitializationPreview.swift"
+      ],
+      "sources": [],
+      "defines": [],
+      "args": [],
+      "frameworks": [
+        "Foundation"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "reason": "Offscreen visual PNG renderer with fixture stores, not an automated assertion test; visual QA is a separate operation."
+    },
+    {
+      "id": "swift.InitializationStabilityTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/InitializationStabilityTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Fixture stores and injected initialization checks; no actual service or network probes."
+    },
+    {
+      "id": "swift.InitializationTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/InitializationTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "UI_REVIEW, explicit fixture stores, injected permission/mutation callbacks and owned temporary storage; one owned /bin/sh progress fixture."
+    },
+    {
+      "id": "swift.IPLeakBridgeTests",
+      "kind": "script",
+      "test_files": [
+        "monitor/tests/IPLeakBridgeTests.swift",
+        "monitor/tests/IPLeakRetryTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW",
+        "IPLEAK_BRIDGE_TEST"
+      ],
+      "args": [
+        "--fixture"
+      ],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [
+        "macos.gui_session"
+      ],
+      "fixture_only": true,
+      "script": "monitor/tests/run_ipleak_bridge_test.sh",
+      "success_markers": [
+        "IPLeak native retry: bounded recovery, timeout and cancellation passed",
+        "IPLeakBridgeTests: local page, WebKit, JS and native result passed with mocked network"
+      ],
+      "safety_notes": "Existing runner builds and runs both mapped tests once. Retry uses FakeDNSRunner; bridge injects fetch responses. Temporary signed app only; fixture mode does not read installed proxy state.",
+      "excluded_modes": {
+        "--live": "Real IPLeak/WebRTC network probes and installed proxy-snapshot read are outside the isolated suite."
+      },
+      "recipe_ref": "monitor/tests/run_ipleak_bridge_test.sh"
+    },
+    {
+      "id": "swift.LeakBridgeTests",
+      "kind": "script",
+      "test_files": [
+        "monitor/tests/LeakBridgeTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW",
+        "LEAK_BRIDGE_TEST"
+      ],
+      "args": [
+        "--run"
+      ],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [
+        "macos.gui_session"
+      ],
+      "fixture_only": true,
+      "script": "monitor/tests/run_leak_bridge_test.sh",
+      "environment": {
+        "LEAK_BRIDGE_APP": "{work_dir}/Leak Bridge Tests.app"
+      },
+      "success_markers": [
+        "LeakBridgeTests: local resource + CSP + JavaScript collector + native receipt passed; fetch and RTC mocked"
+      ],
+      "safety_notes": "Runs the real local page/Swift bridge with fetch and RTCPeerConnection replaced by fixtures. App bundle is in work_dir. Existing script's ignored monitor/build/test-module-cache is the sole repository build-cache output; no install or production configuration.",
+      "recipe_ref": "monitor/tests/run_leak_bridge_test.sh"
+    },
+    {
+      "id": "swift.LeakCheckTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/LeakCheckTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Every LeakCheckStore is fixture-backed; no optional historical/live receipt argument selected."
+    },
+    {
+      "id": "swift.LeakDiagnosticTraceTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/LeakDiagnosticTraceTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Owned temporary log directories and symlink fixtures only; does not use the installed diagnostic directory."
+    },
+    {
+      "id": "swift.MonitorLoginClockTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/MonitorLoginClockTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "UI_REVIEW makes default stores fixture-backed; notification permission result is injected rather than queried or requested."
+    },
+    {
+      "id": "swift.MonitorSnapshotTimingTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/MonitorSnapshotTimingTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Synthetic timestamps and context strings only."
+    },
+    {
+      "id": "swift.NetCoffeeLiveCheck",
+      "kind": "excluded",
+      "test_files": [
+        "monitor/tests/NetCoffeeLiveCheck.swift"
+      ],
+      "sources": [],
+      "defines": [],
+      "args": [],
+      "frameworks": [
+        "Foundation"
+      ],
+      "dependencies": [],
+      "fixture_only": false,
+      "reason": "Standalone live DNS/WebRTC diagnostic performs real external network probes and writes a caller-specified report; outside the isolated test suite."
+    },
+    {
+      "id": "swift.NetCoffeeStoreTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/NetCoffeeStoreTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "UI_REVIEW makes default stores fixture-backed; manually ingested receipts, no Coffee request."
+    },
+    {
+      "id": "swift.NetCoffeeTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/NetCoffeeTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/IdentityPresentation.swift",
+        "monitor/Sources/BundledBackendVariant.swift",
+        "monitor/Sources/LeakCheckModels.swift",
+        "monitor/Sources/NetCoffeeModels.swift"
+      ],
+      "defines": [],
+      "args": [
+        "monitor/tests/fixtures/netcoffee/coffee-lookup-1.1.1.1.json"
+      ],
+      "frameworks": [
+        "Foundation"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Decodes the committed lookup receipt containing trust_score=41; no Coffee subprocess or network request."
+    },
+    {
+      "id": "swift.NetworkExtensionCapabilityTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/NetworkExtensionCapabilityTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/NetworkExtensionCapabilities.swift"
+      ],
+      "defines": [],
+      "args": [],
+      "frameworks": [
+        "Foundation"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Pure entitlement value combinations; no manager initialization, activation request or OS write."
+    },
+    {
+      "id": "swift.NetworkFilterFeasibility",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/NetworkFilterFeasibility.swift"
+      ],
+      "sources": [],
+      "defines": [],
+      "args": [],
+      "frameworks": [
+        "NetworkExtension"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Self-contained API compile contract plus in-memory NetworkChannelFlowGate assertions. NEFilterDataProvider/NETransparentProxyProvider declarations are never instantiated; no extension activation, traffic interception or real socket test.",
+      "success_markers": [
+        "NetworkFilterFeasibility: compiled API contract only; no provider was instantiated or activated"
+      ]
+    },
+    {
+      "id": "swift.NetworkGraphSelectionTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/NetworkGraphSelectionTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Synthetic process/flow selection fixtures only."
+    },
+    {
+      "id": "swift.ObserverIdentityTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/ObserverIdentityTests.swift"
+      ],
+      "sources": [
+        "crates/watch-runtime/native/Observer.swift"
+      ],
+      "defines": [
+        "OBSERVER_TESTING"
+      ],
+      "args": [],
+      "frameworks": [
+        "Foundation"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "concat_sources": true,
+      "safety_notes": "Concatenate Observer.swift then the test to preserve file-private access; OBSERVER_TESTING removes the observer production main. Reads host inventory but only inspects/signals owned /bin/sleep children; no real AI termination or network."
+    },
+    {
+      "id": "swift.RefreshGateTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/RefreshGateTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Pure in-memory refresh gate state machine."
+    },
+    {
+      "id": "swift.ResidentWebViewTests",
+      "kind": "script",
+      "test_files": [
+        "monitor/tests/ResidentWebViewTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/IdentityPresentation.swift",
+        "monitor/Sources/BundledBackendVariant.swift",
+        "monitor/Sources/LeakCheckModels.swift",
+        "monitor/Sources/NetCoffeeModels.swift",
+        "monitor/Sources/NetCoffeeLeakRunner.swift",
+        "monitor/Sources/IPLeakDNSRunner.swift",
+        "monitor/Sources/IPLeakDNSRetryRunner.swift"
+      ],
+      "defines": [
+        "COFFEE_BRIDGE_TEST",
+        "IPLEAK_BRIDGE_TEST"
+      ],
+      "args": [],
+      "frameworks": [
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [
+        "macos.gui_session"
+      ],
+      "fixture_only": true,
+      "script": "monitor/tests/run_resident_webview_tests.sh",
+      "success_markers": [
+        "ResidentWebViewTests passed: page reuse, new DNS session, cancellation, timeout and abnormal-process recovery; all network mocked"
+      ],
+      "safety_notes": "Temporary signed .app; injected fetch/RTC plus a temporary stub watch-engine cover all outbound primitives. Exercises real local WebKit lifecycle only.",
+      "recipe_ref": "monitor/tests/run_resident_webview_tests.sh"
+    },
+    {
+      "id": "swift.ReviewReceiptDecodeTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/ReviewReceiptDecodeTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [
+        "monitor/tests/fixtures/review"
+      ],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Reads six committed production-schema review fixture files; no current-host observation or receipt creation."
+    },
+    {
+      "id": "swift.RustBackendTransportTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/RustBackendTransportTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Synthetic timing and refresh gate inputs; no Rust subprocess."
+    },
+    {
+      "id": "swift.ServerTargetTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/ServerTargetTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "UI_REVIEW fixture MonitorStore; manually supplied server references, no DNS or GeoIP requests."
+    },
+    {
+      "id": "swift.ServiceStatusDecodeTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/ServiceStatusDecodeTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [
+        "{work_dir}/service-status-receipt.json"
+      ],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "prepare": [
+        {
+          "kind": "json_extract",
+          "source": "monitor/tests/fixtures/review/normal.json",
+          "key_path": [
+            "background"
+          ],
+          "destination": "{work_dir}/service-status-receipt.json"
+        }
+      ],
+      "safety_notes": "Decodes only the committed normal review fixture extracted into this run's artifact directory; no installed status or live environment collection."
+    },
+    {
+      "id": "swift.SnapshotProcessTransportTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/SnapshotProcessTransportTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/SnapshotProcessTransport.swift"
+      ],
+      "defines": [],
+      "args": [],
+      "frameworks": [
+        "Foundation"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Only own temporary shell/sleep fixtures. Unverified orphan-PID SIGKILL cleanup was removed; orphan lifetime is checked without signalling. Actual transport timeouts and output bounds are asserted."
+    },
+    {
+      "id": "swift.SwitcherStoreTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/SwitcherStoreTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "All stores fixture-backed; configuration/account/launch actions remain in memory. Cancels one owned /bin/sleep child; no real AI process action."
+    },
+    {
+      "id": "swift.UIReviewApp",
+      "kind": "excluded",
+      "test_files": [
+        "monitor/tests/UIReviewApp.swift"
+      ],
+      "sources": [],
+      "defines": [],
+      "args": [],
+      "frameworks": [
+        "Foundation"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "reason": "Interactive SwiftUI review application with no bounded automatic completion; not an automated regression test."
+    },
+    {
+      "id": "swift.VpnSettingsSaveTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/VpnSettingsSaveTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "SwitcherStore(isFixture: true) and in-memory configurationCommandFixture; VPN expectation saves do not write Watch or VPN configuration."
+    }
+  ]
+}

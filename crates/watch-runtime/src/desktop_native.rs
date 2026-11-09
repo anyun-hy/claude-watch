@@ -244,13 +244,17 @@ impl<R: ReadRunner> NativeDesktop<R> {
                 "应用执行组件路径无效",
             ));
         }
+        let applications = std::env::var_os("CW_APPLICATIONS_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute() && p.is_dir())
+            .unwrap_or_else(|| "/Applications".into());
         Ok(Self {
             runner,
             helper,
             authority,
             target: LaunchTarget::ClaudeDesktop,
             selected: None,
-            applications: "/Applications".into(),
+            applications,
             cask_roots: vec![
                 "/opt/homebrew/Caskroom".into(),
                 "/usr/local/Caskroom".into(),
@@ -261,6 +265,183 @@ impl<R: ReadRunner> NativeDesktop<R> {
     }
     pub fn target(&self) -> LaunchTarget {
         self.target
+    }
+    pub fn set_applications_dir(&mut self, dir: PathBuf) {
+        self.applications = dir;
+    }
+    pub fn sandbox_launcher_binary(&self) -> Result<PathBuf> {
+        if let Some(override_bin) = std::env::var_os("CW_SANDBOX_LAUNCHER_BIN") {
+            let p = PathBuf::from(override_bin);
+            if p.is_absolute() && p.is_file() {
+                return Ok(p);
+            }
+        }
+        let candidate = self
+            .helper
+            .parent()
+            .map(|d| d.join("watch-sandbox-launcher"))
+            .ok_or_else(|| {
+                CoreError::new("sandbox_launcher_missing", "无法定位 watch-sandbox-launcher")
+            })?;
+        let m = fs::symlink_metadata(&candidate).map_err(|_| {
+            CoreError::new("sandbox_launcher_missing", "缺少 watch-sandbox-launcher 组件")
+        })?;
+        if !candidate.is_absolute() || !m.is_file() || m.file_type().is_symlink() {
+            return Err(CoreError::new(
+                "invalid_sandbox_launcher",
+                "watch-sandbox-launcher 组件路径或类型无效",
+            ));
+        }
+        Ok(candidate)
+    }
+    pub fn selected_cli_path(&self) -> Option<&Path> {
+        self.cli.as_ref().map(|c| c.path.as_path())
+    }
+    pub fn build_managed_entry_spec(
+        &self,
+    ) -> Result<crate::managed_entry::DesktopManagedEntrySpec> {
+        if let Some(ref sel) = self.selected {
+            let exe_name = sel
+                .executable
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            return crate::managed_entry::DesktopManagedEntrySpec::resolve_from_app_bundle(
+                self.target,
+                &sel.bundle,
+                &sel.bundle_id,
+                exe_name,
+            );
+        }
+        let claude_bundle = self.applications.join("Claude.app");
+        crate::managed_entry::DesktopManagedEntrySpec::resolve_from_app_bundle(
+            LaunchTarget::ClaudeDesktop,
+            &claude_bundle,
+            "com.anthropic.claudefordesktop",
+            "Claude",
+        )
+    }
+    /// Discovers installed desktop `.app` targets and CLI targets, registering their
+    /// canonical executables and SHA-256 fingerprints in `SandboxLaunchRegistry`
+    /// along with verified app-bundle helper executables (`Contents/Frameworks/*.app/Contents/MacOS/*`
+    /// and `Contents/Resources/**/codex`). Never whitelists generic `node` or `python` interpreters.
+    pub fn refresh_approved_targets_in_registry(
+        &mut self,
+        home: &Path,
+        registry: &crate::sandbox_launch::SandboxLaunchRegistry,
+    ) -> Vec<crate::managed_entry::DesktopManagedEntrySpec> {
+        let orig_target = self.target;
+        let orig_selected = self.selected.clone();
+        let orig_cli = self.cli.take();
+        let mut discovered_desktop_specs = Vec::new();
+
+        for desktop_target in [
+            LaunchTarget::ClaudeDesktop,
+            LaunchTarget::CodexDesktop,
+            LaunchTarget::ChatgptDesktop,
+        ] {
+            let spec_res = if desktop_target.protected() {
+                let claude_bundle = self.applications.join("Claude.app");
+                crate::managed_entry::DesktopManagedEntrySpec::resolve_from_app_bundle(
+                    LaunchTarget::ClaudeDesktop,
+                    &claude_bundle,
+                    "com.anthropic.claudefordesktop",
+                    "Claude",
+                )
+            } else {
+                self.resolve_target(desktop_target).and_then(|sel| {
+                    let exe_name = sel
+                        .executable
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    crate::managed_entry::DesktopManagedEntrySpec::resolve_from_app_bundle(
+                        desktop_target,
+                        &sel.bundle,
+                        &sel.bundle_id,
+                        exe_name,
+                    )
+                })
+            };
+            if let Ok(spec) = spec_res {
+                let target_exe_str = spec.target_executable.to_string_lossy().into_owned();
+                registry.approve_target_executable(&target_exe_str, &spec.target_fingerprint);
+                registry.approve_child_executable(&target_exe_str, &spec.target_fingerprint);
+                for (child_exe, child_sha) in
+                    Self::discover_bundle_child_executables(&spec.target_bundle_path)
+                {
+                    registry.approve_child_executable(
+                        child_exe.to_string_lossy().into_owned(),
+                        &child_sha,
+                    );
+                }
+                discovered_desktop_specs.push(spec);
+            }
+        }
+
+        for cli_target in [LaunchTarget::ClaudeCli, LaunchTarget::CodexCli] {
+            if self.select_cli(cli_target, home).is_ok() {
+                if let Some(ref sel_cli) = self.cli {
+                    if let Some(sha) = claude_watch_system::sha256_file_hex(&sel_cli.path) {
+                        let cli_path_str = sel_cli.path.to_string_lossy().into_owned();
+                        registry.approve_target_executable(&cli_path_str, &sha);
+                        registry.approve_child_executable(&cli_path_str, &sha);
+                    }
+                }
+            }
+        }
+
+        self.target = orig_target;
+        self.selected = orig_selected;
+        self.cli = orig_cli;
+        discovered_desktop_specs
+    }
+
+    pub fn discover_bundle_child_executables(bundle_root: &Path) -> Vec<(PathBuf, String)> {
+        let mut results = Vec::new();
+        let frameworks_dir = bundle_root.join("Contents/Frameworks");
+        if let Ok(entries) = fs::read_dir(&frameworks_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("app") {
+                    let macos_dir = path.join("Contents/MacOS");
+                    if let Ok(bins) = fs::read_dir(&macos_dir) {
+                        for bin_entry in bins.flatten() {
+                            if let Ok(canon) = fs::canonicalize(bin_entry.path()) {
+                                if canon.starts_with(bundle_root)
+                                    && fs::metadata(&canon).is_ok_and(|m| {
+                                        m.is_file() && (m.permissions().mode() & 0o111 != 0)
+                                    })
+                                {
+                                    if let Some(sha) = claude_watch_system::sha256_file_hex(&canon)
+                                    {
+                                        results.push((canon, sha));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for rel in [
+            "Contents/Resources/codex",
+            "Contents/Resources/codex-cli/bin/codex",
+            "Contents/Resources/CodexCLI.app/Contents/MacOS/codex",
+            "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        ] {
+            if let Ok(canon) = fs::canonicalize(bundle_root.join(rel)) {
+                if canon.starts_with(bundle_root)
+                    && fs::metadata(&canon)
+                        .is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+                {
+                    if let Some(sha) = claude_watch_system::sha256_file_hex(&canon) {
+                        results.push((canon, sha));
+                    }
+                }
+            }
+        }
+        results
     }
     pub fn select_target(&mut self, target: LaunchTarget) -> Result<()> {
         self.selected = if target.protected() {
@@ -282,7 +463,12 @@ impl<R: ReadRunner> NativeDesktop<R> {
     }
     pub fn select_cli(&mut self, target: LaunchTarget, home: &Path) -> Result<()> {
         let mut env = std::collections::BTreeMap::new();
-        for key in ["PATH", "CLAUDE_CODE_BIN", "CODEX_CLI_BIN"] {
+        for key in [
+            "PATH",
+            "CLAUDE_CODE_BIN",
+            "CODEX_CLI_BIN",
+            "CW_SHIM_EXECUTABLE",
+        ] {
             match std::env::var(key) {
                 Ok(value) => {
                     env.insert(key.into(), value);
@@ -345,11 +531,38 @@ impl<R: ReadRunner> NativeDesktop<R> {
             }
             candidates.push(p);
         } else {
+            let shim_exe = env
+                .get("CW_SHIM_EXECUTABLE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| paths.watch().join("bin").join(name));
+            let shim_canon = fs::canonicalize(&shim_exe).ok();
+            let shim_dir_canon = shim_canon
+                .as_ref()
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+                .or_else(|| shim_exe.parent().and_then(|p| fs::canonicalize(p).ok()));
+            let watch_bin_canon = fs::canonicalize(paths.watch().join("bin")).ok();
             if let Some(path) = env.get("PATH").and_then(|v| {
-                std::env::split_paths(v).map(|p| p.join(name)).find(|p| {
-                    fs::metadata(p)
-                        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                })
+                std::env::split_paths(v)
+                    .filter(|dir| {
+                        let canon_dir = fs::canonicalize(dir).ok();
+                        canon_dir.is_none()
+                            || (canon_dir != shim_dir_canon && canon_dir != watch_bin_canon)
+                    })
+                    .map(|p| p.join(name))
+                    .find(|p| {
+                        let Ok(meta) = fs::metadata(p) else {
+                            return false;
+                        };
+                        if !meta.is_file() || (meta.permissions().mode() & 0o111 == 0) {
+                            return false;
+                        }
+                        if let (Some(ref sc), Ok(ref pc)) = (&shim_canon, fs::canonicalize(p)) {
+                            if sc == pc {
+                                return false;
+                            }
+                        }
+                        true
+                    })
             }) {
                 candidates.push(path);
             } else {
@@ -448,6 +661,82 @@ impl<R: ReadRunner> NativeDesktop<R> {
             CoreError::new(
                 "cli_spawn_failed",
                 "CLI子进程无法启动；未执行shell或更改当前登录",
+            )
+        })?;
+        Ok(Box::new(NativeCliProcess {
+            job,
+            flag: state.flag.clone(),
+        }))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_cli_via_sandbox_launcher(
+        &self,
+        args: &[String],
+        state: &NativeCliState,
+        launcher_bin: &Path,
+        registration_socket: &Path,
+        gateway_endpoint: &str,
+        executor_boot_id: &str,
+        policy_version: claude_watch_core::channel::PolicyVersion,
+        vpn_epoch: Option<claude_watch_core::vpn::VpnEpoch>,
+    ) -> Result<Box<dyn CliProcess>> {
+        if self.authority != Authority::ExplicitPermit || !self.target.cli() {
+            return Err(CoreError::new(
+                "write_not_authorized",
+                "只读或桌面入口不能执行CLI",
+            ));
+        }
+        let selected = self
+            .cli
+            .as_ref()
+            .ok_or_else(|| CoreError::new("cli_unavailable", "CLI目标尚未绑定"))?;
+        if cli_fingerprint(&selected.path)? != selected.fingerprint {
+            return Err(CoreError::new(
+                "cli_install_changed",
+                "预检期间CLI文件发生变化，未启动",
+            ));
+        }
+        if state.handlers.len() != 2 {
+            return Err(CoreError::new(
+                "cli_signal_unavailable",
+                "CLI中断处理尚未就绪",
+            ));
+        }
+        let target_sha = claude_watch_system::sha256_file_hex(&selected.path)
+            .ok_or_else(|| CoreError::new("cli_unavailable", "无法计算CLI可执行文件哈希"))?;
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+        let req = claude_watch_core::controlled_launch::ControlledLaunchRequest {
+            entry_id: crate::managed_entry::DesktopManagedEntrySpec::entry_bundle_id_for(
+                self.target,
+            )
+            .to_string(),
+            target: self.target,
+            target_executable: selected.path.to_string_lossy().into_owned(),
+            target_fingerprint: target_sha,
+            args: args.to_vec(),
+            cwd,
+            proxy_adaptation: claude_watch_core::controlled_launch::ProxyAdaptationKind::EnvOnly,
+            gateway_endpoint: gateway_endpoint.to_string(),
+            policy_version,
+            vpn_epoch,
+            launch_nonce: format!("cli-nonce-{}", uuid::Uuid::new_v4()),
+            executor_boot_id: executor_boot_id.to_string(),
+        };
+        req.validate()?;
+        let req_json = serde_json::to_string(&req).map_err(|_| {
+            CoreError::new("serialize_launch_request_failed", "序列化CLI受控启动请求失败")
+        })?;
+        let command = Exec::cmd(launcher_bin)
+            .arg("--launch-json")
+            .arg(&req_json)
+            .arg("--registration-socket")
+            .arg(registration_socket);
+        let job = command.start().map_err(|_| {
+            CoreError::new(
+                "cli_spawn_failed",
+                "受控沙箱启动器无法启动CLI子进程",
             )
         })?;
         Ok(Box::new(NativeCliProcess {
@@ -776,6 +1065,94 @@ impl<R: ReadRunner> NativeDesktop<R> {
             Duration::from_secs(15),
         )
     }
+    pub fn open_via_sandbox_launcher(
+        &self,
+        launcher_bin: &Path,
+        registration_socket: &Path,
+        gateway_endpoint: &str,
+        executor_boot_id: &str,
+        policy_version: claude_watch_core::channel::PolicyVersion,
+        vpn_epoch: Option<claude_watch_core::vpn::VpnEpoch>,
+    ) -> Result<()> {
+        if self.authority != Authority::ExplicitPermit {
+            return Err(CoreError::new(
+                "write_not_authorized",
+                "只读运行入口不启动应用",
+            ));
+        }
+        if !self.target.protected() {
+            let selected = self
+                .selected
+                .as_ref()
+                .ok_or_else(|| CoreError::new("target_identity_unavailable", "目标尚未绑定"))?;
+            if &self.resolve_target(self.target)? != selected {
+                return Err(CoreError::new(
+                    "target_install_changed",
+                    "预检期间目标应用安装身份变化，未启动",
+                ));
+            }
+        } else {
+            let env = Observer {
+                runner: &self.runner,
+            }
+            .environment()?;
+            if env.pointer("/claude_app/bundle_id").and_then(Value::as_str)
+                != Some("com.anthropic.claudefordesktop")
+            {
+                return Err(CoreError::new(
+                    "claude_identity_unavailable",
+                    "Claude应用安装身份未验证",
+                ));
+            }
+        }
+        let spec = self.build_managed_entry_spec()?;
+        let req = claude_watch_core::controlled_launch::ControlledLaunchRequest {
+            entry_id: spec.entry_bundle_id.clone(),
+            target: spec.target,
+            target_executable: spec.target_executable.to_string_lossy().into_owned(),
+            target_fingerprint: spec.target_fingerprint.clone(),
+            args: Vec::new(),
+            cwd: None,
+            proxy_adaptation: spec.proxy_adaptation,
+            gateway_endpoint: gateway_endpoint.to_string(),
+            policy_version,
+            vpn_epoch,
+            launch_nonce: format!("desktop-nonce-{}", uuid::Uuid::new_v4()),
+            executor_boot_id: executor_boot_id.to_string(),
+        };
+        req.validate()?;
+        let req_json = serde_json::to_string(&req).map_err(|_| {
+            CoreError::new("serialize_launch_request_failed", "序列化桌面受控启动请求失败")
+        })?;
+        let mut child = std::process::Command::new(launcher_bin)
+            .arg("--launch-json")
+            .arg(&req_json)
+            .arg("--registration-socket")
+            .arg(registration_socket)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|_| {
+                CoreError::new(
+                    "sandbox_launcher_spawn_failed",
+                    "无法启动 watch-sandbox-launcher",
+                )
+            })?;
+        std::thread::sleep(Duration::from_millis(120));
+        if let Ok(Some(status)) = child.try_wait() {
+            if !status.success() {
+                return Err(CoreError::new(
+                    "sandbox_launch_rejected",
+                    &format!(
+                        "watch-sandbox-launcher 拒绝或中止了桌面应用启动 (exit={})",
+                        status.code().unwrap_or(1)
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
     /// The launch target this desktop adapter supervises; the policy family
     /// and every provider-specific decision derive from it.
     pub fn provider(&self) -> Provider {
@@ -870,6 +1247,87 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopRuntime
         // observe; report that as "nothing to do" instead of looping.
         Ok(crate::audit_store::audit_matches_policy(&audit, &policy))
     }
+
+    fn resolve_seatbelt_launch_context(
+        &self,
+        config: &claude_watch_core::config::Config,
+    ) -> Result<(
+        PathBuf,
+        PathBuf,
+        String,
+        String,
+        claude_watch_core::channel::PolicyVersion,
+        Option<claude_watch_core::vpn::VpnEpoch>,
+    )> {
+        let launcher_bin = self.desktop.sandbox_launcher_binary()?;
+        let rt_path = self
+            .storage
+            .paths
+            .watch()
+            .join("state/seatbelt-runtime.json");
+        let rt = self.storage.read_json(&rt_path, Value::Null)?;
+        if rt.is_null() {
+            return Err(CoreError::new(
+                "seatbelt_daemon_unavailable",
+                "Seatbelt 监管后台尚未就绪，拒绝绕过沙箱直接启动目标",
+            ));
+        }
+        if rt["sandbox_ready"] != Value::Bool(true) {
+            return Err(CoreError::new(
+                "seatbelt_identity_gate_blocked",
+                "Seatbelt 生产身份门禁未通过（如 I03 服务端身份未就绪），拒绝启用沙箱启动",
+            ));
+        }
+        let gw_endpoint = rt["gateway_endpoint"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                CoreError::new("seatbelt_gateway_unavailable", "Seatbelt 受控网关地址未就绪")
+            })?
+            .to_string();
+        let reg_sock = rt["registration_socket"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                CoreError::new(
+                    "seatbelt_registration_socket_unavailable",
+                    "Seatbelt 注册通道地址未就绪",
+                )
+            })?;
+        let boot_id = rt["executor_boot_id"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                CoreError::new(
+                    "seatbelt_boot_id_unavailable",
+                    "Seatbelt 执行器 boot_id 未就绪",
+                )
+            })?
+            .to_string();
+        let policy_version = claude_watch_core::channel::PolicyVersion {
+            policy_digest: crate::config_store::policy_digest(&config.value()?)?,
+            guard_policy_digest: crate::config_store::guard_policy_digest(config)?,
+        };
+        let obs_path = self.storage.paths.base().join("vpn-observation.json");
+        let vpn_epoch = self
+            .storage
+            .read_json(&obs_path, Value::Null)
+            .ok()
+            .and_then(|v| {
+                serde_json::from_value::<claude_watch_core::vpn::VpnObservation>(v).ok()
+            })
+            .filter(|obs| obs.is_fresh(native::now()) && obs.epoch.is_valid())
+            .map(|obs| obs.epoch);
+        Ok((
+            launcher_bin,
+            reg_sock,
+            gw_endpoint,
+            boot_id,
+            policy_version,
+            vpn_epoch,
+        ))
+    }
 }
 impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
     for DesktopRuntime<'_, R, T, S>
@@ -888,12 +1346,29 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
             .map(|v| v as i32)
     }
     fn spawn_cli(&mut self, args: &[String]) -> Result<Box<dyn CliProcess>> {
-        self.desktop.spawn_cli(
-            args,
-            self.cli
-                .as_ref()
-                .ok_or_else(|| CoreError::new("cli_route_unconfirmed", "CLI路由尚未准备"))?,
-        )
+        let config = ConfigStore {
+            storage: self.storage.clone(),
+        }
+        .load()?;
+        let cli_state = self
+            .cli
+            .as_ref()
+            .ok_or_else(|| CoreError::new("cli_route_unconfirmed", "CLI路由尚未准备"))?;
+        if config.effective_network_backend().is_sandbox() {
+            let (launcher_bin, reg_sock, gw_endpoint, boot_id, policy_version, vpn_epoch) =
+                self.resolve_seatbelt_launch_context(&config)?;
+            return self.desktop.spawn_cli_via_sandbox_launcher(
+                args,
+                cli_state,
+                &launcher_bin,
+                &reg_sock,
+                &gw_endpoint,
+                &boot_id,
+                policy_version,
+                vpn_epoch,
+            );
+        }
+        self.desktop.spawn_cli(args, cli_state)
     }
     fn launch_target(&self) -> LaunchTarget {
         self.desktop.target()
@@ -1068,6 +1543,22 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
         self.desktop.launcher_matches(l)
     }
     fn open_desktop(&mut self) -> Result<()> {
+        let config = ConfigStore {
+            storage: self.storage.clone(),
+        }
+        .load()?;
+        if config.effective_network_backend().is_sandbox() {
+            let (launcher_bin, reg_sock, gw_endpoint, boot_id, policy_version, vpn_epoch) =
+                self.resolve_seatbelt_launch_context(&config)?;
+            return self.desktop.open_via_sandbox_launcher(
+                &launcher_bin,
+                &reg_sock,
+                &gw_endpoint,
+                &boot_id,
+                policy_version,
+                vpn_epoch,
+            );
+        }
         self.desktop.open()
     }
     fn quit_desktop(&mut self) -> Result<()> {

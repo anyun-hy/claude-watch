@@ -8,7 +8,8 @@ usage() {
 Usage: tools/build-rust-components.sh --output <directory>
 
 Builds the local arm64 Rust candidate runtime and writes components.json plus:
-  watch-engine, watch-native-observer, watch-process-control
+  watch-engine, watch-native-observer, watch-process-control, watch-sandbox-launcher,
+  watch-gateway-broker (staged only; no system service installation)
 USAGE
 }
 
@@ -53,7 +54,9 @@ printf 'Rust compiler driver: %s\nmacOS SDK: %s\n' "$CW_APPLE_CLANG" "$CW_APPLE_
 SDKROOT="$CW_APPLE_SDK" CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="$CW_APPLE_CLANG" \
 CC_aarch64_apple_darwin="$CW_APPLE_CLANG" MACOSX_DEPLOYMENT_TARGET="$CW_MACOS_MINIMUM" \
 "$CW_CARGO_BIN" build --manifest-path "$REPOSITORY_ROOT/Cargo.toml" --locked --release --target aarch64-apple-darwin \
-  --package claude-watch-engine --bin claude-watch-engine
+  --package claude-watch-engine --bin claude-watch-engine \
+  --package claude-watch-sandbox-launcher --bin watch-sandbox-launcher \
+  --package claude-watch-gateway-broker --bin watch-gateway-broker
 
 ENGINE="$REPOSITORY_ROOT/target/aarch64-apple-darwin/release/claude-watch-engine"
 [[ -x "$ENGINE" ]] || { echo "Cargo did not produce executable engine: $ENGINE" >&2; exit 1; }
@@ -78,7 +81,7 @@ stage = Path(sys.argv[3])
 if not isinstance(reported, dict):
     raise SystemExit("Rust engine returned an invalid component-paths document")
 components = {"engine": engine}
-for field in ("native_observer", "process_control"):
+for field in ("native_observer", "process_control", "sandbox_launcher", "gateway_broker"):
     raw = reported.get(field)
     if not isinstance(raw, str) or not raw:
         raise SystemExit(f"Rust engine did not report required component path: {field}")
@@ -90,7 +93,7 @@ for field in ("native_observer", "process_control"):
     components[field] = candidate
 stage.mkdir(parents=True, exist_ok=True)
 bundle_names = {"engine": "watch-engine"}
-for field in ("native_observer", "process_control"):
+for field in ("native_observer", "process_control", "sandbox_launcher", "gateway_broker"):
     bundle_names[field] = components[field].name
 if len(set(bundle_names.values())) != len(bundle_names):
     raise SystemExit("Rust engine reported colliding component filenames")

@@ -101,3 +101,17 @@ fn read_commands_emit_gui_json_shapes_without_apply() {
     );
     assert_eq!(environment["grants_launch_permission"], false);
 }
+
+#[test]
+fn status_does_not_promote_legacy_heartbeat_or_local_readiness_to_applied_policy() {
+    let home = Home::new();
+    let watch = home.0.join("Library/Application Support/ClaudeWatch");
+    fs::create_dir_all(watch.join("switcher")).unwrap();
+    fs::create_dir_all(watch.join("state")).unwrap();
+    fs::write(watch.join("switcher/guard-heartbeat.json"),
+        br#"{"time":1,"status":"ok"}"#).unwrap();
+    fs::write(watch.join("state/seatbelt-runtime.json"),
+        br#"{"executor_boot_id":"old-boot","sandbox_ready":true,"updated_at":1}"#).unwrap();
+    let status = home.run(&["status"]);
+    assert_eq!(status["policy_sync_state"], "pending_apply");
+}

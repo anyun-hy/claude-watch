@@ -711,6 +711,43 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
                 return Err(error("release_identity_mismatch", "后台检测组件不是arm64"));
             }
         }
+        for component in ["watch-sandbox-launcher", "watch-gateway-broker"] {
+            if manifest["NetworkBackend"] != "seatbelt" && !hashes.contains_key(component) {
+                continue;
+            }
+            required.push(component);
+            let out = self.require(
+                "/usr/bin/lipo",
+                &[
+                    "-archs".into(),
+                    resources
+                        .join(component)
+                        .display()
+                        .to_string(),
+                ],
+                Duration::from_secs(10),
+            )?;
+            if out.stdout.split_whitespace().collect::<Vec<_>>() != ["arm64"] {
+                return Err(error("release_identity_mismatch", "受控网络组件不是arm64"));
+            }
+        }
+        if hashes.contains_key("ControlledEntry") {
+            required.push("ControlledEntry");
+            let out = self.require(
+                "/usr/bin/lipo",
+                &[
+                    "-archs".into(),
+                    resources
+                        .join("ControlledEntry")
+                        .display()
+                        .to_string(),
+                ],
+                Duration::from_secs(10),
+            )?;
+            if out.stdout.split_whitespace().collect::<Vec<_>>() != ["arm64"] {
+                return Err(error("release_identity_mismatch", "受控入口组件不是arm64"));
+            }
+        }
         if hashes.len() != required.len() || required.iter().any(|key| !hashes.contains_key(*key)) {
             return Err(error(
                 "release_identity_mismatch",

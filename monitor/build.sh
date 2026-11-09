@@ -26,14 +26,25 @@ CW_SIGNING_IDENTITY=$(cw_resolve_signing_aliases CW_SIGNING_IDENTITY CW_CODESIGN
 CW_SIGNING_IDENTITY="${CW_SIGNING_IDENTITY:--}"
 CW_HOST_PROVISION_PROFILE=$(cw_resolve_signing_aliases CW_HOST_PROVISION_PROFILE CW_HOST_PROFILE CW_APP_PROVISIONING_PROFILE)
 CW_EXTENSION_PROVISION_PROFILE=$(cw_resolve_signing_aliases CW_EXTENSION_PROVISION_PROFILE CW_EXTENSION_PROFILE CW_EXTENSION_PROVISIONING_PROFILE)
+CW_NETWORK_BACKEND="${CW_NETWORK_BACKEND:-seatbelt}"
+case "$CW_NETWORK_BACKEND" in
+  seatbelt|network-extension) ;;
+  *) printf 'CW_NETWORK_BACKEND must be seatbelt or network-extension (got %s).\n' "$CW_NETWORK_BACKEND" >&2; exit 1 ;;
+esac
 case "${CW_REQUIRE_ENTITLED_NETWORK_EXTENSION:-0}" in
   0) ;;
-  1) [[ "$CW_SIGNING_IDENTITY" != - ]] || { echo 'Production NetworkExtension build cannot use an ad-hoc signature.' >&2; exit 1; } ;;
+  1)
+    CW_NETWORK_BACKEND=network-extension
+    if [[ "$CW_SIGNING_IDENTITY" == - ]]; then
+      echo 'Production NetworkExtension build cannot use an ad-hoc signature.' >&2
+      exit 1
+    fi
+    ;;
   *) echo 'CW_REQUIRE_ENTITLED_NETWORK_EXTENSION must be 0 or 1.' >&2; exit 1 ;;
 esac
 CW_SIGN_OPTIONS=()
 CW_EXTENSION_MACH_SERVICE=io.local.watchpanel.network-extension
-if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
+if [[ "$CW_NETWORK_BACKEND" == network-extension && "$CW_SIGNING_IDENTITY" != - ]]; then
   : "${CW_HOST_PROVISION_PROFILE:?Set the Developer ID profile for io.local.watchpanel}"
   : "${CW_EXTENSION_PROVISION_PROFILE:?Set the Developer ID profile for io.local.watchpanel.network-extension}"
   [[ -f "$CW_HOST_PROVISION_PROFILE" && -f "$CW_EXTENSION_PROVISION_PROFILE" ]] || { echo 'Signing profiles are unavailable.' >&2; exit 1; }
@@ -65,6 +76,8 @@ if len(teams) != 1: raise SystemExit('Host and extension must use the same signi
 print(f'{teams.pop()}.io.local.watchpanel.network-extension')
 PY
 )
+  CW_SIGN_OPTIONS=(--timestamp --options runtime)
+elif [[ "$CW_SIGNING_IDENTITY" != - ]]; then
   CW_SIGN_OPTIONS=(--timestamp --options runtime)
 fi
 # The Python backend is retired: the app ships the Rust engine only. A build
@@ -110,7 +123,7 @@ try:
     data = json.loads(manifest.read_text(encoding="utf-8"))
     assert data["schema"] == 1 and data["architecture"] == "arm64" and data["kind"] == "rust-candidate"
     components = data["components"]
-    expected = {"engine", "native_observer", "process_control"}
+    expected = {"engine", "native_observer", "process_control", "sandbox_launcher", "gateway_broker"}
     assert set(components) == expected
     for key in expected:
         item = components[key]
@@ -144,19 +157,29 @@ for CW_TARGET_ARCH in $CW_TARGETS; do
     "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/Sources/IPLeakDNSRunner.swift" "$ROOT/Sources/IPLeakDNSRetryRunner.swift" \
     "$ROOT/tools/BackgroundLeakWorker.swift" -o "$ROOT/build/watch-leak-worker.$CW_TARGET_ARCH"
 
-  # Build the NetworkExtension system extension target
+  # Build the ControlledEntry desktop wrapper binary
   "$SWIFTC" -swift-version 5 -O -parse-as-library \
     -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
-    -framework NetworkExtension "$ROOT"/SystemExtension/*.swift \
-    -o "$ROOT/build/WatchChannelExtension.$CW_TARGET_ARCH"
+    -framework AppKit -framework Foundation "$ROOT/ControlledEntry/ControlledEntryApp.swift" \
+    -o "$ROOT/build/ControlledEntry.$CW_TARGET_ARCH"
+
+  if [[ "$CW_NETWORK_BACKEND" == network-extension ]]; then
+    # Build the NetworkExtension system extension target only when CW_NETWORK_BACKEND=network-extension
+    "$SWIFTC" -swift-version 5 -O -parse-as-library \
+      -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
+      -framework NetworkExtension "$ROOT"/SystemExtension/*.swift \
+      -o "$ROOT/build/WatchChannelExtension.$CW_TARGET_ARCH"
+  fi
 done
 cp "$ROOT/build/ClaudeWatchMonitor.$CW_BUILD_ARCH" "$APP/Contents/MacOS/ClaudeWatchMonitor"
 cp "$ROOT/build/watch-leak-worker.$CW_BUILD_ARCH" "$APP/Contents/Resources/watch-leak-worker"
+cp "$ROOT/build/ControlledEntry.$CW_BUILD_ARCH" "$APP/Contents/Resources/ControlledEntry"
 
 SYSEXT_DIR="$APP/Contents/Library/SystemExtensions/io.local.watchpanel.network-extension.systemextension"
-mkdir -p "$SYSEXT_DIR/Contents/MacOS"
-cp "$ROOT/build/WatchChannelExtension.$CW_BUILD_ARCH" "$SYSEXT_DIR/Contents/MacOS/WatchChannelExtension"
-cat > "$SYSEXT_DIR/Contents/Info.plist" <<PLIST
+if [[ "$CW_NETWORK_BACKEND" == network-extension ]]; then
+  mkdir -p "$SYSEXT_DIR/Contents/MacOS"
+  cp "$ROOT/build/WatchChannelExtension.$CW_BUILD_ARCH" "$SYSEXT_DIR/Contents/MacOS/WatchChannelExtension"
+  cat > "$SYSEXT_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -176,35 +199,39 @@ cat > "$SYSEXT_DIR/Contents/Info.plist" <<PLIST
 </dict>
 </dict></plist>
 PLIST
-if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
-  cp "$CW_EXTENSION_PROVISION_PROFILE" "$SYSEXT_DIR/Contents/embedded.provisionprofile"
-  /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" "${CW_SIGN_OPTIONS[@]}" --entitlements "$ROOT/build/channel-signing/Extension.entitlements" "$SYSEXT_DIR"
+  if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
+    cp "$CW_EXTENSION_PROVISION_PROFILE" "$SYSEXT_DIR/Contents/embedded.provisionprofile"
+    /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" "${CW_SIGN_OPTIONS[@]}" --entitlements "$ROOT/build/channel-signing/Extension.entitlements" "$SYSEXT_DIR"
+  else
+    /usr/bin/codesign --force --sign - "$SYSEXT_DIR"
+  fi
 else
-  /usr/bin/codesign --force --sign - "$SYSEXT_DIR"
+  rm -rf "$APP/Contents/Library/SystemExtensions"
 fi
 cp "$ROOT/Resources/webrtc_probe.html" "$ROOT/Resources/webrtc_probe.js" "$APP/Contents/Resources/"
 cp "$ROOT/Resources/netcoffee_probe.html" "$ROOT/Resources/netcoffee_probe.js" "$ROOT/Resources/netcoffee_probe.css" "$ROOT/Resources/watch-admin.sh" "$APP/Contents/Resources/"
 cp "$ROOT/Resources/ipleak_probe.html" "$ROOT/Resources/ipleak_probe.js" "$APP/Contents/Resources/"
-mkdir -p "$APP/Contents/Resources/ThirdParty/ClaudeSwitcher"
+mkdir -p "$APP/Contents/Resources/ThirdParty/ClaudeSwitcher" "$APP/Contents/Resources/ThirdParty/nono"
 cp "$ROOT/Resources/watch-native-collector.zsh" "$APP/Contents/Resources/"
 chmod 700 "$APP/Contents/Resources/watch-native-collector.zsh"
 cp "$ROOT/ThirdParty/ClaudeSwitcher/LICENSE" "$ROOT/ThirdParty/ClaudeSwitcher/UPSTREAM.json" "$APP/Contents/Resources/ThirdParty/ClaudeSwitcher/"
 cp "$ROOT/ThirdParty/ClaudeSwitcher/RUST_NOTICE.txt" "$APP/Contents/Resources/ThirdParty/ClaudeSwitcher/NOTICE.txt"
+cp "$ROOT/ThirdParty/nono/LICENSE" "$ROOT/ThirdParty/nono/UPSTREAM.json" "$APP/Contents/Resources/ThirdParty/nono/"
 python3 - "$RUST_COMPONENTS_DIR" "$RUST_COMPONENTS_MANIFEST" "$APP/Contents/Resources" <<'PY'
 import json, shutil, sys
 from pathlib import Path
 root, manifest, resources = map(Path, sys.argv[1:])
 components = json.loads(manifest.read_text(encoding="utf-8"))["components"]
-for key in ("engine", "native_observer", "process_control"):
+for key in ("engine", "native_observer", "process_control", "sandbox_launcher", "gateway_broker"):
     item = components[key]
     source = root / item["bundle_name"]
     destination = resources / item["bundle_name"]
     shutil.copy2(source, destination)
     destination.chmod(0o700)
 PY
-chmod 700 "$APP/Contents/Resources/watch-process-control" "$APP/Contents/Resources/watch-admin.sh" "$APP/Contents/Resources/watch-leak-worker"
+chmod 700 "$APP/Contents/Resources/watch-process-control" "$APP/Contents/Resources/watch-sandbox-launcher" "$APP/Contents/Resources/ControlledEntry" "$APP/Contents/Resources/watch-admin.sh" "$APP/Contents/Resources/watch-leak-worker"
 if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
-  for CW_COMPONENT in watch-engine watch-native-observer watch-process-control watch-leak-worker; do
+  for CW_COMPONENT in watch-engine watch-native-observer watch-process-control watch-sandbox-launcher watch-gateway-broker ControlledEntry watch-leak-worker; do
     CW_COMPONENT_ID="io.local.watchpanel.$CW_COMPONENT"
     if [[ "$CW_COMPONENT" == watch-engine ]]; then CW_COMPONENT_ID=io.local.watchpanel.engine; fi
     /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" "${CW_SIGN_OPTIONS[@]}" --identifier "$CW_COMPONENT_ID" "$APP/Contents/Resources/$CW_COMPONENT"
@@ -212,7 +239,19 @@ if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
   BACKEND_SHA256=$(/usr/bin/shasum -a 256 "$APP/Contents/Resources/watch-engine" | /usr/bin/awk '{print $1}')
 else
   /usr/bin/codesign --force --sign - "$APP/Contents/Resources/watch-process-control"
+  /usr/bin/codesign --force --sign - "$APP/Contents/Resources/watch-sandbox-launcher"
+  /usr/bin/codesign --force --sign - "$APP/Contents/Resources/ControlledEntry"
   /usr/bin/codesign --force --sign - "$APP/Contents/Resources/watch-leak-worker"
+fi
+# The free local endpoint broker authenticates live engine code, including
+# hardened runtime/library validation. This is an ad-hoc-capable code signature,
+# not a Developer ID or NetworkExtension entitlement. Pinning happens later,
+# when --prepare reads these FINAL component signatures for admin review.
+if [[ "$CW_NETWORK_BACKEND" == seatbelt ]]; then
+  for CW_COMPONENT in watch-engine watch-gateway-broker; do
+    /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" --options runtime,library "$APP/Contents/Resources/$CW_COMPONENT"
+  done
+  BACKEND_SHA256=$(/usr/bin/shasum -a 256 "$APP/Contents/Resources/watch-engine" | /usr/bin/awk '{print $1}')
 fi
 cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/"
 mkdir -p "$APP/Contents/Resources/Icons"
@@ -245,6 +284,7 @@ cat > "$APP/Contents/Resources/BuildInfo.plist" <<PLIST
 <key>MinimumSystemVersion</key><string>$CW_MACOS_MINIMUM</string>
 <key>Architecture</key><string>$CW_BUILD_ARCH</string>
 <key>BackendVariant</key><string>$CW_BACKEND_VARIANT</string>
+<key>NetworkBackend</key><string>$CW_NETWORK_BACKEND</string>
 <key>SwitcherSchema</key><integer>1</integer>
 <key>RuntimeSchema</key><integer>$RUNTIME_SCHEMA</integer>
 <key>BackgroundEvidenceSchema</key><integer>$BACKGROUND_EVIDENCE_SCHEMA</integer>
@@ -258,17 +298,22 @@ manifest = root / "BuildInfo.plist"
 value = plistlib.loads(manifest.read_bytes())
 forbidden = [p for p in root.rglob("*") if p.suffix == ".py" or p.name in ("claude-watch.sh", "snapshot.sh", "switcher.py")]
 if forbidden: raise SystemExit("The bundle still contains retired Python backend resources")
-files = [root / n for n in ("watch-engine", "watch-native-observer", "watch-admin.sh", "watch-process-control", "watch-native-collector.zsh", "watch-leak-worker", "netcoffee_probe.html", "netcoffee_probe.js", "netcoffee_probe.css", "ipleak_probe.html", "ipleak_probe.js")]
+files = [root / n for n in ("watch-engine", "watch-native-observer", "watch-admin.sh", "watch-process-control", "watch-sandbox-launcher", "watch-gateway-broker", "ControlledEntry", "watch-native-collector.zsh", "watch-leak-worker", "netcoffee_probe.html", "netcoffee_probe.js", "netcoffee_probe.css", "ipleak_probe.html", "ipleak_probe.js")]
 value["RuntimeHashes"] = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
 manifest.write_bytes(plistlib.dumps(value))
 PY
-if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
+if [[ "$CW_NETWORK_BACKEND" == network-extension && "$CW_SIGNING_IDENTITY" != - ]]; then
   cp "$CW_HOST_PROVISION_PROFILE" "$APP/Contents/embedded.provisionprofile"
   /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" "${CW_SIGN_OPTIONS[@]}" --entitlements "$ROOT/build/channel-signing/Host.entitlements" "$APP"
   /usr/bin/codesign --verify --strict "$SYSEXT_DIR"
   /usr/bin/codesign --verify --strict "$APP"
+elif [[ "$CW_SIGNING_IDENTITY" != - ]]; then
+  /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" "${CW_SIGN_OPTIONS[@]}" "$APP"
+  /usr/bin/codesign --verify --strict "$APP"
 else
   /usr/bin/codesign --force --sign - "$APP"
-  echo 'Development signature only: system interception is unavailable until signed, provisioned and activated.' >&2
+  if [[ "$CW_NETWORK_BACKEND" == network-extension ]]; then
+    echo 'Development signature only: system interception is unavailable until signed, provisioned and activated.' >&2
+  fi
 fi
 printf 'Built: %s (app %s; backend %s)\n' "$APP" "$APP_VERSION" "$BACKEND_VERSION"

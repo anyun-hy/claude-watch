@@ -1,6 +1,9 @@
 //! Read-only Mihomo HTTP transport. Fixed GET paths, literal loopback, no proxy or redirects.
 use crate::storage::strict_json;
-use claude_watch_core::tag_config::{self, Credentials, API_PATHS};
+use claude_watch_core::{
+    tag_config::{self, ControllerFastSnapshot, Credentials, API_PATHS},
+    vpn::ObservationConsistency,
+};
 use serde_json::{json, Value};
 use std::{
     fmt,
@@ -172,5 +175,84 @@ impl Client {
         };
         tag_config::api_snapshot(&self.base(), group, &configs, &proxies, &connections, rules)
             .unwrap_or_else(|_| unavailable())
+    }
+
+    /// Fast read-only controller state observation for `VpnObserver`.
+    /// Never requests `/connections` on the fast path, and verifies boundary
+    /// consistency across `/configs` and `/proxies` (plus optional `/rules`).
+    pub fn observe_fast_vpn_state(
+        &self,
+        group: &str,
+        expected_host: &str,
+        expected_port: Option<u16>,
+        include_rules: bool,
+    ) -> Result<(ControllerFastSnapshot, ObservationConsistency), Error> {
+        let configs_before = self.get("/configs")?;
+        let proxies_before = self.get("/proxies")?;
+        let rules_payload = if include_rules {
+            Some(self.get("/rules")?)
+        } else {
+            None
+        };
+        let snap_before = tag_config::fast_controller_snapshot(
+            &self.base(),
+            group,
+            expected_host,
+            expected_port,
+            &configs_before,
+            &proxies_before,
+            rules_payload.as_ref(),
+        )
+        .map_err(|_| Error::Protocol)?;
+
+        if let Some(ref rev_before) = snap_before.revision {
+            let configs_after = self.get("/configs")?;
+            let rev_after = configs_after.get("revision").and_then(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+            });
+            if rev_after.as_deref() == Some(rev_before.as_str()) {
+                return Ok((snap_before, ObservationConsistency::RevisionVerified));
+            }
+            return Ok((
+                snap_before,
+                ObservationConsistency::InconsistentSnapshot(
+                    "controller_revision_changed_during_sample".into(),
+                ),
+            ));
+        }
+
+        // Two-phase boundary verification when controller does not expose a monotonic revision
+        let configs_after = self.get("/configs")?;
+        let proxies_after = self.get("/proxies")?;
+        let snap_after = tag_config::fast_controller_snapshot(
+            &self.base(),
+            group,
+            expected_host,
+            expected_port,
+            &configs_after,
+            &proxies_after,
+            rules_payload.as_ref(),
+        )
+        .map_err(|_| Error::Protocol)?;
+
+        let consistent = snap_before.running_mode == snap_after.running_mode
+            && snap_before.upstream_endpoint == snap_after.upstream_endpoint
+            && snap_before.upstream_protocol == snap_after.upstream_protocol
+            && snap_before.tun_enabled == snap_after.tun_enabled
+            && snap_before.selected_group == snap_after.selected_group
+            && snap_before.selected_node == snap_after.selected_node
+            && snap_before.proxy_chain == snap_after.proxy_chain;
+        if consistent {
+            Ok((snap_before, ObservationConsistency::BoundaryVerified))
+        } else {
+            Ok((
+                snap_after,
+                ObservationConsistency::InconsistentSnapshot(
+                    "controller_state_mutated_during_boundary_read".into(),
+                ),
+            ))
+        }
     }
 }

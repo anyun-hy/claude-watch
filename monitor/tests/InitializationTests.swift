@@ -349,8 +349,8 @@ struct InitializationTests {
         let published = MonitorStore(leakChecks: LeakCheckStore(isFixture: true), aiChecks: AIProbeStore(isFixture: true), switcher: SwitcherStore(isFixture: true))
         published.beginInitialization(startSnapshotPolling: false)
         published.switcher.loadReviewScenario(.normal)
-        func snapshot(node: String, at time: Double) -> MonitorSnapshot {
-            let proxy = ProxySnapshot(observedAt: time, entryState: "verified", entryReason: "fixture", entrySource: "fixture",
+        func snapshot(node: String, at time: Double, proxyObservedAt: Double? = nil) -> MonitorSnapshot {
+            let proxy = ProxySnapshot(observedAt: proxyObservedAt ?? time, entryState: "verified", entryReason: "fixture", entrySource: "fixture",
                 endpoint: "127.0.0.1:7890", listenerPID: 99, listenerPath: "/fixture/tag", apiState: "available", apiReason: "",
                 mode: "global", coversProxy: true, expectedGroup: "GLOBAL", expectedNode: node, selectedNode: node,
                 globalNode: node, pinned: true, selectionChanged: false, flows: [])
@@ -434,7 +434,13 @@ struct InitializationTests {
         recovery.leakChecks.fixtureDelayNanoseconds = 1_000_000
         recovery.leakChecks.onDNSComplete = { _, _ in true }
         let base = Date()
+        // The outer snapshot is current; only its independently sampled proxy
+        // evidence is nine seconds old. An old whole snapshot (TTL 8s) cannot
+        // establish a context for a new receipt, even while proxy TTL is 30s.
         recovery.acceptSnapshot(snapshot(node: "A", at: base.timeIntervalSince1970 - 9), receivedAt: base)
+        expect(recovery.initializationContext == nil, "an expired whole snapshot cannot start a new diagnostic receipt")
+        recovery.acceptSnapshot(snapshot(node: "A", at: base.timeIntervalSince1970,
+                                         proxyObservedAt: base.timeIntervalSince1970 - 9), receivedAt: base)
         let acceptedBeforeGap = await recovery.leakChecks.ensureInitializationReceipt(.dns, maximumWait: 1)
         expect(acceptedBeforeGap, "fresh receipt starts in the verified proxy context")
         let afterGap = base.addingTimeInterval(2)
@@ -615,9 +621,16 @@ struct InitializationTests {
             changedPolicy["rows"] = changedRows; value["policy_evaluation"] = changedPolicy
             expect(try !passed(evaluate(value)), "required \(state) cannot masquerade as a green row")
         }
-        var truncated = data, truncatedPolicy = policy
-        truncatedPolicy["rows"] = Array(rows.dropLast()); truncated["policy_evaluation"] = truncatedPolicy
-        expect(try !passed(evaluate(truncated)), "missing required evidence cannot vacuously pass")
+        for missingID in mandatory {
+            var truncated = data, truncatedPolicy = policy
+            truncatedPolicy["rows"] = rows.filter { $0["id"] as? String != missingID }
+            truncated["policy_evaluation"] = truncatedPolicy
+            expect(try !passed(evaluate(truncated)), "missing required \(missingID) evidence cannot vacuously pass")
+        }
+        var withoutDisplayCard = data, basePolicy = policy
+        basePolicy["rows"] = rows.filter { $0["id"] as? String != "chatgpt_reachability" }
+        withoutDisplayCard["policy_evaluation"] = basePolicy
+        expect(try passed(evaluate(withoutDisplayCard)), "the optional display-only ChatGPT card is not required for a complete base receipt")
         var mismatched = data, mismatchedPolicy = policy
         mismatchedPolicy["observation_id"] = "other-round"; mismatched["policy_evaluation"] = mismatchedPolicy
         expect(try !passed(evaluate(mismatched)), "policy and environment from different rounds cannot combine")

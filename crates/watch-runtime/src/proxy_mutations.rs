@@ -338,9 +338,30 @@ impl<E: ProxyCommandExecutor> ProxyMutationAdapter<E> {
         self.journal_before(action, &path, &old, &new)?;
         write_text(&self.store, &self.paths, &path, &new)
     }
+    fn ensure_mutations_permitted(&self) -> Result<()> {
+        if let Ok(config) = (crate::config_store::ConfigStore {
+            storage: self.store.clone(),
+        })
+        .load()
+        {
+            verify_vpn_write_allowed(&config, "")?;
+        }
+        Ok(())
+    }
+}
+
+pub fn verify_vpn_write_allowed(config: &claude_watch_core::config::Config, _action: &str) -> Result<()> {
+    if config.vpn_is_read_only() {
+        return Err(err(
+            "vpn_managed_externally",
+            "VPN 与代理配置由外部客户端管理，Watch 仅执行只读观测与通道断流",
+        ));
+    }
+    Ok(())
 }
 impl<E: ProxyCommandExecutor> Mutator for ProxyMutationAdapter<E> {
     fn apply(&mut self, action: &Value) -> Result<()> {
+        self.ensure_mutations_permitted()?;
         match Self::action_id(action)? {
             "start_proxy" => self.executor.execute(ProxyCommand::Open(
                 ProxyProvider::parse(action_text(action, "after")?)
@@ -364,6 +385,7 @@ impl<E: ProxyCommandExecutor> Mutator for ProxyMutationAdapter<E> {
         }
     }
     fn restore(&mut self, action: &Value) -> Result<bool> {
+        self.ensure_mutations_permitted()?;
         let id = Self::action_id(action)?;
         if !matches!(id, "enable_tun" | "rules") {
             return Ok(false);

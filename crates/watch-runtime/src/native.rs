@@ -46,6 +46,21 @@ pub fn built_process_control_path() -> Option<&'static std::path::Path> {
         Some(std::path::Path::new(path))
     }
 }
+pub fn built_sandbox_launcher_path() -> Option<std::path::PathBuf> {
+    if let Some(raw) = std::env::var_os("CW_SANDBOX_LAUNCHER_BUILD_PATH") {
+        let candidate = std::path::PathBuf::from(raw);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let candidate = exe.parent()?.join("watch-sandbox-launcher");
+    if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
 #[derive(Clone, Deserialize, Serialize)]
 pub struct ProcessRecord {
     #[serde(flatten)]

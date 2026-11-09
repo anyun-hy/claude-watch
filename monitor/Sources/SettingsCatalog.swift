@@ -35,6 +35,7 @@ enum Setting {
     static let updatePublicKey = TextSetting(key: "update_public_key")
     static let country = TextSetting(key: "country")
     static let locale = TextSetting(key: "locale")
+    static let networkBackend = ChoiceSetting(key: "network_backend", fallback: "seatbelt")
 }
 
 /// How one background service is presented and which setting its switch owns.

@@ -262,6 +262,17 @@ pub fn verify_extract(archive: &Path, destination: &Path, release: &Release) -> 
             ));
         }
     }
+    for component in ["watch-sandbox-launcher", "watch-gateway-broker"] {
+        let runtime = format!("runtime/{component}");
+        let bundled = format!("app/Claude Watch Monitor.app/Contents/Resources/{component}");
+        if (release.files.contains_key(&runtime) || release.files.contains_key(&bundled))
+            && release.files.get(&runtime) != release.files.get(&bundled) {
+            return Err(err(
+                "release_component_mismatch",
+                "应用与后台的受控网络组件不一致或缺失",
+            ));
+        }
+    }
     // No execution bits until the complete listed payload and matching
     // bundled/runtime components have passed content validation.
     permissions::apply(destination, release)

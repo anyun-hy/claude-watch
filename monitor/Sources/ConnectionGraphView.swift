@@ -216,11 +216,64 @@ struct ConnectionGraphView: View {
             text = "Claude 会话保护状态尚未读取；当前连接图保持独立判断。"
             symbol = "shield"; tint = p.secondary
         }
-        return HStack(alignment: .top, spacing: 8) {
-            Image(systemName: symbol).foregroundStyle(tint)
-            Text(text).font(WatchTypography.small).foregroundStyle(p.secondary).lineLimit(2)
-            Spacer(minLength: 0)
-        }.padding(.horizontal, 23).frame(height: 35).background(p.elevated.opacity(0.35))
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: symbol).foregroundStyle(tint)
+                Text(text).font(WatchTypography.small).foregroundStyle(p.secondary).lineLimit(2)
+                Spacer(minLength: 0)
+            }
+            if let vpnSummary = vpnSupervisionSummaryText {
+                Text(vpnSummary)
+                    .font(WatchTypography.small)
+                    .foregroundStyle(vpnSupervisionSummaryTint)
+                    .lineLimit(2)
+            }
+        }.padding(.horizontal, 23).padding(.vertical, 6).background(p.elevated.opacity(0.35))
+    }
+
+    private var vpnSupervisionSummaryText: String? {
+        var parts: [String] = []
+        if store.switcher.policySyncPendingApply {
+            parts.append("策略已保存 · 待执行器应用")
+        }
+        if let sup = store.vpnSupervision {
+            let state = sup.vpn_match?.state ?? "unknown"
+            parts.append("VPN 监督：\(state)")
+            if sup.requires_migration == true {
+                parts.append("配置待迁移确认")
+            }
+            if let channelState = store.channelState(for: selectedProduct), channelState.sandbox_ready == false {
+                let reason = sup.unavailable_reason ?? "I03_server_identity_unverified"
+                parts.append("沙箱生产门禁未就绪（\(reason)）")
+            }
+            if !sup.differences.isEmpty {
+                let diffText = sup.differences.map { "\($0.field): 预期 \($0.expected) ≠ 实际 \($0.observed)" }.joined(separator: "；")
+                parts.append("偏差：\(diffText)")
+            }
+            let reasons = store.vpnUnknownOrStaleReasons
+            if !reasons.isEmpty {
+                parts.append("未知/过期：\(reasons.joined(separator: ", "))")
+            }
+        }
+        let unmanaged = store.unmanagedPids(for: selectedProduct)
+        if !unmanaged.isEmpty {
+            parts.append("发现实例（未受控）：PID \(unmanaged.map(String.init).joined(separator: ", "))")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private var vpnSupervisionSummaryTint: Color {
+        if let sup = store.vpnSupervision {
+            let state = sup.vpn_match?.state ?? "unknown"
+            if state == "mismatch" || !sup.differences.isEmpty { return p.red }
+            if state == "unknown" || state == "stale" || sup.requires_migration == true { return p.amber }
+        }
+        if store.channelState(for: selectedProduct)?.sandbox_ready == false ||
+           !store.unmanagedPids(for: selectedProduct).isEmpty ||
+           store.switcher.policySyncPendingApply {
+            return p.amber
+        }
+        return p.secondary
     }
 
     private func archivedPath(_ sample: GraphPathSample) -> some View {
@@ -606,7 +659,11 @@ struct ConnectionGraphView: View {
                 text = sourceDetail + (hasOtherPath ? "存在平台连接，但未归入当前显示的路径；可在连接列表中选择查看。" : "尚无与此进程关联的连接样本。出现连接后，图中才会显示对应路径。")
             }
         case .gateway:
-            text = graph.gatewayDetail + (gatewayIsProxy ? "\n" + (proxy?.listenerPath ?? "监听者路径未取得") : "")
+            let unmanaged = store.unmanagedPids(for: selectedProduct)
+            let unmanagedNotice = unmanaged.isEmpty
+                ? ""
+                : "\n注意：发现未受控实例 PID \(unmanaged.map(String.init).joined(separator: ", "))（running_unprotected，未经过受控入口启动，不享受沙箱与通道保护）"
+            text = graph.gatewayDetail + (gatewayIsProxy ? "\n" + (proxy?.listenerPath ?? "监听者路径未取得") : "") + unmanagedNotice
         case .tag:
             text = graph.flow?.chains.isEmpty == false
                 ? (graph.flow?.chains.joined(separator: " → ") ?? "") + "\n" + graph.summary

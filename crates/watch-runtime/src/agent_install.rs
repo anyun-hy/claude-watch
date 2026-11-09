@@ -361,6 +361,12 @@ fn install_mode<E: FixedCommandExecutor>(
             }
         }
     }
+    if manifest["NetworkBackend"] == "seatbelt" && !hashes.contains_key("watch-sandbox-launcher") {
+        return Err(err("runtime_missing", "缺少沙盒启动组件校验项"));
+    }
+    if manifest["NetworkBackend"] == "seatbelt" && !hashes.contains_key("watch-gateway-broker") {
+        return Err(err("runtime_missing", "缺少系统托管网关组件校验项（安装运行组件不等于加载系统服务）"));
+    }
     let stage = store
         .paths
         .watch()
@@ -383,7 +389,11 @@ fn install_mode<E: FixedCommandExecutor>(
             store.atomic_bytes(
                 &stage.join(rel),
                 &bytes,
-                if COMPONENTS.contains(&name.as_str()) || name == crate::background_evidence::WORKER
+                if COMPONENTS.contains(&name.as_str())
+                    || name == crate::background_evidence::WORKER
+                    || name == "watch-sandbox-launcher"
+                    || name == "watch-gateway-broker"
+                    || name == "ControlledEntry"
                 {
                     0o700
                 } else {

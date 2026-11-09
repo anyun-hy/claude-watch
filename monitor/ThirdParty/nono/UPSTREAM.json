@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/nolabs-ai/nono",
+  "commit": "e9796cca01eb863a9a83e96c18ae6120aa50beb1",
+  "license": "Apache-2.0",
+  "integration_mode": "rust_library_capability_set_proxy_only_apply",
+  "crate": "nono",
+  "component": "watch-sandbox-launcher"
+}
+

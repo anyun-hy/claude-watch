@@ -1,7 +1,9 @@
+use crate::channel::NetworkBackendKind;
 use crate::error::{CoreError, Result};
 use crate::network::public_unicast;
 use crate::policy::PolicyCatalog;
 use crate::processes::Provider;
+use crate::vpn::VpnExpectation;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -51,6 +53,10 @@ pub struct Config {
     /// Absence means a pre-migration Force string cannot grant SIGKILL.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gpt_force_approved_v1: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_backend: Option<NetworkBackendKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpn_expectation: Option<VpnExpectation>,
     pub update_url: String,
     pub update_public_key: String,
     pub verified_claude_versions: Vec<String>,
@@ -83,6 +89,8 @@ impl Default for Config {
             allow_ip_change: true,
             policy_actions: PolicyCatalog::default_actions(),
             gpt_force_approved_v1: Vec::new(),
+            network_backend: None,
+            vpn_expectation: None,
             update_url: String::new(),
             update_public_key: String::new(),
             verified_claude_versions: Vec::new(),
@@ -94,6 +102,36 @@ fn invalid(detail: &str) -> CoreError {
 }
 
 impl Config {
+    pub fn default_for_new_install() -> Self {
+        Self {
+            schema: 2,
+            network_backend: Some(NetworkBackendKind::Seatbelt),
+            ..Self::default()
+        }
+    }
+
+    pub fn effective_network_backend(&self) -> NetworkBackendKind {
+        if let Some(backend) = self.network_backend {
+            backend
+        } else if self.schema >= 2 {
+            NetworkBackendKind::Seatbelt
+        } else {
+            NetworkBackendKind::NetworkExtension
+        }
+    }
+
+    pub fn requires_backend_migration_setup(&self) -> bool {
+        self.schema < 2 && self.network_backend.is_none()
+    }
+
+    pub fn vpn_is_read_only(&self) -> bool {
+        self.effective_network_backend().is_sandbox()
+            || self
+                .vpn_expectation
+                .as_ref()
+                .is_some_and(|exp| exp.configured)
+    }
+
     pub fn from_value(value: Value) -> Result<Self> {
         let incoming = value.as_object().ok_or_else(|| invalid("配置必须是对象"))?;
         let mut defaults =
@@ -101,9 +139,11 @@ impl Config {
         let merged = defaults
             .as_object_mut()
             .ok_or_else(|| invalid("默认配置格式无效"))?;
-        // The approval field is intentionally omitted from the empty default
-        // document, keeping legacy policy digests stable.
+        // The approval and schema-2 fields are intentionally omitted from the
+        // empty default document, keeping legacy policy digests stable.
         merged.insert("gpt_force_approved_v1".into(), serde_json::json!([]));
+        merged.insert("network_backend".into(), Value::Null);
+        merged.insert("vpn_expectation".into(), Value::Null);
         if incoming.keys().any(|k| !merged.contains_key(k)) {
             return Err(invalid("配置包含未知字段"));
         }
@@ -152,13 +192,34 @@ impl Config {
         }
         let mut result: Self =
             serde_json::from_value(defaults).map_err(|_| invalid("配置字段类型无效"))?;
-        if result.schema != 1
+        if !matches!(result.schema, 1 | 2)
             || !matches!(
                 result.proxy_mode.as_str(),
                 "tag" | "clash-verge" | "shadowrocket" | "sing-box" | "clashx" | "surge" | "auto"
             )
         {
             return Err(invalid("不支持的配置版本或代理类型"));
+        }
+        if result.schema == 2 && result.network_backend.is_none() {
+            result.network_backend = Some(NetworkBackendKind::Seatbelt);
+        }
+        if let Some(ref mut expectation) = result.vpn_expectation {
+            if expectation.proxy_url.is_empty() && !result.proxy_url.is_empty() {
+                expectation.proxy_url = result.proxy_url.clone();
+            } else if result.proxy_url.is_empty() && !expectation.proxy_url.is_empty() {
+                result.proxy_url = expectation.proxy_url.clone();
+            }
+            if expectation.proxy_mode.is_empty() && !result.proxy_mode.is_empty() {
+                expectation.proxy_mode = result.proxy_mode.clone();
+            }
+            if expectation.proxy_group.is_empty() && !result.proxy_group.is_empty() {
+                expectation.proxy_group = result.proxy_group.clone();
+            }
+            expectation.bind_top_level_authority(
+                &result.proxy_mode,
+                &result.proxy_url,
+                &result.proxy_group,
+            )?;
         }
         if !result.country.is_empty()
             && (result.country.len() != 2

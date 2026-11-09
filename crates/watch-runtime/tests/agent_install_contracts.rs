@@ -497,3 +497,29 @@ fn recovery_accepts_previous_supervised_layout_without_log_paths() {
     assert!(!journal.exists());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn seatbelt_backend_requires_and_installs_executable_sandbox_launcher() {
+    let (root, store, source, mut fake, uid) = fixture();
+    fake.manifest["NetworkBackend"] = json!("seatbelt");
+    let err = agent_install::install(&store, &source, uid, &mut fake).unwrap_err();
+    assert_eq!(err.code, "runtime_missing");
+
+    fs::write(source.join("watch-sandbox-launcher"), b"watch-sandbox-launcher").unwrap();
+    fake.manifest["RuntimeHashes"]["watch-sandbox-launcher"] =
+        json!(sha256(b"watch-sandbox-launcher"));
+    let err = agent_install::install(&store, &source, uid, &mut fake).unwrap_err();
+    assert_eq!(err.code, "runtime_missing");
+    fs::write(source.join("watch-gateway-broker"), b"watch-gateway-broker").unwrap();
+    fake.manifest["RuntimeHashes"]["watch-gateway-broker"] = json!(sha256(b"watch-gateway-broker"));
+    agent_install::install(&store, &source, uid, &mut fake).unwrap();
+    let installed = store.paths.watch().join("runtime/watch-sandbox-launcher");
+    assert_eq!(fs::read(&installed).unwrap(), b"watch-sandbox-launcher");
+    assert_eq!(fs::metadata(&installed).unwrap().mode() & 0o777, 0o700);
+    let broker = store.paths.watch().join("runtime/watch-gateway-broker");
+    assert_eq!(fs::read(&broker).unwrap(), b"watch-gateway-broker");
+    assert_eq!(fs::metadata(&broker).unwrap().mode() & 0o777, 0o700);
+    // This per-user runtime operation must not load a system LaunchDaemon.
+    assert!(!fake.calls.iter().any(|call| call.args.iter().any(|arg| arg == "system" || arg.starts_with("system/"))));
+    fs::remove_dir_all(root).unwrap();
+}

@@ -1003,11 +1003,7 @@ impl Controller {
                 .collect()
         };
 
-        let upstream_endpoint = if config.proxy_url.trim().is_empty() {
-            "127.0.0.1:7890".to_string()
-        } else {
-            config.proxy_url.clone()
-        };
+        let upstream_endpoint = config.proxy_url.clone();
 
         let command = ChannelEnforcementCommand {
             family: family.into(),
@@ -1018,6 +1014,7 @@ impl Controller {
             permit: candidate.clone(),
             allowed_processes,
             upstream_endpoint,
+            target_executor_boot_id: None,
             issued_at: now,
         };
 

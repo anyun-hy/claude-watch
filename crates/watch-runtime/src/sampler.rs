@@ -486,10 +486,32 @@ impl<R: ReadRunner> Sampler<R> {
         };
         report["expected_group"] = json!(effective_group);
         let observed = api["selected_node"].as_str().unwrap_or("");
-        let node = if pin.is_empty() { observed } else { pin };
+        let saved_vpn_exp = crate::config_store::ConfigStore {
+            storage: StateStore::new(self.paths.clone()),
+        }
+        .load()
+        .ok()
+        .and_then(|c| c.vpn_expectation);
+        let configured_node = saved_vpn_exp
+            .as_ref()
+            .filter(|e| e.configured)
+            .and_then(|e| e.expected_node.as_deref())
+            .unwrap_or("");
+        let effective_pin = if !pin.is_empty() {
+            pin
+        } else {
+            configured_node
+        };
+        let node = if !effective_pin.is_empty() {
+            effective_pin
+        } else if saved_vpn_exp.as_ref().is_some_and(|e| e.configured) {
+            ""
+        } else {
+            observed
+        };
         report["expected_node"] = json!(node);
         report["selection_observed"] = json!(!observed.is_empty());
-        report["selection_changed"] = json!(selection_drift(pin, observed));
+        report["selection_changed"] = json!(selection_drift(effective_pin, observed));
         let mut native_processes = after.unwrap_or_default();
         for (pid, identity) in &processes.identities {
             native_processes.entry(*pid).and_modify(|p| {

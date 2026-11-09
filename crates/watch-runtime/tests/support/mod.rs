@@ -20,8 +20,15 @@ pub fn oracle(operation: &str, cases: &[Value]) -> Vec<Value> {
     serde_json::from_str(&text).unwrap()
 }
 
-fn snapshot_path(operation: &str, cases: &[Value]) -> PathBuf {
-    let text = serde_json::to_string(cases).unwrap();
+pub(crate) fn snapshot_path(operation: &str, cases: &[Value]) -> PathBuf {
+    // The recorded keys used serde_json's default, sorted object ordering.
+    // A workspace dependency may enable preserve_order for this same crate;
+    // normalize only the lookup copy so that feature unification cannot
+    // change which historical answer is selected. Array order and all values
+    // remain significant, and the cases under test are left untouched.
+    let mut canonical_cases = Value::Array(cases.to_vec());
+    canonical_cases.sort_all_objects();
+    let text = serde_json::to_string(&canonical_cases).unwrap();
     let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.bytes() {
         digest ^= byte as u64;

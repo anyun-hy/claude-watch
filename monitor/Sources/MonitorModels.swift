@@ -234,6 +234,20 @@ struct BoundProcessTokenModel: Codable, Equatable, Sendable {
     let audit_token: [UInt32]?
 }
 
+struct VpnEpochModel: Codable, Equatable, Sendable {
+    let observer_boot_id: String
+    let change_generation: UInt64
+}
+
+struct BackendCoverageScopeModel: Codable, Equatable, Sendable {
+    let backend: String
+    let covers_controlled_desktop_launch: Bool
+    let covers_controlled_cli_launch: Bool
+    let covers_direct_fork_exec_children: Bool
+    let covers_unmanaged_external_launch: Bool
+    let unmanaged_processes_visible: Bool
+}
+
 struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
     var producer_boot_id: String = ""
     let family: String
@@ -259,9 +273,25 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
     var local_proxy_port: UInt16? = nil
     var valid_until: Double? = nil
     let updated_at: Double
+    var backend: String? = nil
+    var vpn_epoch: VpnEpochModel? = nil
+    var coverage_scope: BackendCoverageScopeModel? = nil
+    var unmanaged_member_pids: [UInt32]? = nil
+    var sandbox_ready: Bool? = nil
 
     var isPermitted: Bool {
         permit_state == "permitted"
+    }
+
+    var hasUnmanagedMembers: Bool {
+        !(unmanaged_member_pids ?? []).isEmpty
+    }
+
+    /// True only when a real executor flow-termination receipt has been applied
+    /// (`display_state == .blocked` and `policy_sync_state == .applied`).
+    /// Never true while `pending_apply` or `disconnecting`.
+    var isConfirmedFlowBlocked: Bool {
+        display_state == .blocked && policy_sync_state == .applied && active_flows_count == 0
     }
 
     /// Binds network flows and process rows to the same supervised session and
@@ -269,6 +299,14 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
     /// mixed with the current channel disposition.
     func matchesProcess(_ process: WatchedProcess) -> Bool {
         active_member_pids.contains(UInt32(max(0, process.pid)))
+    }
+
+    func isUnmanagedProcess(_ process: WatchedProcess) -> Bool {
+        let pid = UInt32(max(0, process.pid))
+        if unmanaged_member_pids?.contains(pid) == true {
+            return true
+        }
+        return !active_member_pids.contains(pid)
     }
 }
 
@@ -399,10 +437,107 @@ struct ChannelMonitorSubscriptionStore: Sendable {
                 active_flows_count: state.active_flows_count,
                 terminated_flows_count: state.terminated_flows_count,
                 blocked_new_connections: state.blocked_new_connections,
-                updated_at: state.updated_at
+                updated_at: state.updated_at,
+                backend: state.backend,
+                vpn_epoch: state.vpn_epoch,
+                coverage_scope: state.coverage_scope,
+                unmanaged_member_pids: state.unmanaged_member_pids,
+                sandbox_ready: state.sandbox_ready
             )
         }
         return state
+    }
+}
+
+struct VpnFieldDiffModel: Codable, Equatable, Sendable {
+    let field: String
+    let expected: String
+    let observed: String
+}
+
+struct VpnExpectationModel: Codable, Equatable, Sendable {
+    var configured: Bool = false
+    var proxy_mode: String = "auto"
+    var proxy_url: String = ""
+    var proxy_group: String = ""
+    var running_mode: String? = nil
+    var require_tun: Bool? = nil
+    var require_system_proxy: Bool? = nil
+    var expected_node: String? = nil
+    var expected_chain: [String] = []
+    var expected_rules_digest: String? = nil
+
+    init(
+        configured: Bool = false,
+        proxy_mode: String = "auto",
+        proxy_url: String = "",
+        proxy_group: String = "",
+        running_mode: String? = nil,
+        require_tun: Bool? = nil,
+        require_system_proxy: Bool? = nil,
+        expected_node: String? = nil,
+        expected_chain: [String] = [],
+        expected_rules_digest: String? = nil
+    ) {
+        self.configured = configured
+        self.proxy_mode = proxy_mode
+        self.proxy_url = proxy_url
+        self.proxy_group = proxy_group
+        self.running_mode = running_mode
+        self.require_tun = require_tun
+        self.require_system_proxy = require_system_proxy
+        self.expected_node = expected_node
+        self.expected_chain = expected_chain
+        self.expected_rules_digest = expected_rules_digest
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        configured = try container.decodeIfPresent(Bool.self, forKey: .configured) ?? false
+        proxy_mode = try container.decodeIfPresent(String.self, forKey: .proxy_mode) ?? "auto"
+        proxy_url = try container.decodeIfPresent(String.self, forKey: .proxy_url) ?? ""
+        proxy_group = try container.decodeIfPresent(String.self, forKey: .proxy_group) ?? ""
+        running_mode = try container.decodeIfPresent(String.self, forKey: .running_mode)
+        require_tun = try container.decodeIfPresent(Bool.self, forKey: .require_tun)
+        require_system_proxy = try container.decodeIfPresent(Bool.self, forKey: .require_system_proxy)
+        expected_node = try container.decodeIfPresent(String.self, forKey: .expected_node)
+        expected_chain = try container.decodeIfPresent([String].self, forKey: .expected_chain) ?? []
+        expected_rules_digest = try container.decodeIfPresent(String.self, forKey: .expected_rules_digest)
+    }
+}
+
+struct VpnMatchModel: Codable, Equatable, Sendable {
+    let state: String
+    var differences: [VpnFieldDiffModel]? = nil
+    var reasons: [String]? = nil
+}
+
+struct VpnSupervisionSnapshotModel: Codable, Equatable, Sendable {
+    let captured_at: Double
+    var network_backend: String? = nil
+    var requires_migration: Bool? = nil
+    var expectation: VpnExpectationModel? = nil
+    var unavailable_reason: String? = nil
+    var vpn_match: VpnMatchModel? = nil
+
+    var differences: [VpnFieldDiffModel] {
+        vpn_match?.differences ?? []
+    }
+
+    var unknownOrStaleReasons: [String] {
+        var out: [String] = []
+        if let reason = unavailable_reason, !reason.isEmpty {
+            out.append(reason)
+        }
+        if vpn_match?.state == "stale" {
+            out.append("vpn_observation_stale")
+        }
+        if let reasons = vpn_match?.reasons {
+            for r in reasons where !out.contains(r) {
+                out.append(r)
+            }
+        }
+        return out
     }
 }
 
@@ -417,6 +552,7 @@ struct MonitorSnapshot: Decodable, Sendable {
     let proxyError: String?
     var channelSupervision: ChannelMonitorSnapshot? = nil
     var channelEvents: [ChannelMonitorEvent]? = nil
+    var vpnSupervision: VpnSupervisionSnapshotModel? = nil
     let logPath: String
     /// Absent when an older installed script has not yet published multi-product capability.
     let backendVersion: String?

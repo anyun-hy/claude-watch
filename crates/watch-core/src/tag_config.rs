@@ -2,6 +2,7 @@
 use crate::{
     error::{CoreError, Result},
     json_value::truthy,
+    vpn::{rules_digest_from_published, ObservedField, UpstreamProtocol},
 };
 use serde_json::{json, Value};
 use std::{
@@ -498,4 +499,192 @@ pub fn api_snapshot(
         "selected_node":selected,"route_chains":routes,"global_node":global,"direct_groups":direct_groups,"reason":"","rules":rules}),
         connections.clone(),
     ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerFastSnapshot {
+    pub controller_base: String,
+    pub running_mode: String,
+    pub upstream_endpoint: Option<String>,
+    pub upstream_protocol: ObservedField<UpstreamProtocol>,
+    pub tun_enabled: ObservedField<bool>,
+    pub selected_group: ObservedField<String>,
+    pub selected_node: ObservedField<String>,
+    pub proxy_chain: ObservedField<Vec<String>>,
+    pub rules_digest: ObservedField<String>,
+    pub revision: Option<String>,
+}
+
+pub fn inspect_controller_port(
+    configs: &Value,
+    expected_host: &str,
+    expected_port: Option<u16>,
+) -> (Option<String>, ObservedField<UpstreamProtocol>) {
+    let host = if expected_host.trim().is_empty() {
+        "127.0.0.1"
+    } else {
+        expected_host.trim()
+    };
+    let http_port = configs
+        .get("port")
+        .and_then(Value::as_u64)
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|&p| p > 0);
+    let mixed_port = configs
+        .get("mixed-port")
+        .and_then(Value::as_u64)
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|&p| p > 0);
+    let socks_port = configs
+        .get("socks-port")
+        .and_then(Value::as_u64)
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|&p| p > 0);
+
+    if let Some(target) = expected_port {
+        if http_port == Some(target) {
+            return (
+                Some(format!("http://{host}:{target}")),
+                ObservedField::Known(UpstreamProtocol::HttpConnect),
+            );
+        }
+        if mixed_port == Some(target) {
+            return (
+                Some(format!("http://{host}:{target}")),
+                ObservedField::Known(UpstreamProtocol::MixedHttp),
+            );
+        }
+        if socks_port == Some(target) {
+            return (
+                Some(format!("http://{host}:{target}")),
+                ObservedField::Known(UpstreamProtocol::SocksOnly),
+            );
+        }
+    }
+
+    if let Some(p) = mixed_port {
+        return (
+            Some(format!("http://{host}:{p}")),
+            ObservedField::Known(UpstreamProtocol::MixedHttp),
+        );
+    }
+    if let Some(p) = http_port {
+        return (
+            Some(format!("http://{host}:{p}")),
+            ObservedField::Known(UpstreamProtocol::HttpConnect),
+        );
+    }
+    if let Some(p) = socks_port {
+        return (
+            Some(format!("http://{host}:{p}")),
+            ObservedField::Known(UpstreamProtocol::SocksOnly),
+        );
+    }
+    (
+        None,
+        ObservedField::Unknown("controller_proxy_ports_disabled".into()),
+    )
+}
+
+pub fn fast_controller_snapshot(
+    base: &str,
+    group: &str,
+    expected_host: &str,
+    expected_port: Option<u16>,
+    configs: &Value,
+    proxies_payload: &Value,
+    rules_payload: Option<&Value>,
+) -> Result<ControllerFastSnapshot> {
+    let mode_raw = configs["mode"]
+        .as_str()
+        .ok_or_else(|| CoreError::new("api_schema_incomplete", "控制接口模式无效"))?;
+    let running_mode = mode_raw.to_ascii_lowercase();
+    if !matches!(running_mode.as_str(), "rule" | "global" | "direct") {
+        return Err(CoreError::new("api_schema_incomplete", "控制接口模式无效"));
+    }
+    let proxies = proxies_payload
+        .get("proxies")
+        .filter(|v| v.is_object())
+        .ok_or_else(|| CoreError::new("api_schema_incomplete", "控制接口代理选择表无效"))?;
+    let effective_group = if running_mode == "global" || group.trim().is_empty() {
+        "GLOBAL"
+    } else {
+        group.trim()
+    };
+    let (selected_group, selected_node, proxy_chain) = if running_mode == "direct" {
+        (
+            ObservedField::Known(effective_group.to_string()),
+            ObservedField::Known("DIRECT".into()),
+            ObservedField::Known(vec!["DIRECT".into()]),
+        )
+    } else if let Some(chain_leaf_first) = resolve_chain(proxies, effective_group) {
+        let leaf = chain_leaf_first.first().cloned().unwrap_or_default();
+        let mut root_to_leaf = chain_leaf_first;
+        root_to_leaf.reverse();
+        (
+            ObservedField::Known(effective_group.to_string()),
+            ObservedField::Known(leaf),
+            ObservedField::Known(root_to_leaf),
+        )
+    } else if let Some(now) = proxies
+        .get(effective_group)
+        .and_then(|v| v.get("now"))
+        .and_then(Value::as_str)
+    {
+        // Even if the group currently selects DIRECT or REJECT (which `resolve_chain`
+        // returns None for), expose the actual selection so `compare_vpn` reports Mismatched!
+        (
+            ObservedField::Known(effective_group.to_string()),
+            ObservedField::Known(now.to_string()),
+            ObservedField::Known(vec![effective_group.to_string(), now.to_string()]),
+        )
+    } else {
+        (
+            ObservedField::Unknown("selector_group_unresolvable".into()),
+            ObservedField::Unknown("selected_node_unresolvable".into()),
+            ObservedField::Unknown("proxy_chain_unresolvable".into()),
+        )
+    };
+
+    let (upstream_endpoint, upstream_protocol) =
+        inspect_controller_port(configs, expected_host, expected_port);
+    let tun_enabled = match configs
+        .get("tun")
+        .and_then(|t| t.get("enable"))
+        .and_then(Value::as_bool)
+    {
+        Some(v) => ObservedField::Known(v),
+        None => ObservedField::Unknown("controller_tun_field_absent".into()),
+    };
+    let rules_digest = match rules_payload {
+        Some(raw) => match published_rules(raw)
+            .ok()
+            .and_then(|pub_rules| rules_digest_from_published(&pub_rules))
+        {
+            Some(digest) => ObservedField::Known(digest),
+            None => ObservedField::Unknown("controller_rules_invalid".into()),
+        },
+        None => ObservedField::Unknown("controller_rules_not_sampled".into()),
+    };
+    let revision = configs
+        .get("revision")
+        .or_else(|| proxies_payload.get("revision"))
+        .and_then(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+        });
+
+    Ok(ControllerFastSnapshot {
+        controller_base: base.to_string(),
+        running_mode,
+        upstream_endpoint,
+        upstream_protocol,
+        tun_enabled,
+        selected_group,
+        selected_node,
+        proxy_chain,
+        rules_digest,
+        revision,
+    })
 }

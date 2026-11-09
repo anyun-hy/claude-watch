@@ -676,6 +676,7 @@ struct SwitcherPage: View {
             Toggle("启动前要求 UDP/STUN 出口一致", isOn: store.flag(Setting.requireStun))
             ForEach(store.policyWarnings, id: \.self) { Text($0).font(WatchTypography.caption).foregroundStyle(p.amber) }
             Toggle("启动前要求代理规则覆盖通过", isOn: store.flag(Setting.requirePinnedRules))
+            vpnExpectationSection
             DisclosureGroup("发布源与工具维护", isExpanded: $showSource) {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("此处供本项目发布维护使用。缺少发布源或固定公钥时，自动更新显示尚不可用。")
@@ -693,6 +694,44 @@ struct SwitcherPage: View {
             }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
         }.disabled(store.busy || !store.loaded)
     }
+    private var vpnExpectationSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("只读 VPN 监督预期（不修改外部 VPN / TAG 配置）", systemImage: "network.badge.shield.half.filled")
+                .font(WatchTypography.bodyStrong).foregroundStyle(p.text)
+            Text(store.savedVpnExpectationSummary)
+                .font(WatchTypography.caption).foregroundStyle(p.secondary)
+            if let syncState = store.policySyncState {
+                Text(syncState.labelZh)
+                    .font(WatchTypography.caption)
+                    .foregroundStyle(syncState == .applyFailed ? p.red : syncState == .applied ? p.secondary : p.amber)
+            }
+            HStack(spacing: 8) {
+                TextField("预期运行模式（如 rule / global）", text: Binding(
+                    get: { store.vpnExpectationDraft.running_mode ?? "" },
+                    set: { store.updateVpnExpectationDraft(runningMode: $0) }
+                )).textFieldStyle(.roundedBorder)
+                TextField("预期代理组", text: Binding(
+                    get: { store.vpnExpectationDraft.proxy_group },
+                    set: { store.updateVpnExpectationDraft(proxyGroup: $0) }
+                )).textFieldStyle(.roundedBorder)
+                TextField("预期节点", text: Binding(
+                    get: { store.vpnExpectationDraft.expected_node ?? "" },
+                    set: { store.updateVpnExpectationDraft(expectedNode: $0) }
+                )).textFieldStyle(.roundedBorder)
+            }
+            HStack(spacing: 12) {
+                Button("确认保存 VPN 监督预期") {
+                    Task { await store.confirmAndSaveVpnExpectation() }
+                }
+                .buttonStyle(.bordered)
+                .disabled(store.busy)
+                Text("仅写入 Watch 本地策略，不切换节点、模式、TUN 或系统代理。")
+                    .font(WatchTypography.small).foregroundStyle(p.secondary)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+
     private var draftActions: some View {
         HStack {
             Button("保存设置") { Task { await store.save(); await store.refreshBackground() } }

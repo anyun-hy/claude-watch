@@ -175,8 +175,9 @@ struct GraphContinuityTests {
         var managedTimeline = GraphContinuityStore()
         managedTimeline.observe(snapshot: managedSnapshot, selection: managedSelection, now: 2050, error: nil, automatic: true)
         let managedDisplay = managedTimeline.display(product: .openAI, snapshot: managedSnapshot, selection: managedSelection, now: 2050, error: nil, automatic: true)
-        expect(managedDisplay.sourceProjection(.managed)?.sourcePID == 38392 && managedDisplay.sourceProjection(.managed)?.sourceEdgeState == .confirmed && managedDisplay.sourceProjection(.desktop)?.sourcePID == 72,
-               "managed server has its own confirmed path alongside desktop")
+        expect(managedDisplay.sourceProjection(.managed) == nil && managedDisplay.sourceProjection(.desktop)?.sourcePID == 72 &&
+               managedDisplay.currentFlows.contains(where: { $0.id == "managed-flow" && $0.pid == 38392 }),
+               "app-server folds into the desktop source without deleting its observed flow or replacing the selected desktop PID")
         expect(managedDisplay.sourceProjection(.cli) == nil, "managed server is not shown as independent CLI")
         let frontendFlow = flow(.openAI, pid: 79345, id: "frontend-flow", host: "chatgpt.com")
         let threeSnapshot = snapshot(.openAI, time: 2060, flows: [desktopFlow, managedFlow, frontendFlow], processes: [frontend, managed, desktop])
@@ -186,8 +187,10 @@ struct GraphContinuityTests {
         var threeTimeline = GraphContinuityStore()
         threeTimeline.observe(snapshot: threeSnapshot, selection: threeSelection, now: 2060, error: nil, automatic: true)
         let three = threeTimeline.display(product: .openAI, snapshot: threeSnapshot, selection: threeSelection, now: 2060, error: nil, automatic: true)
-        expect(three.sourceProjection(.cli)?.sourcePID == 79345 && three.sourceProjection(.managed)?.sourcePID == 38392 && three.sourceProjection(.desktop)?.sourcePID == 72,
-               "CLI, managed backend and desktop each retain their own observed flow")
+        expect(three.sourceProjection(.cli)?.sourcePID == 79345 && three.sourceProjection(.managed) == nil &&
+               three.sourceProjection(.desktop)?.sourcePID == 38392 && three.sourceProjection(.desktop)?.sourceEdgeState == .confirmed &&
+               three.currentFlows.contains(where: { $0.id == "desktop-flow" && $0.pid == 72 }),
+               "selecting the app-server keeps its own confirmed PID on the desktop source, alongside the independent CLI and retained desktop flow")
         let desktopOnly = dualDisplay(flow(.openAI, pid: 71, id: "cli-flow", association: "unconfirmed"))
         expect(desktopOnly.sourceProjection(.desktop)?.sourcePID == 72 && desktopOnly.sourceProjection(.cli) == nil,
                "missing CLI evidence leaves desktop evidence intact and CLI as a reference")

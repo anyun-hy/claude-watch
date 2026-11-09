@@ -816,6 +816,10 @@ fn package_environment(
         ("BUILD_NUMBER", build.to_string()),
         ("CW_BUILD_ARCH", "arm64".to_string()),
         ("CW_BACKEND_VARIANT", "rust-candidate".to_string()),
+        (
+            "CW_NETWORK_BACKEND",
+            std::env::var("CW_NETWORK_BACKEND").unwrap_or_else(|_| "seatbelt".to_string()),
+        ),
         ("CW_CARGO_BIN", "cargo".to_string()),
         ("CW_APP_OUTPUT", app_out.display().to_string()),
         ("DMG_NAME", dmg_name.to_string()),

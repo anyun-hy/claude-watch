@@ -28,6 +28,7 @@ fn command(state: ChannelPermitState, seq: u64, now: f64) -> ChannelEnforcementC
         command_seq: seq,
         permit_generation: 1,
         upstream_endpoint: "http://127.0.0.1:7890".into(),
+        target_executor_boot_id: Some("boot".into()),
         issued_at: now,
         allowed_processes: vec![process],
         permit: ChannelPermit {
@@ -43,6 +44,9 @@ fn command(state: ChannelPermitState, seq: u64, now: f64) -> ChannelEnforcementC
             context_id: Some("new-network".into()),
             baseline_ip: Some("1.1.1.1".into()),
             members: vec![],
+            backend: NetworkBackendKind::NetworkExtension,
+            vpn_epoch: None,
+            coverage_scope: None,
         },
     }
 }
@@ -424,6 +428,7 @@ fn intercepted_explicit_proxy_connection_does_not_tunnel_tag_back_to_itself() {
     let e = LocalTunnelEnforcer::new("explicit-proxy", None);
     e.activate_interception(100.).unwrap();
     let mut cmd = command(ChannelPermitState::Permitted, 1, 100.);
+    cmd.target_executor_boot_id = Some(e.boot_id().unwrap());
     cmd.upstream_endpoint = format!("http://{endpoint}");
     e.apply_command(&cmd, 100.).unwrap();
     let (_, mut stream) = e
@@ -434,6 +439,7 @@ fn intercepted_explicit_proxy_connection_does_not_tunnel_tag_back_to_itself() {
         .unwrap();
     rx.recv_timeout(Duration::from_secs(2)).unwrap();
     let mut revoked = command(ChannelPermitState::Revoked, 2, 100.1);
+    revoked.target_executor_boot_id = Some(e.boot_id().unwrap());
     revoked.upstream_endpoint = cmd.upstream_endpoint;
     e.apply_command(&revoked, 100.1).unwrap();
     server.join().unwrap();
