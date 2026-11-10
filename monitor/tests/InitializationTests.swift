@@ -371,12 +371,13 @@ struct InitializationTests {
         var coldTime = epoch
         var publications: [(at: Double, sampled: Double, node: String)] = [(5, 1, "A"), (19, 15, "A")]
         var nativeAvailable = true
+        var freezeSnapshotCapture = false
         func publishColdRound() {
             let elapsed = coldTime - epoch
             cold.switcher.loadReviewReceipts(coldEnvironment, background: backendEvidence(at: coldTime, sampling: true, native: nativeAvailable && elapsed >= 5))
             guard let publication = publications.last(where: { $0.at <= elapsed }) else { cold.snapshot = nil; return }
             let sample = snapshot(node: publication.node, at: epoch + publication.sampled)
-            let reread = MonitorSnapshot(capturedAt: coldTime, health: sample.health,
+            let reread = MonitorSnapshot(capturedAt: freezeSnapshotCapture ? epoch + publication.at : coldTime, health: sample.health,
                 installed: true, autoStart: true, keepAlive: true, hasBaseline: false,
                 stderrBytes: 0, processes: [], events: [], proxy: sample.proxy, proxyError: nil,
                 logPath: "/fixture/log", backendVersion: "fixture", monitoredApps: ["claude"])
@@ -394,8 +395,9 @@ struct InitializationTests {
         expect(passed(coldResult), "clean startup must wait for the second actual proxy publication without requiring Retry")
         expect(coldTime >= epoch + 19 && coldTime < epoch + 30,
                "repeated reads of the first snapshot never count as two samples")
-        func replay(_ values: [(Double, Double, String)], native: Bool = true) async -> InitializationResult {
+        func replay(_ values: [(Double, Double, String)], native: Bool = true, freezeCapture: Bool = false) async -> InitializationResult {
             coldTime = epoch; publications = values; nativeAvailable = native
+            freezeSnapshotCapture = freezeCapture
             cold.snapshot = nil; publishColdRound()
             return await coldChecks.check(.connection)
         }
@@ -408,6 +410,16 @@ struct InitializationTests {
         let frozenSource = await replay([(5, 1, "A")])
         expect(failureCode(frozenSource) == "proxy_next_sample_timeout" && coldTime == epoch + 31,
                "a stalled producer fails at the first source's expiry even as snapshot and service read times advance")
+        // Reproduce the installed daemon's publication gap: UI rereads and
+        // service receipts advance, but neither the captured snapshot nor its
+        // proxy observation is new. The separate snapshot freshness gate must
+        // remain effective instead of renewing the frozen evidence on read.
+        let frozenSnapshot = await replay([(5, 1, "A")], freezeCapture: true)
+        expect(failureCode(frozenSnapshot) == "snapshot_stale" && coldTime == epoch + 31,
+               "a whole-snapshot publication gap fails as snapshot_stale within the original confirmation deadline")
+        expect(cold.snapshot?.capturedAt == epoch + 5 && cold.snapshot?.proxy?.observedAt == epoch + 1 &&
+               cold.switcher.background?.observed_at == coldTime,
+               "fresh service receipts and repeated proxy reads never renew the frozen snapshot or source timestamps")
         let missingSource = await replay([])
         expect(failureCode(missingSource) == "snapshot_unavailable" && coldTime == epoch + 30,
                "absence of a first snapshot has a bounded, specific failure")

@@ -293,6 +293,45 @@ pub struct DiscoveryCounters {
     pub fingerprint_reads: u64,
 }
 type Signature = Vec<(PathBuf, Vec<i128>, Option<PathBuf>)>;
+
+fn record_matches_signature(record: &DiscoveredTarget, signature: &Signature) -> bool {
+    let Some(executable) = &record.executable else { return false; };
+    let mut paths = vec![record.entry_path.clone(), executable.clone()];
+    paths.extend(record.child_executables.clone());
+    if let Some(bundle) = &record.bundle { paths.push(bundle.join("Contents/Info.plist")); }
+    for parent in executable.ancestors().take(8) {
+        if parent.ends_with("node_modules/@openai/codex")
+            || parent.ends_with("node_modules/@anthropic-ai/claude-code")
+        { paths.push(parent.join("package.json")); }
+    }
+    paths.iter().all(|p| signature.iter().find(|(path, _, _)| path == p)
+        .is_some_and(|(_, facts, canonical)| stamp(p) == (facts.clone(), canonical.clone())))
+}
+
+#[derive(Clone, Default)]
+struct ObservedInputs {
+    revision: u64,
+    bundles: Option<(Vec<PathBuf>, BTreeMap<PathBuf, String>, bool)>,
+    cli_entries: Vec<(LaunchTarget, PathBuf)>,
+    cli_seen: bool,
+    cli_partial: bool,
+    interpreters: BTreeMap<PathBuf, PathBuf>,
+    interpreters_seen: bool,
+    interpreters_partial: bool,
+}
+struct PublishedObservation {
+    snapshot: Arc<DiscoverySnapshot>,
+    signature: Signature,
+    hint_path: PathBuf,
+    hint_stamp: Option<(Vec<i128>, Option<PathBuf>)>,
+    input_revision: u64,
+}
+#[derive(Default)]
+struct ObservationState {
+    enabled: AtomicBool,
+    inputs: Mutex<ObservedInputs>,
+    published: Mutex<Option<Arc<PublishedObservation>>>,
+}
 #[derive(Clone)]
 struct DirectoryBatch {
     stamp: (Vec<i128>, Option<PathBuf>),
@@ -593,27 +632,7 @@ impl DiscoveryCache {
         Arc::new(snapshot)
     }
     fn record_is_current(&self, record: &DiscoveredTarget) -> bool {
-        let Some(executable) = &record.executable else {
-            return false;
-        };
-        let mut paths = vec![record.entry_path.clone(), executable.clone()];
-        paths.extend(record.child_executables.clone());
-        if let Some(bundle) = &record.bundle {
-            paths.push(bundle.join("Contents/Info.plist"));
-        }
-        for parent in executable.ancestors().take(8) {
-            if parent.ends_with("node_modules/@openai/codex")
-                || parent.ends_with("node_modules/@anthropic-ai/claude-code")
-            {
-                paths.push(parent.join("package.json"));
-            }
-        }
-        paths.iter().all(|p| {
-            self.signature
-                .iter()
-                .find(|(path, _, _)| path == p)
-                .is_some_and(|(_, facts, canonical)| stamp(p) == (facts.clone(), canonical.clone()))
-        })
+        record_matches_signature(record, &self.signature)
     }
     fn scan<R: ReadRunner + ?Sized>(&mut self, reader: &R) -> (DiscoverySnapshot, Signature) {
         self.counters.scans += 1;
@@ -1493,7 +1512,7 @@ fn is_watch_shim(path: &Path, home: &Path, shim: Option<&Path>) -> bool {
 
 /// In-process shared cache, scoped to an explicit home. It carries no permits.
 #[derive(Clone)]
-pub struct DiscoveryHandle(pub Arc<Mutex<DiscoveryCache>>, Arc<dyn ApplicationRegistry>);
+pub struct DiscoveryHandle(pub Arc<Mutex<DiscoveryCache>>, Arc<dyn ApplicationRegistry>, Arc<ObservationState>);
 
 pub struct ApprovedDiscoveryManifest {
     pub revision: String,
@@ -1509,10 +1528,11 @@ impl DiscoveryHandle {
         Self::with_registry(inputs, Arc::new(SystemApplicationRegistry))
     }
     pub fn with_registry(inputs: DiscoveryInputs, registry: Arc<dyn ApplicationRegistry>) -> Self {
-        Self(Arc::new(Mutex::new(DiscoveryCache::new(inputs))), registry)
+        Self(Arc::new(Mutex::new(DiscoveryCache::new(inputs))), registry, Arc::new(ObservationState::default()))
     }
     pub fn for_home(home: &Path) -> Self {
-        static CACHES: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<DiscoveryCache>>>>> =
+        type SharedCache = (Weak<Mutex<DiscoveryCache>>, Weak<ObservationState>);
+        static CACHES: OnceLock<Mutex<BTreeMap<PathBuf, SharedCache>>> =
             OnceLock::new();
         let resolved = fs::canonicalize(home).unwrap_or_else(|_| home.into());
         let home = resolved.as_path();
@@ -1520,18 +1540,106 @@ impl DiscoveryHandle {
             .get_or_init(|| Mutex::new(BTreeMap::new()))
             .lock()
             .unwrap();
-        caches.retain(|_, weak| weak.strong_count() > 0);
-        if let Some(cache) = caches.get(home).and_then(Weak::upgrade) {
-            return Self(cache, Arc::new(SystemApplicationRegistry));
+        caches.retain(|_, (cache, state)| cache.strong_count() > 0 && state.strong_count() > 0);
+        if let Some((cache, state)) = caches.get(home)
+            .and_then(|(cache, state)| cache.upgrade().zip(state.upgrade())) {
+            return Self(cache, Arc::new(SystemApplicationRegistry), state);
         }
         let cache = Arc::new(Mutex::new(DiscoveryCache::new(DiscoveryInputs::for_home(
             home,
         ))));
-        caches.insert(home.into(), Arc::downgrade(&cache));
-        Self(cache, Arc::new(SystemApplicationRegistry))
+        let state = Arc::new(ObservationState::default());
+        caches.insert(home.into(), (Arc::downgrade(&cache), Arc::downgrade(&state)));
+        Self(cache, Arc::new(SystemApplicationRegistry), state)
     }
     pub fn refresh<R: ReadRunner + ?Sized>(&self, reader: &R, now: f64) -> Arc<DiscoverySnapshot> {
-        self.0.lock().unwrap().refresh(reader, self.1.as_ref(), now)
+        let mut cache = self.0.lock().unwrap();
+        // The mailbox is independent of this slow lock. Observation can keep
+        // accepting new process facts while discovery or content approval runs.
+        let inputs = self.2.inputs.lock().unwrap().clone();
+        if let Some((paths, ids, partial)) = &inputs.bundles {
+            cache.input_issue("observed_bundles_partial", *partial);
+            if cache.inputs.observed_bundles != *paths || cache.inputs.observed_bundle_ids != *ids {
+                cache.inputs.observed_bundles = paths.clone();
+                cache.inputs.observed_bundle_ids = ids.clone();
+                cache.dirty = true;
+            }
+        }
+        if inputs.cli_seen { cache.input_issue("observed_cli_entries_partial", inputs.cli_partial); }
+        for entry in inputs.cli_entries {
+            if !cache.inputs.observed_cli_entries.contains(&entry) {
+                if cache.inputs.observed_cli_entries.len() == 256 {
+                    cache.input_issue("observed_cli_entries_partial", true);
+                } else { cache.inputs.observed_cli_entries.push(entry); cache.dirty = true; }
+            }
+        }
+        if inputs.interpreters_seen { cache.input_issue("observed_interpreters_partial", inputs.interpreters_partial); }
+        for (script, interpreter) in inputs.interpreters {
+            if cache.inputs.observed_interpreters.get(&script) != Some(&interpreter) {
+                if !cache.inputs.observed_interpreters.contains_key(&script)
+                    && cache.inputs.observed_interpreters.len() == 256 {
+                    cache.input_issue("observed_interpreters_partial", true);
+                } else { cache.inputs.observed_interpreters.insert(script, interpreter); cache.dirty = true; }
+            }
+        }
+        let snapshot = cache.refresh(reader, self.1.as_ref(), now);
+        let publication = Arc::new(PublishedObservation {
+            snapshot: snapshot.clone(), signature: cache.signature.clone(), input_revision: inputs.revision,
+            hint_path: Paths { home: cache.inputs.home.clone() }.watch().join("state/target-discovery-hints.json"),
+            hint_stamp: cache.hint_stamp.clone(),
+        });
+        *self.2.published.lock().unwrap() = Some(publication);
+        snapshot
+    }
+    /// The daemon owns the refresh worker. Other callers retain the existing
+    /// synchronous behavior until this mode is explicitly enabled.
+    pub fn enable_background_observation(&self) {
+        self.2.enabled.store(true, Ordering::Release);
+    }
+    /// No slow scan/content-approval lock, external command, or new authority.
+    /// Metadata checks happen after releasing both short publication locks.
+    pub fn observation_snapshot<R: ReadRunner + ?Sized>(&self, reader: &R, now: f64) -> Arc<DiscoverySnapshot> {
+        if !self.2.enabled.load(Ordering::Acquire) { return self.refresh(reader, now); }
+        let published = self.2.published.lock().unwrap().clone();
+        let inputs = self.2.inputs.lock().unwrap().clone();
+        let Some(published) = published else {
+            return Arc::new(DiscoverySnapshot { revision: "observation:initial_discovery_pending".into(),
+                prior_revision: None, complete: false, targets: vec![],
+                issues: vec!["initial_discovery_pending".into()], preferred_sources: BTreeMap::new() });
+        };
+        let mut snapshot = (*published.snapshot).clone();
+        // An added installation changes a watched directory without changing
+        // any previously known executable. Likewise caller hints can select a
+        // different source. Retain current individual candidates for discovery
+        // display, but do not call the whole old catalog complete/approved.
+        let mut pending = inputs.revision != published.input_revision
+            || published.signature.iter().any(|(path, facts, canonical)|
+                stamp(path) != (facts.clone(), canonical.clone()))
+            || published.hint_stamp.as_ref().is_some_and(|previous|
+                &stamp(&published.hint_path) != previous);
+        for record in &mut snapshot.targets {
+            let removed = record.source_kind == "observed_bundle" && inputs.bundles.as_ref()
+                .is_some_and(|(paths, _, _)| !paths.contains(&record.entry_path));
+            if record.valid() && (removed || !record_matches_signature(record, &published.signature)) {
+                record.error_code = Some("target_discovery_observation_changed".into());
+                record.launcher_supported = false;
+                pending = true;
+            }
+        }
+        if pending {
+            snapshot.complete = false;
+            snapshot.issues.push("target_discovery_refresh_pending".into());
+            snapshot.issues.sort(); snapshot.issues.dedup();
+            let previous_revision = snapshot.revision.clone();
+            // Unlike a completed partial scan, this observation has not been
+            // consumed by the discovery owner. Do not inherit its authority
+            // through ensure_snapshot_current's prior-revision allowance.
+            snapshot.prior_revision = None;
+            snapshot.revision = crate::storage::sha256(&serde_json::to_vec(&json!({
+                "observation_pending_from":previous_revision,"inputs":inputs.revision,
+                "targets":snapshot.targets,"issues":snapshot.issues})).unwrap());
+        }
+        Arc::new(snapshot)
     }
     /// The daemon's stop flag bounds cold discovery between system reads.
     /// Cancellation publishes no successful revision and grants no authority.
@@ -1784,6 +1892,15 @@ impl DiscoveryHandle {
             paths.insert(path);
         }
         let paths = paths.into_iter().collect::<Vec<_>>();
+        if self.2.enabled.load(Ordering::Acquire) {
+            let mut inputs = self.2.inputs.lock().unwrap();
+            let observed = (paths, ids, partial);
+            if inputs.bundles.as_ref() != Some(&observed) {
+                inputs.bundles = Some(observed);
+                inputs.revision = inputs.revision.saturating_add(1);
+            }
+            return;
+        }
         let mut cache = self.0.lock().unwrap();
         cache.input_issue("observed_bundles_partial", partial);
         if cache.inputs.observed_bundles != paths || cache.inputs.observed_bundle_ids != ids {
@@ -1793,8 +1910,23 @@ impl DiscoveryHandle {
         }
     }
     pub fn observe_cli_entries(&self, entries: impl IntoIterator<Item = (LaunchTarget, PathBuf)>) {
-        let mut cache = self.0.lock().unwrap();
         let entries = entries.into_iter().take(257).collect::<Vec<_>>();
+        if self.2.enabled.load(Ordering::Acquire) {
+            let mut inputs = self.2.inputs.lock().unwrap();
+            let mut changed = !inputs.cli_seen;
+            inputs.cli_seen = true;
+            let old_partial = inputs.cli_partial;
+            inputs.cli_partial |= entries.len() > 256;
+            for entry in entries.into_iter().take(256) {
+                if !inputs.cli_entries.contains(&entry) {
+                    if inputs.cli_entries.len() == 256 { inputs.cli_partial = true; }
+                    else { inputs.cli_entries.push(entry); changed = true; }
+                }
+            }
+            if changed || old_partial != inputs.cli_partial { inputs.revision = inputs.revision.saturating_add(1); }
+            return;
+        }
+        let mut cache = self.0.lock().unwrap();
         if entries.len() > 256 {
             cache.input_issue("observed_cli_entries_partial", true);
         }
@@ -1813,8 +1945,29 @@ impl DiscoveryHandle {
         }
     }
     pub fn observe_interpreters(&self, entries: impl IntoIterator<Item = (PathBuf, PathBuf)>) {
-        let mut cache = self.0.lock().unwrap();
         let entries = entries.into_iter().take(257).collect::<Vec<_>>();
+        if self.2.enabled.load(Ordering::Acquire) {
+            let partial = entries.len() > 256;
+            // Resolve outside the mailbox lock; slow filesystem work must not
+            // block unrelated publishers or the refresh worker's handoff.
+            let entries = entries.into_iter().take(256).filter_map(|(script, interpreter)|
+                fs::canonicalize(script).ok().zip(fs::canonicalize(interpreter).ok())).collect::<Vec<_>>();
+            let mut inputs = self.2.inputs.lock().unwrap();
+            let mut changed = !inputs.interpreters_seen;
+            inputs.interpreters_seen = true;
+            let old_partial = inputs.interpreters_partial;
+            inputs.interpreters_partial |= partial;
+            for (script, interpreter) in entries {
+                if inputs.interpreters.get(&script) != Some(&interpreter) {
+                    if !inputs.interpreters.contains_key(&script) && inputs.interpreters.len() == 256 {
+                        inputs.interpreters_partial = true;
+                    } else { inputs.interpreters.insert(script, interpreter); changed = true; }
+                }
+            }
+            if changed || old_partial != inputs.interpreters_partial { inputs.revision = inputs.revision.saturating_add(1); }
+            return;
+        }
+        let mut cache = self.0.lock().unwrap();
         if entries.len() > 256 {
             cache.input_issue("observed_interpreters_partial", true);
         }

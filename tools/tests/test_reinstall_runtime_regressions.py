@@ -163,7 +163,7 @@ if stopping:
 
 @unittest.skipUnless(sys.platform == "darwin", "native macOS observation helpers")
 class NativeDaemonStartupRegression(unittest.TestCase):
-    def test_private_daemon_publishes_before_cold_discovery_and_stops_its_original_worker(self):
+    def test_private_daemon_keeps_publishing_during_partial_discovery_and_stops_its_original_worker(self):
         engine = Path(os.environ.get("CW_REINSTALL_TEST_ENGINE", ROOT / "target/debug/claude-watch-engine"))
         if not engine.is_file():
             self.skipTest("build claude-watch-engine first; unified runner supplies this prerequisite")
@@ -186,6 +186,11 @@ class NativeDaemonStartupRegression(unittest.TestCase):
                 # File metadata only. None of these images is executed.
                 (bundle / "MacOS/PrivateMain").write_bytes(b"private metadata fixture, never executed")
                 (bundle / "MacOS/PrivateMain").chmod(0o700)
+            # A permanently unreadable metadata record used to force repeated
+            # synchronous scans and stall the whole publisher for >30 seconds.
+            broken = home / "Applications/Unreadable Ordinary.app/Contents"
+            broken.mkdir(parents=True)
+            (broken / "Info.plist").write_text("not a property list")
             env = {key: value for key, value in os.environ.items() if not key.startswith(("CW_", "WATCH_"))}
             started = time.monotonic()
             parent = subprocess.Popen(["/bin/zsh", "-f", str(runtime / "watch-native-collector.zsh"),
@@ -221,6 +226,23 @@ class NativeDaemonStartupRegression(unittest.TestCase):
                                           capture_output=True, text=True, env=env, timeout=5)
                 self.assertEqual(readback.returncode, 0, readback.stderr)
                 self.assertEqual(json.loads(readback.stdout)["health"]["state"], "unavailable", "unregistered private publisher must fail the normal launchd verifier")
+                captures, proxy_samples, ages = set(), set(), []
+                until = time.monotonic() + 16
+                while time.monotonic() < until and parent.poll() is None:
+                    current = json.loads(snapshot_path.read_text())
+                    self.assertEqual(current["producer"], producer)
+                    view = current["snapshot"]
+                    capture = view["capturedAt"]
+                    captures.add(capture)
+                    ages.append(time.time() - capture)
+                    proxy = view.get("proxy") or {}
+                    if isinstance(proxy.get("observedAt"), (float, int)):
+                        proxy_samples.add(proxy["observedAt"])
+                    self.assertLess(ages[-1], 8, "slow/partial application discovery must not stale the real publisher")
+                    time.sleep(0.1)
+                self.assertIsNone(parent.poll(), "private daemon must remain alive throughout observation")
+                self.assertGreaterEqual(len(captures), 6, "need sustained fresh rounds, not just the bootstrap heartbeat")
+                self.assertGreaterEqual(len(proxy_samples), 2, "need two actual proxy observations, not rereads stamped fresh")
                 stopped = time.monotonic()
                 parent.send_signal(signal.SIGTERM)
                 stdout, stderr = parent.communicate(timeout=5)
@@ -228,7 +250,7 @@ class NativeDaemonStartupRegression(unittest.TestCase):
                 self.assertEqual(parent.returncode, 0, (stdout[-1000:], stderr[-1000:]))
                 ended = identity()
                 self.assertEqual((ended["state"], ended["code"]), ("unknown", "process_exited"))
-                print(f"private native daemon: first observation={publication_seconds:.3f}s; stop={stop_seconds:.3f}s; original worker exit verified; no registered service or AI launch")
+                print(f"private native daemon: first observation={publication_seconds:.3f}s; captures={len(captures)}; proxy samples={len(proxy_samples)}; max age={max(ages):.3f}s; stop={stop_seconds:.3f}s; original worker exit verified; no registered service or AI launch")
             finally:
                 if parent.poll() is None:
                     parent.terminate()

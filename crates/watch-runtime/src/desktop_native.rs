@@ -718,7 +718,7 @@ impl<R: ReadRunner> NativeDesktop<R> {
         discovery.observed_process_bundles(inventory.processes.values().filter_map(|process|
             process.bundle_path.as_ref().map(PathBuf::from).or_else(||process.identity.executable.split_once(".app/Contents/")
                 .map(|(prefix,_)|PathBuf::from(format!("{prefix}.app")))).map(|path|(path,process.bundle_id.clone()))));
-        discovery.refresh(&self.runner,native::now())
+        discovery.observation_snapshot(&self.runner,native::now())
     }
     pub fn launcher(&self) -> Result<Launcher> {
         let inventory = Observer {

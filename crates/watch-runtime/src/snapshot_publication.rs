@@ -680,6 +680,59 @@ mod tests {
     }
 
     #[test]
+    fn publisher_keeps_real_rounds_fresh_while_discovery_is_busy_without_renewing_cached_proxy() {
+        use std::{os::unix::fs::PermissionsExt, sync::{Arc, mpsc}, thread};
+        let (path, store) = temp();
+        let bundle = fs::canonicalize(&path).unwrap().join("Applications/Private Client.app");
+        fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        let exe = bundle.join("Contents/MacOS/PrivateMain");
+        fs::write(&exe, b"metadata fixture, never executed").unwrap();
+        fs::set_permissions(exe, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(bundle.join("Contents/Info.plist"), r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string><key>CFBundleExecutable</key><string>PrivateMain</string></dict></plist>"#).unwrap();
+        let runner = Arc::new(PipelineFake { incomplete: AtomicBool::new(false), bundle });
+        let mut sampler = Sampler::new(runner.clone(), store.paths.clone());
+        sampler.use_fixture_tag();
+        let discovery = sampler.discovery();
+        discovery.enable_background_observation();
+        // Deterministic stalled scan/approval hash: hold precisely the slow
+        // cache lock, and release even if the publisher violates the deadline.
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let slow = thread::spawn(move || {
+            let _cache = discovery.0.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let (result_tx, result_rx) = mpsc::channel();
+        let publisher_store = store.clone();
+        let publishing = thread::spawn(move || {
+            let mut publisher = SnapshotPublisher::new(publisher_store, sampler, identity()).unwrap();
+            let first = publisher.poll("", "", true).unwrap();
+            thread::sleep(Duration::from_millis(10));
+            let reused = publisher.poll("", "", false).unwrap();
+            thread::sleep(Duration::from_millis(10));
+            let next = publisher.poll("", "", true).unwrap();
+            result_tx.send((first, reused, next)).unwrap();
+        });
+        let result = result_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        slow.join().unwrap();
+        publishing.join().unwrap();
+        let (first, reused, next) = result.expect("discovery must not stall actual publisher rounds");
+        assert!(reused["capturedAt"].as_f64().unwrap() > first["capturedAt"].as_f64().unwrap());
+        assert_eq!(reused["proxy"]["observedAt"], first["proxy"]["observedAt"]);
+        assert_eq!(reused["samplingDiagnostics"]["network_reused"], true);
+        assert!(next["proxy"]["observedAt"].as_f64().unwrap() > first["proxy"]["observedAt"].as_f64().unwrap());
+        assert_ne!(next["samplingDiagnostics"]["network_round_id"], first["samplingDiagnostics"]["network_round_id"]);
+        assert_eq!(next["targetDiscovery"]["complete"], false);
+        assert!(next["targetDiscovery"]["issues"].as_array().is_some_and(|v| !v.is_empty()));
+        assert_ne!(next["grants_launch_permission"], true);
+        assert!(next["samplingDiagnostics"]["process_sampled_at"].as_f64().unwrap() <= next["capturedAt"].as_f64().unwrap());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn publisher_failure_keeps_only_bounded_error_code_in_sampling_diagnostics() {
         let (path, store) = temp(); let producer = identity();
         let owner = crate::daemon::DaemonLease::acquire(store.clone(), producer.clone(), &std::collections::BTreeMap::from([(producer.pid,producer)])).unwrap();

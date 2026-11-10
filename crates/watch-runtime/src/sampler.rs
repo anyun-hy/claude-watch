@@ -252,7 +252,7 @@ impl<R: ReadRunner> Sampler<R> {
         let inventory = observer.inventory()?;
         self.discovery.observed_process_bundles(inventory.processes.values().filter_map(|p|p.bundle_path.as_ref().map(PathBuf::from)
             .or_else(||p.identity.executable.split_once(".app/Contents/").map(|(prefix,_)|PathBuf::from(format!("{prefix}.app")))).map(|path|(path,p.bundle_id.clone()))));
-        let mut discovery_snapshot=self.discovery.refresh(&self.runner,native::now());
+        let mut discovery_snapshot=self.discovery.observation_snapshot(&self.runner,native::now());
         let merge_aliases=|snapshot:&crate::target_discovery::DiscoverySnapshot| {
             let accepted=snapshot.cli_paths();let mut trusted=snapshot.process_paths(true);
             if let Some(aliases)=&self.aliases {
@@ -358,7 +358,7 @@ impl<R: ReadRunner> Sampler<R> {
             self.discovery.observe_interpreters(arguments.values().filter(|args|Path::new(&args.identity.executable).file_name().is_some_and(|n|n=="node" || n=="nodejs" || n=="bun"))
                 .filter_map(|args|process_roots::node_script_entry(&args.tokens,Some(&args.cwd)).map(|script|(script,PathBuf::from(&args.identity.executable)))));
             self.discovery.observe_cli_entries(entries);
-            discovery_snapshot=self.discovery.refresh(&self.runner,native::now());
+            discovery_snapshot=self.discovery.observation_snapshot(&self.runner,native::now());
             trusted=merge_aliases(&discovery_snapshot);
         }
         for pid in need_args {
@@ -463,7 +463,7 @@ impl<R: ReadRunner> Sampler<R> {
             diagnostic_reasons,
             confirmed_exited_count: inventory.confirmed_exited_count,
             complete,
-            observed_at: native::now(),
+            observed_at: inventory.finished_at,
             discovery: Some(json!({"revision":discovery_snapshot.revision,"complete":discovery_snapshot.complete,"issues":discovery_snapshot.issues})),
         })
     }

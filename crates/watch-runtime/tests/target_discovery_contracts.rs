@@ -81,6 +81,153 @@ impl ApplicationRegistry for Registry {
         })
     }
 }
+
+struct NoObservationCommands;
+impl ReadRunner for NoObservationCommands {
+    fn run(&self, _: ReadCommand, _: &[u8], _: Duration, _: usize) -> Result<Output> {
+        panic!("background observation must not run discovery commands");
+    }
+}
+
+#[test]
+fn background_observation_does_not_wait_for_blocked_plist_or_drop_new_process_inputs() {
+    use std::sync::mpsc;
+    let fixture = Fixture::new();
+    let first = fixture.home.join("Applications/First.app");
+    fixture.app(&first, DESKTOP_IDS[0].0, "First");
+    let later = fixture.root.join("outside/Later.app");
+    fixture.app(&later, DESKTOP_IDS[1].0, "Later");
+    let script = fixture.root.join("script");
+    let interpreter = fixture.root.join("runtime");
+    fs::write(&script, "private fixture").unwrap();
+    fs::write(&interpreter, "private fixture").unwrap();
+    let handle = fixture.handle();
+    handle.enable_background_observation();
+    struct BlockFirstRead<'a> {
+        inner: &'a SystemRunner,
+        first: AtomicBool,
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+    impl ReadRunner for BlockFirstRead<'_> {
+        fn run(&self, command: ReadCommand, input: &[u8], timeout: Duration, limit: usize) -> Result<Output> {
+            if matches!(command, ReadCommand::Plist(_)) && !self.first.swap(true, Ordering::SeqCst) {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+            self.inner.run(command, input, timeout, limit)
+        }
+    }
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let reader = BlockFirstRead { inner: &fixture.reader, first: AtomicBool::new(false),
+        entered: entered_tx, release: Mutex::new(release_rx) };
+    std::thread::scope(|scope| {
+        let refresh = scope.spawn(|| handle.refresh(&reader, 100.0));
+        let entered = entered_rx.recv_timeout(Duration::from_secs(3));
+        let (tx, rx) = mpsc::channel();
+        let handle = handle.clone();
+        let later = later.clone();
+        let observe = scope.spawn(move || {
+            handle.observed_process_bundles([(later, Some(DESKTOP_IDS[1].0.into()))]);
+            handle.observe_cli_entries([(LaunchTarget::ClaudeCli, script.clone())]);
+            handle.observe_interpreters([(script, interpreter)]);
+            let snapshot = handle.observation_snapshot(&NoObservationCommands, 101.0);
+            tx.send(snapshot).unwrap();
+        });
+        let observed = rx.recv_timeout(Duration::from_secs(2));
+        // Always release the slow reader before assertions so regression
+        // failures cannot strand a worker or hang the test process.
+        release_tx.send(()).unwrap();
+        refresh.join().unwrap();
+        observe.join().unwrap();
+        assert!(entered.is_ok(), "fixture must hold a real discovery read");
+        let snapshot = observed.expect("observation must finish while the discovery read is still blocked");
+        assert!(!snapshot.complete);
+        assert!(snapshot.targets.is_empty(), "cold pending observation cannot invent discovered targets");
+    });
+    let pending = handle.observation_snapshot(&NoObservationCommands, 102.0);
+    assert!(!pending.complete, "input queued during the scan remains pending until consumed");
+    let refreshed = handle.refresh(&fixture.reader, 103.0);
+    assert!(refreshed.targets.iter().any(|r| r.entry_path == later && r.valid()),
+        "the worker must consume inputs submitted while its earlier scan was blocked");
+    let cache = handle.0.lock().unwrap();
+    assert_eq!(cache.inputs.observed_cli_entries.len(), 1);
+    assert_eq!(cache.inputs.observed_interpreters.len(), 1);
+}
+
+#[test]
+fn background_observation_invalidates_changed_candidate_without_waiting_for_approval_lock() {
+    use std::sync::mpsc;
+    let fixture = Fixture::new();
+    let app = fixture.home.join("Applications/Client.app");
+    let executable = fixture.app(&app, DESKTOP_IDS[0].0, "Client");
+    let handle = fixture.handle();
+    let accepted = handle.refresh(&fixture.reader, 100.0);
+    assert!(accepted.complete);
+    handle.enable_background_observation();
+    fs::write(&executable, b"\xcf\xfa\xed\xfe updated private fixture, never executed").unwrap();
+    let held = handle.0.lock().unwrap();
+    let worker = handle.clone();
+    let (tx, rx) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        tx.send(worker.observation_snapshot(&NoObservationCommands, 101.0)).unwrap();
+    });
+    let pending = rx.recv_timeout(Duration::from_secs(2));
+    drop(held);
+    thread.join().unwrap();
+    let pending = pending.expect("snapshot reads must not wait for discovery/approval lock");
+    assert!(!pending.complete);
+    assert_ne!(pending.revision, accepted.revision);
+    assert!(pending.targets.iter().all(|r| r.executable.as_ref() != Some(&executable) || !r.valid()));
+    assert!(handle.approved_manifest(&pending).is_err(), "pending observations are not an accepted approval revision");
+    let refreshed = handle.refresh(&fixture.reader, 102.0);
+    assert!(refreshed.complete);
+    assert!(refreshed.targets.iter().any(|r| r.executable.as_ref() == Some(&executable) && r.valid()));
+    assert_ne!(refreshed.revision, accepted.revision);
+    assert_eq!(handle.observation_snapshot(&NoObservationCommands, 103.0).revision, refreshed.revision);
+
+    let added_app = fixture.home.join("Applications/New Installation.app");
+    let added_executable = fixture.app(&added_app, DESKTOP_IDS[1].0, "NewClient");
+    let added_pending = handle.observation_snapshot(&NoObservationCommands, 104.0);
+    assert!(!added_pending.complete, "a changed installation directory must invalidate catalog completeness");
+    assert!(added_pending.targets.iter().any(|r| r.executable.as_ref() == Some(&executable) && r.valid()),
+        "an unchanged known installation remains useful observation evidence");
+    assert!(!added_pending.targets.iter().any(|r| r.executable.as_ref() == Some(&added_executable)),
+        "a directory change does not invent a newly verified executable");
+    assert!(handle.approved_manifest(&added_pending).is_err());
+    let with_added = handle.refresh(&fixture.reader, 105.0);
+    assert!(with_added.complete);
+    assert!(with_added.targets.iter().any(|r| r.executable.as_ref() == Some(&added_executable) && r.valid()));
+
+    let store = StateStore::new(Paths { home: fixture.home.clone() });
+    store.atomic_json(&store.paths.watch().join("state/target-discovery-hints.json"),
+        &json!({"caller_path":[],"caller_paths":{},"desktop_sources":{},"overrides":{}})).unwrap();
+    let hints_pending = handle.observation_snapshot(&NoObservationCommands, 106.0);
+    assert!(!hints_pending.complete, "new source hints require the owner to consume them before approval");
+    assert!(handle.approved_manifest(&hints_pending).is_err());
+    let with_hints = handle.refresh(&fixture.reader, 107.0);
+    assert!(with_hints.complete);
+    assert_eq!(handle.observation_snapshot(&NoObservationCommands, 108.0).revision, with_hints.revision);
+}
+
+#[test]
+fn background_observation_mode_and_mailbox_are_shared_by_canonical_home_handles() {
+    let fixture = Fixture::new();
+    let alias = fixture.root.join("home-alias");
+    symlink(&fixture.home, &alias).unwrap();
+    let one = DiscoveryHandle::for_home(&fixture.home);
+    let two = DiscoveryHandle::for_home(&alias);
+    one.enable_background_observation();
+    two.observed_process_bundles([(fixture.home.join("Applications/Unverified.app"), None)]);
+    let pending = two.observation_snapshot(&NoObservationCommands, 100.0);
+    assert!(!pending.complete);
+    assert!(pending.targets.is_empty());
+    one.refresh(&fixture.reader, 101.0);
+    assert_eq!(one.0.lock().unwrap().inputs.observed_bundles.len(), 1);
+    assert_eq!(one.observation_snapshot(&NoObservationCommands, 102.0).revision,
+        two.observation_snapshot(&NoObservationCommands, 102.0).revision);
+}
 struct Fixture {
     root: PathBuf,
     home: PathBuf,

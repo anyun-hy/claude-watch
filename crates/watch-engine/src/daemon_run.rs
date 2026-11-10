@@ -77,7 +77,7 @@ fn refresh_and_stage_production_targets(
     use claude_watch_runtime::target_discovery::DiscoveryHandle;
     let discovery = DiscoveryHandle::for_home(&storage.paths.home);
     let runner = super::runtime::runner()?;
-    let snapshot = discovery.refresh(runner.as_ref(), native::now());
+    let snapshot = discovery.observation_snapshot(runner.as_ref(), native::now());
     stage_discovery_snapshot(storage, resources_dir, registry, event_tx, &discovery, &snapshot)
 }
 
@@ -129,7 +129,7 @@ fn stage_discovery_snapshot(
 fn target_metadata_signature(storage: &StateStore, resources_dir: Option<&std::path::Path>) -> Vec<(PathBuf, Vec<i128>, Option<PathBuf>)> {
     use std::os::unix::fs::MetadataExt;
     let discovery=claude_watch_runtime::target_discovery::DiscoveryHandle::for_home(&storage.paths.home);
-    let revision=super::runtime::runner().map(|runner|discovery.refresh(runner.as_ref(),native::now()).revision.clone()).unwrap_or_default();
+    let revision=super::runtime::runner().map(|runner|discovery.observation_snapshot(runner.as_ref(),native::now()).revision.clone()).unwrap_or_default();
     let mut out=vec![(storage.paths.watch().join("state/target-discovery-revision"),revision.bytes().map(i128::from).collect(),None)];
     if let Some(resources)=resources_dir {
         for name in ["watch-engine","watch-sandbox-launcher","ControlledEntry"] {
@@ -929,6 +929,39 @@ where
         })
         .map_err(|_| CoreError::new("baseline_start_failed", "后台环境采样线程无法启动"))
 }
+// Discovery reads application metadata and may hash executable contents. It
+// must never hold the process/proxy publisher or the risk loop behind its lock.
+// The owner also cancels/joins on early daemon errors, not just normal shutdown.
+struct DiscoveryWorker {
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+impl DiscoveryWorker {
+    fn start<R: claude_watch_runtime::commands::ReadRunner + Send + Sync + 'static>(
+        discovery: claude_watch_runtime::target_discovery::DiscoveryHandle,
+        runner: R,
+        stop: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        discovery.cancel_pending_when(stop.clone());
+        discovery.enable_background_observation();
+        let cancelled = stop.clone();
+        let worker = thread::Builder::new().name("watch-installation-discovery".into()).spawn(move || {
+            while !cancelled.load(Ordering::Acquire) {
+                let started = Instant::now();
+                discovery.refresh(&runner, native::now());
+                sleep_until(started + PROCESS_INTERVAL, &cancelled);
+            }
+        }).map_err(|_| CoreError::new("discovery_worker_failed", "应用发现工作线程无法启动"))?;
+        Ok(Self { stop, worker: Some(worker) })
+    }
+}
+impl Drop for DiscoveryWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+    }
+}
+
 pub fn run(request: &Request, paths: Paths) -> Result<Value> {
     request.require_apply()?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -960,7 +993,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
     runner.publish_listeners(&storage)?;
     owner.publish_initial_inventory(&identities, native::now())?;
     let sampler = Sampler::new(runner.clone(), paths.clone());
-    sampler.discovery().cancel_pending_when(stop.clone());
+    let discovery_worker = DiscoveryWorker::start(sampler.discovery(), runner.clone(), stop.clone())?;
     let mut publisher = SnapshotPublisher::new(
         storage.clone(),
         sampler,
@@ -1126,6 +1159,12 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
         loop {
             if stop.load(Ordering::Acquire) {
                 return Ok(json!({"status":"stopped","rounds":rounds}));
+            }
+            if discovery_worker.worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+                return Err(CoreError::new(
+                    "discovery_worker_failed",
+                    "应用发现线程异常退出，后台停止发布正常心跳",
+                ));
             }
             if evidence.as_ref().is_some_and(|worker| worker.is_finished()) {
                 return Err(CoreError::new(
