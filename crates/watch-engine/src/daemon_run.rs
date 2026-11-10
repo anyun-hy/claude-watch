@@ -14,6 +14,7 @@ use claude_watch_runtime::{
         LocalTunnelEnforcer,
     },
     channel_supervisor::{AsyncAuditRequest, ChannelSupervisor, SupervisionEvent},
+    channel_diagnostics::ChannelDiagnostics,
     config_store::ConfigStore,
     controlled::{Controller, DesktopSystem},
     daemon::{DaemonLease, PROCESS_INTERVAL},
@@ -451,6 +452,7 @@ fn spawn_vpn_observation_worker(
     Ok((handle, wake_handle))
 }
 
+#[cfg(test)]
 pub fn assemble_production_channel_stack<F>(
     storage: StateStore,
     stop: Arc<AtomicBool>,
@@ -469,6 +471,7 @@ where
     )
 }
 
+#[cfg(test)]
 pub fn assemble_production_channel_stack_with_vpn_reader<F>(
     storage: StateStore,
     stop: Arc<AtomicBool>,
@@ -478,6 +481,16 @@ pub fn assemble_production_channel_stack_with_vpn_reader<F>(
 ) -> Result<ProductionChannelStack>
 where
     F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + 'static,
+{
+    let diagnostics = ChannelDiagnostics::new(storage.clone());
+    assemble_channel_stack_with_diagnostics(storage, stop, activate_local_interception, custom_vpn_reader, diagnostics, run_audit)
+}
+
+fn assemble_channel_stack_with_diagnostics<F>(
+    storage: StateStore, stop: Arc<AtomicBool>, activate_local_interception: bool,
+    custom_vpn_reader: Option<Arc<dyn VpnSourceReader>>, diagnostics: ChannelDiagnostics, run_audit: F,
+) -> Result<ProductionChannelStack>
+where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + 'static,
 {
     let resources_dir = locate_runtime_resources_dir(&storage);
     let packaged_backend = resources_dir
@@ -504,6 +517,7 @@ where
     );
     let enforcer = Arc::new(LocalTunnelEnforcer::new(boot_id.clone(), Some(storage.clone())));
     enforcer.set_clock(native::now)?;
+    enforcer.set_diagnostics(diagnostics.clone())?;
     enforcer.set_strict_peer_verification(activate_local_interception);
 
     let sandbox_registry: Option<Arc<SandboxLaunchRegistry>> = None;
@@ -591,13 +605,15 @@ where
     let (audit_req_tx, async_audit_worker) =
         ChannelSupervisor::spawn_async_audit_worker(stop.clone(), event_tx.clone(), run_audit)?;
 
-    let supervisor = ChannelSupervisor::new_with_config(
+    let mut supervisor = ChannelSupervisor::new_with_config(
         storage,
         config,
         config_blocking_reason,
         Some(enforcer.clone()),
         Some(audit_req_tx),
     )?;
+
+    supervisor.set_diagnostics(diagnostics);
 
     let mut stack = ProductionChannelStack {
         stop,
@@ -1008,6 +1024,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
         )))
     };
     let diagnostic_queue = super::diagnostic_queue::DiagnosticQueue::new(storage.clone());
+    let channel_diagnostics = ChannelDiagnostics::new(storage.clone());
     let events = EventStore::new(storage.clone());
     events.append(
         "daemon-start",
@@ -1063,15 +1080,18 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
         let store = storage.clone();
         let stop = stop.clone();
         let guard_alerts = alerts.clone();
+        let guard_channel_diagnostics = channel_diagnostics.clone();
         let audit_paths = paths.clone();
         Some(
             thread::Builder::new()
                 .name("claude-session-guard".into())
                 .spawn(move || -> Result<()> {
-                    let mut channel_stack = assemble_production_channel_stack(
+                    let mut channel_stack = assemble_channel_stack_with_diagnostics(
                         store.clone(),
                         stop.clone(),
                         true,
+                        None,
+                        guard_channel_diagnostics,
                         move |req| {
                             let enforcer = claude_watch_runtime::channel_enforcer::registered_production_enforcer(&audit_paths.watch())
                                 .ok_or_else(|| CoreError::new("controlled_channel_missing", "受控诊断执行器不可用，保持待验证"))?;
@@ -1197,6 +1217,9 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
             let pin = pinned_node(&storage.paths, &config.proxy_group);
             let sample = publisher.poll(&config.proxy_group, &pin, false);
             let mut log_error = diagnostic_queue.health_message();
+            if let Some(note) = channel_diagnostics.health_message() {
+                log_error = Some(log_error.map(|existing| format!("{existing}；{note}")).unwrap_or(note));
+            }
             if let Some(count) = alerts.as_ref().map(|a| a.record_failures()).filter(|n| *n > 0) {
                 let note = format!("本次后台运行的通知事件记录或冷却写入失败 {count} 次。");
                 log_error = Some(log_error.map(|existing| format!("{existing}；{note}")).unwrap_or(note));

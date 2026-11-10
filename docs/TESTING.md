@@ -1,5 +1,8 @@
 # Unified local test suite
 
+For installed-app runtime logs and safe diagnostic exports, see
+[运行问题排查](DIAGNOSTICS.md). Test output and production runtime evidence are separate.
+
 From the logged-in user's macOS Terminal, run:
 
 ```bash

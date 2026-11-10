@@ -707,6 +707,8 @@ fn real_tcp_connection_traces_permit_forwarding_revocation_disconnecting_and_con
     .unwrap();
 
     let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-live-1", Some(store.clone())));
+    let channel_logs = claude_watch_runtime::channel_diagnostics::ChannelDiagnostics::new(store.clone());
+    enforcer.set_diagnostics(channel_logs.clone()).unwrap();
     // Verify Item 2: At construction, interception_active and direct_fallback_blocked
     // are false until actual interception activation succeeds!
     assert!(!enforcer.is_ready().unwrap());
@@ -888,6 +890,24 @@ fn real_tcp_connection_traces_permit_forwarding_revocation_disconnecting_and_con
             RuntimeTracePhase::TerminationConfirmed,
         ]
     );
+    // The same real EOF lifecycle is recoverable from rotating disk history,
+    // without persisting byte-level chatter or the raw target/upstream text.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let persisted = loop {
+        let history = claude_watch_runtime::events::EventStore::new(store.clone()).history().unwrap();
+        let rows: Vec<_> = history.events.into_iter().filter_map(|e| e.fields.channel_diagnostic)
+            .filter(|d| d.flow_id.as_deref() == Some(flow_id.as_str())).collect();
+        if rows.iter().any(|d| d.stage == "termination_confirmed") { break rows; }
+        assert!(std::time::Instant::now() < deadline, "critical flow history missing from disk");
+        thread::sleep(Duration::from_millis(10));
+    };
+    for stage in ["permit_verified", "forwarding_established", "revocation_requested", "termination_confirmed"] {
+        assert!(persisted.iter().any(|d| d.stage == stage), "missing {stage}");
+    }
+    assert!(!persisted.iter().any(|d| d.stage == "bytes_forwarded"));
+    assert!(persisted.iter().all(|d| d.executor_boot_id.as_deref() == Some("boot-live-1")
+        && d.policy_version.is_some() && d.permit_generation.is_some() && d.command_seq.is_some()));
+
 }
 
 #[test]

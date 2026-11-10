@@ -75,3 +75,27 @@ automatic instruction to execute administrator changes.
 Code/isolated transaction tests do not prove actual launchd activation, root to
 user descriptor transfer or real AI protection. Those remain installation and
 real-host acceptance steps requiring separate authorization.
+
+## Bounded production diagnostics
+
+The administrator install prepares `/Library/Logs/ClaudeWatchGateway` as a
+root-owned 0755 directory. The broker writes 0644 JSON-lines files
+`events.jsonl`, `events.jsonl.1`, and `events.jsonl.2`, each limited to 1 MiB.
+The stable `.write.lock` is private and is not exported. Unknown files, writable
+paths, symlinks or hardlinked log files cause logging to refuse that destination;
+they are never overwritten. Log failure emits a fixed warning and does not
+change an installation result or authorize/deny a connection.
+
+Records contain only schema, timestamp, component/version, PID, operation,
+result, stable reason, validated transaction ID and optional numeric OS error.
+Raw requests, credentials, full command arguments, destinations and peer
+identity records are excluded. Listener events use a bounded nonblocking queue
+of 64 records so slow disk I/O cannot delay handoff decisions. Queue overflow
+may lose diagnostics and emits `gateway_logging_unavailable`; diagnostics are
+not enforcement receipts. Management/startup/failure records use bounded
+synchronous writes, and an unavailable logger never replaces the actual error.
+
+The launchd plist shape is unchanged, so existing known installations remain
+recognizable during upgrades. Logs live outside the installation transaction
+and survive service replacement, rollback and explicit removal. No logs are
+created by `--prepare` or unprivileged `--service-preview`.

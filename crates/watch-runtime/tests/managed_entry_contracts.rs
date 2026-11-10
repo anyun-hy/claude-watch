@@ -501,6 +501,7 @@ extension ControlledEntryDelegate {
     fs::write(&source_path, source).unwrap();
     let compile = Command::new("xcrun").args(["swiftc", "-swift-version", "5", "-parse-as-library",
         "-module-cache-path", cache.to_str().unwrap(), source_path.to_str().unwrap(),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../monitor/Sources/BoundedDiagnosticLog.swift"),
         "-framework", "AppKit", "-framework", "Foundation", "-o", binary.to_str().unwrap()])
         .output().expect("compile actual entry batch state");
     assert!(compile.status.success(), "{}", String::from_utf8_lossy(&compile.stderr));
@@ -557,6 +558,7 @@ fn run_controlled_entry_appkit_fixture(require_file_completion: bool) {
             "-O",
             "-parse-as-library",
             &swift_src.to_string_lossy(),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../monitor/Sources/BoundedDiagnosticLog.swift"),
             "-o",
             &controlled_entry_bin.to_string_lossy(),
             "-framework",
@@ -877,7 +879,7 @@ app.run()
             "successful document open must present its window: {target_received}");
         assert!(file_out.status.success(), "standard file reply unconfirmed: status={:?}, wrapper_log={file_events}, target_state={target_received}", file_out.status.code());
         let events: Vec<serde_json::Value> = file_events.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-        let forwarded_files: Vec<_> = events.iter().filter(|event| event["event"] == "forward_open_items" && event["files"].as_array().is_some_and(|files| !files.is_empty())).collect();
+        let forwarded_files: Vec<_> = events.iter().filter(|event| event["event"] == "forward_open_items" && event["file_count"].as_u64().is_some_and(|count| count > 0)).collect();
         assert_eq!(forwarded_files.len(), 1);
         assert_eq!(forwarded_files[0]["apple_event_reply_confirmed"], true);
         assert_eq!(forwarded_files[0]["status"], "ok");
@@ -888,7 +890,7 @@ app.run()
         let events: Vec<serde_json::Value> = file_events.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
         assert_eq!(events.iter().filter(|event| event["error"] == "apple_event_reply_timeout" && event["outcome"] == "unconfirmed").count(), 1,
             "one missing reply must produce one unconfirmed timeout: {file_events}");
-        let forwarded_files: Vec<_> = events.iter().filter(|event| event["event"] == "forward_open_items" && event["files"].as_array().is_some_and(|files| !files.is_empty())).collect();
+        let forwarded_files: Vec<_> = events.iter().filter(|event| event["event"] == "forward_open_items" && event["file_count"].as_u64().is_some_and(|count| count > 0)).collect();
         assert_eq!(forwarded_files.len(), 1, "file delivery must not retry: {file_events}");
         assert_eq!(forwarded_files[0]["apple_event_reply_confirmed"], false);
         assert_ne!(forwarded_files[0]["status"], "ok");

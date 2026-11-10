@@ -262,7 +262,7 @@ pub fn verify_extract(archive: &Path, destination: &Path, release: &Release) -> 
             ));
         }
     }
-    for component in ["watch-sandbox-launcher", "watch-gateway-broker"] {
+    for component in ["watch-sandbox-launcher", "watch-gateway-broker", "BuildIdentity.json"] {
         let runtime = format!("runtime/{component}");
         let bundled = format!("app/Claude Watch Monitor.app/Contents/Resources/{component}");
         if (release.files.contains_key(&runtime) || release.files.contains_key(&bundled))

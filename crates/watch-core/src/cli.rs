@@ -109,7 +109,7 @@ impl Request {
                 ],
                 &[],
             ),
-            "logs" => (&[], &[], &["export"]),
+            "logs" | "diagnostic-export" => (&[], &[], &["export"]),
             "event-history" => (&[], &[], &[]),
             "event-diagnostic" => (&[], &["apply"], &[]),
             "guard-diagnostic" => (&[], &["apply"], &[]),
@@ -351,7 +351,7 @@ impl Request {
             "setup" => &["mode", "candidate-id", "plan-id"],
             "environment" => &["mode"],
             "repair" | "fix" | "set-region" => &["plan-id", "allow-country"],
-            "logs" => &["export"],
+            "logs" | "diagnostic-export" => &["export"],
             _ => &[],
         };
         for key in optional {

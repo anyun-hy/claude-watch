@@ -42,6 +42,27 @@ fn fields(v: &Value, keys: &[&str]) {
 }
 
 #[test]
+fn diagnostic_export_reads_offline_without_overwrite_or_runtime_mutation() {
+    let home = Home::new();
+    let destination = fs::canonicalize(&home.0).unwrap().join("diagnostics.json");
+    let out = home.run(&["diagnostic-export", "--export", destination.to_str().unwrap()]);
+    assert_eq!(out["status"], "ok");
+    assert_eq!(out["grants_launch_permission"], false);
+    let original = fs::read(&destination).unwrap();
+    let value: Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(value["kind"], "claude_watch_diagnostics");
+    assert!(value["sources"].as_array().unwrap().iter().any(|source| source["status"] == "missing"));
+    assert!(!home.0.join("Library/Application Support/ClaudeWatch").exists());
+    let repeated = Command::new(env!("CARGO_BIN_EXE_claude-watch-engine"))
+        .args(["diagnostic-export", "--export", destination.to_str().unwrap(), "--home", home.0.to_str().unwrap()])
+        .output().unwrap();
+    assert!(!repeated.status.success());
+    assert_eq!(fs::read(&destination).unwrap(), original);
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(fs::metadata(&destination).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
 fn read_commands_emit_gui_json_shapes_without_apply() {
     let home = Home::new();
     let status = home.run(&["status"]);

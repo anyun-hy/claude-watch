@@ -363,7 +363,18 @@ fn claim_owner(peer: &ProcessKernelIdentity) -> io::Result<()> {
 
 /// Entry used only by the installed root launchd service. It does not bind TCP
 /// or unlink/create a control socket; both descriptors must come from launchd.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatewayBrokerEvent {
+    pub operation: &'static str,
+    pub result: &'static str,
+    pub reason: &'static str,
+}
+
 pub fn run_gateway_broker() -> io::Result<()> {
+    run_gateway_broker_with_events(&|_| {})
+}
+
+pub fn run_gateway_broker_with_events(events: &dyn Fn(GatewayBrokerEvent)) -> io::Result<()> {
     #[cfg(not(target_os = "macos"))]
     return Err(io::Error::new(io::ErrorKind::Unsupported, "launchd gateway requires macOS"));
     #[cfg(target_os = "macos")]
@@ -385,21 +396,30 @@ pub fn run_gateway_broker() -> io::Result<()> {
             return Err(denied("invalid launchd control listener"));
         }
         verify_protected_path(Path::new(CONTROL_PATH), true)?;
+        events(GatewayBrokerEvent { operation: "listener_activation", result: "verified", reason: "protected_listeners_verified" });
         for connection in control.incoming() {
             let mut stream = connection?;
+            let mut failure_reason = "peer_identity_rejected";
             let result = (|| {
                 stream.set_read_timeout(Some(Duration::from_secs(3)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(3)))?;
                 let peer = platform::verify_peer(&stream, config.engine_uid, &config.engine_executable, &config.engine_sha256, &config.engine_cdhash)?;
+                failure_reason = "handoff_protocol_rejected";
                 let mut request = [0; 8]; stream.read_exact(&mut request)?;
                 if request != *WIRE_MAGIC { return Err(invalid("unsupported gateway handoff protocol")); }
+                failure_reason = "peer_identity_changed";
                 let after = platform::verify_peer(&stream, config.engine_uid, &config.engine_executable, &config.engine_sha256, &config.engine_cdhash)?;
                 if after != peer { return Err(denied("engine identity changed during handoff")); }
+                failure_reason = "listener_owner_unconfirmed";
                 claim_owner(&peer)?;
+                failure_reason = "descriptor_transfer_failed";
                 send_listeners(&stream, &[&listener, &ipv6])
             })();
             // Never log credentials, request bytes, or raw process metadata.
-            if let Err(error) = result { eprintln!("gateway_handoff_denied: {}", error.kind()); }
+            events(match result {
+                Ok(()) => GatewayBrokerEvent { operation: "listener_handoff", result: "completed", reason: "descriptors_transferred" },
+                Err(_) => GatewayBrokerEvent { operation: "listener_handoff", result: "rejected", reason: failure_reason },
+            });
         }
         Ok(())
     }

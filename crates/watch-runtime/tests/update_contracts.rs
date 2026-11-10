@@ -120,7 +120,7 @@ impl UpdateOs for Os {
 
 #[test]
 fn native_archives_require_matching_components_and_reject_old_business_resources() {
-    for case in ["native", "legacy", "missing", "mismatch"] {
+    for case in ["native", "legacy", "missing", "mismatch", "build_identity", "build_identity_missing", "build_identity_mismatch"] {
         let root = temp();
         let archive = root.join("release.zip");
         let mut contents = BTreeMap::<String, Vec<u8>>::new();
@@ -152,6 +152,12 @@ fn native_archives_require_matching_components_and_reject_old_business_resources
         if case == "mismatch" {
             contents.insert("runtime/watch-engine".into(), b"different".to_vec());
         }
+        if case.starts_with("build_identity") {
+            contents.insert("app/Claude Watch Monitor.app/Contents/Resources/BuildIdentity.json".into(), b"identity".to_vec());
+            if case != "build_identity_missing" {
+                contents.insert("runtime/BuildIdentity.json".into(), if case == "build_identity_mismatch" { b"other".to_vec() } else { b"identity".to_vec() });
+            }
+        }
         let mut writer = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
         for (name, bytes) in &contents {
             writer
@@ -171,7 +177,7 @@ fn native_archives_require_matching_components_and_reject_old_business_resources
                 .collect(),
         };
         let result = verify_extract(&archive, &root.join("out"), &release);
-        if case == "native" {
+        if case == "native" || case == "build_identity" {
             result.unwrap();
         } else {
             assert_eq!(

@@ -32,3 +32,13 @@ enum EventHistoryRunner {
         }
     }
 }
+
+enum DiagnosticExportRunner {
+    static func write(to path: String) -> Bool {
+        do {
+            let data = try SwitcherCommandRunner.run(["diagnostic-export", "--export", path])
+            let response = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            return response?["status"] as? String == "ok"
+        } catch { return false }
+    }
+}

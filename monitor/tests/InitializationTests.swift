@@ -584,6 +584,10 @@ struct InitializationTests {
         full.refreshReadiness(at: Date().addingTimeInterval(31))
         full.refreshReadiness(at: Date().addingTimeInterval(32))
         for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
+        if full.running || !full.allPassed || fullLeaks.dns.result!.finishedAt <= skippedDNS || fullLeaks.rtc.result!.finishedAt != skippedRTC {
+            let states = full.rows.map { $0.step.rawValue + ":" + $0.status.rawValue + ":" + $0.code }
+            print("DNS-only refresh evidence: running=\(full.running) rows=\(states) dnsDelta=\(fullLeaks.dns.result!.finishedAt - skippedDNS) rtcDelta=\(fullLeaks.rtc.result!.finishedAt - skippedRTC)")
+        }
         expect(!full.running && full.allPassed && fullLeaks.dns.result!.finishedAt > skippedDNS && fullLeaks.rtc.result!.finishedAt == skippedRTC,
                "an invalidated DNS receipt re-runs DNS only; the current WebRTC receipt is not re-collected")
         let readback = fullSwitcher.currentEnvironment?.initialization_receipts

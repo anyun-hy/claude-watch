@@ -439,6 +439,21 @@ final class FirstRunChecks: InitializationChecking {
         snapshotIsCurrent(at: Date().timeIntervalSince1970)
     }
     var connectionDiagnosticReport: String { connectionLog.report }
+    func diagnosticReason(for step: InitializationStep) -> String? {
+        guard step == .protection || step == .verification else { return nil }
+        guard protectionSettingsEnabled else { return "protection_settings_disabled" }
+        guard store.switcher.backgroundError.isEmpty else { return "background_read_failed" }
+        guard let value = store.switcher.background else { return "background_missing" }
+        let now = Date().timeIntervalSince1970
+        guard value.observed_at.isFinite, (0..<30).contains(now - value.observed_at) else { return "background_stale" }
+        guard let service = value.services.first(where: { $0.id == "guard" }) else { return "guard_receipt_missing" }
+        if !service.healthy || service.desired != true { return service.reason_code ?? "guard_receipt_unverified" }
+        guard value.guard_backend_healthy == true else { return value.backend_diagnostics?.reason ?? "backend_unverified" }
+        guard let watchdog = value.services.first(where: { $0.id == "watchdog" }), watchdog.healthy, watchdog.desired == true else {
+            return "watchdog_unverified"
+        }
+        return "protection_evidence_unverified"
+    }
     private func traceConnection(event: String, phase: String, code: String, deadline: Double? = nil,
                                  candidate: String? = nil, sampled: Double? = nil) {
         let now = connectionNow(), background = store.switcher.background, snapshot = store.snapshot

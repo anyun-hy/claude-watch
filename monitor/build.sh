@@ -107,8 +107,13 @@ if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   printf 'APP_VERSION must be semantic version (for example 2.2.0): %s\n' "$APP_VERSION" >&2
   exit 1
 fi
-# The UI policy rows are generated from Rust. A stale checked-in table
-# must fail before we compile or sign an app with mismatched action defaults.
+# Capture source before compilation; never label mixed/changed inputs as one build.
+mkdir -p "$ROOT/build"
+CW_SOURCE_RECEIPT=$(mktemp "$ROOT/build/source-identity.XXXXXX")
+trap 'rm -f "$CW_SOURCE_RECEIPT"' EXIT
+python3 "$REPOSITORY_ROOT/tools/write-build-identity.py" capture --root "$REPOSITORY_ROOT" --snapshot "$CW_SOURCE_RECEIPT" --version "$APP_VERSION" --build "$BUILD_NUMBER"
+# The UI policy rows are generated from Rust. A stale checked-in table must fail
+# before we compile or sign an app with mismatched action defaults.
 python3 "$REPOSITORY_ROOT/tools/generate-ai-policy-swift.py" --check
 # The engine's own manifest carries the version and digest of each component.
 RUST_COMPONENTS_DIR="$ROOT/build/rust-components"
@@ -160,7 +165,7 @@ for CW_TARGET_ARCH in $CW_TARGETS; do
   # Build the ControlledEntry desktop wrapper binary
   "$SWIFTC" -swift-version 5 -O -parse-as-library \
     -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
-    -framework AppKit -framework Foundation "$ROOT/ControlledEntry/ControlledEntryApp.swift" \
+    -framework AppKit -framework Foundation "$ROOT/Sources/BoundedDiagnosticLog.swift" "$ROOT/ControlledEntry/ControlledEntryApp.swift" \
     -o "$ROOT/build/ControlledEntry.$CW_TARGET_ARCH"
 
   if [[ "$CW_NETWORK_BACKEND" == network-extension ]]; then
@@ -290,6 +295,7 @@ cat > "$APP/Contents/Resources/BuildInfo.plist" <<PLIST
 <key>BackgroundEvidenceSchema</key><integer>$BACKGROUND_EVIDENCE_SCHEMA</integer>
 </dict></plist>
 PLIST
+python3 "$REPOSITORY_ROOT/tools/write-build-identity.py" verify --root "$REPOSITORY_ROOT" --snapshot "$CW_SOURCE_RECEIPT" --version "$APP_VERSION" --build "$BUILD_NUMBER" --resources "$APP/Contents/Resources"
 python3 - "$APP/Contents/Resources" <<'PY'
 from pathlib import Path
 import hashlib, plistlib, sys
@@ -298,7 +304,7 @@ manifest = root / "BuildInfo.plist"
 value = plistlib.loads(manifest.read_bytes())
 forbidden = [p for p in root.rglob("*") if p.suffix == ".py" or p.name in ("claude-watch.sh", "snapshot.sh", "switcher.py")]
 if forbidden: raise SystemExit("The bundle still contains retired Python backend resources")
-files = [root / n for n in ("watch-engine", "watch-native-observer", "watch-admin.sh", "watch-process-control", "watch-sandbox-launcher", "watch-gateway-broker", "ControlledEntry", "watch-native-collector.zsh", "watch-leak-worker", "netcoffee_probe.html", "netcoffee_probe.js", "netcoffee_probe.css", "ipleak_probe.html", "ipleak_probe.js")]
+files = [root / n for n in ("watch-engine", "watch-native-observer", "watch-admin.sh", "watch-process-control", "watch-sandbox-launcher", "watch-gateway-broker", "ControlledEntry", "watch-native-collector.zsh", "watch-leak-worker", "netcoffee_probe.html", "netcoffee_probe.js", "netcoffee_probe.css", "ipleak_probe.html", "ipleak_probe.js", "BuildIdentity.json")]
 value["RuntimeHashes"] = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
 manifest.write_bytes(plistlib.dumps(value))
 PY

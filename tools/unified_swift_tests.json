@@ -587,6 +587,18 @@
       "safety_notes": "Pure branding, country and JSON parsing fixtures."
     },
     {
+      "id": "swift.InitializationFlowLogTests",
+      "kind": "swift",
+      "test_files": ["monitor/tests/InitializationFlowLogTests.swift"],
+      "sources": ["monitor/Sources/*.swift"],
+      "defines": ["UI_REVIEW"],
+      "args": [],
+      "frameworks": ["SwiftUI", "AppKit", "WebKit"],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Owned temporary private log directories, synthetic initialization outcomes and production entry-log factory; no real UI launch, AI, service, VPN or installed log writes."
+    },
+    {
       "id": "swift.InitializationConnectionLogTests",
       "kind": "swift",
       "test_files": [

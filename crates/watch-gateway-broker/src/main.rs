@@ -1,4 +1,5 @@
 mod service;
+mod logging;
 use claude_watch_system::launchd_gateway::{GatewayInstallConfig, INSTALL_DIR, BROKER_PATH, CONTROL_PATH, SERVICE_LABEL};
 use std::{fs, io, path::Path, process::Command};
 
@@ -61,12 +62,26 @@ fn prepare(args: &[String]) -> io::Result<()> {
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let operation = logging::operation(&args);
+    let transaction = logging::transaction_argument(&args);
+    if args.is_empty() {
+        std::panic::set_hook(Box::new(|_| logging::record("broker_run", "failed", "panic", None, None)));
+        logging::record("broker_run", "started", "process_started", None, None);
+    }
     let result = if args.first().map(String::as_str) == Some("--prepare") { prepare(&args[1..]) }
         else if args.first().is_some_and(|v| v.starts_with("--service-")) { service::dispatch(&args) }
-        else if args.is_empty() { claude_watch_system::launchd_gateway::run_gateway_broker() }
+        else if args.is_empty() { claude_watch_system::launchd_gateway::run_gateway_broker_with_events(&|event| logging::record_async(event.operation, event.result, event.reason)) }
         else { Err(io::Error::other("unsupported broker command")) };
     match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(error) => { eprintln!("gateway_broker_unavailable: {error}"); std::process::ExitCode::from(78) }
+        Ok(()) => {
+            if let Some(operation) = operation {
+                let (result, reason) = if operation == "service_install" { ("prepared", "awaiting_endpoint_verification") } else { ("completed", "operation_completed") };
+                logging::record(operation, result, reason, transaction, None);
+            }
+            std::process::ExitCode::SUCCESS
+        },
+        Err(error) => {
+            if let Some(operation) = operation { logging::record(operation, "failed", logging::error_reason(&error), transaction, error.raw_os_error()); }
+            eprintln!("gateway_broker_unavailable: {error}"); std::process::ExitCode::from(78) }
     }
 }

@@ -49,6 +49,7 @@ fn compile(source: &Path, binary: &Path, root: &Path) {
         ])
         .arg(root.join("swift-cache"))
         .arg(source)
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../monitor/Sources/BoundedDiagnosticLog.swift"))
         .arg("-o")
         .arg(binary)
         .output()

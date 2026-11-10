@@ -64,6 +64,7 @@ protocol InitializationChecking: AnyObject {
     func refreshWaitingEvidence() async -> InitializationRefreshOutcome
     func currentEvidenceFailures() -> [InitializationStep: InitializationResult]
     var connectionDiagnosticReport: String { get }
+    func diagnosticReason(for step: InitializationStep) -> String?
     func finish()
 }
 extension InitializationChecking {
@@ -75,6 +76,7 @@ extension InitializationChecking {
         .failed(step: .verification, code: "refresh_unavailable", detail: "自动刷新不可用，请重新检查。")
     }
     var connectionDiagnosticReport: String { "" }
+    func diagnosticReason(for step: InitializationStep) -> String? { nil }
 }
 
 /// This marker remembers onboarding only. It contains no address, account,
@@ -142,6 +144,7 @@ final class FirstRunInitialization: ObservableObject {
     @Published private(set) var validUntil: Double?
     private let checks: InitializationChecking
     private let saveCompletion: () throws -> Void
+    private let diagnosticLog: BoundedDiagnosticLog?
     private var started = false
     private var approvalOperation: UUID?
     private var automaticRefreshEligible = false
@@ -149,8 +152,24 @@ final class FirstRunInitialization: ObservableObject {
     private var nextAccessibilityPoll: Date?
     private var accessibilityGeneration = 0
 
-    init(checks: InitializationChecking, completed: Bool, saveCompletion: @escaping () throws -> Void) {
+    init(checks: InitializationChecking, completed: Bool, diagnosticLog: BoundedDiagnosticLog? = nil,
+         saveCompletion: @escaping () throws -> Void) {
         self.checks = checks; self.entered = completed; self.saveCompletion = saveCompletion
+        self.diagnosticLog = diagnosticLog
+    }
+    private func log(_ event: String, index: Int? = nil, code: String? = nil) {
+        guard let diagnosticLog else { return }
+        var record: [String: Any] = ["event": event, "source": "FirstRunInitialization",
+                                    "attempt_id": diagnosticLog.runID, "passed_count": passedCount]
+        if let index {
+            let row = rows[index]
+            record["step"] = row.step.rawValue; record["status"] = row.status.rawValue
+            record["reason_code"] = BoundedDiagnosticLog.code(code ?? row.code)
+            if row.status == .failed, row.code == "protection_not_ready", let cause = checks.diagnosticReason(for: row.step) {
+                record["cause_code"] = BoundedDiagnosticLog.code(cause)
+            }
+        } else if let code { record["reason_code"] = BoundedDiagnosticLog.code(code) }
+        diagnosticLog.append(record)
     }
     var passedCount: Int { rows.filter { $0.status == .passed }.count }
     var allPassed: Bool { rows.allSatisfy { $0.status == .passed } }
@@ -160,11 +179,14 @@ final class FirstRunInitialization: ObservableObject {
     func start() async {
         guard !started, !entered else { return }
         started = true
+        diagnosticLog?.begin(); log("attempt_started", code: "initial")
         checks.begin()
         await run(from: 0)
     }
     func retry() async {
         guard !running, !entered else { return }
+        diagnosticLog?.begin(); log("attempt_started", code: "retry")
+        for index in rows.indices where rows[index].status == .passed { log("evidence_retained", index: index) }
         // A failed round resumes at the earliest step without current evidence
         // instead of discarding every green. Kept greens stay trustworthy
         // because currentEvidenceFailures revokes any whose context, snapshot,
@@ -181,6 +203,7 @@ final class FirstRunInitialization: ObservableObject {
         // on every rerun instead of trusting a green from an earlier round.
         if rows[0].status == .passed {
             rows[0].status = .running; rows[0].detail = "正在读取实际状态…"
+            log("step_started", index: 0, code: "component_recheck")
             let result = await checks.check(.components)
             guard !Task.isCancelled else {
                 accept(.failed(code: "cancelled", detail: "本轮检查已取消，请重新检查。"), at: 0)
@@ -195,10 +218,11 @@ final class FirstRunInitialization: ObservableObject {
     private func run(from index: Int) async {
         guard !running else { return }
         running = true
-        defer { running = false }
+        defer { running = false; log("attempt_paused", code: allPassed ? "checks_passed" : "checks_incomplete") }
         for offset in index..<rows.count {
             rows[offset].status = .running
             rows[offset].detail = "正在读取实际状态…"
+            log("step_started", index: offset, code: "checking")
             let result = await checks.check(rows[offset].step)
             guard !Task.isCancelled else {
                 accept(.failed(code: "cancelled", detail: "本轮检查已取消，请重新检查。"), at: offset)
@@ -213,6 +237,7 @@ final class FirstRunInitialization: ObservableObject {
         switch result {
         case .passed(let detail, let expiry):
             rows[index].status = .passed; rows[index].detail = detail; rows[index].code = "passed"
+            log("step_result", index: index)
             if let expiry { validUntil = expiry }
             approval = nil
             let current = reconcilePassedEvidence()
@@ -230,6 +255,7 @@ final class FirstRunInitialization: ObservableObject {
             approval = nil
         }
         validUntil = nil
+        log("step_result", index: index)
         _ = reconcilePassedEvidence()
         return false
     }
@@ -244,6 +270,7 @@ final class FirstRunInitialization: ObservableObject {
             guard case .failed(let code, let detail)? = failures[rows[index].step] else { continue }
             rows[index].status = .failed; rows[index].code = code; rows[index].detail = detail
             rows[index].checkedAt = Date().timeIntervalSince1970
+            log("evidence_invalidated", index: index)
             invalidated = true
             invalidSteps.insert(rows[index].step)
         }
@@ -259,6 +286,7 @@ final class FirstRunInitialization: ObservableObject {
                     (rows[index].status == .passed || rows[index].status == .authorization) {
                 rows[index].status = .pending; rows[index].code = "dependency_invalidated"
                 rows[index].detail = "依赖的检查状态已变化，请重新检查。"
+                log("evidence_invalidated", index: index)
             }
             if approval != nil { approval = nil }
         }
@@ -272,11 +300,13 @@ final class FirstRunInitialization: ObservableObject {
         rows[index].detail = request.action == .accessibility
             ? "正在请求辅助功能授权，请在系统设置中确认…" : SetupProgressPhase.verifyEgress.detail
         let operation = UUID(); approvalOperation = operation
+        log("authorization_started", index: index, code: "authorization_started")
         let result = await checks.approve(request, progress: { [weak self] phase in
             guard let self, self.approvalOperation == operation, self.running,
                   self.rows[index].status == .running else { return }
             self.rows[index].detail = phase.detail
             self.rows[index].code = "progress_" + phase.rawValue
+            self.log("authorization_progress", index: index)
         })
         approvalOperation = nil
         if request.action == .accessibility, case .approval(let pending) = result, pending.action == .accessibility {
@@ -291,6 +321,7 @@ final class FirstRunInitialization: ObservableObject {
               let index = rows.firstIndex(where: { $0.step == .accessibility }) else { return }
         running = true
         let generation = accessibilityGeneration
+        log("step_started", index: index, code: "authorization_recheck")
         let result = await checks.check(.accessibility)
         guard generation == accessibilityGeneration, !entered, approval?.action == .accessibility else {
             running = false
@@ -355,11 +386,22 @@ final class FirstRunInitialization: ObservableObject {
             guard let index = rows.firstIndex(where: { $0.step == step }) else { continue }
             rows[index].status = .running; rows[index].code = "automatic_refresh"
             rows[index].detail = "正在自动刷新并核对本轮结果…"
+            log("step_started", index: index, code: "automatic_refresh")
         }
         Task { @MainActor [weak self] in
             guard let self else { return }
             let outcome = await self.checks.refreshWaitingEvidence()
             guard !self.entered else { self.running = false; return }
+            let prior = self.rows.map { ($0.status, $0.code) }
+            defer {
+                // Automatic refresh updates several rows at once. Preserve
+                // every changed result, including dependencies invalidated by
+                // a failed refresh, without logging on every timer tick.
+                for index in self.rows.indices where
+                    (self.rows[index].status != prior[index].0 || self.rows[index].code != prior[index].1) {
+                    self.log("refresh_result", index: index)
+                }
+            }
             switch outcome {
             case .passed(let expiry):
                 if self.rows[1].status == .failed && ["context_unavailable", "snapshot_unavailable"].contains(self.rows[1].code) {
@@ -423,6 +465,7 @@ final class FirstRunInitialization: ObservableObject {
             try saveCompletion()
             checks.finish()
             entered = true
+            log("initialization_completed", code: "completion_saved")
         } catch {
             accept(.failed(code: "completion_write_failed", detail: "初始化记录未能保存，请检查 Watch 数据目录权限后重试。"), at: index)
         }
@@ -438,6 +481,6 @@ final class FirstRunInitialization: ObservableObject {
         }
         let summary = (["Claude Watch 首次初始化检查", "包含步骤、状态、采样时间、PID 与核对结果；不含 IP、节点、账号或凭据。"] + values).joined(separator: "\n")
         let connection = checks.connectionDiagnosticReport
-        return connection.isEmpty ? summary : summary + "\n\n" + connection
+        return [summary, diagnosticLog?.report ?? "", connection].filter { !$0.isEmpty }.joined(separator: "\n\n")
     }
 }

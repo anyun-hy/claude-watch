@@ -124,6 +124,8 @@ pub struct EventFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_diagnostics: Option<SamplingDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_diagnostic: Option<crate::channel_diagnostics::ChannelDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub egress_sampled_at: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_sampled_at: Option<f64>,
@@ -172,6 +174,7 @@ impl EventFields {
         if self.sampling_diagnostics.as_ref().is_some_and(|v| !v.valid()) { return Err(invalid("采样诊断无效")); }
         if self.reason_counts.as_ref().is_some_and(|m| m.len() > 12 || m.keys().any(|k| !matches!(k.as_str(), "process_exited" | "identity_changed" | "identity_unavailable" | "missing_target_sample" | "fd_inventory_unavailable" | "socket_deadline" | "socket_info_unavailable" | "fd_closed_during_sample" | "fd_list_truncated" | "foreign_socket_pid" | "socket_sample_partial" | "other"))) { return Err(invalid("采样原因无效")); }
         if let Some(value) = &self.guard_diagnostics { value.validate()?; }
+        if let Some(value) = &self.channel_diagnostic { value.validate()?; }
         Ok(())
     }
 }
@@ -181,6 +184,8 @@ pub struct Event {
     pub id: String,
     pub time: f64,
     pub category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_identity: Option<crate::build_identity::BuildIdentity>,
     #[serde(flatten)]
     pub fields: EventFields,
 }
@@ -298,6 +303,8 @@ impl EventStore {
     pub fn append(&self, category: &str, fields: EventFields, at: f64) -> Result<Event> {
         let stream = if category == "traffic-counter" {
             "traffic"
+        } else if category == "channel-diagnostic" {
+            "diagnostics"
         } else {
             "events"
         };
@@ -499,6 +506,7 @@ impl EventStore {
             id: uuid::Uuid::new_v4().simple().to_string(),
             time: at,
             category: category.into(),
+            build_identity: crate::build_identity::current(),
             fields,
         };
         let mut raw = serde_json::to_vec(&event).map_err(|_| invalid("事件无法序列化"))?;
@@ -523,6 +531,7 @@ impl EventStore {
                 v.time.is_finite()
                     && v.time >= 0.0
                     && valid_label(&v.category, 80)
+                    && v.build_identity.as_ref().is_none_or(|identity| identity.valid())
                     && v.fields.validate().is_ok()
             })
             .collect()
@@ -550,6 +559,7 @@ impl EventStore {
                             if event.time.is_finite()
                                 && event.time >= 0.0
                                 && valid_label(&event.category, 80)
+                                && event.build_identity.as_ref().is_none_or(|identity| identity.valid())
                                 && event.fields.validate().is_ok() =>
                         {
                             if event.id.is_empty() {

@@ -156,6 +156,13 @@ fn local_command(request: &claude_watch_core::cli::Request, paths: Paths) -> Res
                 .status()?
                 .value(),
         )),
+        ("diagnostic-export", _) => {
+            let path = request.value("export").ok_or_else(|| CoreError::new("export_path_required", "请选择新的诊断导出文件"))?;
+            let data = claude_watch_runtime::diagnostic_bundle::collect(&storage);
+            let encoded = serde_json::to_vec(&data).map_err(|_| CoreError::new("export_failed", "诊断无法编码"))?;
+            export_new(Path::new(path), &encoded)?;
+            Ok(Some(json!({"status":"ok","message":"诊断包已导出；缺失和截断证据已单独标明","grants_launch_permission":false})))
+        }
         ("logs", _) => {
             let events = EventStore::new(storage);
             let data = events.export(100)?;

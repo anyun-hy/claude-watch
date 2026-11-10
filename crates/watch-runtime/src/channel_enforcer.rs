@@ -227,6 +227,7 @@ struct EnforcerInner {
     on_dial_hook: Option<OnDialHook>,
     clock: Option<ClockFn>,
     receipt_sink: Option<ReceiptEventSink>,
+    diagnostics: Option<crate::channel_diagnostics::ChannelDiagnostics>,
     socket_attributor: Option<SocketAttributor>,
     context_socket_attributor: Option<ContextSocketAttributor>,
     verified_peer_sockets: BTreeMap<SocketAddr, (String, BoundProcessToken)>,
@@ -252,6 +253,11 @@ pub struct LocalTunnelEnforcer {
 }
 
 impl LocalTunnelEnforcer {
+    pub fn set_diagnostics(&self, diagnostics: crate::channel_diagnostics::ChannelDiagnostics) -> Result<()> {
+        self.lock()?.diagnostics = Some(diagnostics);
+        Ok(())
+    }
+
     /// Creates an enforcer instance.
     ///
     /// Critical invariant (Requirement 2): `local_proxy_ready`,
@@ -280,6 +286,7 @@ impl LocalTunnelEnforcer {
                 on_dial_hook: None,
                 clock: None,
                 receipt_sink: None,
+                diagnostics: None,
                 socket_attributor: None,
                 context_socket_attributor: None,
                 verified_peer_sockets: BTreeMap::new(),
@@ -581,6 +588,14 @@ impl LocalTunnelEnforcer {
             guard.direct_fallback_blocked = false;
             guard.activation_error_code = Some(error_code.into());
             guard.last_wall_now = Some(now);
+            if let Some(logger) = &guard.diagnostics {
+                logger.record(crate::channel_diagnostics::ChannelDiagnostic {
+                    component: "channel_enforcer".into(), stage: "activation_failed".into(),
+                    executor_boot_id: Some(guard.boot_id.clone()),
+                    failure: Some(crate::channel_diagnostics::DiagnosticFailure::from_error(&CoreError::new(error_code, ""))),
+                    ..Default::default()
+                }, now);
+            }
             let families: Vec<String> = guard.families.keys().cloned().collect();
             for family in families {
                 if let Some(state) = guard.families.get_mut(&family) {
@@ -2248,6 +2263,32 @@ impl LocalTunnelEnforcer {
         handshake_override: Option<bool>,
         now: f64,
     ) -> Result<(String, TunnelStream)> {
+        let flow_id = format!("flow-{}-{}", family, self.next_flow_id.fetch_add(1, Ordering::Relaxed));
+        let result = self.connect_supervised_tcp_to_inner(family, process, target_destination, handshake_override, now, flow_id.clone());
+        if let Err(error) = &result {
+            if let Ok(guard) = self.lock() {
+                if let Some(logger) = &guard.diagnostics {
+                    use crate::channel_diagnostics::{ChannelDiagnostic, DiagnosticFailure};
+                    let trace = guard.traces.iter().rev().find(|t| t.flow_id == flow_id);
+                    logger.record(ChannelDiagnostic {
+                        component: "channel_enforcer".into(), stage: "connection_failed".into(),
+                        executor_boot_id: Some(guard.boot_id.clone()), family: Some(family.into()),
+                        session_id: trace.and_then(|t| t.session_id.clone()), flow_id: Some(flow_id),
+                        policy_version: trace.map(|t| t.policy_version.clone()),
+                        permit_generation: trace.map(|t| t.permit_generation), command_seq: trace.map(|t| t.command_seq),
+                        pid: Some(process.pid), failure: Some(DiagnosticFailure::from_error(error)),
+                        ..Default::default()
+                    }, guard.clock.as_ref().map(|clock| clock()).unwrap_or(now));
+                }
+            }
+        }
+        result
+    }
+
+    fn connect_supervised_tcp_to_inner(
+        &self, family: &str, process: &BoundProcessToken, target_destination: &str,
+        handshake_override: Option<bool>, now: f64, flow_id: String,
+    ) -> Result<(String, TunnelStream)> {
         if target_destination.ends_with(":53") || target_destination.ends_with(":853") {
             let _ = self.record_blocked_protocol_attempt(
                 family,
@@ -2261,11 +2302,7 @@ impl LocalTunnelEnforcer {
                 "受控通道禁止直连 DNS (53/853)，已拦截并阻断",
             ));
         }
-        let flow_id = format!(
-            "flow-{}-{}",
-            family,
-            self.next_flow_id.fetch_add(1, Ordering::Relaxed)
-        );
+
         let (
             dial_session_id,
             dial_policy_version,
@@ -3031,6 +3068,26 @@ impl LocalTunnelEnforcer {
             let overflow = guard.traces.len() + 1 - MAX_TRACE_EVENTS;
             guard.traces.drain(0..overflow);
         }
+        if phase != ConnectionTracePhase::BytesForwarded {
+            if let Some(logger) = &guard.diagnostics {
+                use crate::channel_diagnostics::{ChannelDiagnostic, DiagnosticFailure};
+                // The in-memory detail can contain upstream addresses. Durable
+                // history retains structured context, never that free text.
+                let failure = guard.families.get(&family).and_then(|f| f.last_error_code.as_ref())
+                    .filter(|_| matches!(phase, ConnectionTracePhase::BlockedOnArrival | ConnectionTracePhase::TerminationFailed))
+                    .map(|code| DiagnosticFailure::from_error(&CoreError::new(code, "")));
+                let stage = serde_json::to_value(&phase).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "unknown".into());
+                let state = serde_json::to_value(&enforcement_state).ok().and_then(|v| v.as_str().map(str::to_owned));
+                logger.record(ChannelDiagnostic {
+                    component: "channel_enforcer".into(), stage, executor_boot_id: Some(guard.boot_id.clone()),
+                    family: Some(family.clone()), session_id: session_id.clone(), flow_id: Some(flow_id.clone()),
+                    policy_version: Some(policy_version.clone()), permit_generation: Some(permit_generation),
+                    command_seq: Some(command_seq), event_seq: Some(seq), pid: Some(pid), state, failure,
+                    reason_code: guard.families.get(&family).and_then(|f| f.local_revoke_reason.clone()),
+                    ..Default::default()
+                }, observed_at);
+            }
+        }
         guard.traces.push(ConnectionTraceEvent {
             seq,
             flow_id,
@@ -3065,7 +3122,7 @@ impl LocalTunnelEnforcer {
         let (receipt, persisted, dispatch) = {
             let mut publisher = publication.lock().map_err(|_| CoreError::new(
                 "receipt_publication_poisoned", "通道回执发布锁不可用"))?;
-            let (receipt, sink) = {
+            let (receipt, sink, diagnostics) = {
                 let guard = inner.lock().map_err(|_| CoreError::new(
                     "enforcer_poisoned", "通道执行器状态锁不可用"))?;
                 // A real clock sample must stay truthful even if it moved
@@ -3074,7 +3131,7 @@ impl LocalTunnelEnforcer {
                 let now = guard.clock.as_ref().map(|clock| clock()).unwrap_or_else(||
                     prior.observed_at.max(guard.families.get(&prior.family)
                         .map(|s| s.last_updated_at).unwrap_or(prior.observed_at)));
-                (Self::build_receipt_locked(&guard, &prior.family, now)?, guard.receipt_sink.clone())
+                (Self::build_receipt_locked(&guard, &prior.family, now)?, guard.receipt_sink.clone(), guard.diagnostics.clone())
             };
             let persisted = if let Some(store) = storage { store.atomic_json(
                 &store
@@ -3083,6 +3140,15 @@ impl LocalTunnelEnforcer {
                     .join(format!("state/channel-receipt-{}.json", receipt.family)),
                 &json!(receipt),
             ) } else { Ok(()) };
+            if let (Some(logger), Err(error)) = (&diagnostics, &persisted) {
+                logger.persistence_failed(crate::channel_diagnostics::ChannelDiagnostic {
+                    component: "channel_enforcer".into(), stage: "persist_receipt".into(),
+                    executor_boot_id: Some(receipt.executor_boot_id.clone()), family: Some(receipt.family.clone()),
+                    session_id: receipt.session_id.clone(), policy_version: Some(receipt.policy_version.clone()),
+                    permit_generation: Some(receipt.permit_generation), command_seq: Some(receipt.command_seq),
+                    ..Default::default()
+                }, error, receipt.observed_at);
+            }
             if let Some(sink) = sink { publisher.pending.push_back((receipt.clone(), sink)); }
             let dispatch = !publisher.dispatching && !publisher.pending.is_empty();
             if dispatch { publisher.dispatching = true; }

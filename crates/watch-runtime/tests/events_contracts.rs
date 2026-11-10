@@ -15,6 +15,43 @@ fn store(name: &str) -> (EventStore, std::path::PathBuf) {
         root,
     )
 }
+
+#[test]
+fn channel_failure_history_remains_searchable_and_retains_build_and_execution_identity() {
+    use claude_watch_runtime::{channel_diagnostics::{ChannelDiagnostic, DiagnosticFailure}, monitor_snapshot::{event_history, EventHistoryQuery}};
+    let (events, root) = store("channel-build-history");
+    events.append("channel-diagnostic", EventFields { channel_diagnostic: Some(ChannelDiagnostic {
+        component: "channel_enforcer".into(), stage: "termination_failed".into(),
+        producer_boot_id: Some("producer-123".into()), executor_boot_id: Some("executor-456".into()),
+        family: Some("claude".into()), flow_id: Some("flow-789".into()), command_seq: Some(12),
+        failure: Some(DiagnosticFailure::from_error(&claude_watch_core::error::CoreError::new("state_io_failed", "secret-not-retained"))),
+        ..Default::default()
+    }), ..Default::default() }, 10.0).unwrap();
+    let path = root.join("Library/Application Support/ClaudeWatch/switcher/diagnostic-events.jsonl");
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["build_identity"] = serde_json::json!({"schema":1,"app_version":"3.0.0","app_build":"381", "source_revision":"a".repeat(40),"source_dirty":true,"source_tree_digest":"b".repeat(64)});
+    fs::write(&path, format!("{}\n", record)).unwrap();
+    assert_eq!(events.history().unwrap().events[0].build_identity.as_ref().unwrap().app_build, "381");
+    let history = event_history(&StateStore::new(Paths::new(&root).unwrap()), &EventHistoryQuery {
+        filter: "attention".into(), query: "flow-789".into(), offset: 0,
+    }).unwrap();
+    assert_eq!(history["total"], 1);
+    assert_eq!(history["events"][0]["severity"], "error");
+    assert_eq!(history["events"][0]["category"], "network");
+    let event = history["events"][0].to_string();
+    for expected in ["state_io_failed", "executor-456", "producer-123", "381", "termination_failed"] { assert!(event.contains(expected)); }
+    assert!(!event.contains("secret-not-retained"));
+    // Historical records without a build receipt remain readable.
+    record.as_object_mut().unwrap().remove("build_identity");
+    fs::write(&path, format!("{}\n", record)).unwrap();
+    assert!(events.history().unwrap().events[0].build_identity.is_none());
+    record["build_identity"] = serde_json::json!({"schema":1,"app_version":"secret://private", "app_build":"381", "source_revision":null,"source_dirty":null,"source_tree_digest":"b".repeat(64)});
+    fs::write(&path, format!("{}\n", record)).unwrap();
+    let invalid = events.history().unwrap();
+    assert!(invalid.events.is_empty());
+    assert_eq!(invalid.invalid_records, 1);
+    fs::remove_dir_all(root).unwrap();
+}
 #[test]
 fn rotation_preserves_only_one_previous_private_history_and_reads_are_bounded() {
     let (events, root) = store("rotation");

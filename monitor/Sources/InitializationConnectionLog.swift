@@ -89,45 +89,20 @@ struct InitializationConnectionRecord: Encodable {
 /// failure. Writes happen before returning the result, not in a detached task.
 @MainActor
 final class InitializationConnectionLog {
-    private let directory: URL?
-    private var file: FileHandle?
+    private let writer: BoundedDiagnosticLog?
     private var attempt = ""
     private var records: [String] = []
-    private var paths: [String] = []
-    private(set) var writeError = ""
+    private var encodingError = ""
+    var writeError: String { encodingError.isEmpty ? (writer?.writeError ?? "") : encodingError }
     private var count = 0
 
     init(directory: URL? = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/ClaudeWatch/logs", isDirectory: true)) {
-        self.directory = directory
-    }
-    private func privateDirectory(_ url: URL) -> Bool {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              attributes[.type] as? FileAttributeType == .typeDirectory,
-              (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
-              let mode = attributes[.posixPermissions] as? NSNumber else { return false }
-        return mode.intValue & 0o077 == 0
+        self.writer = directory.map { BoundedDiagnosticLog(component: "initialization", directory: $0) }
     }
     func begin() {
-        try? file?.close(); file = nil
-        attempt = UUID().uuidString; count = 0; writeError = ""
-        guard let directory else { return }
-        do {
-            guard privateDirectory(directory.deletingLastPathComponent()) else { throw CocoaError(.fileWriteNoPermission) }
-            if !FileManager.default.fileExists(atPath: directory.path) {
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
-                                                        attributes: [.posixPermissions: 0o700])
-            }
-            guard privateDirectory(directory) else { throw CocoaError(.fileWriteNoPermission) }
-            let dirFD = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-            guard dirFD >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-            defer { close(dirFD) }
-            let name = "initialization-\(attempt).jsonl"
-            let fd = openat(dirFD, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode_t(0o600))
-            guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-            file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-            paths.append(directory.appendingPathComponent(name).path)
-        } catch { writeError = "初始化日志写入失败（错误码 \((error as NSError).code)）；以下记录仅保留在当前窗口。" }
+        writer?.begin()
+        attempt = writer?.runID ?? UUID().uuidString; count = 0; encodingError = ""
     }
     func append(_ value: InitializationConnectionRecord) {
         guard count < 256 else { return }
@@ -140,15 +115,12 @@ final class InitializationConnectionLog {
             guard data.count <= 8192 else { throw CocoaError(.fileWriteUnknown) }
             records.append(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .newlines))
             if records.count > 512 { records.removeFirst() }
-            try file?.write(contentsOf: data)
-            if ["passed", "failed", "cancelled"].contains(value.event) {
-                try file?.synchronize(); try file?.close(); file = nil
-            }
-        } catch { writeError = "初始化日志写入失败（错误码 \((error as NSError).code)）；以下记录仅保留在当前窗口。" }
+            writer?.append(object)
+        } catch { encodingError = "diagnostic_encoding_failed_\((error as NSError).code)" }
     }
     var report: String {
         guard !records.isEmpty else { return "" }
-        return (["第 2 步逐轮诊断（含本次窗口的首次检查与重试）："] + paths.map { "日志文件：" + $0 }
-                + (writeError.isEmpty ? [] : [writeError]) + records).joined(separator: "\n")
+        return (["第 2 步逐轮诊断（含本次窗口的首次检查与重试）："] + (writer?.paths ?? []).map { "日志文件：" + $0 }
+                + (writeError.isEmpty ? [] : ["日志写入失败：" + writeError]) + records).joined(separator: "\n")
     }
 }

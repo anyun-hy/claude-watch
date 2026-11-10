@@ -492,7 +492,8 @@ struct ClaudeWatchApp: App {
         let storage = InitializationStorage()
         _store = StateObject(wrappedValue: store)
         _initialization = StateObject(wrappedValue: FirstRunInitialization(checks: FirstRunChecks(store: store),
-            completed: storage.isComplete(), saveCompletion: { try storage.complete() }))
+            completed: storage.isComplete(), diagnosticLog: BoundedDiagnosticLog(component: "initialization_flow"),
+            saveCompletion: { try storage.complete() }))
     }
     var body: some Scene {
         WindowGroup("Claude Watch") {

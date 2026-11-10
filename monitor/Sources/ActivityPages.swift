@@ -82,6 +82,8 @@ struct EventTimelinePage: View {
     @State private var hasLoaded = false
     @State private var showingOlder = false
     @State private var requestID = UUID()
+    @State private var exportingDiagnostics = false
+    @State private var diagnosticExportNotice: String?
     @ObservedObject private var diagnosticLog = DiagnosticLogStatus.shared
 
     private let filters = ["关键", "需关注", "网络", "进程", "采样", "全部"]
@@ -111,6 +113,9 @@ struct EventTimelinePage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             controls
+            if let diagnosticExportNotice {
+                Text(diagnosticExportNotice).font(.callout).foregroundStyle(p.secondary).textSelection(.enabled)
+            }
             Surface(p) {
                 HStack(alignment: .firstTextBaseline) {
                     SectionHeading(title: "事件记录", caption: hasHistoryBackend
@@ -227,6 +232,8 @@ struct EventTimelinePage: View {
 
             Spacer(minLength: 8)
             if hasHistoryBackend {
+                Button(exportingDiagnostics ? "正在导出…" : "导出诊断包") { exportDiagnostics() }
+                    .buttonStyle(.bordered).controlSize(.small).disabled(exportingDiagnostics)
                 Button("刷新") { Task { await loadHistory(reset: true) } }
                     .buttonStyle(.bordered).controlSize(.small).disabled(loading)
             }
@@ -266,6 +273,24 @@ struct EventTimelinePage: View {
     private func openLog() {
         guard let path = store.snapshot?.logPath, !path.isEmpty else { return }
         NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    }
+
+    @MainActor private func exportDiagnostics() {
+        let panel = NSSavePanel()
+        panel.title = "导出排障诊断包"
+        panel.message = "仅导出经过筛选的本地运行记录；不会重新检测网络。请选择新文件，已有文件不会被覆盖。"
+        panel.nameFieldStringValue = "ClaudeWatch-diagnostics-\(Int(Date().timeIntervalSince1970)).json"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        exportingDiagnostics = true
+        diagnosticExportNotice = nil
+        let path = url.path
+        Task {
+            let success = await Task.detached(priority: .utility) { DiagnosticExportRunner.write(to: path) }.value
+            exportingDiagnostics = false
+            diagnosticExportNotice = success
+                ? "诊断包已导出。缺失、截断或无法读取的记录会在包内标明。"
+                : "诊断导出失败。请检查保存位置权限，并使用一个不存在的新文件名。"
+        }
     }
 
     private func logURL(named name: String) -> URL? {

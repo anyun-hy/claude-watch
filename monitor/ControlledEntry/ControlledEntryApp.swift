@@ -103,8 +103,8 @@ final class ControlledEntryDelegate: NSObject, NSApplicationDelegate {
             ?? "\(NSHomeDirectory())/Library/Application Support/ClaudeWatch/state"
     }()
 
-    lazy var eventLogPath: String? = {
-        env["CW_ENTRY_EVENT_LOG"]
+    lazy var eventLog: BoundedDiagnosticLog = {
+        ControlledEntryDiagnosticFields.logger(stateDirectory: watchStateDir, overridePath: env["CW_ENTRY_EVENT_LOG"])
     }()
 
     private var pendingURLs: [URL] = []
@@ -259,21 +259,7 @@ final class ControlledEntryDelegate: NSObject, NSApplicationDelegate {
     }
 
     func appendEventLog(_ payload: [String: Any]) {
-        guard let logPath = eventLogPath, !logPath.isEmpty else { return }
-        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
-              var line = String(data: data, encoding: .utf8) else {
-            return
-        }
-        line.append("\n")
-        let url = URL(fileURLWithPath: logPath)
-        if FileManager.default.fileExists(atPath: logPath),
-           let fh = try? FileHandle(forWritingTo: url) {
-            fh.seekToEndOfFile()
-            fh.write(Data(line.utf8))
-            try? fh.close()
-        } else {
-            try? Data(line.utf8).write(to: url, options: .atomic)
-        }
+        eventLog.append(ControlledEntryDiagnosticFields.sanitize(payload))
     }
 
     func inspectKernelProcessIdentity(pid: pid_t) -> (uid: UInt32, ppid: UInt32, startSec: UInt64, startUsec: UInt32, canonicalPath: String)? {
@@ -704,6 +690,7 @@ final class ControlledEntryDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        appendEventLog(["event": "entry_started", "status": "running", "target": target])
         // Parse CLI flags passed to ControlledEntry (--reopen, --open-url <u1>, --open-file <f1>)
         let rawArgs = Array(CommandLine.arguments.dropFirst())
         var idx = 0

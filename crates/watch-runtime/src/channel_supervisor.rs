@@ -48,6 +48,63 @@ pub const ASYNC_AUDIT_RETRY_BACKOFF_SECONDS: f64 = 2.0;
 pub const MAX_EMITTED_EVENTS: usize = 128;
 pub const MAX_PERSISTED_EVENTS: usize = 64;
 
+#[cfg(test)]
+mod logging_tests {
+    use super::*;
+    use crate::{channel_diagnostics::ChannelDiagnostics, events::EventStore, storage::Paths};
+    use std::{fs, sync::atomic::{AtomicUsize, Ordering}, time::{Duration, Instant}};
+
+    struct FailingEnforcer(AtomicUsize);
+    impl ChannelEnforcer for FailingEnforcer {
+        fn boot_id(&self) -> Result<String> { Ok("boot-log-error".into()) }
+        fn is_ready(&self) -> Result<bool> { Ok(true) }
+        fn apply_command(&self, _: &ChannelEnforcementCommand, _: f64) -> Result<ChannelEnforcementReceipt> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(CoreError::new("fixture_apply_denied", "http://user:secret@proxy/?password=secret"))
+        }
+        fn receipt_for(&self, _: &str, _: f64) -> Result<Option<ChannelEnforcementReceipt>> { Ok(None) }
+        fn enforce_active_deadlines(&self, _: f64, _: bool) -> Result<Vec<ChannelEnforcementReceipt>> { Ok(vec![]) }
+    }
+
+    #[test]
+    fn execution_error_and_snapshot_failure_remain_visible_without_suppressing_revoke() {
+        let root = std::env::temp_dir().join(format!("cw-supervisor-log-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let storage = StateStore::new(Paths::new(&root).unwrap());
+        let enforcer = Arc::new(FailingEnforcer(AtomicUsize::new(0)));
+        let mut supervisor = ChannelSupervisor::new_with_config(storage.clone(), Config::default(), None,
+            Some(enforcer.clone()), None).unwrap();
+        let logger = ChannelDiagnostics::new(storage.clone());
+        supervisor.set_diagnostics(logger.clone());
+        // A directory cannot be atomically replaced by a JSON state file.
+        for file in ["channel-permits.json", "channel-supervision.json", "channel-events.json", "vpn-supervision.json"] {
+            fs::create_dir_all(storage.paths.watch().join("state").join(file)).unwrap();
+        }
+        supervisor.handle_event(SupervisionEvent::ProcessInventoryUnavailable {
+            family: "claude".into(), observed_at: 1_800_000_000.0,
+        }).unwrap();
+        assert!(enforcer.0.load(Ordering::SeqCst) > 0, "state logging failure must not suppress the revoke command");
+        assert_eq!(supervisor.tracks["claude"].policy_sync_state, PolicySyncState::ApplyFailed);
+        assert!(logger.health().state_write_failed >= 4);
+        assert!(logger.health_message().unwrap().contains("状态保存失败"));
+        let events = EventStore::new(storage);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let rows = loop {
+            let rows: Vec<_> = events.history().unwrap().events.into_iter().filter_map(|e| e.fields.channel_diagnostic).collect();
+            if rows.iter().any(|r| r.stage == "persist_vpn_observation") { break rows; }
+            assert!(Instant::now() < deadline); thread::sleep(Duration::from_millis(10));
+        };
+        let failure = rows.iter().find(|r| r.stage == "command_failed").unwrap();
+        assert_eq!(failure.failure.as_ref().unwrap().code, "fixture_apply_denied");
+        assert_eq!(failure.executor_boot_id.as_deref(), Some("boot-log-error"));
+        assert_eq!(failure.producer_boot_id.as_deref(), Some(supervisor.producer_boot_id.as_str()));
+        assert_eq!(failure.command_seq, Some(supervisor.tracks["claude"].command_seq));
+        assert!(failure.policy_version.is_some());
+        let json = serde_json::to_string(&rows).unwrap();
+        assert!(!json.contains("secret") && !json.contains("password="));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AsyncAuditOutcome {
     Succeeded {
@@ -208,6 +265,7 @@ pub struct ChannelSupervisor {
     pub storage: StateStore,
     pub producer_boot_id: String,
     enforcer: Option<Arc<dyn ChannelEnforcer>>,
+    diagnostics: Option<crate::channel_diagnostics::ChannelDiagnostics>,
     expected_executor_boot_id: Option<String>,
     audit_tx: Option<Sender<AsyncAuditRequest>>,
     next_audit_request_id: u64,
@@ -285,6 +343,7 @@ impl ChannelSupervisor {
             storage,
             producer_boot_id,
             enforcer,
+            diagnostics: None,
             expected_executor_boot_id,
             audit_tx,
             next_audit_request_id: 0,
@@ -304,6 +363,30 @@ impl ChannelSupervisor {
             emitted_events: Vec::new(),
             persisted_events: Vec::new(),
         })
+    }
+
+    pub fn set_diagnostics(&mut self, diagnostics: crate::channel_diagnostics::ChannelDiagnostics) {
+        self.diagnostics = Some(diagnostics);
+    }
+
+    fn diagnostic(&self, family: Option<&str>, stage: &str) -> crate::channel_diagnostics::ChannelDiagnostic {
+        let track = family.and_then(|f| self.tracks.get(f));
+        crate::channel_diagnostics::ChannelDiagnostic {
+            component: "channel_supervisor".into(), stage: stage.into(),
+            producer_boot_id: Some(self.producer_boot_id.clone()), executor_boot_id: self.expected_executor_boot_id.clone(),
+            family: family.map(str::to_owned), session_id: track.and_then(|t| t.session_id.clone()),
+            policy_version: Some(self.saved_policy_version.clone()),
+            permit_generation: track.map(|t| t.permit_generation), command_seq: track.map(|t| t.command_seq),
+            event_seq: Some(self.event_seq), ..Default::default()
+        }
+    }
+
+    fn persist_state(&self, file: &str, stage: &str, value: &Value, now: f64) {
+        if let Err(error) = self.storage.atomic_json(&self.storage.paths.watch().join(file), value) {
+            if let Some(logger) = &self.diagnostics {
+                logger.persistence_failed(self.diagnostic(None, stage), &error, now);
+            }
+        }
     }
 
     pub fn config(&self) -> &Config {
@@ -832,14 +915,8 @@ impl ChannelSupervisor {
         published["enforcement_receipts"] = json!(self.tracks.iter()
             .filter_map(|(family, track)| track.latest_receipt.as_ref().map(|r| (family.clone(), r.clone())))
             .collect::<BTreeMap<_, _>>());
-        let _ = self.storage.atomic_json(
-            &self.storage.paths.watch().join("state/channel-supervision.json"),
-            &published,
-        );
-        let _ = self.storage.atomic_json(
-            &self.storage.paths.watch().join("state/channel-events.json"),
-            &json!(self.persisted_events),
-        );
+        self.persist_state("state/channel-supervision.json", "persist_supervision", &published, now);
+        self.persist_state("state/channel-events.json", "persist_monitor_events", &json!(self.persisted_events), now);
         let vpn_supervision = json!({
             "captured_at": now,
             "network_backend": self.config.effective_network_backend(),
@@ -849,10 +926,7 @@ impl ChannelSupervisor {
             "unavailable_reason": self.latest_vpn_unavailable_reason,
             "vpn_match": self.compute_vpn_match(now),
         });
-        let _ = self.storage.atomic_json(
-            &self.storage.paths.watch().join("state/vpn-supervision.json"),
-            &vpn_supervision,
-        );
+        self.persist_state("state/vpn-supervision.json", "persist_vpn_observation", &vpn_supervision, now);
         crate::native::notify_channel_update();
         Ok(snap)
     }
@@ -1485,10 +1559,13 @@ impl ChannelSupervisor {
                             restored.context_id = context_id.to_string();
                             restored.baseline = exit;
                             restored.reason = None;
-                            let _ = self.storage.atomic_json(
-                                &self.storage.paths.session_for(family),
-                                &serde_json::to_value(&restored).unwrap_or(Value::Null),
-                            );
+                            if let Err(error) = self.storage.atomic_json(
+                                &self.storage.paths.session_for(family), &json!(restored),
+                            ) {
+                                if let Some(logger) = &self.diagnostics {
+                                    logger.persistence_failed(self.diagnostic(Some(family), "persist_recovered_session"), &error, completed_at);
+                                }
+                            }
                         }
                     }
                     self.apply_permit_to_enforcer(family, recovered_permit, completed_at)?;
@@ -1720,17 +1797,25 @@ impl ChannelSupervisor {
                 all_permits.insert(fam.clone(), p.clone());
             }
         }
-        let _ = self.storage.atomic_json(
-            &self.storage.paths.watch().join("state/channel-permits.json"),
-            &serde_json::to_value(&all_permits).unwrap_or(serde_json::Value::Null),
-        );
+        self.persist_state("state/channel-permits.json", "persist_permits", &json!(all_permits), now);
+        if let Some(logger) = &self.diagnostics {
+            let mut diagnostic = self.diagnostic(Some(family), "command_issued");
+            diagnostic.state = serde_json::to_value(command.permit.state).ok().and_then(|v| v.as_str().map(str::to_owned));
+            diagnostic.reason_code = Some(command.permit.reason_code.clone());
+            logger.record(diagnostic, now);
+        }
         if let Some(enforcer) = self.enforcer.clone() {
             match enforcer.apply_command(&command, now) {
                 Ok(receipt) => {
                     self.ingest_receipt(receipt, now)?;
                     return Ok(());
                 }
-                Err(_) => {
+                Err(error) => {
+                    if let Some(logger) = &self.diagnostics {
+                        let mut diagnostic = self.diagnostic(Some(family), "command_failed");
+                        diagnostic.failure = Some(crate::channel_diagnostics::DiagnosticFailure::from_error(&error));
+                        logger.record(diagnostic, now);
+                    }
                     if let Some(track) = self.tracks.get_mut(family) {
                         track.policy_sync_state = PolicySyncState::ApplyFailed;
                         track.latest_receipt = None;
@@ -1746,6 +1831,12 @@ impl ChannelSupervisor {
         let family = receipt.family.clone();
         let expected_boot_id = self.expected_executor_boot_id.clone();
         let mut autonomous_cutoff = None;
+        let receipt_for_log = receipt.clone();
+        let changed = self.tracks.get(&family).and_then(|t| t.latest_receipt.as_ref()).is_none_or(|old|
+            old.executor_boot_id != receipt.executor_boot_id || old.command_seq != receipt.command_seq
+            || old.permit_generation != receipt.permit_generation || old.enforcement_state != receipt.enforcement_state
+            || old.error_code != receipt.error_code || old.new_connections_blocked != receipt.new_connections_blocked
+            || old.active_flows_count != receipt.active_flows_count);
         let accepted = {
             let Some(track) = self.tracks.get_mut(&family) else {
                 return Ok(());
@@ -1792,6 +1883,20 @@ impl ChannelSupervisor {
                 true
             }
         };
+        if changed {
+            if let Some(logger) = &self.diagnostics {
+                let mut diagnostic = self.diagnostic(Some(&family), if accepted { "receipt_received" } else { "receipt_rejected" });
+                diagnostic.executor_boot_id = Some(receipt_for_log.executor_boot_id);
+                diagnostic.session_id = receipt_for_log.session_id;
+                diagnostic.policy_version = Some(receipt_for_log.policy_version);
+                diagnostic.permit_generation = Some(receipt_for_log.permit_generation);
+                diagnostic.command_seq = Some(receipt_for_log.command_seq);
+                diagnostic.source_observed_at = Some(receipt_for_log.observed_at);
+                diagnostic.state = serde_json::to_value(receipt_for_log.enforcement_state).ok().and_then(|v| v.as_str().map(str::to_owned));
+                diagnostic.failure = receipt_for_log.error_code.map(|code| crate::channel_diagnostics::DiagnosticFailure::from_error(&CoreError::new(&code, "")));
+                logger.record(diagnostic, receiver_now);
+            }
+        }
         if let Some(reason) = autonomous_cutoff {
             if let Some(spec) = PolicyCatalog::family(&family) {
                 let session = self.load_channel_session(spec.id, receiver_now)?;

@@ -21,9 +21,15 @@ fn invalid(message: &str) -> io::Error {
 trait Host {
     fn launchctl(&mut self, args: &[&str]) -> io::Result<(i32, String)>;
     fn signature(&mut self, path: &Path) -> io::Result<String>;
+    fn log(&mut self, _operation: &str, _reason: &str, _transaction: Option<&str>) {}
+    fn prepare_logging(&mut self) {}
 }
 struct Native;
 impl Host for Native {
+    fn prepare_logging(&mut self) { crate::logging::prepare(); }
+    fn log(&mut self, operation: &str, reason: &str, transaction: Option<&str>) {
+        crate::logging::record(operation, "progress", reason, transaction, None);
+    }
     fn launchctl(&mut self, args: &[&str]) -> io::Result<(i32, String)> {
         let out = Command::new("/bin/launchctl").args(args).output()?;
         Ok((
@@ -355,6 +361,7 @@ fn rollback<H: Host>(
     engine: &str,
 ) -> io::Result<()> {
     let tx = read_transaction(paths, id, uid, engine)?;
+    host.log("service_rollback", "rollback_started", Some(id));
     if tx.phase == "preparing" {
         let actual = installed(paths, host, uid, engine)?;
         if !match (&actual, &tx.previous) {
@@ -365,6 +372,7 @@ fn rollback<H: Host>(
             return Err(invalid("gateway changed during transaction preparation"));
         }
         fs::remove_dir_all(&paths.transaction)?;
+        host.log("service_rollback", "preparation_discarded", Some(id));
         return Ok(());
     }
     // An interruption can leave a partial new copy; only the files staged in
@@ -419,6 +427,7 @@ fn rollback<H: Host>(
         }
     }
     fs::remove_dir_all(&paths.transaction)?;
+    host.log("service_rollback", "previous_gateway_restored", Some(id));
     Ok(())
 }
 fn install<H: Host>(paths: &Paths, host: &mut H, prepared: &Path, id: &str) -> io::Result<()> {
@@ -515,14 +524,18 @@ fn install<H: Host>(paths: &Paths, host: &mut H, prepared: &Path, id: &str) -> i
             ))),
         };
     }
+    host.log("service_install", "rollback_record_prepared", Some(id));
     let result = (|| {
         stop(paths, host)?;
+        host.log("service_install", "previous_service_stopped", Some(id));
         if tx.previous.is_some() {
             remove_known_files(paths)?;
         }
         copy_install(paths, &staged, &tx.next)?;
         installed(paths, host, tx.next.engine_uid, &tx.next.engine_executable)?;
-        start(paths, host)
+        start(paths, host)?;
+        host.log("service_install", "socket_activation_registered", Some(id));
+        Ok(())
     })();
     if let Err(error) = result {
         return match rollback(
@@ -557,6 +570,8 @@ pub fn dispatch(args: &[String]) -> io::Result<()> {
         }
         paths.ensure_install_parent()?;
         let _lock = service_lock(&paths)?;
+        host.prepare_logging();
+        host.log("service_install", "installation_started", Some(&args[4]));
         install(&paths, &mut host, Path::new(&args[2]), &args[4])?;
         println!(
             "{}",
@@ -593,6 +608,8 @@ pub fn dispatch(args: &[String]) -> io::Result<()> {
         ));
     }
     let _lock = service_lock(&paths)?;
+    host.prepare_logging();
+    if let Some(operation) = crate::logging::operation(args) { host.log(operation, "management_started", crate::logging::transaction_argument(args)); }
     if matches!(command, "--service-rollback" | "--service-commit")
         && matches!(args.len(), 7 | 9)
         && args[5] == "--transaction"

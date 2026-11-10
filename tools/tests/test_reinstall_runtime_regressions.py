@@ -19,7 +19,7 @@ class ReinstallBuildRegression(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="cw-build-entry-")
         self.root = Path(self.temp.name).resolve()
-        for name in ("monitor/reinstall.sh", "tools/build-rust-components.sh", "monitor/macos-minimum.txt"):
+        for name in ("monitor/reinstall.sh", "tools/build-rust-components.sh", "monitor/macos-minimum.txt", "tools/reinstall_log.py"):
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / name, target)
@@ -33,6 +33,9 @@ root = pathlib.Path(__file__).resolve().parents[2]
 with (root / "calls.jsonl").open("a") as out:
     out.write(json.dumps({"kind":"cargo", "args":sys.argv[1:], "environment":{
         key:os.environ.get(key) for key in ("SDKROOT", "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER", "CC_aarch64_apple_darwin", "MACOSX_DEPLOYMENT_TARGET")}}) + "\n")
+if os.environ.get("CW_FIXTURE_BUILD_FAILURE") == "1":
+    print("fixture compiler failure", file=sys.stderr)
+    raise SystemExit(23)
 target = root / "target/aarch64-apple-darwin/release"
 target.mkdir(parents=True, exist_ok=True)
 engine = target / "claude-watch-engine"
@@ -59,6 +62,9 @@ for name in ("watch-native-observer", "watch-process-control", "watch-sandbox-la
         cargo.chmod(0o700)
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(("CW_", "WATCH_", "CARGO_TARGET_"))}
+        fixture_home = self.root / "home"
+        (fixture_home / "Library/Logs").mkdir(parents=True)
+        self.env["HOME"] = str(fixture_home)
         self.env["CARGO_HOME"] = str(self.root / "cargo-home")
         self.env["CW_CARGO_BIN"] = str(cargo)
 
@@ -86,6 +92,24 @@ for name in ("watch-native-observer", "watch-process-control", "watch-sandbox-la
                                            "--project", str(self.root), "--dry-run"])
         manifest = json.loads((self.root / "staging/components.json").read_text())
         self.assertEqual(len(manifest["components"]), 5)
+        summaries = list((Path(self.env["HOME"]) / "Library/Logs/ClaudeWatchInstaller").glob("reinstall-*/run.json"))
+        self.assertEqual(len(summaries), 1)
+        summary = json.loads(summaries[0].read_text())
+        self.assertEqual(summary["status"], "passed")
+        self.assertEqual([(p["phase"], p["exit_code"]) for p in summary["phases"] if p["status"] != "running"], [("build", 0), ("install", 0)])
+
+    def test_reinstall_build_failure_keeps_one_compile_and_durable_failed_summary(self):
+        self.env["CW_FIXTURE_BUILD_FAILURE"] = "1"
+        result = self.run_script("monitor/reinstall.sh", "3.0.0", "378", "--dry-run")
+        self.assertEqual(result.returncode, 23, result.stdout + "\n" + result.stderr)
+        calls = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual([call["kind"] for call in calls], ["cargo"])
+        summaries = list((Path(self.env["HOME"]) / "Library/Logs/ClaudeWatchInstaller").glob("reinstall-*/run.json"))
+        self.assertEqual(len(summaries), 1)
+        value = json.loads(summaries[0].read_text())
+        self.assertEqual(value["status"], "failed")
+        self.assertEqual(value["phases"][-1]["exit_code"], 23)
+        self.assertIn("fixture compiler failure", (summaries[0].parent / "build.log").read_text())
 
     def test_build_only_does_not_stage_or_run_the_engine(self):
         build = self.run_script("tools/build-rust-components.sh", "--build-only")

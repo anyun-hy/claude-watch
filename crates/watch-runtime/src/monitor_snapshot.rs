@@ -291,6 +291,7 @@ fn present_event(e: Event) -> Value {
         "dns-diagnostic" => ("DNS 检测", "info", "network"),
         "webrtc-diagnostic" => ("WebRTC 检测", "info", "network"),
         "guard-diagnostic" => ("保护后台心跳检查", "info", "service"),
+        "channel-diagnostic" => ("受控网关执行记录", "info", "network"),
         "guard-decision" => ("会话保护判定", "info", "service"),
         "guard-stop" => ("会话保护退出", "info", "service"),
         "receipt-diagnostic" => ("检测回执提交", "info", "network"),
@@ -328,6 +329,24 @@ fn present_event(e: Event) -> Value {
     }
     let mut summary = Vec::new();
     let mut explanation = None;
+    if let Some(diagnostic) = &fields.channel_diagnostic {
+        summary.push(format!("组件：{} · 阶段：{}", diagnostic.component, diagnostic.stage));
+        if let Some(failure) = &diagnostic.failure {
+            severity = "error";
+            summary.push(format!("{}（{}）", failure.reason, failure.code));
+        }
+        if let Some(health) = &diagnostic.log_health {
+            if [health.dropped, health.write_failed, health.state_write_failed, health.health_write_failed].into_iter().any(|n| n > 0) {
+                severity = "warning";
+                summary.push(format!("日志不完整：丢弃 {}，写入失败 {}，状态保存失败 {}", health.dropped, health.write_failed, health.state_write_failed));
+            }
+        }
+        if let Some(family) = &diagnostic.family { summary.push(format!("应用：{family}")); }
+        if let Some(pid) = diagnostic.pid { summary.push(format!("PID {pid}")); }
+        if let Some(seq) = diagnostic.command_seq { summary.push(format!("命令序号：{seq}")); }
+        if let Some(flow) = &diagnostic.flow_id { summary.push(format!("连接：{flow}")); }
+        if let Some(state) = &diagnostic.state { summary.push(format!("执行状态：{state}")); }
+    }
     if title == "监控记录" {
         summary.push(format!("事件：{}", e.category));
     }
@@ -514,7 +533,11 @@ fn present_event(e: Event) -> Value {
             summary.push(format!("来源：{label}"));
         }
     }
-    let raw = serde_json::to_string(fields).unwrap_or_default();
+    let mut raw_fields = serde_json::to_value(fields).unwrap_or_default();
+    if let Some(identity) = &e.build_identity {
+        raw_fields["build_identity"] = json!(identity);
+    }
+    let raw = serde_json::to_string(&raw_fields).unwrap_or_default();
     let detail = if summary.is_empty() {
         "没有更多摘要，可展开原始记录。".to_string()
     } else {
