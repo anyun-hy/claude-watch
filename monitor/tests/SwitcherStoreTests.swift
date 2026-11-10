@@ -500,8 +500,8 @@ struct SwitcherStoreTests {
         let claude = AIPolicyCatalog.services.first { $0.id == "claude" }
         let openAI = AIPolicyCatalog.services.first { $0.id == "openai" }
         expect(claude?.actions.count == 3 && claude?.criteria.filter { $0.id != "session" }.allSatisfy { policy in
-            claude?.setting(policy).fallback == "close"
-        } == true, "the supervised session keeps the full action set and assumes close")
+            claude?.setting(policy).fallback == "force"
+        } == true, "the supervised session keeps the full action set")
         expect(claude?.criteria.first { $0.id == "session" }?.fallback == "close",
                "an unestablished session keeps the historical normal exit for Claude")
         expect(openAI?.actions.map(\.id) == ["force", "close", "warn"]
