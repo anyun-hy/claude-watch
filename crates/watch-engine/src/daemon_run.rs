@@ -1130,7 +1130,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                             if let Some(alerts) = &guard_alerts {
                                 if matches!(
                                     receipt["action"].as_str(),
-                                    Some("close-desktop" | "disconnect-channel")
+                                    Some("close-desktop" | "disconnect-channel" | "disconnect-and-force-quit")
                                 ) {
                                     unknown_gate.observe(false);
                                     alerts.enqueue(Alert {

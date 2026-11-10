@@ -455,7 +455,7 @@ impl ChannelPermit {
             .or_else(|| receipt["code"].as_str())
             .unwrap_or(if members.is_empty() { "idle" } else { "active" })
             .to_string();
-        let state = if matches!(action, "close-desktop" | "disconnect-channel")
+        let state = if matches!(action, "close-desktop" | "disconnect-channel" | "disconnect-and-force-quit")
             || matches!(
                 receipt["status"].as_str(),
                 Some("protection_triggered" | "protection_unavailable")

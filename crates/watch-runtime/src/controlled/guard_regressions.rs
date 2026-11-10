@@ -428,3 +428,51 @@ fn close_action_in_channel_mode_preserves_process_and_cuts_channel() {
     assert_eq!(receipt["action"], "disconnect-channel");
     assert_eq!(receipt["process_disposition"], "preserved");
 }
+
+#[test]
+fn force_quit_execution_failure_in_channel_mode_marks_process_preserved_and_downgrades_action() {
+    let f = Fixture::new("claude", &[("claude_close_ip", "force")]);
+    let _session = f.active();
+    let mut system = Mock::new("claude");
+    system.channel_mode = true;
+    system.fail_quit = true; // inject failure: quit_for_confirmed_ip_risk fails!
+    system.ip = "8.8.8.8"; // IP drift -> egress_ip_changed -> action = force
+    let receipt = f.tick(&mut system);
+    assert_eq!(system.forces, 1, "force must be attempted");
+    assert_eq!(receipt["process_requested_action"], "force_quit");
+    assert_eq!(receipt["process_execution_state"], "failed");
+    assert_eq!(receipt["process_preserved"], json!(true), "failed quit means process is STILL ALIVE and preserved");
+    assert_eq!(receipt["disposition_mode"], "force_quit_failed_disconnect_channel");
+    assert_eq!(receipt["action"], "disconnect-channel", "failed quit must downgrade action from force to disconnect");
+}
+
+#[test]
+fn unconfigured_claude_uses_family_force_default_and_executes_force_in_channel_mode() {
+    // Empty config: Claude defaults to "force" as per policy contract
+    let f = Fixture::new("claude", &[]);
+    let _session = f.active();
+    let mut system = Mock::new("claude");
+    system.channel_mode = true;
+    system.ip = "8.8.8.8"; // IP drift
+    let receipt = f.tick(&mut system);
+    assert_eq!(system.forces, 1, "unconfigured Claude defaults to force");
+    assert_eq!(receipt["process_preserved"], json!(false));
+    assert_eq!(receipt["action"], "disconnect-and-force-quit");
+    assert_eq!(receipt["disposition_mode"], "disconnect_channel_and_force_quit");
+}
+
+#[test]
+fn unconfigured_openai_uses_family_close_default_and_preserves_process_in_channel_mode() {
+    // Empty config: OpenAI defaults to "close" as per policy contract
+    let f = Fixture::new("openai", &[]);
+    let _session = f.active();
+    let mut system = Mock::new("openai");
+    system.channel_mode = true;
+    system.ip = "8.8.8.8"; // IP drift
+    let receipt = f.tick(&mut system);
+    assert_eq!(system.forces, 0, "unconfigured OpenAI defaults to close/preserve");
+    assert_eq!(system.closes, 0, "close in channel mode does not terminate process");
+    assert_eq!(receipt["process_preserved"], json!(true));
+    assert_eq!(receipt["action"], "disconnect-channel");
+    assert_eq!(receipt["disposition_mode"], "disconnect_channel_keep_process");
+}

@@ -545,11 +545,20 @@ mod protection_tests {
         let config = Config::from_value(json!({})).unwrap();
         assert!(!config.require_dns && !config.require_stun);
         for criterion in ["ip", "cn", "dns", "webrtc"] {
+            // Claude defaults to "force" as declared by its policy family contract.
+            // OpenAI defaults to "close" (preserve process & disconnect channel).
             assert_eq!(config.action("claude", criterion), "force");
-            // ChatGPT / Codex assumes a normal close when no key is set; it
-            // may still be configured to force.
             assert_eq!(config.action("openai", criterion), "close");
         }
+
+        // Explicit user configuration requesting close on Claude is respected
+        let explicit_close = Config::from_value(json!({
+            "claude_close_ip": "close",
+            "claude_close_cn": "warn"
+        })).unwrap();
+        assert_eq!(explicit_close.action("claude", "ip"), "close");
+        assert_eq!(explicit_close.action("claude", "cn"), "warn");
+        assert_eq!(explicit_close.action("claude", "dns"), "force"); // unconfigured remains default force
     }
     #[test]
     fn close_actions_accept_only_the_three_documented_values() {
@@ -588,6 +597,15 @@ mod protection_tests {
         assert_eq!(split.close_action("egress_ip_changed", Provider::Chatgpt), "warn");
         assert_eq!(split.close_action("egress_ip_changed", Provider::Claude), "force");
         assert_eq!(split.close_action("egress_country_cn", Provider::Codex), "close");
+
+        // When Claude is explicitly configured for close, it returns close
+        let explicit_claude_close = Config::from_value(json!({
+            "claude_close_ip": "close",
+            "claude_close_cn": "warn"
+        })).unwrap();
+        assert_eq!(explicit_claude_close.close_action("egress_ip_changed", Provider::Claude), "close");
+        assert_eq!(explicit_claude_close.close_action("egress_country_cn", Provider::Claude), "warn");
+        assert_eq!(explicit_claude_close.close_action("egress_ip_changed", Provider::Chatgpt), "close");
         // Codes are resolved inside the family, and the stricter of two
         // drifting probe families wins.
         let strict =
@@ -660,5 +678,26 @@ mod protection_tests {
                 .code,
             "invalid_config"
         );
+    }
+    #[test]
+    fn saved_configuration_preserves_explicit_actions_and_does_not_revert_to_default_close() {
+        let original = Config::from_value(json!({
+            "claude_close_ip": "force",
+            "claude_close_cn": "close",
+            "gpt_close_cn": "warn"
+        })).unwrap();
+
+        let serialized = original.value().unwrap();
+        assert_eq!(serialized["claude_close_ip"], "force");
+        assert_eq!(serialized["claude_close_cn"], "close");
+        assert_eq!(serialized["gpt_close_cn"], "warn");
+
+        let reloaded = Config::from_value(serialized).unwrap();
+        assert_eq!(reloaded.action("claude", "ip"), "force");
+        assert_eq!(reloaded.action("claude", "cn"), "close");
+        assert_eq!(reloaded.action("openai", "cn"), "warn");
+        // Unconfigured fields remain their family default ("force" for Claude, "close" for OpenAI)
+        assert_eq!(reloaded.action("claude", "dns"), "force");
+        assert_eq!(reloaded.action("openai", "ip"), "close");
     }
 }

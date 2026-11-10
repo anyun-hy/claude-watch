@@ -13,6 +13,7 @@ fn legacy_openai_force_without_a_matching_grant_resolves_to_close() {
     assert_eq!(config.close_action("egress_ip_changed", Provider::Codex), "close");
     assert_eq!(config.close_action("dns_egress_changed", Provider::Chatgpt), "close");
     assert_eq!(config.close_action("webrtc_egress_changed", Provider::Codex), "warn");
+    // Unconfigured Claude defaults to its family contract default (force)
     assert_eq!(config.close_action("egress_ip_changed", Provider::Claude), "force");
     assert_eq!(config.value().unwrap()["gpt_close_ip"], "close");
 }
@@ -74,5 +75,11 @@ fn raw_struct_mutation_cannot_bypass_force_confirmation() {
     let mut config = Config::default();
     config.policy_actions.insert("gpt_close_ip".into(), "force".into());
     assert_eq!(config.close_action("egress_ip_changed", Provider::Codex), "close");
+    assert_eq!(config.close_action("egress_ip_changed", Provider::Claude), "force");
+    // Explicit close configuration on Claude evaluates to close
+    config.policy_actions.insert("claude_close_ip".into(), "close".into());
+    assert_eq!(config.close_action("egress_ip_changed", Provider::Claude), "close");
+    // Explicit force configuration on Claude evaluates to force
+    config.policy_actions.insert("claude_close_ip".into(), "force".into());
     assert_eq!(config.close_action("egress_ip_changed", Provider::Claude), "force");
 }

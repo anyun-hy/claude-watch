@@ -580,8 +580,13 @@ struct SwitcherStoreTests {
 
         let state = SwitcherCommandRunner.SafeExecutionState()
         expect(!state.isTimedOut, "initial execution state is not timed out")
+        expect(!state.isExceededMaxBytes, "initial execution state has not exceeded max bytes")
         state.markTimedOut()
         expect(state.isTimedOut, "thread-safe state correctly records timedOut under lock")
+        state.markExceededMaxBytes()
+        expect(state.isExceededMaxBytes, "thread-safe state correctly records exceededMaxBytes under lock")
+        state.setExitCode(124)
+        expect(state.terminationStatus == 124, "terminationStatus correctly returned")
 
         print("SwitcherStore: \(checks) isolated assertions passed")
     }

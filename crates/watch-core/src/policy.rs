@@ -140,7 +140,7 @@ const CLAUDE: PolicyFamily = PolicyFamily {
     key_prefix: "claude",
     providers: &[Provider::Claude],
     actions: &["force", "close", "warn"],
-    default_action: "close",
+    default_action: "force",
 };
 const OPENAI: PolicyFamily = PolicyFamily {
     id: "openai",

@@ -436,6 +436,7 @@ enum SwitcherCommandRunner {
     final class SafeExecutionState: @unchecked Sendable {
         private let lock = NSLock()
         private var timedOut = false
+        private var exceededMaxBytes = false
         private var exitCode: Int32? = nil
 
         var isTimedOut: Bool {
@@ -450,10 +451,42 @@ enum SwitcherCommandRunner {
             lock.unlock()
         }
 
+        var isExceededMaxBytes: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return exceededMaxBytes
+        }
+
+        func markExceededMaxBytes() {
+            lock.lock()
+            exceededMaxBytes = true
+            lock.unlock()
+        }
+
         func setExitCode(_ code: Int32) {
             lock.lock()
             exitCode = code
             lock.unlock()
+        }
+
+        var terminationStatus: Int32? {
+            lock.lock()
+            defer { lock.unlock() }
+            return exitCode
+        }
+    }
+
+    private static func reapProcess(_ task: Process) {
+        if task.isRunning {
+            task.terminate()
+            let pid = task.processIdentifier
+            if pid > 0 {
+                // Short grace interval for SIGTERM
+                usleep(300_000)
+                if task.isRunning {
+                    kill(pid, SIGKILL)
+                }
+            }
         }
     }
 
@@ -461,6 +494,7 @@ enum SwitcherCommandRunner {
                         setupProgress: SetupProgressReader? = nil) throws -> Data {
         let category = CommandCategory.classify(args: task.arguments)
         let timeoutSeconds = category.timeoutSeconds
+        let deadline = DispatchTime.now() + timeoutSeconds
 
         let output = Pipe(), progressOutput = Pipe()
         task.standardOutput = output
@@ -481,6 +515,13 @@ enum SwitcherCommandRunner {
         task.standardInput = incoming
 
         let state = SafeExecutionState()
+        let exitGroup = DispatchGroup()
+        exitGroup.enter()
+
+        task.terminationHandler = { t in
+            state.setExitCode(t.terminationStatus)
+            exitGroup.leave()
+        }
 
         // 1. Start child process
         if let cancellation { try cancellation.start(task) } else { try task.run() }
@@ -495,38 +536,51 @@ enum SwitcherCommandRunner {
             try? incoming.fileHandleForWriting.close()
         }
 
-        // 3. Asynchronously read stdout to prevent synchronous deadlock in readDataToEndOfFile
+        // 3. Asynchronously read stdout in chunks with 4MB memory ceiling
         let outputGroup = DispatchGroup()
         let readLock = NSLock()
         var receivedData = Data()
+        let maxAllowedBytes = 4_000_000
 
         outputGroup.enter()
         DispatchQueue.global(qos: .userInitiated).async {
             defer { outputGroup.leave() }
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            readLock.lock()
-            receivedData = data
-            readLock.unlock()
+            let handle = output.fileHandleForReading
+            while true {
+                // Read in 64KB chunks
+                let chunk = handle.readData(ofLength: 65536)
+                if chunk.isEmpty { break }
+                readLock.lock()
+                if receivedData.count + chunk.count > maxAllowedBytes {
+                    state.markExceededMaxBytes()
+                    readLock.unlock()
+                    try? handle.close()
+                    break
+                }
+                receivedData.append(chunk)
+                readLock.unlock()
+            }
+            try? handle.close()
         }
 
         // 4. Bounded wait on process output
-        let waitResult = outputGroup.wait(timeout: .now() + timeoutSeconds)
+        let outputWaitResult = outputGroup.wait(timeout: deadline)
 
-        if waitResult == .timedOut {
-            state.markTimedOut()
-            // Close reader handle to unblock any hanging file descriptor
+        // If reading exceeded 4MB, immediately terminate and reap
+        if state.isExceededMaxBytes {
+            try? incoming.fileHandleForWriting.close()
             try? output.fileHandleForReading.close()
+            reapProcess(task)
+            _ = exitGroup.wait(timeout: .now() + 1.0)
+            throw NSError(domain: "Switcher", code: 2, userInfo: [NSLocalizedDescriptionKey: "后台命令输出超出 4MB 限制，已终止进程。"])
+        }
 
-            // Graceful SIGTERM with escalation to SIGKILL
-            task.terminate()
-            let pid = task.processIdentifier
-            if pid > 0 {
-                usleep(500_000)
-                if task.isRunning {
-                    kill(pid, SIGKILL)
-                }
-            }
-            task.waitUntilExit()
+        if outputWaitResult == .timedOut {
+            state.markTimedOut()
+            try? incoming.fileHandleForWriting.close()
+            try? output.fileHandleForReading.close()
+            reapProcess(task)
+            _ = exitGroup.wait(timeout: .now() + 1.0)
 
             let errorMsg = category == .mutatingTransaction
                 ? "事务操作执行超时（超过 \(Int(timeoutSeconds)) 秒），已中断子进程以防挂死；请检查事务恢复日志并重试。"
@@ -538,8 +592,24 @@ enum SwitcherCommandRunner {
             )
         }
 
-        task.waitUntilExit()
-        state.setExitCode(task.terminationStatus)
+        // 5. Bounded wait on process exit itself (prevents hang if stdout is closed early)
+        let exitWaitResult = exitGroup.wait(timeout: deadline)
+        if exitWaitResult == .timedOut {
+            state.markTimedOut()
+            try? incoming.fileHandleForWriting.close()
+            try? output.fileHandleForReading.close()
+            reapProcess(task)
+            _ = exitGroup.wait(timeout: .now() + 1.0)
+
+            let errorMsg = category == .mutatingTransaction
+                ? "事务操作等待退出超时（超过 \(Int(timeoutSeconds)) 秒），已强制终止以防挂死；请检查事务恢复日志并重试。"
+                : "后台命令等待退出超时（超过 \(Int(timeoutSeconds)) 秒），已强制终止以防挂死。"
+            throw NSError(
+                domain: "Switcher",
+                code: 124,
+                userInfo: [NSLocalizedDescriptionKey: errorMsg]
+            )
+        }
 
         if cancellation?.isCancelled == true { throw CancellationError() }
 

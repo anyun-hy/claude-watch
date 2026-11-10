@@ -140,27 +140,48 @@ impl Controller {
             }
             Ok(StopOutcome::SkippedWarn)
         } else if action == "force" && family.is_some_and(|f| f.performable("force")) {
-            // When user explicitly requested force (SIGKILL), respect it regardless of channel mode.
-            // Explicitly separate process disposition from channel disposition.
-            receipt["process_disposition"] = json!("force_quit");
-            receipt["process_preserved"] = json!(false);
+            // When user policy requested force (SIGKILL), respect it regardless of channel mode.
+            // Explicitly separate requested action from actual execution outcome.
+            receipt["process_requested_action"] = json!("force_quit");
             if system.channel_mode() {
+                receipt["channel_requested_action"] = json!("disconnect");
                 receipt["channel_disposition"] = json!("disconnect_channel");
-                receipt["disposition_mode"] = json!("disconnect_channel_and_force_quit");
-                receipt["action"] = json!("disconnect-and-force-quit");
             }
             let mut forced = None;
             let result = system.quit_for_confirmed_ip_risk(&mut forced);
             receipt["stop_force_requested"] = json!(forced);
             receipt["stop_force_reported"] = json!(forced.is_some());
+            match &result {
+                Ok(()) => {
+                    receipt["process_execution_state"] = json!("confirmed");
+                    receipt["process_disposition"] = json!("force_quit");
+                    receipt["process_preserved"] = json!(false);
+                    if system.channel_mode() {
+                        receipt["disposition_mode"] = json!("disconnect_channel_and_force_quit");
+                        receipt["action"] = json!("disconnect-and-force-quit");
+                    }
+                }
+                Err(_err) => {
+                    receipt["process_execution_state"] = json!("failed");
+                    receipt["process_disposition"] = json!("force_quit_failed");
+                    receipt["process_preserved"] = json!(true);
+                    if system.channel_mode() {
+                        receipt["disposition_mode"] = json!("force_quit_failed_disconnect_channel");
+                        receipt["action"] = json!("disconnect-channel");
+                    }
+                }
+            }
             result.map(|()| StopOutcome::Confirmed)
         } else if system.channel_mode() {
             // Channel supervision mode: default disposition cuts off the
             // target application's network channel and keeps its processes
             // alive (`断流保进程`). It never implicitly invokes legacy process
             // exit (`quit_desktop` / `quit_for_confirmed_ip_risk`).
+            receipt["process_requested_action"] = json!("preserve");
+            receipt["process_execution_state"] = json!("preserved");
             receipt["process_disposition"] = json!("preserved");
             receipt["process_preserved"] = json!(true);
+            receipt["channel_requested_action"] = json!("disconnect");
             receipt["channel_disposition"] = json!("disconnect_channel");
             receipt["disposition_mode"] = json!("disconnect_channel_keep_process");
             receipt["action"] = json!("disconnect-channel");
@@ -168,10 +189,22 @@ impl Controller {
             // The executor receipt, not this request, establishes isolation.
             Ok(StopOutcome::SkippedWarn)
         } else {
-            receipt["process_disposition"] = json!("close_desktop");
-            receipt["process_preserved"] = json!(false);
+            receipt["process_requested_action"] = json!("close_desktop");
+            let result = system.quit_desktop();
+            match &result {
+                Ok(()) => {
+                    receipt["process_execution_state"] = json!("confirmed");
+                    receipt["process_disposition"] = json!("close_desktop");
+                    receipt["process_preserved"] = json!(false);
+                }
+                Err(_) => {
+                    receipt["process_execution_state"] = json!("failed");
+                    receipt["process_disposition"] = json!("close_desktop_failed");
+                    receipt["process_preserved"] = json!(true);
+                }
+            }
             receipt["channel_disposition"] = json!("not_applicable");
-            system.quit_desktop().map(|()| StopOutcome::Confirmed)
+            result.map(|()| StopOutcome::Confirmed)
         };
         receipt["stop_completed_at"] = json!(system.now());
         receipt["stop_elapsed_seconds"] = json!(started.elapsed().as_secs_f64());
@@ -218,7 +251,9 @@ impl Controller {
             Ok(Some(StopOutcome::SkippedWarn)) => {}
             Ok(Some(StopOutcome::Confirmed)) => {
                 if receipt.get("action") != Some(&json!("disconnect-and-force-quit")) {
-                    receipt["action"] = json!("close-desktop");
+                    if receipt.get("process_preserved") == Some(&json!(false)) {
+                        receipt["action"] = json!("close-desktop");
+                    }
                 }
                 receipt["stop_state"] = json!("confirmed");
                 if let Some(reason) = persist_reason {

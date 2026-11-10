@@ -1145,32 +1145,37 @@ impl Controller {
 
         if system.channel_mode() {
             let process_already_terminated = receipt.get("process_preserved") == Some(&json!(false))
-                || receipt.get("disposition_mode") == Some(&json!("disconnect_channel_and_force_quit"))
-                || receipt.get("action") == Some(&json!("disconnect-and-force-quit"))
-                || receipt.get("process_disposition") == Some(&json!("force_quit"));
+                && receipt.get("process_execution_state") == Some(&json!("confirmed"));
 
             if process_already_terminated {
                 receipt["disposition_mode"] = json!("disconnect_channel_and_force_quit");
                 receipt["process_preserved"] = json!(false);
                 receipt["action"] = json!("disconnect-and-force-quit");
             } else {
-                receipt["disposition_mode"] = json!("disconnect_channel_keep_process");
+                receipt["disposition_mode"] = if receipt.get("process_requested_action") == Some(&json!("force_quit")) {
+                    json!("force_quit_failed_disconnect_channel")
+                } else {
+                    json!("disconnect_channel_keep_process")
+                };
                 receipt["process_preserved"] = json!(true);
                 if effective_permit.state == ChannelPermitState::Revoked {
                     receipt["action"] = json!("disconnect-channel");
                 }
             }
             if effective_permit.state == ChannelPermitState::Revoked {
+                receipt["channel_requested_action"] = json!("disconnect");
                 if !process_already_terminated {
                     receipt["action"] = json!("disconnect-channel");
                 }
                 match &verdict {
                     ChannelSupervisionVerdict::IsolatedKeepProcess => {
+                        receipt["channel_execution_state"] = json!("blocked");
                         receipt["stop_state"] = json!("channel_blocked");
                         receipt["channel_state"] = json!("blocked");
                         receipt["channel_status_label"] = json!("已阻断");
                     }
                     ChannelSupervisionVerdict::PendingIsolation { .. } => {
+                        receipt["channel_execution_state"] = json!("disconnecting");
                         receipt["stop_state"] = json!("disconnecting");
                         receipt["channel_state"] = json!("disconnecting");
                         receipt["channel_status_label"] = json!("正在断开");
@@ -1179,6 +1184,7 @@ impl Controller {
                         code,
                         status_label_zh,
                     } => {
+                        receipt["channel_execution_state"] = json!("failed");
                         receipt["status"] = json!("protection_unavailable");
                         receipt["stop_state"] = json!("enforcement_failed");
                         receipt["channel_state"] = json!("failed");
@@ -1217,7 +1223,7 @@ fn fold_guard_receipts(receipts: Vec<Value>) -> Value {
         // A family that actually closed or disconnected outranks one that only reported.
         let acted = u8::from(matches!(
             receipt["action"].as_str(),
-            Some("close-desktop" | "disconnect-channel")
+            Some("close-desktop" | "disconnect-channel" | "disconnect-and-force-quit")
         ));
         (severity(receipt["status"].as_str().unwrap_or("")), acted)
     };
