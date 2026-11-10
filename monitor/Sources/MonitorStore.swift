@@ -265,9 +265,6 @@ final class MonitorStore: ObservableObject {
             channelSubscription.applySnapshot(channelSnap)
         }
         // The UI observes authoritative receipts; it never reissues permits.
-        if NetworkBackendCapabilities.requiresSystemExtensionActivation() {
-            _ = NetworkExtensionHostManager.shared
-        }
         // Re-evaluate only after both the tracker and snapshot describe this
         // observation. Otherwise a recovered sampler can leave a fresh
         // receipt marked incomplete until an unrelated later clock tick.

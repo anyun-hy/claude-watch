@@ -45,7 +45,8 @@ fn controlled_egress(
         "upstream_endpoint": cfg.proxy_url,
         "policy_version": policy_ver,
         "context_id": "ctx-vpn",
-        "via_controlled_path": true
+        "via_controlled_path": true,
+        "backend": "seatbelt"
     });
     if let Some(ep) = vpn_epoch {
         val["vpn_epoch"] = json!(ep);

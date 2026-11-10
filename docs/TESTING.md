@@ -13,8 +13,9 @@ Run without `sudo`. The current native desktop fixtures require Apple Silicon,
 macOS 26+, Xcode's macOS SDK, the repository's Rust toolchain, Python 3 and Node.
 The runner does not install missing tools. It opens temporary fixture windows,
 uses local sockets and Seatbelt, and may stop processes created by the tests.
-It does not launch real AI applications, modify VPN settings, install services,
-or activate the NetworkExtension.
+It does not launch real AI applications, modify VPN settings, or install services.
+The retired NetworkExtension implementation and its dedicated tests are no longer
+part of the build or test plan; the supported backend is Rust+nono/Seatbelt.
 
 ## Results
 

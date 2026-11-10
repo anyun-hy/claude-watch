@@ -21,7 +21,6 @@ ROOT = Path(__file__).resolve().parents[2]
 ENGINE = ROOT / "target" / "debug" / "claude-watch-engine"
 SWITCHER = ROOT / "monitor" / "Sources" / "SwitcherStore.swift"
 MODELS = ROOT / "monitor" / "Sources" / "MonitorModels.swift"
-BACKEND_CAP = ROOT / "monitor" / "Sources" / "NetworkBackendCapabilities.swift"
 COFFEE = ROOT / "monitor" / "Sources" / "NetCoffeeModels.swift"
 LEAK = ROOT / "monitor" / "Sources" / "LeakCheckModels.swift"
 INIT_LOG = ROOT / "monitor" / "Sources" / "InitializationConnectionLog.swift"
@@ -112,7 +111,6 @@ def production_models() -> str:
         (MODELS, "VpnExpectationModel"),
         (MODELS, "VpnMatchModel"),
         (MODELS, "VpnSupervisionSnapshotModel"),
-        (BACKEND_CAP, "NetworkBackendCapabilities"),
         (MODELS, "TargetDiscoveryStatusModel"),
         (MODELS, "MonitorSnapshot"),
     )
@@ -286,7 +284,7 @@ struct RustSwiftReceiptContract {
         )
         require(blockedConfirmed.isConfirmedFlowBlocked == true, "U01: applied blocked receipt with 0 active flows must report isConfirmedFlowBlocked")
 
-        // Verify VpnSupervisionSnapshotModel diffs & unknown/stale reasons and NetworkBackendCapabilities alignment
+        // Verify VpnSupervisionSnapshotModel diffs & unknown/stale reasons
         let vpnSnap = VpnSupervisionSnapshotModel(
             captured_at: 1007.0,
             network_backend: "seatbelt",
@@ -301,8 +299,6 @@ struct RustSwiftReceiptContract {
         )
         require(vpnSnap.differences.count == 1 && vpnSnap.differences[0].field == "selected_node", "U01: VpnSupervisionSnapshotModel differences mismatch")
         require(vpnSnap.unknownOrStaleReasons == ["system_proxy_not_sampled"], "U01: VpnSupervisionSnapshotModel unknownOrStaleReasons mismatch")
-        require(NetworkBackendCapabilities.requiresLegacyMigration(from: ["schema": 1]) == true, "U01: legacy schema 1 must require migration under seatbelt package")
-        require(NetworkBackendCapabilities.isBackendAligned(with: ["schema": 2, "network_backend": "seatbelt"]) == true, "U01: schema 2 seatbelt must be aligned")
 
         print("RustSwiftReceiptContract: decoded status nested accounts/audit/service, checkdetail --no-report, service-status, environment, snapshot, and non-null Rust online lookup")
     }

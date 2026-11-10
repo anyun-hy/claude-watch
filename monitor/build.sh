@@ -24,60 +24,12 @@ cw_resolve_signing_aliases() {
 }
 CW_SIGNING_IDENTITY=$(cw_resolve_signing_aliases CW_SIGNING_IDENTITY CW_CODESIGN_IDENTITY CW_SIGN_IDENTITY)
 CW_SIGNING_IDENTITY="${CW_SIGNING_IDENTITY:--}"
-CW_HOST_PROVISION_PROFILE=$(cw_resolve_signing_aliases CW_HOST_PROVISION_PROFILE CW_HOST_PROFILE CW_APP_PROVISIONING_PROFILE)
-CW_EXTENSION_PROVISION_PROFILE=$(cw_resolve_signing_aliases CW_EXTENSION_PROVISION_PROFILE CW_EXTENSION_PROFILE CW_EXTENSION_PROVISIONING_PROFILE)
-CW_NETWORK_BACKEND="${CW_NETWORK_BACKEND:-seatbelt}"
-case "$CW_NETWORK_BACKEND" in
-  seatbelt|network-extension) ;;
-  *) printf 'CW_NETWORK_BACKEND must be seatbelt or network-extension (got %s).\n' "$CW_NETWORK_BACKEND" >&2; exit 1 ;;
-esac
-case "${CW_REQUIRE_ENTITLED_NETWORK_EXTENSION:-0}" in
-  0) ;;
-  1)
-    CW_NETWORK_BACKEND=network-extension
-    if [[ "$CW_SIGNING_IDENTITY" == - ]]; then
-      echo 'Production NetworkExtension build cannot use an ad-hoc signature.' >&2
-      exit 1
-    fi
-    ;;
-  *) echo 'CW_REQUIRE_ENTITLED_NETWORK_EXTENSION must be 0 or 1.' >&2; exit 1 ;;
-esac
+# Only the nono/Seatbelt backend is supported. Reject retired command lines
+# before building anything; never silently switch a requested network backend.
+source "$ROOT/network-backend.sh"
+cw_require_seatbelt_backend
 CW_SIGN_OPTIONS=()
-CW_EXTENSION_MACH_SERVICE=io.local.watchpanel.network-extension
-if [[ "$CW_NETWORK_BACKEND" == network-extension && "$CW_SIGNING_IDENTITY" != - ]]; then
-  : "${CW_HOST_PROVISION_PROFILE:?Set the Developer ID profile for io.local.watchpanel}"
-  : "${CW_EXTENSION_PROVISION_PROFILE:?Set the Developer ID profile for io.local.watchpanel.network-extension}"
-  [[ -f "$CW_HOST_PROVISION_PROFILE" && -f "$CW_EXTENSION_PROVISION_PROFILE" ]] || { echo 'Signing profiles are unavailable.' >&2; exit 1; }
-  mkdir -p "$ROOT/build/channel-signing"
-  CW_EXTENSION_MACH_SERVICE=$(python3 - "$ROOT" "$CW_HOST_PROVISION_PROFILE" "$CW_EXTENSION_PROVISION_PROFILE" <<'PY'
-import datetime, pathlib, plistlib, subprocess, sys
-root = pathlib.Path(sys.argv[1])
-teams = set()
-for kind, bundle, profile_path in zip(('Host', 'Extension'), ('io.local.watchpanel', 'io.local.watchpanel.network-extension'), sys.argv[2:]):
-    decoded = subprocess.run(['/usr/bin/security', 'cms', '-D', '-i', profile_path], check=True, capture_output=True).stdout
-    profile = plistlib.loads(decoded)
-    permitted = profile['Entitlements']
-    team = permitted['com.apple.developer.team-identifier']
-    if not team.isalnum() or len(team) != 10:
-        raise SystemExit('Invalid signing team')
-    teams.add(team)
-    app_id = permitted.get('com.apple.application-identifier')
-    if app_id != f'{team}.{bundle}' or profile['ExpirationDate'].replace(tzinfo=datetime.timezone.utc) <= datetime.datetime.now(datetime.timezone.utc):
-        raise SystemExit('Wrong or expired NetworkExtension provisioning profile')
-    requested = plistlib.loads((root / 'Signing' / f'{kind}.entitlements').read_bytes())
-    for key, value in requested.items():
-        if isinstance(value, list):
-            if not all(item in permitted.get(key, []) for item in value): raise SystemExit('Profile lacks the required NetworkExtension entitlement')
-        elif permitted.get(key) != value: raise SystemExit('Profile lacks system-extension installation entitlement')
-    requested['com.apple.application-identifier'] = app_id
-    requested['com.apple.developer.team-identifier'] = team
-    (root / 'build/channel-signing' / f'{kind}.entitlements').write_bytes(plistlib.dumps(requested))
-if len(teams) != 1: raise SystemExit('Host and extension must use the same signing team')
-print(f'{teams.pop()}.io.local.watchpanel.network-extension')
-PY
-)
-  CW_SIGN_OPTIONS=(--timestamp --options runtime)
-elif [[ "$CW_SIGNING_IDENTITY" != - ]]; then
+if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
   CW_SIGN_OPTIONS=(--timestamp --options runtime)
 fi
 # The Python backend is retired: the app ships the Rust engine only. A build
@@ -167,52 +119,15 @@ for CW_TARGET_ARCH in $CW_TARGETS; do
     -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
     -framework AppKit -framework Foundation "$ROOT/Sources/BoundedDiagnosticLog.swift" "$ROOT/ControlledEntry/ControlledEntryApp.swift" \
     -o "$ROOT/build/ControlledEntry.$CW_TARGET_ARCH"
-
-  if [[ "$CW_NETWORK_BACKEND" == network-extension ]]; then
-    # Build the NetworkExtension system extension target only when CW_NETWORK_BACKEND=network-extension
-    "$SWIFTC" -swift-version 5 -O -parse-as-library \
-      -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
-      -framework NetworkExtension "$ROOT"/SystemExtension/*.swift \
-      -o "$ROOT/build/WatchChannelExtension.$CW_TARGET_ARCH"
-  fi
 done
 cp "$ROOT/build/ClaudeWatchMonitor.$CW_BUILD_ARCH" "$APP/Contents/MacOS/ClaudeWatchMonitor"
 cp "$ROOT/build/watch-leak-worker.$CW_BUILD_ARCH" "$APP/Contents/Resources/watch-leak-worker"
 cp "$ROOT/build/ControlledEntry.$CW_BUILD_ARCH" "$APP/Contents/Resources/ControlledEntry"
 
-SYSEXT_DIR="$APP/Contents/Library/SystemExtensions/io.local.watchpanel.network-extension.systemextension"
-if [[ "$CW_NETWORK_BACKEND" == network-extension ]]; then
-  mkdir -p "$SYSEXT_DIR/Contents/MacOS"
-  cp "$ROOT/build/WatchChannelExtension.$CW_BUILD_ARCH" "$SYSEXT_DIR/Contents/MacOS/WatchChannelExtension"
-  cat > "$SYSEXT_DIR/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>CFBundleIdentifier</key><string>io.local.watchpanel.network-extension</string>
-<key>CFBundleName</key><string>WatchChannelExtension</string>
-<key>CFBundleExecutable</key><string>WatchChannelExtension</string>
-<key>CFBundlePackageType</key><string>SYSX</string>
-<key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
-<key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
-<key>NetworkExtension</key>
-<dict>
-    <key>NEMachServiceName</key><string>$CW_EXTENSION_MACH_SERVICE</string>
-    <key>NEProviderClasses</key>
-    <dict>
-        <key>com.apple.networkextension.app-proxy</key><string>WatchChannelExtension</string>
-    </dict>
-</dict>
-</dict></plist>
-PLIST
-  if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
-    cp "$CW_EXTENSION_PROVISION_PROFILE" "$SYSEXT_DIR/Contents/embedded.provisionprofile"
-    /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" "${CW_SIGN_OPTIONS[@]}" --entitlements "$ROOT/build/channel-signing/Extension.entitlements" "$SYSEXT_DIR"
-  else
-    /usr/bin/codesign --force --sign - "$SYSEXT_DIR"
-  fi
-else
-  rm -rf "$APP/Contents/Library/SystemExtensions"
-fi
+# A reused build directory must not carry a retired extension/profile into
+# the Seatbelt package. This only cleans the candidate output, never an install.
+rm -rf "$APP/Contents/Library/SystemExtensions"
+rm -f "$APP/Contents/embedded.provisionprofile"
 cp "$ROOT/Resources/webrtc_probe.html" "$ROOT/Resources/webrtc_probe.js" "$APP/Contents/Resources/"
 cp "$ROOT/Resources/netcoffee_probe.html" "$ROOT/Resources/netcoffee_probe.js" "$ROOT/Resources/netcoffee_probe.css" "$ROOT/Resources/watch-admin.sh" "$APP/Contents/Resources/"
 cp "$ROOT/Resources/ipleak_probe.html" "$ROOT/Resources/ipleak_probe.js" "$APP/Contents/Resources/"
@@ -308,18 +223,10 @@ files = [root / n for n in ("watch-engine", "watch-native-observer", "watch-admi
 value["RuntimeHashes"] = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
 manifest.write_bytes(plistlib.dumps(value))
 PY
-if [[ "$CW_NETWORK_BACKEND" == network-extension && "$CW_SIGNING_IDENTITY" != - ]]; then
-  cp "$CW_HOST_PROVISION_PROFILE" "$APP/Contents/embedded.provisionprofile"
-  /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" "${CW_SIGN_OPTIONS[@]}" --entitlements "$ROOT/build/channel-signing/Host.entitlements" "$APP"
-  /usr/bin/codesign --verify --strict "$SYSEXT_DIR"
-  /usr/bin/codesign --verify --strict "$APP"
-elif [[ "$CW_SIGNING_IDENTITY" != - ]]; then
+if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
   /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" "${CW_SIGN_OPTIONS[@]}" "$APP"
-  /usr/bin/codesign --verify --strict "$APP"
 else
   /usr/bin/codesign --force --sign - "$APP"
-  if [[ "$CW_NETWORK_BACKEND" == network-extension ]]; then
-    echo 'Development signature only: system interception is unavailable until signed, provisioned and activated.' >&2
-  fi
 fi
+/usr/bin/codesign --verify --strict "$APP"
 printf 'Built: %s (app %s; backend %s)\n' "$APP" "$APP_VERSION" "$BACKEND_VERSION"

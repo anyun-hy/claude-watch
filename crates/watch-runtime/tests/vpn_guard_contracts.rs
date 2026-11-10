@@ -109,7 +109,7 @@ fn controlled_egress(
         "upstream_endpoint": cfg.proxy_url,
         "policy_version": policy_ver,
         "context_id": "ctx-vpn",
-        "via_controlled_path": true
+        "backend": "seatbelt", "via_controlled_path": true
     });
     if let Some(ep) = vpn_epoch {
         val["vpn_epoch"] = json!(ep);
@@ -1165,7 +1165,7 @@ fn r1_r2_seatbelt_missing_vpn_expectation_corrupt_config_or_legacy_migration_fai
         Some("legacy_config_migration_required")
     );
 
-    // 4. Package mismatch (`Seatbelt` package vs `network_extension` config): fails closed.
+    // 4. Explicit retired backend is retained for migration, never executed.
     let (_tmp4, store4) = make_local_store("cw-r1-mismatch");
     std::fs::create_dir_all(store4.paths.config().parent().unwrap()).unwrap();
     {
@@ -1190,10 +1190,10 @@ fn r1_r2_seatbelt_missing_vpn_expectation_corrupt_config_or_legacy_migration_fai
     };
     let resolved_mismatch =
         cfg_store4.resolve_runtime_config_state(Some(NetworkBackendKind::Seatbelt));
-    assert!(resolved_mismatch.package_mismatch);
+    assert!(resolved_mismatch.legacy_migration_required);
     assert_eq!(
         resolved_mismatch.blocking_reason().as_deref(),
-        Some("backend_package_config_mismatch")
+        Some("legacy_config_migration_required")
     );
 }
 

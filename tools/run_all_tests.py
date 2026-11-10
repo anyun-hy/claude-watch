@@ -121,12 +121,6 @@ def build_plan(run_dir: Path) -> tuple[list[Step], dict]:
                     "May open owned fixture windows and terminate owned child processes."]),
         Step("rust.engine", "prerequisite", dependencies=["rust.build"], prepare=[
             {"kind": "require_file", "path": "{engine}"}]),
-        Step("rust.extension_command_fixture", "prerequisite", dependencies=["rust.workspace"], prepare=[
-            {"kind": "require_file", "path": "{run_dir}/artifacts/rust-command.json"}],
-             notes=["Exported by the workspace test; no duplicate test run."]),
-        Step("rust.extension_capture_fixture", "prerequisite", dependencies=["rust.workspace"], prepare=[
-            {"kind": "require_file", "path": "{run_dir}/artifacts/root-capture.json"}],
-             notes=["Exported by the workspace test; no duplicate test run."]),
         Step("rust.monitor_coverage_fixture", "prerequisite", dependencies=["rust.workspace"], prepare=[
             {"kind": "require_file", "path": "{run_dir}/artifacts/monitor-coverage-wire.json"},
             {"kind": "require_file", "path": "{run_dir}/artifacts/managed-cli-unlinked-visible.json"}],
@@ -456,7 +450,7 @@ class Runner:
             # A workspace assertion failure need not discard fresh fixture
             # exports from other passing tests. These steps verify the actual
             # files in this NEW run directory; they never reuse an older run.
-            if step.id in ("rust.extension_command_fixture", "rust.extension_capture_fixture", "rust.monitor_coverage_fixture", "rust.process_protection_fixture", "rust.target_discovery_fixture"):
+            if step.id in ("rust.monitor_coverage_fixture", "rust.process_protection_fixture", "rust.target_discovery_fixture"):
                 bad_deps = [dep for dep in bad_deps if prior.get(dep) != "failed"]
             if step.excluded_reason:
                 result.update(status="excluded", reason=step.excluded_reason)

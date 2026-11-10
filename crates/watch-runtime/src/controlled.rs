@@ -933,7 +933,7 @@ impl Controller {
                     valid_until: now,
                     baseline_ip: None,
                     members: Vec::new(),
-                    backend: if system.channel_mode() { NetworkBackendKind::Seatbelt } else { NetworkBackendKind::NetworkExtension },
+                    backend: NetworkBackendKind::Seatbelt,
                     vpn_epoch: None,
                     coverage_scope: None,
                 }
@@ -952,7 +952,7 @@ impl Controller {
                     valid_until: now,
                     baseline_ip: None,
                     members: Vec::new(),
-                    backend: if system.channel_mode() { NetworkBackendKind::Seatbelt } else { NetworkBackendKind::NetworkExtension },
+                    backend: NetworkBackendKind::Seatbelt,
                     vpn_epoch: None,
                     coverage_scope: None,
                 }

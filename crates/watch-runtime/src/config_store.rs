@@ -22,6 +22,13 @@ impl ResolvedRuntimeConfig {
         if let Some(ref code) = self.config_error {
             return Some(format!("config_invalid:{code}"));
         }
+        match self.packaged_backend {
+            None => return Some("packaged_network_backend_missing".into()),
+            Some(NetworkBackendKind::NetworkExtension) => {
+                return Some("legacy_network_backend_removed".into());
+            }
+            Some(NetworkBackendKind::Seatbelt) => {}
+        }
         if self.legacy_migration_required {
             return Some("legacy_config_migration_required".into());
         }
@@ -43,57 +50,51 @@ impl ConfigStore {
         )
     }
 
-    /// Resolves the runtime configuration aligned with the packaged backend:
-    /// - New installation (no `config.json` on disk) on a `Seatbelt` package defaults to
-    ///   `Config::default_for_new_install()` (`schema: 2`, `network_backend: Some(Seatbelt)`).
-    /// - Existing `schema: 1` configuration on disk without explicit `network_backend` on a
-    ///   `Seatbelt` package returns `legacy_migration_required = true` until the user explicitly
-    ///   saves/migrates their `vpn_expectation` or `network_backend`.
+    /// Resolves a configuration for the only supported execution backend.
+    /// Old documents remain readable and require an explicit save/migration;
+    /// missing or retired package metadata never selects another backend.
     pub fn resolve_runtime_config(
         &self,
         packaged_backend: Option<NetworkBackendKind>,
     ) -> Result<(Config, bool)> {
-        if !self.storage.paths.config().exists() {
-            if packaged_backend == Some(NetworkBackendKind::Seatbelt) {
-                return Ok((Config::default_for_new_install(), false));
+        match packaged_backend {
+            Some(NetworkBackendKind::Seatbelt) => {}
+            Some(NetworkBackendKind::NetworkExtension) => {
+                return Err(CoreError::new("legacy_network_backend_removed", "旧网络扩展后端已移除"));
             }
-            return Ok((Config::default(), false));
+            None => {
+                return Err(CoreError::new("packaged_network_backend_missing", "运行组件缺少有效的 Seatbelt 后端信息"));
+            }
+        }
+        if !self.storage.paths.config().exists() {
+            return Ok((Config::default_for_new_install(), false));
         }
         let config = self.load()?;
-        let legacy_migration_required = packaged_backend == Some(NetworkBackendKind::Seatbelt)
-            && config.requires_backend_migration_setup();
+        let legacy_migration_required = config.requires_backend_migration_setup();
         Ok((config, legacy_migration_required))
     }
 
-    /// Fail-closed runtime configuration resolution that preserves parse/validation errors,
-    /// legacy `schema: 1` migration gating, and packaged vs configured backend mismatch
-    /// without silently falling back to an unrestricted `Config::default()`.
+    /// Keeps invalid configuration and unavailable package metadata observable.
+    /// The fallback object is always a new Seatbelt configuration, but cannot
+    /// authorize a channel while `blocking_reason` is present.
     pub fn resolve_runtime_config_state(
         &self,
         packaged_backend: Option<NetworkBackendKind>,
     ) -> ResolvedRuntimeConfig {
         if !self.storage.paths.config().exists() {
-            let config = if packaged_backend == Some(NetworkBackendKind::Seatbelt) {
-                Config::default_for_new_install()
-            } else {
-                Config::default()
-            };
             return ResolvedRuntimeConfig {
-                config,
+                config: Config::default_for_new_install(),
                 packaged_backend,
                 legacy_migration_required: false,
-                package_mismatch: false,
+                package_mismatch: packaged_backend.is_some_and(|pkg| !pkg.is_sandbox()),
                 config_error: None,
             };
         }
         match self.load() {
             Ok(config) => {
-                let legacy_migration_required =
-                    packaged_backend == Some(NetworkBackendKind::Seatbelt)
-                        && config.requires_backend_migration_setup();
+                let legacy_migration_required = config.requires_backend_migration_setup();
                 let package_mismatch = !legacy_migration_required
-                    && packaged_backend
-                        .is_some_and(|pkg| pkg != config.effective_network_backend());
+                    && packaged_backend.is_some_and(|pkg| !pkg.is_sandbox());
                 ResolvedRuntimeConfig {
                     config,
                     packaged_backend,
@@ -102,20 +103,13 @@ impl ConfigStore {
                     config_error: None,
                 }
             }
-            Err(err) => {
-                let fallback_config = if packaged_backend == Some(NetworkBackendKind::Seatbelt) {
-                    Config::default_for_new_install()
-                } else {
-                    Config::default()
-                };
-                ResolvedRuntimeConfig {
-                    config: fallback_config,
-                    packaged_backend,
-                    legacy_migration_required: false,
-                    package_mismatch: false,
-                    config_error: Some(err.code),
-                }
-            }
+            Err(err) => ResolvedRuntimeConfig {
+                config: Config::default_for_new_install(),
+                packaged_backend,
+                legacy_migration_required: false,
+                package_mismatch: false,
+                config_error: Some(err.code),
+            },
         }
     }
 
@@ -141,11 +135,10 @@ impl ConfigStore {
         expectation.configured = true;
         expectation.validate()?;
         let _lock = self.storage.lock("operation", None)?;
-        let mut current = self.load().unwrap_or_default();
+        let mut current = self.load()?;
         current.schema = current.schema.max(2);
-        if current.network_backend.is_none() {
-            current.network_backend = Some(NetworkBackendKind::Seatbelt);
-        }
+        // This user-confirmed save is the explicit migration boundary.
+        current.network_backend = Some(NetworkBackendKind::Seatbelt);
         if !expectation.proxy_mode.is_empty() {
             current.proxy_mode = expectation.proxy_mode.clone();
         }
@@ -168,8 +161,11 @@ impl ConfigStore {
     }
 
     pub fn save_network_backend(&self, backend: NetworkBackendKind) -> Result<Config> {
+        if !backend.is_sandbox() {
+            return Err(CoreError::new("legacy_network_backend_removed", "只能保存 Seatbelt 网络后端"));
+        }
         let _lock = self.storage.lock("operation", None)?;
-        let mut current = self.load().unwrap_or_default();
+        let mut current = self.load()?;
         current.schema = current.schema.max(2);
         current.network_backend = Some(backend);
         let validated = Config::from_value(current.value()?)?;
@@ -276,6 +272,9 @@ impl ConfigStore {
             serde_json::json!(approved.into_iter().collect::<Vec<_>>()),
         );
         let validated = Config::from_value(value)?;
+        if validated.network_backend == Some(NetworkBackendKind::NetworkExtension) {
+            return Err(CoreError::new("legacy_network_backend_removed", "旧网络扩展配置只可读取并迁移，不能重新启用"));
+        }
         self.storage
             .atomic_json(&self.storage.paths.config(), &validated.value()?)?;
         Ok(validated)

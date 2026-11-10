@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Explicitly reviewed independent Swift test recipes. Fixtures and owned test processes do not establish installed service, real AI, VPN or SystemExtension acceptance.",
+  "description": "Explicitly reviewed independent Swift test recipes. Fixtures and owned test processes do not establish installed service, real AI, VPN or installed-gateway acceptance.",
   "source_semantics": "sources contains production inputs only; append test_files for kind=swift. concat_sources preserves listed order, including test_files. Script entries document their internal compile inputs.",
   "defaults": {
     "swift_version": "5",
@@ -219,100 +219,6 @@
       ],
       "safety_notes": "Builds/ad-hoc-signs an owned temporary .app and launches only that test app. Both JS run implementations are replaced with local receipts before execution. Require the completion marker and inspect combined stdout/stderr: open exit alone is insufficient.",
       "recipe_ref": "monitor/tests/run_background_leak_worker_test.sh"
-    },
-    {
-      "id": "swift.ChannelEpochTests",
-      "kind": "swift",
-      "test_files": [
-        "monitor/tests/ChannelEpochTests.swift"
-      ],
-      "sources": [
-        "monitor/SystemExtension/ChannelContract.swift",
-        "monitor/SystemExtension/ChannelIdentity.swift",
-        "monitor/SystemExtension/ChannelTransport.swift"
-      ],
-      "defines": [],
-      "args": [
-        "{run_dir}/artifacts/rust-command.json"
-      ],
-      "frameworks": [
-        "Security"
-      ],
-      "dependencies": [
-        "rust.extension_command_fixture"
-      ],
-      "fixture_only": true,
-      "safety_notes": "SystemExtension contract/identity/transport sources only; no provider construction or extension activation."
-    },
-    {
-      "id": "swift.ChannelRemovalReceiptTests",
-      "kind": "swift",
-      "test_files": [
-        "monitor/tests/ChannelRemovalReceiptTests.swift"
-      ],
-      "sources": [
-        "monitor/SystemExtension/ChannelContract.swift",
-        "monitor/SystemExtension/ChannelIdentity.swift",
-        "monitor/SystemExtension/ChannelTransport.swift"
-      ],
-      "defines": [],
-      "args": [],
-      "frameworks": [
-        "Security"
-      ],
-      "dependencies": [],
-      "fixture_only": true,
-      "safety_notes": "SystemExtension contract/identity/transport sources only; no provider construction or extension activation."
-    },
-    {
-      "id": "swift.ChannelSupervisionTests",
-      "kind": "swift",
-      "test_files": [
-        "monitor/tests/ChannelSupervisionTests.swift"
-      ],
-      "sources": [
-        "monitor/SystemExtension/ChannelContract.swift",
-        "monitor/SystemExtension/ChannelIdentity.swift",
-        "monitor/SystemExtension/ChannelTransport.swift"
-      ],
-      "defines": [],
-      "args": [
-        "{run_dir}/artifacts/root-capture.json"
-      ],
-      "frameworks": [
-        "Security"
-      ],
-      "dependencies": [
-        "rust.extension_capture_fixture"
-      ],
-      "fixture_only": true,
-      "safety_notes": "Synthetic process identities plus owned temporary alias files; checks Rust-exported capture cases. No real app launch, network or configuration."
-    },
-    {
-      "id": "swift.ChannelTransportTests",
-      "kind": "swift",
-      "test_files": [
-        "monitor/tests/ChannelTransportTests.swift"
-      ],
-      "sources": [
-        "monitor/SystemExtension/ChannelContract.swift",
-        "monitor/SystemExtension/ChannelIdentity.swift",
-        "monitor/SystemExtension/ChannelTransport.swift"
-      ],
-      "defines": [
-        "CHANNEL_TRANSPORT_TESTS"
-      ],
-      "args": [
-        "{run_dir}/artifacts/rust-command.json"
-      ],
-      "frameworks": [
-        "Security"
-      ],
-      "dependencies": [
-        "rust.extension_command_fixture"
-      ],
-      "fixture_only": true,
-      "safety_notes": "Synthetic command envelope plus owned AF_UNIX listener/socketpair under /tmp and current-process kernel identity. No TCP/UDP/external network or provider activation."
     },
     {
       "id": "swift.ClaudeLoginProbeTests",
@@ -902,43 +808,6 @@
       "safety_notes": "Decodes the committed lookup receipt containing trust_score=41; no Coffee subprocess or network request."
     },
     {
-      "id": "swift.NetworkExtensionCapabilityTests",
-      "kind": "swift",
-      "test_files": [
-        "monitor/tests/NetworkExtensionCapabilityTests.swift"
-      ],
-      "sources": [
-        "monitor/Sources/NetworkExtensionCapabilities.swift"
-      ],
-      "defines": [],
-      "args": [],
-      "frameworks": [
-        "Foundation"
-      ],
-      "dependencies": [],
-      "fixture_only": true,
-      "safety_notes": "Pure entitlement value combinations; no manager initialization, activation request or OS write."
-    },
-    {
-      "id": "swift.NetworkFilterFeasibility",
-      "kind": "swift",
-      "test_files": [
-        "monitor/tests/NetworkFilterFeasibility.swift"
-      ],
-      "sources": [],
-      "defines": [],
-      "args": [],
-      "frameworks": [
-        "NetworkExtension"
-      ],
-      "dependencies": [],
-      "fixture_only": true,
-      "safety_notes": "Self-contained API compile contract plus in-memory NetworkChannelFlowGate assertions. NEFilterDataProvider/NETransparentProxyProvider declarations are never instantiated; no extension activation, traffic interception or real socket test.",
-      "success_markers": [
-        "NetworkFilterFeasibility: compiled API contract only; no provider was instantiated or activated"
-      ]
-    },
-    {
       "id": "swift.NetworkGraphSelectionTests",
       "kind": "swift",
       "test_files": [
@@ -1217,6 +1086,25 @@
       "dependencies": [],
       "fixture_only": true,
       "safety_notes": "SwitcherStore(isFixture: true) and in-memory configurationCommandFixture; VPN expectation saves do not write Watch or VPN configuration."
+    },
+    {
+      "id": "swift.SeatbeltBackendTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/SeatbeltBackendTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/MonitorModels.swift"
+      ],
+      "defines": [],
+      "args": [],
+      "frameworks": [
+        "Foundation",
+        "CryptoKit"
+      ],
+      "dependencies": [],
+      "fixture_only": true,
+      "safety_notes": "Decodes synthetic current, retired and incomplete coverage receipts; no process launch, host observation, VPN or configuration changes."
     }
   ]
 }

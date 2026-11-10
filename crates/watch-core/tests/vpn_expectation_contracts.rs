@@ -186,7 +186,7 @@ fn config_supports_schema_2_seatbelt_backend_and_validated_vpn_expectation() {
     assert_eq!(legacy.vpn_expectation, None);
     assert_eq!(
         legacy.effective_network_backend(),
-        NetworkBackendKind::NetworkExtension
+        NetworkBackendKind::Seatbelt
     );
     assert!(legacy.requires_backend_migration_setup());
 
@@ -356,6 +356,7 @@ fn channel_permit_and_supervision_enforce_backend_and_vpn_epoch_binding() {
         "observed_at": 1006.0,
         "source": "fixture",
         "via_controlled_path": true,
+            "backend": "seatbelt",
         "family": "claude",
         "upstream_endpoint": "127.0.0.1:7890",
         "context_id": "ctx-2",

@@ -50,7 +50,6 @@ use std::{
 pub struct ProductionChannelStack {
     stop: Arc<AtomicBool>,
     pub packaged_backend: Option<NetworkBackendKind>,
-    pub backend: NetworkBackendKind,
     pub enforcer: Arc<LocalTunnelEnforcer>,
     pub sandbox_registry: Option<Arc<SandboxLaunchRegistry>>,
     pub supervisor: ChannelSupervisor,
@@ -60,7 +59,6 @@ pub struct ProductionChannelStack {
     pub vpn_wake_handle: Option<Arc<AtomicBool>>,
     pub lease_watchdog: thread::JoinHandle<()>,
     pub async_audit_worker: thread::JoinHandle<()>,
-    pub extension_watcher: Option<thread::JoinHandle<()>>,
     pub sandbox_registration_worker: Option<thread::JoinHandle<()>>,
     pub vpn_observer_worker: Option<thread::JoinHandle<()>>,
     pub last_policy_version: Option<PolicyVersion>,
@@ -501,14 +499,7 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
     }
     .resolve_runtime_config_state(packaged_backend);
     let config = resolved_cfg.config.clone();
-    let legacy_migration_required = resolved_cfg.legacy_migration_required;
-    let package_mismatch = resolved_cfg.package_mismatch;
     let config_blocking_reason = resolved_cfg.blocking_reason();
-    let backend = if legacy_migration_required || packaged_backend == Some(NetworkBackendKind::Seatbelt) {
-        NetworkBackendKind::Seatbelt
-    } else {
-        config.effective_network_backend()
-    };
     let initial_policy_version = ChannelSupervisor::compute_policy_version(&config)?;
     let boot_id = format!(
         "daemon-{}-{}",
@@ -522,39 +513,11 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
 
     let sandbox_registry: Option<Arc<SandboxLaunchRegistry>> = None;
     let sandbox_registration_worker: Option<thread::JoinHandle<()>> = None;
-    let mut extension_watcher: Option<thread::JoinHandle<()>> = None;
 
     let now_ts = native::now();
-    if let Some(ref cfg_err) = resolved_cfg.config_error {
-        let _ = enforcer.record_activation_failure(&format!("config_invalid:{cfg_err}"), now_ts);
-    } else if package_mismatch {
-        let _ = enforcer.record_activation_failure("backend_package_config_mismatch", now_ts);
-    } else if legacy_migration_required {
-        let _ = enforcer.record_activation_failure("legacy_config_migration_required", now_ts);
-    } else if backend.is_network_extension() && activate_local_interception {
-        // Legacy NetworkExtension branch: starts local proxy listener, extension gateway,
-        // and root-authored extension observation watcher.
-        if let Err(e) = enforcer.start_local_proxy_listener("127.0.0.1:0", stop.clone(), now_ts) {
-            let _ = enforcer.record_activation_failure(&e.code, now_ts);
-        }
-        enforcer.start_extension_gateway(stop.clone())?;
-        let enforcer_ext = enforcer.clone();
-        let stop_ext = stop.clone();
-        extension_watcher = Some(
-            thread::Builder::new()
-                .name("channel-extension-observations".into())
-                .spawn(move || {
-                    let mut notification =
-                        claude_watch_runtime::channel_extension::ObservationSignal::new();
-                    while !stop_ext.load(Ordering::Acquire) {
-                        let _ = enforcer_ext.refresh_system_extension(native::now());
-                        notification.wait(Duration::from_millis(250));
-                    }
-                })
-                .map_err(|_| {
-                    CoreError::new("extension_observer_failed", "扩展回执订阅线程启动失败")
-                })?,
-        );
+    enforcer.configure_seatbelt_backend(false, now_ts)?;
+    if let Some(ref reason) = config_blocking_reason {
+        enforcer.record_activation_failure(reason, now_ts)?;
     }
 
     let _ = storage.atomic_json(
@@ -618,7 +581,6 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
     let mut stack = ProductionChannelStack {
         stop,
         packaged_backend,
-        backend,
         enforcer,
         sandbox_registry,
         supervisor,
@@ -627,7 +589,6 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
         vpn_wake_handle,
         lease_watchdog,
         async_audit_worker,
-        extension_watcher,
         sandbox_registration_worker,
         vpn_observer_worker,
         last_policy_version: Some(initial_policy_version),
@@ -673,7 +634,6 @@ impl ProductionChannelStack {
     where R: FnOnce(&Arc<SandboxLaunchRegistry>, &std::path::Path, Arc<AtomicBool>) -> Result<thread::JoinHandle<()>>,
           P: FnOnce(&Arc<LocalTunnelEnforcer>, Arc<AtomicBool>, f64) -> Result<(std::net::SocketAddr, thread::JoinHandle<()>)>,
     {
-        if !self.backend.is_sandbox() { return Ok(()); }
         let resolved = (ConfigStore { storage: self.supervisor.storage.clone() })
             .resolve_runtime_config_state(self.packaged_backend);
         if let Some(reason) = resolved.blocking_reason() {
@@ -757,10 +717,6 @@ impl ProductionChannelStack {
         self.drain_background_events()?;
         let now = system.now();
 
-        if self.backend.is_network_extension() {
-            self.enforcer.refresh_system_extension(now)?;
-        }
-
         let resolved_cfg = (ConfigStore {
             storage: self.supervisor.storage.clone(),
         })
@@ -769,7 +725,7 @@ impl ProductionChannelStack {
         if blocking_reason.is_none() {
             self.synchronize_runtime_policy(resolved_cfg.config, now)?;
             self.supervisor.set_config_blocking_reason(None, now)?;
-            if self.backend.is_sandbox() { self.reconcile_controlled_backend(now)?; }
+            self.reconcile_controlled_backend(now)?;
         } else {
             self.supervisor.set_config_blocking_reason(blocking_reason, now)?;
         }
@@ -889,7 +845,6 @@ impl ProductionChannelStack {
         unregister_production_enforcer(&self.supervisor.storage.paths.watch());
         let _ = self.lease_watchdog.join();
         let _ = self.async_audit_worker.join();
-        if let Some(worker) = self.extension_watcher { let _ = worker.join(); }
         if let Some(worker) = self.sandbox_registration_worker { let _ = worker.join(); }
         if let Some(worker) = self.local_proxy_worker { let _ = worker.join(); }
         if let Some(worker) = self.target_refresh_worker { let _ = worker.join(); }
@@ -1356,268 +1311,44 @@ mod tests {
     }
 
     #[test]
-    fn production_daemon_channel_stack_wires_enforcer_supervisor_async_audit_and_lease_watchdog() {
-        use claude_watch_core::{
-            channel::{BoundProcessToken, ChannelMonitorDisplayState, ChannelPermitState},
-            config::Config,
-            processes::{LaunchTarget, ProcessRole},
-            session::{Desktop, Launcher},
-        };
-        use claude_watch_runtime::channel_enforcer::{registered_production_enforcer, ChannelEnforcer};
-
-        struct DaemonFixtureSystem {
-            family: &'static str,
-            now: f64,
-            country: &'static str,
+    fn production_assembly_rejects_missing_retired_and_legacy_backend_inputs_without_fallback() {
+        use claude_watch_core::{channel::ChannelPermitState, config::Config};
+        for (backend, config, expected) in [
+            (None, None, "packaged_network_backend_missing"),
+            (Some("invalid"), Some(Config::default_for_new_install().value().unwrap()), "packaged_network_backend_missing"),
+            (Some("network-extension"), Some(Config::default_for_new_install().value().unwrap()), "legacy_network_backend_removed"),
+            (Some("seatbelt"), Some(json!({"schema":1})), "legacy_config_migration_required"),
+            (Some("seatbelt"), Some(json!({"schema":2,"network_backend":"network_extension"})), "legacy_config_migration_required"),
+        ] {
+            let root = PathBuf::from("/private/tmp").join(format!("cw-no-ne-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let store = StateStore::new(Paths::new(&root).unwrap());
+            if let Some(config) = config {
+                store.atomic_json(&store.paths.config(), &config).unwrap();
+            }
+            // Even missing/invalid metadata gets a local candidate, so the
+            // fixture can never discover unrelated metadata beside the test binary.
+            let runtime = store.paths.watch().join("runtime");
+            std::fs::create_dir_all(&runtime).unwrap();
+            std::fs::write(runtime.join("components.json"), json!({"network_backend":backend}).to_string()).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut stack = assemble_production_channel_stack(store.clone(), stop.clone(), false,
+                |_| panic!("blocked backend must not request a recovery audit")).unwrap();
+            assert_eq!(stack.supervisor.config_blocking_reason(), Some(expected));
+            assert_eq!(stack.enforcer.activation_error_code().unwrap().as_deref(), Some(expected));
+            assert!(!stack.enforcer.is_ready().unwrap());
+            assert!(stack.enforcer.local_proxy_port().is_none());
+            assert!(stack.sandbox_registry.is_none());
+            // Reconciliation must preserve the error, not silently reopen a backend.
+            stack.reconcile_controlled_backend(native::now()).unwrap();
+            assert_eq!(stack.supervisor.config_blocking_reason(), Some(expected));
+            assert!(stack.supervisor.snapshot(native::now()).families.values()
+                .all(|family| family.permit_state != ChannelPermitState::Permitted));
+            stack.shutdown();
+            assert!(stop.load(Ordering::Acquire));
+            assert!(claude_watch_runtime::channel_enforcer::registered_production_enforcer(&store.paths.watch()).is_none());
+            std::fs::remove_dir_all(root).unwrap();
         }
-        impl DesktopSystem for DaemonFixtureSystem {
-            fn launch_target(&self) -> LaunchTarget {
-                if self.family == "openai" {
-                    LaunchTarget::CodexDesktop
-                } else {
-                    LaunchTarget::ClaudeDesktop
-                }
-            }
-            fn set_family(&mut self, family_id: &str) -> Result<()> {
-                self.family = if family_id == "openai" { "openai" } else { "claude" };
-                Ok(())
-            }
-            fn now(&self) -> f64 {
-                self.now
-            }
-            fn monotonic(&self) -> Duration {
-                Duration::from_secs(1)
-            }
-            fn wait(&mut self, _: Duration) {}
-            fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
-                if self.family == "claude" {
-                    Ok(vec![(
-                        Desktop {
-                            pid: 4100,
-                            start_seconds: 900,
-                            start_microseconds: 1,
-                        },
-                        true,
-                        "u501:900:1".into(),
-                    )])
-                } else {
-                    Ok(vec![])
-                }
-            }
-            fn supervised_processes(&mut self) -> Result<Vec<BoundProcessToken>> {
-                // Explicit fixture identities avoid querying real host PIDs/UIDs.
-                Ok(self
-                    .desktops()?
-                    .into_iter()
-                    .map(|(desktop, main, _)| {
-                        BoundProcessToken::with_system_identity(
-                            desktop.pid,
-                            501,
-                            desktop.start_seconds,
-                            desktop.start_microseconds,
-                            if main {
-                                ProcessRole::DesktopMain
-                            } else {
-                                ProcessRole::DesktopHelper
-                            },
-                        )
-                        .with_audit_token([501, 501, 20, 501, 20, desktop.pid, 0, 9])
-                    })
-                    .collect())
-            }
-            fn desktop_alive(&mut self, _: &Desktop) -> Result<bool> {
-                Ok(true)
-            }
-            fn desktop_tree_running(&mut self) -> Result<bool> {
-                Ok(self.family == "claude")
-            }
-            fn launcher(&mut self) -> Result<Launcher> {
-                Ok(Launcher {
-                    pid: 1,
-                    start: "init".into(),
-                })
-            }
-            fn full_audit(&mut self) -> Result<Value> {
-                panic!("guard loop must not call synchronous full_audit when async worker is active")
-            }
-            fn egress(&mut self) -> Value {
-                let mut dummy_config = claude_watch_core::config::Config::default();
-                dummy_config.enabled = true;
-                dummy_config.guard_enabled = true;
-                let policy_ver = ChannelSupervisor::compute_policy_version(&dummy_config).unwrap();
-                json!({
-                    "ip": if self.country == "CN" { "223.5.5.5" } else { "1.1.1.1" },
-                    "country": self.country,
-                    "observed_at": self.now,
-                    "source": "fixture",
-                    "family": "*",
-                    "upstream_endpoint": "127.0.0.1:7890",
-                    "policy_version": policy_ver,
-                    "context_id": "ctx",
-                    "via_controlled_path": true
-                })
-            }
-            fn local_guard(&mut self) -> Result<Value> {
-                Ok(json!({
-                    "context": "ctx",
-                    "context_id": "ctx",
-                    "proxy": "ok",
-                    "tun": "ok",
-                    "guard_backend_healthy": true,
-                    "observation_unavailable": []
-                }))
-            }
-            fn backend_healthy(&mut self) -> Result<bool> {
-                Ok(true)
-            }
-            fn launcher_matches(&mut self, _: &Launcher) -> Result<bool> {
-                Ok(true)
-            }
-            fn open_desktop(&mut self) -> Result<()> {
-                Ok(())
-            }
-            fn quit_desktop(&mut self) -> Result<()> {
-                panic!("channel mode must preserve process and never call quit_desktop")
-            }
-            fn quit_for_confirmed_ip_risk(&mut self, _: &mut Option<u32>) -> Result<()> {
-                panic!("channel mode must preserve process and never call quit_for_confirmed_ip_risk")
-            }
-        }
-
-        let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
-        let root = std::path::PathBuf::from("/tmp").join(format!("cwdm-{short_id}"));
-        std::fs::create_dir_all(&root).unwrap();
-        let store = StateStore::new(Paths::new(&root).unwrap());
-        let mut cfg = Config::default();
-        cfg.enabled = true;
-        cfg.guard_enabled = true;
-        store
-            .atomic_json(&store.paths.config(), &cfg.value().unwrap())
-            .unwrap();
-
-        let now = native::now();
-        let stop = Arc::new(AtomicBool::new(false));
-        let (release_audit_tx, release_audit_rx) = std::sync::mpsc::channel();
-        let release_audit_rx = Arc::new(std::sync::Mutex::new(release_audit_rx));
-        let rx = Arc::clone(&release_audit_rx);
-        let mut stack = assemble_production_channel_stack(
-            store.clone(),
-            stop.clone(),
-            false,
-            move |req| {
-                rx.lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(2))
-                    .map_err(|_| {
-                        CoreError::new("fixture_audit_barrier_timeout", "审计测试未收到释放信号")
-                    })?;
-                let completed_at = native::now();
-                Ok((
-                    json!({
-                        "ready": true,
-                        "observed_at": completed_at,
-                        "expires_at": completed_at + 30.0,
-                        "context_id": "ctx",
-                        "observation_id": "fixture",
-                        "context_transition": {"state": "stable"},
-                        "policy": req.policy_version.policy_digest,
-                        "egress_reference": {
-                            "ip": "1.1.1.1",
-                            "country": "JP",
-                            "checked_at": completed_at,
-                            "context": "ctx",
-                            "source": "fixture"
-                        }
-                    }),
-                    json!({
-                        "ip": "1.1.1.1",
-                        "country": "JP",
-                        "observed_at": completed_at,
-                        "source": "fixture",
-                        "family": "claude",
-                        "upstream_endpoint": "127.0.0.1:7890",
-                        "policy_version": req.policy_version,
-                        "context_id": "ctx",
-                        "via_controlled_path": true
-                    }),
-                    completed_at,
-                ))
-            },
-        )
-        .unwrap();
-
-        // Isolated orchestration fixture: inject kernel observations separately
-        // from the production authenticated observation tests.
-        stack.enforcer.start_local_proxy_listener("127.0.0.1:0", stop.clone(), now).unwrap();
-        // The enforcer requires both local proxy and system extension to be active.
-        // Local proxy is ready, but system extension is not yet confirmed -> not ready!
-        assert!(!stack.enforcer.is_ready().unwrap());
-        stack.enforcer.set_system_extension_active(true, None, now).unwrap();
-        assert!(stack.enforcer.is_ready().unwrap());
-        assert!(registered_production_enforcer(&store.paths.watch()).is_some());
-
-        let mut sys = DaemonFixtureSystem {
-            family: "claude",
-            now,
-            country: "JP",
-        };
-        assert!(sys
-            .supervised_processes()
-            .unwrap()
-            .iter()
-            .all(|p| p.has_verified_audit_token()));
-        // Step 1: Running Claude without a session schedules async audit on the worker
-        sys.now = native::now();
-        let snap1 = stack.step_with_system(&mut sys).unwrap();
-        assert_eq!(
-            snap1.families["claude"].permit_state,
-            ChannelPermitState::PendingVerification
-        );
-
-        // wait_or_drain wakes for any event, including unrelated receipts.
-        // Wait for the audited state, using the workers' clock and a real deadline.
-        release_audit_tx.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let snap2 = loop {
-            sys.now = native::now();
-            let snapshot = stack.step_with_system(&mut sys).unwrap();
-            if snapshot.families["claude"].permit_state == ChannelPermitState::Permitted {
-                break snapshot;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "async audit did not reach Permitted: {:?}",
-                snapshot.families["claude"]
-            );
-            stack.wait_or_drain(deadline, &stop);
-        };
-        assert_eq!(
-            snap2.families["claude"].permit_state,
-            ChannelPermitState::Permitted
-        );
-        assert_eq!(
-            snap2.families["claude"].display_state,
-            ChannelMonitorDisplayState::Forwarding
-        );
-
-        // Step 2: Trigger CN exit risk -> cuts off channel while preserving process
-        sys.now = native::now();
-        sys.country = "CN";
-        let snap3 = stack.step_with_system(&mut sys).unwrap();
-        assert_eq!(
-            snap3.families["claude"].permit_state,
-            ChannelPermitState::Revoked
-        );
-        assert_eq!(
-            snap3.families["claude"].display_state,
-            ChannelMonitorDisplayState::Blocked
-        );
-        assert!(snap3.families["claude"].process_preserved);
-
-        stack.shutdown();
-        assert!(stop.load(Ordering::Acquire));
-        assert!(registered_production_enforcer(&store.paths.watch()).is_none());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

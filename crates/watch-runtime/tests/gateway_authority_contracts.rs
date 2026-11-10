@@ -44,46 +44,17 @@ fn command(state: ChannelPermitState, seq: u64, now: f64) -> ChannelEnforcementC
             context_id: Some("new-network".into()),
             baseline_ip: Some("1.1.1.1".into()),
             members: vec![],
-            backend: NetworkBackendKind::NetworkExtension,
+            backend: NetworkBackendKind::Seatbelt,
             vpn_epoch: None,
             coverage_scope: None,
         },
-    }
-}
-fn heartbeat(now: f64) -> SystemExtensionHeartbeat {
-    SystemExtensionHeartbeat {
-        executor_boot_id: "boot".into(),
-        extension_boot_id: "extension".into(),
-        heartbeat_at: now,
-        interception_active: true,
-    }
-}
-fn ack(cmd: &ChannelEnforcementCommand) -> SystemExtensionReceipt {
-    let permitted = cmd.permit.state == ChannelPermitState::Permitted;
-    SystemExtensionReceipt {
-        family: cmd.family.clone(),
-        command_binding: claude_watch_runtime::channel_extension::command_binding(cmd).unwrap(),
-        executor_boot_id: "boot".into(),
-        extension_boot_id: "extension".into(),
-        policy_version: cmd.policy_version.clone(),
-        command_seq: cmd.command_seq,
-        permit_generation: cmd.permit_generation,
-        applied_at: cmd.issued_at,
-        allowed_pids: vec![1234],
-        local_proxy_port: 0,
-        permit_state: if permitted { "permitted" } else { "revoked" }.into(),
-        status: if permitted { "ok" } else { "revoked" }.into(),
-        active_flows: 0,
-        new_connections_blocked: !permitted,
-        reason: None,
     }
 }
 fn enforcer() -> LocalTunnelEnforcer {
     let e = LocalTunnelEnforcer::new("boot", None);
     e.set_strict_peer_verification(true);
     e.set_local_proxy_ready(true, 100.).unwrap();
-    e.observe_system_extension(Some(heartbeat(100.)), vec![], 100.)
-        .unwrap();
+    e.configure_seatbelt_backend(true, 100.).unwrap();
     e
 }
 #[test]
@@ -142,16 +113,20 @@ fn local_expiry_keeps_authority_command_immutable_and_other_family_renewable() {
     live.family = "openai".into(); live.permit.family = "openai".into();
     e.apply_command(&idle, 100.).unwrap();
     e.apply_command(&live, 108.).unwrap();
-    let before = e.extension_commands().unwrap();
+    let before = e.receipt_for("claude", 100.).unwrap().unwrap();
     e.enforce_active_deadlines(111., false).unwrap();
-    assert_eq!(e.extension_commands().unwrap(), before, "local cutoff must not rewrite any authority payload under the same sequence");
+    let after = e.apply_command(&idle, 111.).unwrap();
+    assert_eq!(after.command_seq, before.command_seq);
+    assert_eq!(after.permit_generation, before.permit_generation);
+    // An identical command remains idempotent after local expiry; changing
+    // authority under the same sequence would have returned a conflict.
+
     let mut renewed = live.clone();
     renewed.command_seq = 2; renewed.permit.command_seq = 2;
     renewed.issued_at = 111.; renewed.permit.issued_at = 111.; renewed.permit.valid_until = 121.;
     e.apply_command(&renewed, 111.).unwrap();
-    e.observe_system_extension(Some(heartbeat(111.)), vec![ack(&renewed)], 111.).unwrap();
     assert_eq!(e.receipt_for("openai", 111.).unwrap().unwrap().enforcement_state, ChannelEnforcementState::Forwarding);
-    assert_eq!(e.extension_commands().unwrap()["commands"][0], before["commands"][0]);
+    assert_eq!(e.receipt_for("claude", 111.).unwrap().unwrap().command_seq, before.command_seq);
 }
 
 #[test]
@@ -159,7 +134,6 @@ fn autonomous_cutoff_cannot_be_undone_by_replaying_the_old_command() {
     let e = enforcer();
     let cmd = command(ChannelPermitState::Permitted, 5, 100.);
     e.apply_command(&cmd, 100.).unwrap();
-    e.observe_system_extension(Some(heartbeat(100.)), vec![ack(&cmd)], 100.).unwrap();
     e.mark_upstream_unhealthy(101.).unwrap();
     e.mark_upstream_healthy().unwrap();
     let replayed = e.apply_command(&cmd, 101.).unwrap();
@@ -178,29 +152,7 @@ fn autonomous_cutoff_cannot_be_undone_by_replaying_the_old_command() {
     let mut renewed = command(ChannelPermitState::Permitted, 8, 104.);
     renewed.permit_generation = 3; renewed.permit.permit_generation = 3;
     e.apply_command(&renewed, 104.).unwrap();
-    e.observe_system_extension(Some(heartbeat(104.)), vec![ack(&renewed)], 104.).unwrap();
     assert_eq!(e.receipt_for("claude", 104.).unwrap().unwrap().enforcement_state, ChannelEnforcementState::Forwarding);
-}
-
-#[test]
-fn receipt_binding_rejects_another_session_or_same_pid_different_instance() {
-    let e = enforcer();
-    let cmd = command(ChannelPermitState::Revoked, 1, 100.);
-    e.apply_command(&cmd, 100.).unwrap();
-    for altered in [0, 1, 2] {
-        let mut other = cmd.clone();
-        match altered {
-            0 => other.session_id = Some("different-session".into()),
-            1 => other.allowed_processes[0].start_seconds += 1,
-            _ => other.allowed_processes[0].audit_token.as_mut().unwrap()[7] += 1,
-        }
-        let mut receipt = ack(&cmd);
-        receipt.command_binding = claude_watch_runtime::channel_extension::command_binding(&other).unwrap();
-        e.observe_system_extension(Some(heartbeat(100.1)), vec![receipt], 100.1).unwrap();
-        assert_ne!(e.receipt_for("claude", 100.1).unwrap().unwrap().enforcement_state, ChannelEnforcementState::Blocked);
-    }
-    e.observe_system_extension(Some(heartbeat(100.2)), vec![ack(&cmd)], 100.2).unwrap();
-    assert_eq!(e.receipt_for("claude", 100.2).unwrap().unwrap().enforcement_state, ChannelEnforcementState::Blocked);
 }
 
 #[test]
@@ -208,7 +160,6 @@ fn strict_permission_requires_the_audit_identity_and_duplicate_payload_is_exact(
     let e = enforcer();
     let cmd = command(ChannelPermitState::Permitted, 1, 100.);
     e.apply_command(&cmd, 100.).unwrap();
-    e.observe_system_extension(Some(heartbeat(100.)), vec![ack(&cmd)], 100.).unwrap();
     for missing_or_changed in [0, 1] {
         let mut process = cmd.allowed_processes[0].clone();
         if missing_or_changed == 0 { process.audit_token = None; }
@@ -224,8 +175,7 @@ fn strict_permission_requires_the_audit_identity_and_duplicate_payload_is_exact(
         }
         assert_eq!(e.apply_command(&changed, 100.1).unwrap_err().code, "conflicting_command_seq");
     }
-    assert_eq!(e.extension_commands().unwrap()["commands"][0]["command_binding"],
-        json!(claude_watch_runtime::channel_extension::command_binding(&cmd).unwrap()));
+    assert_eq!(e.apply_command(&cmd, 100.1).unwrap().command_seq, cmd.command_seq);
 }
 
 #[test]
@@ -234,9 +184,9 @@ fn failed_inventory_revokes_but_retains_managed_cli_membership() {
     let root = std::env::temp_dir().join(format!("cw-inventory-contract-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&root).unwrap();
     let store = StateStore::new(Paths::new(&root).unwrap());
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot", None));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot", Some(store.clone())));
     enforcer.activate_interception(100.).unwrap();
-    let mut supervisor = ChannelSupervisor::new(store, Some(enforcer.clone()), None).unwrap();
+    let mut supervisor = ChannelSupervisor::new(store.clone(), Some(enforcer.clone()), None).unwrap();
     let mut processes = command(ChannelPermitState::Revoked, 1, 100.).allowed_processes;
     processes[0].role = ProcessRole::Cli;
     supervisor.handle_event(SupervisionEvent::ProcessInventoryUpdated {
@@ -246,143 +196,13 @@ fn failed_inventory_revokes_but_retains_managed_cli_membership() {
         family: "claude".into(), observed_at: 101.,
     }).unwrap();
     assert_eq!(snapshot.families["claude"].permit_state, ChannelPermitState::Revoked);
-    let commands = enforcer.extension_commands().unwrap();
-    assert_eq!(commands["commands"][0]["allowed_pids"], json!([1234]));
-    assert_eq!(commands["commands"][0]["reason"], "channel_inventory_incomplete");
+    let command = store.read_json(&store.paths.watch().join("state/channel-command-claude.json"), json!(null)).unwrap();
+    assert_eq!(command["allowed_processes"][0]["pid"], 1234);
+    assert_eq!(command["permit"]["reason_code"], "channel_inventory_incomplete");
     std::fs::remove_dir_all(root).unwrap();
 }
 #[test]
-fn extension_receipts_require_both_versions_boot_sequence_and_real_drain() {
-    let e = enforcer();
-    let cmd = command(ChannelPermitState::Revoked, 1, 100.);
-    e.apply_command(&cmd, 100.).unwrap();
-    let root = ack(&cmd);
-    e.observe_system_extension(Some(heartbeat(100.)), vec![root.clone()], 100.)
-        .unwrap();
-    assert_eq!(
-        e.receipt_for("claude", 100.)
-            .unwrap()
-            .unwrap()
-            .enforcement_state,
-        ChannelEnforcementState::Blocked
-    );
-    for bad in 0..7 {
-        let mut receipt = root.clone();
-        match bad {
-            0 => receipt.policy_version.guard_policy_digest = "other".into(),
-            1 => receipt.executor_boot_id = "previous".into(),
-            2 => receipt.extension_boot_id = "previous".into(),
-            3 => receipt.command_seq = 0,
-            4 => receipt.active_flows = 1,
-            5 => receipt.new_connections_blocked = false,
-            _ => receipt.allowed_pids = vec![9999],
-        }
-        e.observe_system_extension(Some(heartbeat(101.)), vec![receipt], 101.)
-            .unwrap();
-        let r = e.receipt_for("claude", 101.).unwrap().unwrap();
-        assert_ne!(
-            r.enforcement_state,
-            ChannelEnforcementState::Blocked,
-            "case {bad}"
-        );
-        assert!(!r.active_flows_closed);
-    }
-    let mut missing = serde_json::to_value(root).unwrap();
-    missing.as_object_mut().unwrap().remove("active_flows");
-    assert!(serde_json::from_value::<SystemExtensionReceipt>(missing).is_err());
-}
-#[test]
-fn heartbeat_expiry_or_missing_receipt_clears_success_and_emits_event() {
-    let e = enforcer();
-    let (tx, rx) = mpsc::channel();
-    e.set_receipt_event_sink(move |r| {
-        let _ = tx.send(r);
-    })
-    .unwrap();
-    let cmd = command(ChannelPermitState::Revoked, 1, 100.);
-    e.apply_command(&cmd, 100.).unwrap();
-    // A long-applied revocation remains confirmed by fresh liveness, not reapplication.
-    e.observe_system_extension(Some(heartbeat(200.)), vec![ack(&cmd)], 200.)
-        .unwrap();
-    assert_eq!(
-        e.receipt_for("claude", 200.)
-            .unwrap()
-            .unwrap()
-            .enforcement_state,
-        ChannelEnforcementState::Blocked
-    );
-    while rx.try_recv().is_ok() {}
-    e.observe_system_extension(Some(heartbeat(200.)), vec![], 200.1)
-        .unwrap();
-    assert_eq!(
-        rx.recv_timeout(Duration::from_secs(1))
-            .unwrap()
-            .enforcement_state,
-        ChannelEnforcementState::Failed
-    );
-    e.observe_system_extension(Some(heartbeat(200.)), vec![ack(&cmd)], 209.)
-        .unwrap();
-    let r = e.receipt_for("claude", 209.).unwrap().unwrap();
-    assert!(!r.system_extension_active && !r.active_flows_closed && !r.new_connections_blocked);
-    e.observe_system_extension(None, vec![ack(&cmd)], 210.)
-        .unwrap();
-    assert!(!e.system_extension_active().unwrap());
-}
-
-#[test]
-fn superseding_command_and_restarted_extension_need_new_matching_receipts() {
-    let e = enforcer();
-    let original = command(ChannelPermitState::Revoked, 1, 100.);
-    e.apply_command(&original, 100.).unwrap();
-    e.observe_system_extension(Some(heartbeat(100.)), vec![ack(&original)], 100.).unwrap();
-    assert_eq!(e.receipt_for("claude", 100.).unwrap().unwrap().enforcement_state,
-        ChannelEnforcementState::Blocked);
-
-    // Same-tick process/policy events can supersede an already-acknowledged command.
-    let current = command(ChannelPermitState::Revoked, 2, 101.);
-    let result = e.apply_command(&current, 101.).unwrap();
-    assert_eq!(result.enforcement_state, ChannelEnforcementState::Failed);
-    e.observe_system_extension(Some(heartbeat(101.)), vec![ack(&original)], 101.).unwrap();
-    assert_eq!(e.receipt_for("claude", 101.).unwrap().unwrap().enforcement_state,
-        ChannelEnforcementState::Failed);
-    e.observe_system_extension(Some(heartbeat(101.)), vec![ack(&current)], 101.).unwrap();
-    assert_eq!(e.receipt_for("claude", 101.).unwrap().unwrap().enforcement_state,
-        ChannelEnforcementState::Blocked);
-
-    // A fresh heartbeat from a new provider cannot authenticate the old receipt.
-    let mut restarted = heartbeat(102.);
-    restarted.extension_boot_id = "next-extension".into();
-    e.observe_system_extension(Some(restarted.clone()), vec![ack(&current)], 102.).unwrap();
-    assert_eq!(e.receipt_for("claude", 102.).unwrap().unwrap().enforcement_state,
-        ChannelEnforcementState::Failed);
-    let mut confirmed = ack(&current);
-    confirmed.extension_boot_id = restarted.extension_boot_id.clone();
-    confirmed.applied_at = 102.;
-    e.observe_system_extension(Some(restarted), vec![confirmed], 102.).unwrap();
-    assert_eq!(e.receipt_for("claude", 102.).unwrap().unwrap().enforcement_state,
-        ChannelEnforcementState::Blocked);
-}
-#[test]
-fn unconfirmed_permit_cannot_dial_and_diagnostic_changes_invalidate_evidence() {
-    let e = enforcer();
-    let cmd = command(ChannelPermitState::Permitted, 1, 100.);
-    e.apply_command(&cmd, 100.).unwrap();
-    assert_eq!(
-        e.connect_supervised_tcp(&cmd.family, &cmd.allowed_processes[0], 100.)
-            .unwrap_err()
-            .code,
-        "extension_permit_unconfirmed"
-    );
-    e.observe_system_extension(Some(heartbeat(100.)), vec![ack(&cmd)], 100.)
-        .unwrap();
-    let result = e.probe_via_controlled_diagnostic_channel("claude", "new-network", 100., |_| {
-        e.mark_upstream_unhealthy(100.1)?;
-        Ok(json!({"ip":"1.1.1.1"}))
-    });
-    assert_eq!(result.unwrap_err().code, "diagnostic_path_changed");
-}
-#[test]
-fn production_tcp_headers_cannot_impersonate_the_extension() {
+fn client_identity_headers_cannot_replace_kernel_attribution() {
     let e = Arc::new(enforcer());
     let stop = Arc::new(AtomicBool::new(false));
     let (address, worker) = e
@@ -403,7 +223,7 @@ fn production_tcp_headers_cannot_impersonate_the_extension() {
 }
 
 #[test]
-fn intercepted_explicit_proxy_connection_does_not_tunnel_tag_back_to_itself() {
+fn explicit_proxy_connection_does_not_tunnel_upstream_back_to_itself() {
     let tag = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = tag.local_addr().unwrap().to_string();
     let (tx, rx) = mpsc::channel();
@@ -445,35 +265,6 @@ fn intercepted_explicit_proxy_connection_does_not_tunnel_tag_back_to_itself() {
     server.join().unwrap();
 }
 #[test]
-fn user_authored_and_symlinked_observations_are_not_system_proof() {
-    let root = std::env::temp_dir().join(format!("cw-receipt-contract-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&root).unwrap();
-    let store = StateStore::new(Paths::new(&root).unwrap());
-    let path = store
-        .paths
-        .watch()
-        .join("state/system-extension-heartbeat.json");
-    store.atomic_json(&path, &json!(heartbeat(100.))).unwrap();
-    assert!(
-        claude_watch_runtime::channel_extension::read_observation::<SystemExtensionHeartbeat>(
-            &store,
-            "system-extension-heartbeat.json"
-        )
-        .is_err()
-    );
-    std::fs::remove_file(&path).unwrap();
-    std::os::unix::fs::symlink("/dev/null", &path).unwrap();
-    assert!(
-        claude_watch_runtime::channel_extension::read_observation::<SystemExtensionHeartbeat>(
-            &store,
-            "system-extension-heartbeat.json"
-        )
-        .is_err()
-    );
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
 fn unchanged_observation_does_not_outrun_acknowledgements_but_identity_change_does() {
     use claude_watch_runtime::channel_supervisor::{ChannelSupervisor, SupervisionEvent};
     let root = std::env::temp_dir().join(format!("cw-command-contract-{}", uuid::Uuid::new_v4()));
@@ -502,58 +293,21 @@ fn unchanged_observation_does_not_outrun_acknowledgements_but_identity_change_do
     std::fs::remove_dir_all(root).unwrap();
 }
 
+
 #[test]
-fn production_command_envelope_keeps_families_independent() {
-    let root = std::env::temp_dir().join(format!("cw-envelope-contract-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&root).unwrap();
-    let store = StateStore::new(Paths::new(&root).unwrap());
-    let e = Arc::new(LocalTunnelEnforcer::new("boot", Some(store.clone())));
-    e.set_strict_peer_verification(true);
-    let stop = Arc::new(AtomicBool::new(false));
-    e.start_extension_gateway(stop.clone()).unwrap();
-    let cmd = command(ChannelPermitState::Revoked, 1, 100.);
-    e.apply_command(&cmd, 100.).unwrap();
-    let mut other = cmd.clone();
-    other.family = "openai".into();
-    other.permit.family = other.family.clone();
-    other.allowed_processes[0].pid = 5678;
-    other.allowed_processes[0].audit_token.as_mut().unwrap()[5] = 5678;
-    e.apply_command(&other, 100.).unwrap();
-    let locator = store
-        .read_json(
-            &store
-                .paths
-                .watch()
-                .join("state/system-extension-command.json"),
-            json!(null),
-        )
-        .unwrap();
-    assert!(locator.get("commands").is_none(), "Disk is discovery, not authority");
-    store.atomic_json(&store.paths.watch().join("state/system-extension-command.json"),
-        &json!({"gateway_socket":"/tmp/cw-channel-forged/gateway.sock", "executor_boot_id":"forged", "commands":[{"permit_state":"permitted"}]})).unwrap();
-    let before_observation = e.extension_commands().unwrap();
-    assert!(before_observation["extension_boot_id"].is_null());
-    e.observe_system_extension(Some(heartbeat(100.)), vec![], 100.).unwrap();
-    assert_eq!(e.extension_commands().unwrap()["extension_boot_id"], "extension");
-    let mut awake = heartbeat(101.);
-    awake.extension_boot_id = "extension-after-wake".into();
-    e.observe_system_extension(Some(awake), vec![], 101.).unwrap();
-    let payload = e.extension_commands().unwrap();
-    assert_eq!(payload["extension_boot_id"], "extension-after-wake");
-    assert_eq!(payload["commands"], before_observation["commands"], "Observing a wake cannot rewrite authority commands");
-    assert_eq!(payload["executor_boot_id"], "boot");
-    assert_eq!(payload["gateway_socket"], locator["gateway_socket"]);
-    assert_eq!(payload["commands"].as_array().unwrap().len(), 2);
-    assert_eq!(payload["commands"][0]["allowed_pids"], json!([1234]));
-    assert_eq!(payload["commands"][1]["allowed_pids"], json!([5678]));
-    // Export this actual production-serialized envelope for the Swift wire test.
-    if let Some(dir) = std::env::var_os("CW_CHANNEL_CONTRACT_DIR") {
-        std::fs::write(
-            std::path::Path::new(&dir).join("rust-command.json"),
-            serde_json::to_vec(&payload).unwrap(),
-        )
-        .unwrap();
-    }
-    stop.store(true, Ordering::Release);
-    std::fs::remove_dir_all(root).unwrap();
+fn legacy_command_cannot_mutate_or_replace_seatbelt_authority() {
+    let e = enforcer();
+    let cmd = command(ChannelPermitState::Permitted, 1, 100.);
+    let before = e.apply_command(&cmd, 100.).unwrap();
+    let mut legacy = command(ChannelPermitState::Permitted, 2, 101.);
+    legacy.permit.backend = NetworkBackendKind::NetworkExtension;
+    assert_eq!(e.apply_command(&legacy, 101.).unwrap_err().code, "legacy_network_backend_removed");
+    let after = e.receipt_for("claude", 101.).unwrap().unwrap();
+    assert_eq!(after.command_seq, before.command_seq);
+    assert_eq!(after.backend, NetworkBackendKind::Seatbelt);
+    assert!(!after.system_extension_active);
+    let coverage = e.protocol_coverage_boundaries();
+    assert_eq!(coverage["backend"], "seatbelt");
+    assert_eq!(coverage["unmanaged_processes"]["disposition"], "outside_protected_scope");
+    assert!(coverage.get("system_extension_active").is_none());
 }

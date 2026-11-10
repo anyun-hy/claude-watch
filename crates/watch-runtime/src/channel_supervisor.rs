@@ -1704,8 +1704,8 @@ impl ChannelSupervisor {
                 )
             };
 
-        // Do not replace a command on every observation tick: the extension
-        // needs a stable sequence to acknowledge. Renew only near lease expiry.
+        // Do not replace a command on every observation tick: execution receipts
+        // need a stable sequence to match. Renew only near lease expiry.
         if self.tracks.get(family).is_some_and(|track| {
             track.current_permit.as_ref().is_some_and(|p| {
                 p.state == effective_desired_state && p.reason_code == effective_reason

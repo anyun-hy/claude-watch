@@ -404,7 +404,7 @@ struct BackendCoverageScopeModel: Codable, Equatable, Sendable {
 
     /// Coverage is an observed set, separate from backend capabilities and permits.
     var allDiscoveredProtected: Bool {
-        hasRequiredFacts && ["seatbelt", "network_extension"].contains(backend)
+        hasRequiredFacts && backend == "seatbelt"
             && hasVerifiedEndpoint && !configured_entries.isEmpty && !protected_pids.isEmpty && unprotected_pids.isEmpty
     }
 }

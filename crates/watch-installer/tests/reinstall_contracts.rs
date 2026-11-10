@@ -190,6 +190,7 @@ impl Fake {
         for relative in [
             "monitor/package-dmg.sh",
             "monitor/build.sh",
+            "monitor/network-backend.sh",
             "tools/build-rust-components.sh",
             "target/aarch64-apple-darwin/release/watch-gateway-broker",
             "Cargo.toml",
@@ -795,6 +796,18 @@ fn missing_macos_minimum_stops_before_any_uninstall() {
     std::fs::remove_file(h.fake.layout.project.join("monitor/macos-minimum.txt"))
         .expect("minimum");
     h.blocked(h.perform("3.0.0", "314", false, "y"), "打包脚本");
+    assert!(h.fake.layout.app.exists());
+    assert!(h.fake.layout.base().exists());
+    assert!(h.fake.calls().is_empty());
+    h.assert_preserved();
+}
+
+#[test]
+fn missing_network_backend_helper_stops_before_confirmation_or_uninstall() {
+    let h = Harness::new();
+    std::fs::remove_file(h.fake.layout.project.join("monitor/network-backend.sh"))
+        .expect("network backend helper");
+    h.blocked(h.perform_with(&mut |_| panic!("missing helper must stop before confirmation")), "打包脚本");
     assert!(h.fake.layout.app.exists());
     assert!(h.fake.layout.base().exists());
     assert!(h.fake.calls().is_empty());

@@ -1518,8 +1518,9 @@ pub fn lookup_trusted_component_sha256(
     None
 }
 
-/// Reads the packaged `NetworkBackend` capability from `BuildInfo.plist` or `components.json`
-/// (`seatbelt` vs `network_extension`) if present.
+/// Reads packaged backend metadata. Seatbelt is the only executable backend;
+/// legacy values are returned solely so configuration resolution can report an
+/// explicit migration/unsupported-package error instead of inventing support.
 pub fn lookup_packaged_network_backend(manifest_dir: &Path) -> Option<NetworkBackendKind> {
     let build_info = manifest_dir.join("BuildInfo.plist");
     if build_info.is_file() {

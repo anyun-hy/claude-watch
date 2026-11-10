@@ -23,9 +23,10 @@ pub const CLOCK_ROLLBACK_TOLERANCE_SECONDS: f64 = 0.05;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkBackendKind {
-    #[default]
+    /// Historical wire value only: never a selectable execution backend.
     #[serde(alias = "network-extension", alias = "ne", alias = "legacy_ne")]
     NetworkExtension,
+    #[default]
     #[serde(rename = "seatbelt", alias = "sandbox", alias = "nono")]
     Seatbelt,
 }
@@ -42,10 +43,6 @@ impl NetworkBackendKind {
         matches!(self, Self::Seatbelt)
     }
 
-    pub fn is_network_extension(self) -> bool {
-        matches!(self, Self::NetworkExtension)
-    }
-
     pub fn parse_wire(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "network_extension" | "network-extension" | "ne" | "legacy_ne" => {
@@ -57,9 +54,16 @@ impl NetworkBackendKind {
     }
 }
 
+// Old messages omitted the backend. They remain readable, but cannot be
+// reinterpreted as proof that a process entered the Seatbelt sandbox.
+fn legacy_wire_backend() -> NetworkBackendKind {
+    NetworkBackendKind::NetworkExtension
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct BackendCoverageScope {
+    #[serde(default = "legacy_wire_backend")]
     pub backend: NetworkBackendKind,
     pub configured_entries: Vec<String>,
     pub protected_pids: Vec<u32>,
@@ -190,7 +194,7 @@ pub struct ControlledPathEvidence {
     pub context_id: String,
     pub via_controlled_path: bool,
     pub observed_at: f64,
-    #[serde(default)]
+    #[serde(default = "legacy_wire_backend")]
     pub backend: NetworkBackendKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vpn_epoch: Option<VpnEpoch>,
@@ -233,6 +237,9 @@ impl ControlledPathEvidence {
         now: f64,
         ttl: f64,
     ) -> std::result::Result<(), &'static str> {
+        if !self.backend.is_sandbox() {
+            return Err("legacy_network_backend_removed");
+        }
         if !self.via_controlled_path {
             return Err("evidence_not_from_controlled_path");
         }
@@ -362,7 +369,7 @@ pub struct ChannelPermit {
     pub context_id: Option<String>,
     pub baseline_ip: Option<String>,
     pub members: Vec<Desktop>,
-    #[serde(default)]
+    #[serde(default = "legacy_wire_backend")]
     pub backend: NetworkBackendKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vpn_epoch: Option<VpnEpoch>,
@@ -393,6 +400,9 @@ impl ChannelPermit {
         current_policy: &PolicyVersion,
         current_vpn_epoch: Option<&VpnEpoch>,
     ) -> (ChannelPermitState, &'static str) {
+        if !self.backend.is_sandbox() {
+            return (ChannelPermitState::Revoked, "legacy_network_backend_removed");
+        }
         if !self.policy_version.valid() || &self.policy_version != current_policy {
             return (ChannelPermitState::Revoked, "policy_version_changed");
         }
@@ -492,7 +502,7 @@ impl ChannelPermit {
                 .map(|s| s.baseline.ip.clone())
                 .filter(|s| !s.is_empty()),
             members,
-            backend: NetworkBackendKind::NetworkExtension,
+            backend: NetworkBackendKind::Seatbelt,
             vpn_epoch: None,
             coverage_scope: None,
         })
@@ -530,6 +540,9 @@ pub struct AuthenticatedCommandEnvelope {
 
 impl AuthenticatedCommandEnvelope {
     pub fn verify_target_executor(&self, actual_executor_boot_id: &str) -> Result<()> {
+        if !self.backend.is_sandbox() || !self.command.permit.backend.is_sandbox() {
+            return Err(CoreError::new("legacy_network_backend_removed", "旧网络扩展后端已移除，命令必须来自当前 Seatbelt 后端"));
+        }
         if self.target_executor_boot_id.trim().is_empty()
             || actual_executor_boot_id.trim().is_empty()
             || self.target_executor_boot_id != actual_executor_boot_id
@@ -586,7 +599,7 @@ pub struct ChannelEnforcementReceipt {
     pub observed_at: f64,
     #[serde(default)]
     pub error_code: Option<String>,
-    #[serde(default)]
+    #[serde(default = "legacy_wire_backend")]
     pub backend: NetworkBackendKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vpn_epoch: Option<VpnEpoch>,
@@ -640,6 +653,12 @@ pub fn evaluate_channel_supervision_with_boot_id(
     expected_executor_boot_id: Option<&str>,
     receiver_now: f64,
 ) -> ChannelSupervisionVerdict {
+    if !permit.backend.is_sandbox() || receipt.is_some_and(|r| !r.backend.is_sandbox()) {
+        return ChannelSupervisionVerdict::EnforcementFailed {
+            code: "legacy_network_backend_removed".into(),
+            status_label_zh: "保护不可用".into(),
+        };
+    }
     let (effective_permit, permit_reason) = permit.effective_state(receiver_now, current_policy);
     let Some(receipt) = receipt else {
         return ChannelSupervisionVerdict::EnforcementFailed {
@@ -725,8 +744,8 @@ pub fn evaluate_channel_supervision_with_boot_id(
             status_label_zh: "执行失败".into(),
         };
     }
-    // Critical invariant: disabling interception or returning false in
-    // NETransparentProxyProvider allows direct connections and is never valid.
+    // Sandboxed network confinement and gateway enforcement must remain active
+    // while a permit is revoked; a stopped listener alone is not isolation.
     if !receipt.interception_active || !receipt.direct_fallback_blocked {
         return ChannelSupervisionVerdict::EnforcementFailed {
             code: "interception_inactive_direct_leak_risk".into(),
@@ -815,86 +834,6 @@ pub fn evaluate_channel_supervision_with_boot_id(
     }
 }
 
-/// System extension execution receipt produced by WatchChannelExtension.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SystemExtensionReceipt {
-    pub family: String,
-    #[serde(default)]
-    pub command_binding: String,
-    pub executor_boot_id: String,
-    pub extension_boot_id: String,
-    pub policy_version: PolicyVersion,
-    pub command_seq: u64,
-    pub permit_generation: u64,
-    pub applied_at: f64,
-    pub allowed_pids: Vec<u32>,
-    #[serde(default)]
-    pub local_proxy_port: u16,
-    pub permit_state: String,
-    pub status: String,
-    pub active_flows: usize,
-    pub new_connections_blocked: bool,
-    pub reason: Option<String>,
-}
-
-impl SystemExtensionReceipt {
-    pub fn is_fresh(&self, now: f64, max_age_seconds: f64) -> bool {
-        self.applied_at.is_finite() && now.is_finite() && max_age_seconds > 0.0
-            && self.applied_at > 0.0 && self.applied_at <= now + 1.0
-            && now - self.applied_at <= max_age_seconds
-    }
-
-    pub fn is_disconnecting(&self) -> bool {
-        self.status == "disconnecting"
-            || self.permit_state == "disconnecting"
-            || (self.status == "revoked" && self.active_flows > 0)
-    }
-
-    pub fn is_confirmed_revoked(&self) -> bool {
-        self.status == "revoked" && self.permit_state == "revoked"
-            && self.active_flows == 0
-            && self.new_connections_blocked
-    }
-
-    pub fn matches_supervision(
-        &self,
-        expected_policy_version: &PolicyVersion,
-        expected_command_seq: u64,
-        expected_generation: u64,
-        expected_boot: &str,
-        extension_boot: &str,
-        issued_at: f64,
-        now: f64,
-    ) -> bool {
-        self.executor_boot_id == expected_boot
-            && !extension_boot.is_empty()
-            && self.extension_boot_id == extension_boot
-            && &self.policy_version == expected_policy_version
-            && self.command_seq == expected_command_seq
-            && self.permit_generation == expected_generation
-            && self.applied_at.is_finite()
-            && self.applied_at >= issued_at - CLOCK_ROLLBACK_TOLERANCE_SECONDS
-            && self.applied_at <= now + CLOCK_ROLLBACK_TOLERANCE_SECONDS
-    }
-}
-
-/// Liveness is refreshed independently; an acknowledgement keeps its execution time.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SystemExtensionHeartbeat {
-    pub executor_boot_id: String,
-    pub extension_boot_id: String,
-    pub heartbeat_at: f64,
-    pub interception_active: bool,
-}
-impl SystemExtensionHeartbeat {
-    pub fn is_live(&self, executor_boot: &str, now: f64) -> bool {
-        self.executor_boot_id == executor_boot && !self.extension_boot_id.is_empty()
-            && self.interception_active && self.heartbeat_at.is_finite() && now.is_finite()
-            && self.heartbeat_at <= now + CLOCK_ROLLBACK_TOLERANCE_SECONDS
-            && now - self.heartbeat_at < 8.0
-    }
-}
-
 /// Restoring a revoked channel requires fresh evidence sampled strictly after
 /// the revocation timestamp under the current session and current policy version.
 /// Old probe results or another session's audit can never re-open a blocked channel.
@@ -915,6 +854,9 @@ pub fn verify_channel_recovery(
     now: f64,
     ttl: f64,
 ) -> Result<ChannelPermit> {
+    if !previous.backend.is_sandbox() {
+        return Err(CoreError::new("legacy_network_backend_removed", "旧后端许可不能通过恢复审计转换为 Seatbelt 许可"));
+    }
     if !current_policy.valid() || audit_policy != current_policy {
         return Err(CoreError::new(
             "recovery_policy_version_mismatch",
@@ -1101,7 +1043,7 @@ pub struct FamilyChannelMonitorState {
     #[serde(default)]
     pub valid_until: Option<f64>,
     pub updated_at: f64,
-    #[serde(default)]
+    #[serde(default = "legacy_wire_backend")]
     pub backend: NetworkBackendKind,
     #[serde(default)]
     pub vpn_epoch: Option<VpnEpoch>,
@@ -1297,7 +1239,7 @@ mod tests {
                 start_seconds: 900,
                 start_microseconds: 1,
             }],
-            backend: NetworkBackendKind::NetworkExtension,
+            backend: NetworkBackendKind::Seatbelt,
             vpn_epoch: None,
             coverage_scope: None,
         }
@@ -1459,6 +1401,7 @@ mod tests {
             "observed_at": 1005.0,
             "source": "fixture",
             "via_controlled_path": true,
+            "backend": "seatbelt",
             "family": "claude",
             "upstream_endpoint": "127.0.0.1:7890",
             "context_id": "ctx-2",
@@ -1559,19 +1502,19 @@ mod tests {
                 ProcessRole::DesktopMain,
             )],
             local_proxy_ready: true,
-            system_extension_active: true,
+            system_extension_active: false,
             active_flows_count: 1,
             terminated_flows_count: 0,
             blocked_new_connections: 0,
             local_proxy_port: Some(7890),
             valid_until: Some(1030.0),
             updated_at: 1000.0,
-            backend: NetworkBackendKind::NetworkExtension,
+            backend: NetworkBackendKind::Seatbelt,
             vpn_epoch: None,
             vpn_match: None,
             coverage_scope: BackendCoverageScope::default(),
             unmanaged_member_pids: Vec::new(),
-            sandbox_ready: false,
+            sandbox_ready: true,
         };
         let mut families = BTreeMap::new();
         families.insert("claude".into(), state1.clone());
@@ -1737,49 +1680,55 @@ mod tests {
         assert!(!placeholder_token.matches_process(4100, 0, 900, 1, None));
     }
 
+
     #[test]
-    fn system_extension_receipt_requires_exact_confirmed_execution() {
-        let version = policy("extension");
-        let mut receipt = SystemExtensionReceipt {
-            family: "claude".into(),
-            command_binding: "fixture".into(),
-            executor_boot_id: "rust-boot".into(),
-            extension_boot_id: "extension-boot".into(),
-            policy_version: version.clone(),
-            command_seq: 14,
-            permit_generation: 5,
-            applied_at: 100.0,
-            allowed_pids: vec![4100],
-            local_proxy_port: 0,
-            permit_state: "revoked".into(),
-            status: "revoked".into(),
-            active_flows: 0,
-            new_connections_blocked: true,
-            reason: None,
-        };
-        let matches = |r: &SystemExtensionReceipt, seq, generation, boot: &str| {
-            r.matches_supervision(&version, seq, generation, "rust-boot", boot, 99.0, 105.0)
-                && r.is_confirmed_revoked()
-        };
-        assert!(matches(&receipt, 14, 5, "extension-boot"));
-        assert!(receipt.is_fresh(105.0, 8.0));
-        assert!(!matches(&receipt, 13, 5, "extension-boot"));
-        assert!(!matches(&receipt, 14, 4, "extension-boot"));
-        assert!(!matches(&receipt, 14, 5, "previous-boot"));
-        receipt.status = "failed".into();
-        assert!(!matches(&receipt, 14, 5, "extension-boot"));
-        receipt.status = "revoked".into();
-        receipt.permit_state = "disconnecting".into();
-        assert!(!receipt.is_confirmed_revoked());
-        receipt.permit_state = "revoked".into();
-        receipt.active_flows = 1;
-        assert!(!receipt.is_confirmed_revoked());
-        receipt.active_flows = 0;
-        receipt.new_connections_blocked = false;
-        assert!(!receipt.is_confirmed_revoked());
-        receipt.applied_at = 110.0;
-        assert!(!receipt.is_fresh(100.0, 8.0));
-        receipt.applied_at = f64::NAN;
-        assert!(!receipt.is_fresh(100.0, 8.0));
+    fn retired_backend_and_unlabelled_wire_cannot_authorize_or_confirm_protection() {
+        assert_eq!(NetworkBackendKind::default(), NetworkBackendKind::Seatbelt);
+        let version = policy("current");
+        let current = sample_permit(ChannelPermitState::Permitted, version.clone());
+        let current_receipt = sample_receipt(&current, ChannelEnforcementState::Forwarding, false, 1);
+        for legacy_wire in [Some("network_extension"), Some("ne"), None] {
+            let mut value = serde_json::to_value(&current).unwrap();
+            if let Some(backend) = legacy_wire {
+                value["backend"] = json!(backend);
+            } else {
+                value.as_object_mut().unwrap().remove("backend");
+            }
+            let legacy: ChannelPermit = serde_json::from_value(value).unwrap();
+            assert_eq!(legacy.effective_state(1002.0, &version),
+                (ChannelPermitState::Revoked, "legacy_network_backend_removed"));
+            assert!(matches!(evaluate_channel_supervision(&legacy, Some(&current_receipt), &version, 1002.0),
+                ChannelSupervisionVerdict::EnforcementFailed { code, .. } if code == "legacy_network_backend_removed"));
+        }
+        for legacy_wire in [Some("network_extension"), None] {
+            let mut value = serde_json::to_value(&current_receipt).unwrap();
+            if let Some(backend) = legacy_wire { value["backend"] = json!(backend); }
+            else { value.as_object_mut().unwrap().remove("backend"); }
+            let receipt = serde_json::from_value(value).unwrap();
+            assert!(matches!(evaluate_channel_supervision(&current, Some(&receipt), &version, 1002.0),
+                ChannelSupervisionVerdict::EnforcementFailed { code, .. } if code == "legacy_network_backend_removed"));
+        }
+        assert_eq!(evaluate_channel_supervision(&current, Some(&current_receipt), &version, 1002.0),
+            ChannelSupervisionVerdict::ForwardingVerified);
     }
+
+    #[test]
+    fn retired_path_evidence_remains_readable_but_never_reopens_a_channel() {
+        let version = policy("current");
+        let current = sample_permit(ChannelPermitState::Revoked, version.clone());
+        let evidence = json!({"family":"claude", "upstream_endpoint":"127.0.0.1:7890",
+            "policy_version":version, "context_id":"ctx-1", "via_controlled_path":true,
+            "observed_at":1005.0, "ip":"1.1.1.1", "country":"JP", "backend":"network_extension"});
+        for labelled in [true, false] {
+            let mut raw = evidence.clone();
+            if !labelled { raw.as_object_mut().unwrap().remove("backend"); }
+            let parsed = ControlledPathEvidence::parse(&raw).unwrap();
+            assert_eq!(parsed.matches_path("claude", "127.0.0.1:7890", &version, Some("ctx-1"), 1006.0, 10.0),
+                Err("legacy_network_backend_removed"));
+            assert_eq!(verify_channel_recovery(&current, 1003.0, Some("s1"), true, 1005.0, &version,
+                &raw, Some("s1"), &version, "ctx-1", 3, 6, 1006.0, 10.0).unwrap_err().code,
+                "legacy_network_backend_removed");
+        }
+    }
+
 }

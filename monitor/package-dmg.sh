@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd -P)
+source "$ROOT/network-backend.sh"
+cw_require_seatbelt_backend
 # Version and build number always come from the caller (the engine's reinstall
 # command or an explicit command line); no built-in default may go stale.
 : "${APP_VERSION:?Set APP_VERSION (for example 3.0.0)}"

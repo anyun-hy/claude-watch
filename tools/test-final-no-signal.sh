@@ -18,12 +18,8 @@ python3 -m unittest -v \
   tools/tests/test_platform_contract.py \
   tools/tests/test_architecture_boundaries.py \
   tools/tests/test_snapshot_transport_contract.py \
-  tools/tests/test_extension_cutoff_contract.py \
   tools/tests/test_channel_stop_contract.py \
-  tools/tests/test_extension_activation_and_attribution.py \
-  tools/tests/test_extension_receipt_authority.py \
-  tools/tests/test_extension_epoch_and_signing.py \
-  tools/tests/test_removed_family_receipt_contract.py
+  tools/tests/test_seatbelt_build_contract.py
 python3 tools/generate-ai-policy-swift.py --check
 bash -n monitor/build.sh monitor/package-dmg.sh tools/build-rust-components.sh
 
@@ -83,26 +79,7 @@ if [[ "$(uname -s)" == Darwin ]]; then
     -o "$BUILD/process-control-tests"
   "$BUILD/process-control-tests"
   "$BUILD/process-control-tests" --owned-exec-identity
-  echo '===== EXTENSION WAKE AND SIGNING CAPABILITY REGRESSIONS ====='
-  CW_CHANNEL_CONTRACT_DIR="$BUILD" cargo test --locked -p claude-watch-runtime --test extension_control_contracts \
-    production_command_envelope_keeps_families_independent -- --exact
-  "$SWIFTC" -swift-version 5 -Onone -parse-as-library \
-    -target "$ARCH-apple-macosx$MIN" -sdk "$SDK" -module-cache-path "$BUILD/module-cache" \
-    monitor/SystemExtension/ChannelContract.swift monitor/SystemExtension/ChannelIdentity.swift \
-    monitor/SystemExtension/ChannelTransport.swift monitor/tests/ChannelEpochTests.swift \
-    -o "$BUILD/channel-epoch-tests"
-  "$BUILD/channel-epoch-tests" "$BUILD/rust-command.json"
-  "$SWIFTC" -swift-version 5 -Onone -parse-as-library \
-    -target "$ARCH-apple-macosx$MIN" -sdk "$SDK" -module-cache-path "$BUILD/module-cache" \
-    monitor/Sources/NetworkExtensionCapabilities.swift monitor/tests/NetworkExtensionCapabilityTests.swift \
-    -o "$BUILD/extension-capability-tests"
-  "$BUILD/extension-capability-tests"
-  "$SWIFTC" -swift-version 5 -Onone -parse-as-library \
-    -target "$ARCH-apple-macosx$MIN" -sdk "$SDK" -module-cache-path "$BUILD/module-cache" \
-    monitor/SystemExtension/ChannelContract.swift monitor/SystemExtension/ChannelIdentity.swift \
-    monitor/SystemExtension/ChannelTransport.swift monitor/tests/ChannelRemovalReceiptTests.swift \
-    -o "$BUILD/channel-removal-receipt-tests"
-  "$BUILD/channel-removal-receipt-tests"
+
 else
   echo 'SKIP: macOS production Swift typecheck (not running on macOS)'
 fi

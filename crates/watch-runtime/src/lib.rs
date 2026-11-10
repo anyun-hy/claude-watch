@@ -12,7 +12,6 @@ pub mod background_evidence;
 pub mod build_identity;
 pub mod channel_enforcer;
 pub mod channel_diagnostics;
-pub mod channel_extension;
 pub mod channel_policy_status;
 pub mod channel_supervisor;
 pub mod commands;

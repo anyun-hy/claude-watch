@@ -22,7 +22,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
-    os::unix::{net::{UnixStream, UnixListener}, fs::{DirBuilderExt, PermissionsExt}},
+    os::unix::net::UnixStream,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -215,7 +215,6 @@ struct EnforcerInner {
     backend: NetworkBackendKind,
     sandbox_ready: bool,
     local_proxy_ready: bool,
-    system_extension_active: bool,
     interception_active: bool,
     direct_fallback_blocked: bool,
     upstream_healthy: bool,
@@ -240,9 +239,6 @@ struct EnforcerInner {
     traces: Vec<ConnectionTraceEvent>,
     next_trace_seq: u64,
     strict_peer_verification: bool,
-    extension_socket_path: Option<String>,
-    extension_receipts: BTreeMap<String, claude_watch_core::channel::SystemExtensionReceipt>,
-    extension_heartbeat: Option<claude_watch_core::channel::SystemExtensionHeartbeat>,
 }
 
 pub struct LocalTunnelEnforcer {
@@ -260,8 +256,7 @@ impl LocalTunnelEnforcer {
 
     /// Creates an enforcer instance.
     ///
-    /// Critical invariant (Requirement 2): `local_proxy_ready`,
-    /// `system_extension_active`, `interception_active`, and
+    /// Critical invariant: `local_proxy_ready`, `sandbox_ready`, `interception_active`, and
     /// `direct_fallback_blocked` start as `false` and are NEVER defaulted to
     /// `true` at construction!
     pub fn new(boot_id: impl Into<String>, storage: Option<StateStore>) -> Self {
@@ -271,10 +266,9 @@ impl LocalTunnelEnforcer {
         Self {
             inner: Arc::new(Mutex::new(EnforcerInner {
                 boot_id: boot_id.into(),
-                backend: NetworkBackendKind::NetworkExtension,
+                backend: NetworkBackendKind::Seatbelt,
                 sandbox_ready: false,
                 local_proxy_ready: false,
-                system_extension_active: false,
                 interception_active: false,
                 direct_fallback_blocked: false,
                 upstream_healthy: true,
@@ -299,9 +293,6 @@ impl LocalTunnelEnforcer {
                 traces: Vec::new(),
                 next_trace_seq: 1,
                 strict_peer_verification: false,
-                extension_socket_path: None,
-                extension_receipts: BTreeMap::new(),
-                extension_heartbeat: None,
             })),
             next_flow_id: Arc::new(AtomicU64::new(1)),
             receipt_publication: Arc::new(Mutex::new(ReceiptPublication::default())),
@@ -324,12 +315,11 @@ impl LocalTunnelEnforcer {
     }
 
     /// Configures Seatbelt (`nono`) sandbox backend state without pretending
-    /// that a macOS SystemExtension (`NETransparentProxyProvider`) is active.
+    /// that processes outside controlled launches are protected.
     pub fn configure_seatbelt_backend(&self, sandbox_ready: bool, now: f64) -> Result<String> {
         let mut guard = self.lock()?;
         guard.backend = NetworkBackendKind::Seatbelt;
         guard.sandbox_ready = sandbox_ready;
-        guard.system_extension_active = false;
         guard.interception_active = sandbox_ready && guard.local_proxy_ready;
         guard.direct_fallback_blocked = sandbox_ready;
         guard.last_wall_now = Some(now);
@@ -353,7 +343,6 @@ impl LocalTunnelEnforcer {
         let mut guard = self.lock()?;
         guard.backend = NetworkBackendKind::Seatbelt;
         guard.sandbox_ready = can_enable;
-        guard.system_extension_active = false;
         guard.interception_active = can_enable && guard.local_proxy_ready;
         guard.direct_fallback_blocked = can_enable;
         guard.last_wall_now = Some(now);
@@ -370,147 +359,15 @@ impl LocalTunnelEnforcer {
         Ok(can_enable)
     }
 
-    pub fn start_extension_gateway(self: &Arc<Self>, stop: Arc<AtomicBool>) -> Result<()> {
-        let dir = std::path::PathBuf::from("/tmp")
-            .join(format!("cw-channel-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::DirBuilder::new().mode(0o700).create(&dir)
-            .map_err(|_| CoreError::new("extension_gateway_unavailable", "扩展网关目录创建失败"))?;
-        let path = dir.join("gateway.sock");
-        let listener = UnixListener::bind(&path)
-            .map_err(|_| CoreError::new("extension_gateway_unavailable", "扩展网关绑定失败"))?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|_| CoreError::new("extension_gateway_unavailable", "扩展网关权限设置失败"))?;
-        listener.set_nonblocking(true)
-            .map_err(|_| CoreError::new("extension_gateway_unavailable", "扩展网关监听设置失败"))?;
-        self.lock()?.extension_socket_path = Some(path.to_string_lossy().into_owned());
-        let enforcer = self.clone();
-        thread::Builder::new().name("channel-extension-gateway".into()).spawn(move || {
-            while !stop.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let enforcer = enforcer.clone();
-                        thread::spawn(move || {
-                            if crate::channel_extension::is_authenticated_extension(&stream) {
-                                Self::serve_gateway_connection(enforcer, TunnelStream::Unix(stream), None, true);
-                            } else {
-                                let _ = stream.shutdown(Shutdown::Both);
-                            }
-                        });
-                    }
-                    Err(_) => thread::sleep(Duration::from_millis(25)),
-                }
-            }
-            drop(listener);
-            let _ = std::fs::remove_file(path);
-            let _ = std::fs::remove_dir(dir);
-        }).map_err(|_| CoreError::new("extension_gateway_unavailable", "扩展网关线程创建失败"))?;
-        Ok(())
-    }
-
-    /// Read only root-authored observations. Every unavailable/invalid path
-    /// clears prior success; the UI's activation cache is never evidence here.
-    pub fn refresh_system_extension(&self, now: f64) -> Result<()> {
-        use claude_watch_core::channel::{SystemExtensionHeartbeat, SystemExtensionReceipt};
-        if !self.lock()?.strict_peer_verification { return Ok(()); }
-        let Some(store) = &self.storage else { return Ok(()); };
-        let heartbeat = crate::channel_extension::read_observation::<SystemExtensionHeartbeat>(store, "system-extension-heartbeat.json").ok();
-        let receipts = crate::channel_extension::read_observation::<Vec<SystemExtensionReceipt>>(store, "system-extension-receipt.json").unwrap_or_default();
-        self.observe_system_extension(heartbeat, receipts, now)
-    }
-
-    pub fn observe_system_extension(
-        &self,
-        heartbeat: Option<claude_watch_core::channel::SystemExtensionHeartbeat>,
-        receipts: Vec<claude_watch_core::channel::SystemExtensionReceipt>,
-        now: f64,
-    ) -> Result<()> {
-        let updates = {
-            let mut guard = self.lock()?;
-            let live = heartbeat.as_ref().is_some_and(|h| h.is_live(&guard.boot_id, now));
-            let receipt_map = receipts.into_iter().map(|r| (r.family.clone(), r)).collect::<BTreeMap<_, _>>();
-            if guard.extension_heartbeat == heartbeat && guard.extension_receipts == receipt_map
-                && guard.system_extension_active == live { return Ok(()); }
-            let lost = guard.system_extension_active && !live;
-            let changed = guard.extension_heartbeat.as_ref().map(|h| &h.extension_boot_id)
-                != heartbeat.as_ref().map(|h| &h.extension_boot_id);
-            guard.extension_heartbeat = heartbeat;
-            guard.extension_receipts = receipt_map;
-            guard.system_extension_active = live;
-            guard.interception_active = live && guard.local_proxy_ready;
-            guard.direct_fallback_blocked = live;
-            guard.activation_error_code = if live { None } else { Some("system_extension_liveness_unconfirmed".into()) };
-            let families: Vec<_> = guard.families.keys().cloned().collect();
-            if lost || changed {
-                for family in &families {
-                    Self::begin_autonomous_revoke_locked(&mut guard, family, "extension_control_lost_or_restarted", now);
-                }
-            }
-            for family in &families {
-                let reason = guard.families.get(family).filter(|s|
-                    s.command.as_ref().is_some_and(|c| c.permit.state == ChannelPermitState::Permitted)
-                        && s.local_revoke_reason.is_none())
-                    .and_then(|_| Self::matching_extension_receipt(&guard, family, now))
-                    .filter(|r| r.new_connections_blocked && (r.is_confirmed_revoked()
-                        || r.is_disconnecting() || r.status == "failed"))
-                    .map(|r| r.reason.clone().unwrap_or_else(|| "extension_autonomous_cutoff".into()));
-                if let Some(reason) = reason {
-                    // Mirror the extension's actual cutoff into our own relay
-                    // before reporting it; neither half can reopen on its own.
-                    Self::begin_autonomous_revoke_locked(&mut guard, family, &reason, now);
-                }
-            }
-            let updates = families.iter().filter_map(|f| Self::build_receipt_locked(&guard, f, now).ok()).collect::<Vec<_>>();
-            updates
-        };
-        for receipt in updates {
-            self.publish_current_receipt(&receipt)?;
-        }
-        Ok(())
-    }
-
-    pub fn extension_commands(&self) -> Result<serde_json::Value> {
-        Ok({
-            let guard = self.lock()?;
-            let commands = guard.families.iter().filter_map(|(family, state)| {
-                let cmd = state.command.as_ref()?;
-                Some(json!({
-                    "family": family,
-                    "policy_version": cmd.policy_version,
-                    "command_seq": cmd.command_seq,
-                    "permit_generation": cmd.permit_generation,
-                    "issued_at": cmd.issued_at,
-                    "valid_until": cmd.permit.valid_until,
-                    "permit_state": cmd.permit.state,
-                    "allowed_pids": cmd.allowed_processes.iter().map(|p| p.pid).collect::<Vec<_>>(),
-                    "allowed_processes": cmd.allowed_processes,
-                    "session_id": cmd.session_id,
-                    "command_binding": crate::channel_extension::command_binding(cmd),
-                    "reason": cmd.permit.reason_code,
-                }))
-            }).collect::<Vec<_>>();
-            json!({"executor_boot_id": guard.boot_id,
-                "extension_boot_id": guard.extension_heartbeat.as_ref().map(|h| h.extension_boot_id.as_str()),
-                "gateway_socket": guard.extension_socket_path,
-                "control_home": self.storage.as_ref().map(|s| &s.paths.home), "commands": commands})
-        })
-    }
-
-    fn publish_extension_commands(&self) -> Result<()> {
-        let Some(store) = &self.storage else { return Ok(()); };
-        if !self.lock()?.strict_peer_verification { return Ok(()); }
-        let snapshot = self.extension_commands()?;
-        let value = json!({"gateway_socket": snapshot["gateway_socket"], "executor_boot_id": snapshot["executor_boot_id"]});
-        // Discovery and wakeup only. The extension obtains authority from our
-        // authenticated Unix CONTROL endpoint, never the contents of this file.
-        store.atomic_json(&store.paths.watch().join("state/system-extension-command.json"), &value)
-    }
-
-    /// Activates local tunnel interception and direct-fallback blocking,
-    /// returning the active `executor_boot_id` for supervisor handshake.
+    /// Sets up an in-memory executor fixture. Production strict mode must use
+    /// the verified Seatbelt identity gate and a real listener instead.
     pub fn activate_interception(&self, now: f64) -> Result<String> {
         let mut guard = self.lock()?;
+        if guard.strict_peer_verification {
+            return Err(CoreError::new("fixture_activation_forbidden", "生产执行器必须使用受控启动与网关身份核验"));
+        }
+        guard.sandbox_ready = true;
         guard.local_proxy_ready = true;
-        guard.system_extension_active = true;
         guard.interception_active = true;
         guard.direct_fallback_blocked = true;
         guard.activation_error_code = None;
@@ -519,14 +376,14 @@ impl LocalTunnelEnforcer {
     }
 
     /// Records whether the local proxy listener is ready, separate from
-    /// system-extension kernel interception readiness.
+    /// Seatbelt controlled-instance readiness.
     pub fn set_local_proxy_ready(&self, ready: bool, now: f64) -> Result<()> {
         let mut guard = self.lock()?;
         guard.local_proxy_ready = ready;
         guard.last_wall_now = Some(now);
         if !ready {
             guard.gateway_endpoint_protection = None;
-            if guard.backend.is_sandbox() { guard.sandbox_ready = false; }
+            guard.sandbox_ready = false;
             guard.interception_active = false;
             guard.direct_fallback_blocked = false;
             guard.activation_error_code = Some("local_proxy_not_ready".into());
@@ -535,40 +392,10 @@ impl LocalTunnelEnforcer {
                 state.last_error_code = Some("local_proxy_not_ready".into());
                 state.last_updated_at = now;
             }
-        } else if guard.backend.is_sandbox() && guard.sandbox_ready {
-            guard.system_extension_active = false;
+        } else if guard.sandbox_ready {
             guard.interception_active = true;
             guard.direct_fallback_blocked = true;
             guard.activation_error_code = None;
-        }
-        Ok(())
-    }
-
-    /// Records whether the macOS SystemExtension / NetworkExtension takeover
-    /// is active, separate from local proxy listener readiness.
-    pub fn set_system_extension_active(
-        &self,
-        active: bool,
-        error_code: Option<&str>,
-        now: f64,
-    ) -> Result<()> {
-        let mut guard = self.lock()?;
-        guard.system_extension_active = active;
-        guard.last_wall_now = Some(now);
-        if active && guard.local_proxy_ready {
-            guard.interception_active = true;
-            guard.direct_fallback_blocked = true;
-            guard.activation_error_code = None;
-        } else if !active {
-            let code = error_code.unwrap_or("system_extension_inactive").to_string();
-            guard.interception_active = false;
-            guard.direct_fallback_blocked = false;
-            guard.activation_error_code = Some(code.clone());
-            for state in guard.families.values_mut() {
-                state.enforcement_state = ChannelEnforcementState::Failed;
-                state.last_error_code = Some(code.clone());
-                state.last_updated_at = now;
-            }
         }
         Ok(())
     }
@@ -617,10 +444,6 @@ impl LocalTunnelEnforcer {
 
     pub fn local_proxy_ready(&self) -> Result<bool> {
         Ok(self.lock()?.local_proxy_ready)
-    }
-
-    pub fn system_extension_active(&self) -> Result<bool> {
-        Ok(self.lock()?.system_extension_active)
     }
 
     pub fn local_listener_addr(&self) -> Result<Option<String>> {
@@ -759,7 +582,6 @@ impl LocalTunnelEnforcer {
         let mut guard = self.lock()?;
         guard.interception_active = active;
         guard.direct_fallback_blocked = active;
-        guard.system_extension_active = active;
         if !active {
             for state in guard.families.values_mut() {
                 state.enforcement_state = ChannelEnforcementState::Failed;
@@ -778,7 +600,6 @@ impl LocalTunnelEnforcer {
         guard.boot_id = new_boot_id.into();
         guard.interception_active = true;
         guard.direct_fallback_blocked = true;
-        guard.system_extension_active = true;
         guard.local_proxy_ready = true;
         guard.last_wall_now = Some(now);
         let families: Vec<String> = guard.families.keys().cloned().collect();
@@ -1258,27 +1079,14 @@ impl LocalTunnelEnforcer {
             let mut guard = self.lock()?;
             guard.local_proxy_ready = true;
             guard.gateway_endpoint_protection = protection;
-            // The local listener only proves that the proxy server is ready.
-            // System extension activation and direct fallback blocking must be
-            // confirmed separately by the system extension manager or IPC!
-            if guard.backend.is_sandbox() && guard.sandbox_ready {
-                guard.system_extension_active = false;
-                guard.interception_active = true;
-                guard.direct_fallback_blocked = true;
-                guard.activation_error_code = None;
-            } else if guard.system_extension_active {
-                guard.interception_active = true;
-                guard.direct_fallback_blocked = true;
-                guard.activation_error_code = None;
+            // A listener alone cannot prove that clients entered the controlled sandbox.
+            guard.interception_active = guard.sandbox_ready;
+            guard.direct_fallback_blocked = guard.sandbox_ready;
+            guard.activation_error_code = if guard.sandbox_ready {
+                None
             } else {
-                guard.interception_active = false;
-                guard.direct_fallback_blocked = false;
-                guard.activation_error_code = Some(if guard.backend.is_sandbox() {
-                    "sandbox_backend_not_ready".into()
-                } else {
-                    "system_extension_inactive".into()
-                });
-            }
+                Some("sandbox_backend_not_ready".into())
+            };
             guard.require_upstream_connect_handshake = true;
             guard.local_listener_addr = Some(addr.to_string());
             guard.last_wall_now = Some(now);
@@ -1297,7 +1105,7 @@ impl LocalTunnelEnforcer {
                             let _ = incoming.set_nonblocking(false);
                             let enf = Arc::clone(&enforcer);
                             thread::spawn(move || {
-                                Self::serve_gateway_connection(enf, TunnelStream::Tcp(incoming), Some(peer_addr), false);
+                                Self::serve_gateway_connection(enf, TunnelStream::Tcp(incoming), Some(peer_addr));
                             });
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1439,23 +1247,12 @@ impl LocalTunnelEnforcer {
         Ok(raw_chunked_payload)
     }
 
-    fn serve_gateway_connection(enf: Arc<Self>, mut incoming: TunnelStream, peer_addr: Option<SocketAddr>, authenticated_extension: bool) {
+    fn serve_gateway_connection(enf: Arc<Self>, mut incoming: TunnelStream, peer_addr: Option<SocketAddr>) {
         const MAX_HTTP_HEADER_BYTES: usize = 16384;
         const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-        // Production NetworkExtension identity comes from the authenticated extension socket.
-        // Seatbelt (`nono`) sandboxed clients connect via loopback TCP and are attributed
-        // via kernel `PROC_PIDFDSOCKETINFO` + `BoundProcessToken` verification.
-        if !authenticated_extension
-            && enf
-                .lock()
-                .map_or(true, |g| g.strict_peer_verification && !g.backend.is_sandbox())
-        {
-            let _ = incoming.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
-            let _ = incoming.shutdown(Shutdown::Both);
-            return;
-        }
-
+        // Only the kernel-attributed controlled instance can authorize this loopback flow.
+        // Client headers never supply process identity or command authority.
         let mut bound_keepalive_authority: Option<String> = None;
         loop {
             let _ = incoming.set_read_timeout(Some(Duration::from_secs(2)));
@@ -1499,24 +1296,6 @@ impl LocalTunnelEnforcer {
             };
             let first_line = header.lines().next().unwrap_or("").trim_end_matches('\r');
             let parts: Vec<&str> = first_line.split_whitespace().collect();
-            if parts.first() == Some(&"WATCH-CONTROL") {
-                if authenticated_extension
-                    && parts.len() == 3
-                    && uuid::Uuid::parse_str(parts[1]).is_ok()
-                    && parts[2] == "HTTP/1.1"
-                {
-                    if let Ok(envelope) = enf.extension_commands() {
-                        if let Ok(bytes) = serde_json::to_vec(&json!({"nonce": parts[1], "envelope": envelope})) {
-                            if bytes.len() <= 1_048_576 {
-                                let _ = incoming.write_all(&(bytes.len() as u32).to_be_bytes());
-                                let _ = incoming.write_all(&bytes);
-                            }
-                        }
-                    }
-                }
-                let _ = incoming.shutdown(Shutdown::Both);
-                return;
-            }
             let is_connect = parts.len() == 3
                 && parts[0].eq_ignore_ascii_case("CONNECT")
                 && matches!(parts[2], "HTTP/1.1" | "HTTP/1.0");
@@ -1781,66 +1560,7 @@ impl LocalTunnelEnforcer {
                 b
             };
 
-            // Support both direct socket attribution (via kernel PROC_PIDFDSOCKETINFO / lsof) and
-            // transparent proxy attribution from verified NetworkExtension with X-Watch identity headers.
-            let mut resolved_identity = peer_addr.and_then(|peer| enf.resolve_peer_socket_identity(peer).ok());
-            if resolved_identity.is_none() && authenticated_extension {
-                let mut x_pid: Option<u32> = None;
-                let mut x_uid: Option<u32> = None;
-                let mut x_start: Option<u64> = None;
-                let mut x_micros: Option<u32> = None;
-                let mut x_audit_hex: Option<String> = None;
-                for line in header.lines() {
-                    let line = line.trim_end_matches('\r');
-                    if let Some(v) = line.strip_prefix("X-Watch-PID:").or_else(|| line.strip_prefix("x-watch-pid:")) {
-                        x_pid = v.trim().parse().ok();
-                    } else if let Some(v) = line.strip_prefix("X-Watch-UID:").or_else(|| line.strip_prefix("x-watch-uid:")) {
-                        x_uid = v.trim().parse().ok();
-                    } else if let Some(v) = line.strip_prefix("X-Watch-Audit-Token:").or_else(|| line.strip_prefix("x-watch-audit-token:")) {
-                        x_audit_hex = Some(v.trim().to_string());
-                    } else if let Some(v) = line.strip_prefix("X-Watch-Start-Seconds:") {
-                        x_start = v.trim().parse().ok();
-                    } else if let Some(v) = line.strip_prefix("X-Watch-Start-Micros:") {
-                        x_micros = v.trim().parse().ok();
-                    }
-                }
-                if let (Some(pid), Some(uid)) = (x_pid, x_uid) {
-                    if let Some(parsed_audit) = x_audit_hex.as_deref().and_then(parse_audit_token_hex) {
-                        if parsed_audit[5] == pid && parsed_audit[1] == uid {
-                            if let Ok(guard) = enf.lock() {
-                                for (fam, st) in &guard.families {
-                                    if let Some(cmd) = &st.command {
-                                        for tok in &cmd.allowed_processes {
-                                            if tok.pid == pid
-                                                && tok.uid == uid
-                                                && Some(tok.start_seconds) == x_start
-                                                && Some(tok.start_microseconds) == x_micros
-                                            {
-                                                let matched_tok = if let Some(ref expected) = tok.audit_token {
-                                                    if expected == &parsed_audit {
-                                                        tok.clone()
-                                                    } else {
-                                                        continue;
-                                                    }
-                                                } else {
-                                                    tok.clone().with_audit_token(parsed_audit)
-                                                };
-                                                if matched_tok.has_valid_identity() {
-                                                    resolved_identity = Some((fam.clone(), matched_tok));
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if resolved_identity.is_some() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let resolved_identity = peer_addr.and_then(|peer| enf.resolve_peer_socket_identity(peer).ok());
             let Ok((family, proc_token)) = resolved_identity.ok_or_else(|| {
                 CoreError::new("unverified_peer_socket_identity", "未核验来源进程身份")
             }) else {
@@ -2315,13 +2035,6 @@ impl LocalTunnelEnforcer {
             defer_confirm,
         ) = {
             let mut guard = self.lock()?;
-            if guard.strict_peer_verification
-                && !guard.backend.is_sandbox()
-                && Self::build_receipt_locked(&guard, family, now)?.enforcement_state
-                    != ChannelEnforcementState::Forwarding
-            {
-                return Err(CoreError::new("extension_permit_unconfirmed", "系统扩展尚未确认当前许可，连接保持阻断"));
-            }
             let defer_confirm = guard.defer_auto_flow_confirm;
             let upstream_connector = guard.upstream_connector.clone();
             let require_connect_handshake =
@@ -2546,8 +2259,7 @@ impl LocalTunnelEnforcer {
                 .max(now + dial_elapsed)
                 .max(guard.last_wall_now.unwrap_or(now));
             let interception_ok = guard.interception_active && guard.direct_fallback_blocked
-                && (!guard.strict_peer_verification || guard.backend.is_sandbox() || Self::build_receipt_locked(&guard, family, post_dial_now)
-                    .is_ok_and(|r| r.enforcement_state == ChannelEnforcementState::Forwarding));
+                && guard.sandbox_ready;
             let upstream_ok = guard.upstream_healthy;
             let last_wall = guard.last_wall_now;
             let strict = guard.strict_peer_verification;
@@ -2916,19 +2628,6 @@ impl LocalTunnelEnforcer {
         closing_ids
     }
 
-    fn matching_extension_receipt<'a>(
-        guard: &'a EnforcerInner, family: &str, now: f64,
-    ) -> Option<&'a claude_watch_core::channel::SystemExtensionReceipt> {
-        let cmd = guard.families.get(family)?.command.as_ref()?;
-        let live = guard.extension_heartbeat.as_ref().filter(|h| h.is_live(&guard.boot_id, now))?;
-        guard.extension_receipts.get(family).filter(|r|
-            r.matches_supervision(&cmd.policy_version, cmd.command_seq, cmd.permit_generation,
-                &guard.boot_id, &live.extension_boot_id, cmd.issued_at, now)
-                && r.allowed_pids.iter().copied().collect::<BTreeSet<_>>()
-                    == cmd.allowed_processes.iter().map(|p| p.pid).collect::<BTreeSet<_>>()
-                && crate::channel_extension::command_binding(cmd).as_ref() == Some(&r.command_binding))
-    }
-
     fn build_receipt_locked(
         guard: &EnforcerInner,
         family: &str,
@@ -2960,7 +2659,7 @@ impl LocalTunnelEnforcer {
             enforcement_state: state.enforcement_state,
             interception_active: guard.interception_active,
             local_proxy_ready: guard.local_proxy_ready,
-            system_extension_active: guard.system_extension_active,
+            system_extension_active: false,
             new_connections_blocked,
             active_flows_closed: active_count == 0,
             direct_fallback_blocked: guard.direct_fallback_blocked,
@@ -2986,12 +2685,12 @@ impl LocalTunnelEnforcer {
             coverage_scope: cmd.permit.coverage_scope.clone(),
             sandbox_ready: guard.sandbox_ready,
         };
-        if cmd.permit.backend.is_sandbox() || guard.backend.is_sandbox() {
+        {
             receipt.backend = NetworkBackendKind::Seatbelt;
             receipt.system_extension_active = false;
             receipt.sandbox_ready = guard.sandbox_ready;
-            receipt.interception_active = guard.sandbox_ready && guard.local_proxy_ready;
-            receipt.direct_fallback_blocked = guard.sandbox_ready;
+            receipt.interception_active = guard.interception_active && guard.sandbox_ready && guard.local_proxy_ready;
+            receipt.direct_fallback_blocked = guard.direct_fallback_blocked && guard.sandbox_ready;
             if !receipt.interception_active || !receipt.direct_fallback_blocked {
                 receipt.enforcement_state = ChannelEnforcementState::Failed;
                 receipt.new_connections_blocked = false;
@@ -3004,42 +2703,6 @@ impl LocalTunnelEnforcer {
                         }
                         .into(),
                     );
-                }
-            }
-        } else if guard.strict_peer_verification {
-            let live = guard.extension_heartbeat.as_ref().filter(|h| h.is_live(&guard.boot_id, now));
-            let extension = Self::matching_extension_receipt(guard, family, now);
-            receipt.system_extension_active = live.is_some();
-            receipt.interception_active = live.is_some() && guard.local_proxy_ready;
-            receipt.direct_fallback_blocked = live.is_some();
-            // Rust closes its relay, the extension closes the application's flow.
-            // Neither half alone is a successful isolation receipt.
-            match extension {
-                Some(ext) if ext.status == "failed" => {
-                    receipt.enforcement_state = ChannelEnforcementState::Failed;
-                    receipt.error_code = Some(ext.reason.clone().unwrap_or_else(|| "extension_execution_failed".into()));
-                    receipt.active_flows_closed = false;
-                }
-                Some(ext) => {
-                    receipt.active_flows_count = receipt.active_flows_count.max(ext.active_flows.min(u32::MAX as usize) as u32);
-                    receipt.new_connections_blocked &= ext.new_connections_blocked;
-                    receipt.active_flows_closed &= ext.is_confirmed_revoked();
-                    if receipt.permit_state == ChannelPermitState::Permitted {
-                        if ext.status != "ok" || ext.permit_state != "permitted" {
-                            receipt.enforcement_state = ChannelEnforcementState::Failed;
-                            receipt.error_code = Some("extension_permit_not_applied".into());
-                        }
-                    } else if ext.is_disconnecting() || !receipt.active_flows_closed {
-                        receipt.enforcement_state = ChannelEnforcementState::Disconnecting;
-                    } else if receipt.new_connections_blocked && receipt.interception_active {
-                        receipt.enforcement_state = ChannelEnforcementState::Blocked;
-                    }
-                }
-                None => {
-                    receipt.enforcement_state = ChannelEnforcementState::Failed;
-                    receipt.new_connections_blocked = false;
-                    receipt.active_flows_closed = false;
-                    receipt.error_code = Some(if live.is_some() { "extension_receipt_pending_or_invalid" } else { "system_extension_liveness_unconfirmed" }.into());
                 }
             }
         }
@@ -3195,11 +2858,7 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
 
     fn is_ready(&self) -> Result<bool> {
         let guard = self.lock()?;
-        let backend_ready = if guard.backend.is_sandbox() {
-            guard.sandbox_ready
-        } else {
-            guard.system_extension_active
-        };
+        let backend_ready = guard.sandbox_ready;
         Ok(guard.interception_active
             && guard.direct_fallback_blocked
             && backend_ready
@@ -3212,6 +2871,9 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
         command: &ChannelEnforcementCommand,
         now: f64,
     ) -> Result<ChannelEnforcementReceipt> {
+        if !command.permit.backend.is_sandbox() {
+            return Err(CoreError::new("legacy_network_backend_removed", "旧网络扩展命令不能在 Seatbelt 网关执行"));
+        }
         if !command.policy_version.valid() || !command.permit.policy_version.valid() {
             return Err(CoreError::new(
                 "invalid_policy_version",
@@ -3431,7 +3093,6 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
                 &json!(command),
             )?;
         }
-        self.publish_extension_commands()?;
         let receipt = self.publish_current_receipt(&receipt)?;
         Ok(receipt)
     }
@@ -3531,66 +3192,26 @@ pub fn unregister_production_enforcer(watch_dir: &std::path::Path) {
 }
 
 impl LocalTunnelEnforcer {
-    /// Explicit protocol coverage matrix distinguishing `local_proxy_ready`
-    /// and `system_extension_active`.
+    /// Reports only the controlled-instance network boundary; no system-wide capture is claimed.
     pub fn protocol_coverage_boundaries(&self) -> serde_json::Value {
         let ready = self.is_ready().unwrap_or(false);
         let local_proxy_ready = self.local_proxy_ready().unwrap_or(false);
-        let sysext_active = self.system_extension_active().unwrap_or(false);
+        let sandbox_ready = self.sandbox_ready().unwrap_or(false);
         let proxy_addr = self.lock().ok().and_then(|g| g.local_listener_addr.clone());
         json!({
+            "backend": "seatbelt",
+            "coverage_scope": "controlled_instance_tree",
             "enforcer_ready": ready,
             "local_proxy_ready": local_proxy_ready,
-            "system_extension_active": sysext_active,
+            "sandbox_ready": sandbox_ready,
             "local_proxy_addr": proxy_addr,
-            "tcp_ipv4": {
-                "local_proxy_relay": if local_proxy_ready { "active_with_upstream_connect_handshake" } else { "inactive" },
-                "transparent_kernel_capture": if sysext_active { "active" } else { "pending_system_extension_activation" },
-                "disposition": "forward_via_controlled_tunnel_or_block_when_revoked"
-            },
-            "tcp_ipv6": {
-                "local_proxy_relay": if local_proxy_ready { "active_with_upstream_connect_handshake" } else { "inactive" },
-                "transparent_kernel_capture": if sysext_active { "active" } else { "pending_system_extension_activation" },
-                "disposition": "forward_via_controlled_tunnel_or_block_when_revoked"
-            },
-            "udp_quic": {
-                "flow_gate_policy": "claimed_and_blocked_in_channel_mode",
-                "transparent_kernel_capture": if sysext_active { "active" } else { "pending_system_extension_activation" },
-                "disposition": "claim_and_block"
-            },
-            "dns": {
-                "flow_gate_policy": "direct_53_853_claimed_and_blocked",
-                "transparent_kernel_capture": if sysext_active { "active" } else { "pending_system_extension_activation" },
-                "disposition": "claim_and_block"
-            },
-            "unsupported": {
-                "flow_gate_policy": "claimed_and_blocked_no_direct_bypass",
-                "transparent_kernel_capture": if sysext_active { "active" } else { "pending_system_extension_activation" },
-                "disposition": "claim_and_block"
-            }
+            "tcp_ipv4": {"disposition": "gateway_only_or_block"},
+            "tcp_ipv6": {"disposition": "gateway_only_or_block"},
+            "udp_quic": {"disposition": "blocked_by_sandbox"},
+            "dns": {"disposition": "direct_dns_blocked_proxy_resolves_destination"},
+            "unmanaged_processes": {"disposition": "outside_protected_scope"}
         })
     }
-}
-
-fn parse_audit_token_hex(hex: &str) -> Option<[u32; 8]> {
-    let clean = hex.trim();
-    if clean.len() != 64 {
-        return None;
-    }
-    let mut bytes = [0u8; 32];
-    for i in 0..32 {
-        bytes[i] = u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    let mut words = [0u32; 8];
-    for i in 0..8 {
-        words[i] = u32::from_ne_bytes([
-            bytes[i * 4],
-            bytes[i * 4 + 1],
-            bytes[i * 4 + 2],
-            bytes[i * 4 + 3],
-        ]);
-    }
-    Some(words)
 }
 
 #[cfg(test)]
@@ -3613,7 +3234,7 @@ mod control_rpc_contracts {
                 state: ChannelPermitState::Permitted, reason_code: "fixture".into(),
                 issued_at: 100., valid_until: 200., context_id: Some("fixture".into()),
                 baseline_ip: Some("1.1.1.1".into()), members: vec![],
-                backend: NetworkBackendKind::NetworkExtension, vpn_epoch: None, coverage_scope: None,
+                backend: NetworkBackendKind::Seatbelt, vpn_epoch: None, coverage_scope: None,
             },
         }
     }
@@ -3750,30 +3371,18 @@ mod control_rpc_contracts {
     }
 
     #[test]
-    fn control_rpc_requires_authentication_and_returns_a_fresh_bound_memory_snapshot() {
-        fn exchange(authenticated: bool, nonce: &str) -> Vec<u8> {
-            let enforcer = Arc::new(LocalTunnelEnforcer::new("live-boot", None));
-            enforcer.set_strict_peer_verification(true);
-            let (mut client, server) = UnixStream::pair().unwrap();
-            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            // Fixture exercises the transport AFTER the OS authentication
-            // decision; it does not claim a genuine signed extension login.
-            let worker = thread::spawn(move || LocalTunnelEnforcer::serve_gateway_connection(
-                enforcer, TunnelStream::Unix(server), None, authenticated));
-            client.write_all(format!("WATCH-CONTROL {nonce} HTTP/1.1\r\n\r\n").as_bytes()).unwrap();
-            let mut response = Vec::new();
-            client.read_to_end(&mut response).unwrap();
-            worker.join().unwrap();
-            response
-        }
-        let nonce = uuid::Uuid::new_v4().to_string();
-        let bytes = exchange(true, &nonce);
-        let size = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
-        assert_eq!(size, bytes.len() - 4);
-        let value: serde_json::Value = serde_json::from_slice(&bytes[4..]).unwrap();
-        assert_eq!(value["nonce"], nonce);
-        assert_eq!(value["envelope"]["executor_boot_id"], "live-boot");
-        assert!(exchange(false, &nonce).starts_with(b"HTTP/1.1 403"));
-        assert!(exchange(true, "invalid").is_empty());
+    fn retired_control_protocol_cannot_fetch_authority() {
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("live-boot", None));
+        enforcer.set_strict_peer_verification(true);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let worker = thread::spawn(move || LocalTunnelEnforcer::serve_gateway_connection(
+            enforcer, TunnelStream::Unix(server), None));
+        client.write_all(b"WATCH-CONTROL 00000000-0000-0000-0000-000000000000 HTTP/1.1\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        worker.join().unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 400"));
+        assert!(!String::from_utf8_lossy(&response).contains("executor_boot_id"));
     }
 }

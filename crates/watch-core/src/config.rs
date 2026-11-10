@@ -111,25 +111,18 @@ impl Config {
     }
 
     pub fn effective_network_backend(&self) -> NetworkBackendKind {
-        if let Some(backend) = self.network_backend {
-            backend
-        } else if self.schema >= 2 {
-            NetworkBackendKind::Seatbelt
-        } else {
-            NetworkBackendKind::NetworkExtension
-        }
+        self.network_backend.unwrap_or(NetworkBackendKind::Seatbelt)
     }
 
     pub fn requires_backend_migration_setup(&self) -> bool {
-        self.schema < 2 && self.network_backend.is_none()
+        (self.schema < 2 && self.network_backend.is_none())
+            || self.network_backend == Some(NetworkBackendKind::NetworkExtension)
     }
 
     pub fn vpn_is_read_only(&self) -> bool {
-        self.effective_network_backend().is_sandbox()
-            || self
-                .vpn_expectation
-                .as_ref()
-                .is_some_and(|exp| exp.configured)
+        // VPN configuration belongs to the VPN application, including while
+        // an old Watch document is waiting for explicit migration.
+        true
     }
 
     pub fn from_value(value: Value) -> Result<Self> {

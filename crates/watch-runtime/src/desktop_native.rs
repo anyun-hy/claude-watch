@@ -43,6 +43,31 @@ fn channel_process_tokens(targets: &[Target], provider: Provider) -> Vec<claude_
             t.identity.start_seconds, t.identity.start_microseconds, t.kind.role())).collect()
 }
 
+fn with_controlled_path_evidence(
+    mut data: Value,
+    evidence: claude_watch_core::channel::ControlledPathEvidence,
+) -> Value {
+    data["via_controlled_path"] = serde_json::json!(evidence.via_controlled_path);
+    data["family"] = serde_json::json!(evidence.family);
+    data["upstream_endpoint"] = serde_json::json!(evidence.upstream_endpoint);
+    data["context_id"] = serde_json::json!(evidence.context_id);
+    data["policy_version"] = serde_json::json!(evidence.policy_version);
+    data["observed_at"] = serde_json::json!(evidence.observed_at);
+    data["backend"] = serde_json::json!(evidence.backend);
+    data["vpn_epoch"] = serde_json::json!(evidence.vpn_epoch);
+    data["executor_boot_id"] = serde_json::json!(evidence.executor_boot_id);
+    data
+}
+
+/// The launcher command is constructed only by the controlled-entry path.
+/// Keep terminal I/O, exit status and explicit user signals shared with fixtures.
+fn start_cli_process(command: Exec, state: &NativeCliState) -> Result<Box<dyn CliProcess>> {
+    let job = command.start().map_err(|_| {
+        CoreError::new("cli_spawn_failed", "受控沙箱启动器无法启动CLI子进程")
+    })?;
+    Ok(Box::new(NativeCliProcess { job, flag: state.flag.clone() }))
+}
+
 fn execute_output(program: &Path, args: &[&str], timeout: Duration) -> Result<Vec<u8>> {
     let started = Instant::now();
     let mut job = Exec::cmd(program)
@@ -93,9 +118,6 @@ fn execute_output(program: &Path, args: &[&str], timeout: Duration) -> Result<Ve
         }
     }
     outcome
-}
-fn execute(program: &Path, args: &[&str], timeout: Duration) -> Result<()> {
-    execute_output(program, args, timeout).map(|_| ())
 }
 pub struct NativeDesktop<R: ReadRunner> {
     pub runner: R,
@@ -443,64 +465,6 @@ impl<R: ReadRunner> NativeDesktop<R> {
         self.cli = Some(SelectedCli { path, fingerprint });
         self.selected = None; self.target = target; Ok(())
     }
-    fn spawn_cli(&self, args: &[String], state: &NativeCliState) -> Result<Box<dyn CliProcess>> {
-        if self.authority != Authority::ExplicitPermit || !self.target.cli() {
-            return Err(CoreError::new(
-                "write_not_authorized",
-                "只读或桌面入口不能执行CLI",
-            ));
-        }
-        let selected = self
-            .cli
-            .as_ref()
-            .ok_or_else(|| CoreError::new("cli_unavailable", "CLI目标尚未绑定"))?;
-        if cli_fingerprint(&selected.path)? != selected.fingerprint {
-            return Err(CoreError::new(
-                "cli_install_changed",
-                "预检期间CLI文件发生变化，未启动",
-            ));
-        }
-        let proxy = state
-            .proxy
-            .as_deref()
-            .filter(|p| claude_watch_core::config::valid_loopback_proxy(p))
-            .ok_or_else(|| CoreError::new("cli_route_unconfirmed", "本次子进程代理入口未确认"))?;
-        if state.handlers.len() != 2 {
-            return Err(CoreError::new(
-                "cli_signal_unavailable",
-                "CLI中断处理尚未就绪",
-            ));
-        }
-        let mut command = Exec::cmd(&selected.path).args(args);
-        for key in [
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-            "NO_PROXY",
-            "no_proxy",
-        ] {
-            command = command.env_remove(key);
-        }
-        for key in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
-            command = command.env(key, proxy);
-        }
-        for key in ["NO_PROXY", "no_proxy"] {
-            command = command.env(key, "localhost,127.0.0.1,::1");
-        }
-        let job = command.start().map_err(|_| {
-            CoreError::new(
-                "cli_spawn_failed",
-                "CLI子进程无法启动；未执行shell或更改当前登录",
-            )
-        })?;
-        Ok(Box::new(NativeCliProcess {
-            job,
-            flag: state.flag.clone(),
-        }))
-    }
     #[allow(clippy::too_many_arguments)]
     fn spawn_cli_via_sandbox_launcher(
         &self,
@@ -566,16 +530,7 @@ impl<R: ReadRunner> NativeDesktop<R> {
             .arg(&req_json)
             .arg("--registration-socket")
             .arg(registration_socket);
-        let job = command.start().map_err(|_| {
-            CoreError::new(
-                "cli_spawn_failed",
-                "受控沙箱启动器无法启动CLI子进程",
-            )
-        })?;
-        Ok(Box::new(NativeCliProcess {
-            job,
-            flag: state.flag.clone(),
-        }))
+        start_cli_process(command, state)
     }
     fn resolve_target(&self, target: LaunchTarget) -> Result<SelectedApplication> {
         if target.cli() { return Err(CoreError::new("invalid_target", "CLI 使用独立受控入口")); }
@@ -743,19 +698,6 @@ impl<R: ReadRunner> NativeDesktop<R> {
             .processes
             .get(&launcher.pid)
             .is_some_and(|p| p.identity.start_stamp == launcher.start))
-    }
-    pub fn open(&self) -> Result<()> {
-        if self.authority != Authority::ExplicitPermit {
-            return Err(CoreError::new(
-                "write_not_authorized",
-                "只读运行入口不启动应用",
-            ));
-        }
-        let selected = self.selected.as_ref().ok_or_else(||CoreError::new("target_identity_unavailable", "目标尚未绑定"))?;
-        if &self.resolve_target(self.target)? != selected {
-            return Err(CoreError::new("target_install_changed", "预检期间目标应用安装身份变化，未启动"));
-        }
-        execute(Path::new("/usr/bin/open"), &["-a",selected.path.to_str().ok_or_else(||CoreError::new("invalid_target_path", "目标路径编码无效"))?],Duration::from_secs(15))
     }
     pub fn open_via_sandbox_launcher(
         &self,
@@ -931,6 +873,12 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopRuntime
         claude_watch_core::channel::PolicyVersion,
         Option<claude_watch_core::vpn::VpnEpoch>,
     )> {
+        if config.requires_backend_migration_setup() || !config.effective_network_backend().is_sandbox() {
+            return Err(CoreError::new(
+                "legacy_config_migration_required",
+                "旧网络配置须先迁移为 Seatbelt，不能绕过受控入口启动目标",
+            ));
+        }
         let launcher_bin = self.desktop.sandbox_launcher_binary()?;
         let rt_path = self
             .storage
@@ -1026,21 +974,12 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
             .cli
             .as_ref()
             .ok_or_else(|| CoreError::new("cli_route_unconfirmed", "CLI路由尚未准备"))?;
-        if config.effective_network_backend().is_sandbox() {
-            let (launcher_bin, reg_sock, gw_endpoint, boot_id, policy_version, vpn_epoch) =
-                self.resolve_seatbelt_launch_context(&config)?;
-            return self.desktop.spawn_cli_via_sandbox_launcher(
-                args,
-                cli_state,
-                &launcher_bin,
-                &reg_sock,
-                &gw_endpoint,
-                &boot_id,
-                policy_version,
-                vpn_epoch,
-            );
-        }
-        self.desktop.spawn_cli(args, cli_state)
+        let (launcher_bin, reg_sock, gw_endpoint, boot_id, policy_version, vpn_epoch) =
+            self.resolve_seatbelt_launch_context(&config)?;
+        self.desktop.spawn_cli_via_sandbox_launcher(
+            args, cli_state, &launcher_bin, &reg_sock, &gw_endpoint,
+            &boot_id, policy_version, vpn_epoch,
+        )
     }
     fn launch_target(&self) -> LaunchTarget {
         self.desktop.target()
@@ -1141,7 +1080,7 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
                 let local = self.system.local_for_target(&config, self.desktop.target())?;
                 let context = local["context_id"].as_str().filter(|s| !s.is_empty())
                     .ok_or_else(|| CoreError::new("missing_context_id", "当前环境上下文无法确认"))?;
-                let (mut data, evidence) = enf.probe_via_controlled_diagnostic_channel(family_id, context, now, |proxy| {
+                let (data, evidence) = enf.probe_via_controlled_diagnostic_channel(family_id, context, now, |proxy| {
                     self.network.fast_egress_via(Some(proxy)).data
                         .ok_or_else(|| CoreError::new("controlled_probe_failed", "受控出口采样失败"))
                 })?;
@@ -1150,13 +1089,7 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
                 if config.value()? != latest.value()? || after["context_id"].as_str() != Some(context) {
                     return Err(CoreError::new("audit_context_changed", "出口采样期间环境变化"));
                 }
-                data["via_controlled_path"] = serde_json::json!(true);
-                data["family"] = serde_json::json!(evidence.family);
-                data["upstream_endpoint"] = serde_json::json!(evidence.upstream_endpoint);
-                data["context_id"] = serde_json::json!(evidence.context_id);
-                data["policy_version"] = serde_json::json!(evidence.policy_version);
-                data["observed_at"] = serde_json::json!(evidence.observed_at);
-                Ok(data)
+                Ok(with_controlled_path_evidence(data, evidence))
             })();
             return probe.unwrap_or_else(|error| serde_json::json!({
                 "state":"unknown", "error":error.code, "via_controlled_path":false, "observed_at":native::now()
@@ -1220,19 +1153,11 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
             storage: self.storage.clone(),
         }
         .load()?;
-        if config.effective_network_backend().is_sandbox() {
-            let (launcher_bin, reg_sock, gw_endpoint, boot_id, policy_version, vpn_epoch) =
-                self.resolve_seatbelt_launch_context(&config)?;
-            return self.desktop.open_via_sandbox_launcher(
-                &launcher_bin,
-                &reg_sock,
-                &gw_endpoint,
-                &boot_id,
-                policy_version,
-                vpn_epoch,
-            );
-        }
-        self.desktop.open()
+        let (launcher_bin, reg_sock, gw_endpoint, boot_id, policy_version, vpn_epoch) =
+            self.resolve_seatbelt_launch_context(&config)?;
+        self.desktop.open_via_sandbox_launcher(
+            &launcher_bin, &reg_sock, &gw_endpoint, &boot_id, policy_version, vpn_epoch,
+        )
     }
     fn quit_desktop(&mut self) -> Result<()> {
         self.desktop.quit()
@@ -1361,7 +1286,10 @@ mod target_contracts {
         assert_eq!(desktop.selected.as_ref().unwrap().kind, Kind::OpenaiMain);
         desktop.select_target(LaunchTarget::ChatgptDesktop).unwrap();
         assert_eq!(desktop.selected.as_ref().unwrap().kind, Kind::OpenaiMain);
-        assert_eq!(desktop.open().unwrap_err().code, "write_not_authorized");
+        assert_eq!(desktop.open_via_sandbox_launcher(
+            Path::new("/unused/launcher"), Path::new("/unused/socket"), "127.0.0.1:1", "fixture",
+            claude_watch_core::channel::PolicyVersion { policy_digest: "p".into(), guard_policy_digest: "g".into() }, None,
+        ).unwrap_err().code, "write_not_authorized");
         // The target belongs to a supervised family, so the exit entry accepts
         // it in principle; only the read-only authority refuses the action.
         assert_eq!(desktop.quit().unwrap_err().code, "write_not_authorized");
@@ -1431,7 +1359,10 @@ mod target_contracts {
             );
             let state = NativeCliState::new(Some(crate::network_client::DEFAULT_PROXY.into()));
             assert_eq!(
-                desktop.spawn_cli(&[], &state).err().unwrap().code,
+                desktop.spawn_cli_via_sandbox_launcher(&[], &state,
+                Path::new("/unused/launcher"), Path::new("/unused/socket"), "127.0.0.1:1", "fixture",
+                claude_watch_core::channel::PolicyVersion { policy_digest: "p".into(), guard_policy_digest: "g".into() }, None,
+            ).err().unwrap().code,
                 "write_not_authorized"
             );
         }
@@ -1497,7 +1428,7 @@ int main(int argc,char **argv) {
             .unwrap();
         let mut state = NativeCliState::new(Some(crate::network_client::DEFAULT_PROXY.into()));
         state.prepare().unwrap();
-        let args = if mode == "io" {
+        let args: Vec<String> = if mode == "io" {
             vec!["--home".into(), "$(not-a-shell)\nsecond line".into()]
         } else {
             Vec::new()
@@ -1509,7 +1440,9 @@ int main(int argc,char **argv) {
                     .any(|v| k == *v)
             })
             .collect::<std::collections::BTreeMap<_, _>>();
-        let mut child = desktop.spawn_cli(&args, &state).unwrap();
+        // Exercise the shared terminal process wrapper with our owned native
+        // fixture; network adaptation belongs to watch-sandbox-launcher tests.
+        let mut child = start_cli_process(Exec::cmd(&program).args(&args), &state).unwrap();
         let code = child.wait().unwrap();
         let after = std::env::vars_os()
             .filter(|(k, _)| {
@@ -1528,7 +1461,7 @@ int main(int argc,char **argv) {
         eprintln!("WRAPPED={code}");
     }
     #[test]
-    fn native_cli_keeps_stdio_arguments_exit_and_only_changes_child_proxy_env() {
+    fn native_cli_keeps_stdio_arguments_exit_and_parent_environment() {
         let root = std::env::temp_dir().join(format!("cli-io-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
         let parent_proxy = std::env::var_os("HTTP_PROXY");
@@ -1562,9 +1495,7 @@ int main(int argc,char **argv) {
         assert!(stdout.contains("ARG:--home\n"));
         assert!(stdout.contains("ARG:$(not-a-shell)\nsecond line\n"));
         assert!(stdout.contains("INPUT:fixture input"));
-        assert!(stdout.contains(
-            "PROXY:http://127.0.0.1:7890|http://127.0.0.1:7890|unset|localhost,127.0.0.1,::1"
-        ));
+        assert!(stdout.contains("|http://bad.invalid:1|"), "terminal wrapper preserves inherited environment: {stdout}");
         assert!(String::from_utf8_lossy(&result.stderr).contains("WRAPPED=7"));
         assert_eq!(std::env::var_os("HTTP_PROXY"), parent_proxy);
         fs::remove_dir_all(root).unwrap();
@@ -1653,7 +1584,10 @@ int main(int argc,char **argv) {
         state.prepare().unwrap();
         fs::write(&program, b"changed executable").unwrap();
         assert_eq!(
-            desktop.spawn_cli(&[], &state).err().unwrap().code,
+            desktop.spawn_cli_via_sandbox_launcher(&[], &state,
+                Path::new("/unused/launcher"), Path::new("/unused/socket"), "127.0.0.1:1", "fixture",
+                claude_watch_core::channel::PolicyVersion { policy_digest: "p".into(), guard_policy_digest: "g".into() }, None,
+            ).err().unwrap().code,
             "cli_install_changed"
         );
         let other = root.join("untrusted");
@@ -1667,6 +1601,90 @@ int main(int argc,char **argv) {
                 .code,
             "cli_source_unverified"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod controlled_entry_backend_tests {
+    use super::*;
+    use crate::{commands::{Output, ReadCommand}, network_client::{Request, Response, TransportError}, storage::Paths};
+    use claude_watch_core::config::Config;
+
+    struct NoHostAccess;
+    impl ReadRunner for NoHostAccess {
+        fn run(&self, _: ReadCommand, _: &[u8], _: Duration, _: usize) -> Result<Output> { panic!("rejected entry must not inspect or start host applications") }
+    }
+    impl Transport for NoHostAccess {
+        fn get(&self, _: &Request) -> std::result::Result<Response, TransportError> { panic!("rejected entry must not access VPN or network") }
+    }
+    impl AuditSystem for NoHostAccess {
+        fn now(&self) -> f64 { 1.0 }
+        fn network(&self) -> Result<Value> { panic!("unexpected audit") }
+        fn local(&self, _: &Config) -> Result<Value> { panic!("unexpected audit") }
+        fn online(&mut self, _: &Config, _: &Value) -> Result<Value> { panic!("unexpected audit") }
+    }
+    impl ServiceSystem for NoHostAccess {
+        fn now(&self) -> f64 { 1.0 }
+        fn backend_healthy(&self) -> bool { panic!("unexpected service access") }
+        fn guard_status(&self, _: &Config) -> Result<bool> { panic!("unexpected service access") }
+        fn service_job(&self, _: &str) -> Result<Value> { panic!("unexpected service access") }
+        fn watchdog_state(&self) -> Result<Value> { panic!("unexpected service access") }
+        fn admin_helper_status(&self) -> Result<Value> { panic!("unexpected service access") }
+        fn runtime_present(&self) -> bool { panic!("unexpected service access") }
+        fn apply_service(&mut self, _: &Value) -> Result<()> { panic!("must never install services") }
+    }
+
+    #[test]
+    fn diagnostic_projection_preserves_actual_backend_epoch_and_executor_evidence() {
+        use claude_watch_core::{channel::{ControlledPathEvidence, NetworkBackendKind, PolicyVersion}, vpn::VpnEpoch};
+        let policy = PolicyVersion { policy_digest: "p".into(), guard_policy_digest: "g".into() };
+        let epoch = VpnEpoch::new("observer", 3);
+        let evidence = ControlledPathEvidence {
+            family: "claude".into(), upstream_endpoint: "http://127.0.0.1:7890".into(),
+            policy_version: policy.clone(), context_id: "ctx".into(), via_controlled_path: true,
+            observed_at: 100.0, backend: NetworkBackendKind::Seatbelt, vpn_epoch: Some(epoch.clone()),
+            executor_boot_id: Some("executor-current".into()),
+        };
+        let data = serde_json::json!({"ip":"192.0.2.1", "country":"JP", "backend":"network_extension", "executor_boot_id":"stale"});
+        let projected = with_controlled_path_evidence(data, evidence.clone());
+        assert_eq!(projected["ip"], "192.0.2.1");
+        let parsed = ControlledPathEvidence::parse(&projected).unwrap();
+        assert_eq!(parsed, evidence);
+        assert!(parsed.matches_path_with_vpn("claude", "http://127.0.0.1:7890", &policy, Some("ctx"), Some(&epoch), 101.0, 10.0).is_ok());
+        assert_eq!(parsed.matches_path_with_vpn("claude", "http://127.0.0.1:7890", &policy, Some("ctx"), Some(&VpnEpoch::new("observer", 4)), 101.0, 10.0), Err("evidence_vpn_epoch_mismatch"));
+        let mut legacy = evidence;
+        legacy.backend = NetworkBackendKind::NetworkExtension;
+        let projected = with_controlled_path_evidence(serde_json::json!({}), legacy);
+        assert_eq!(ControlledPathEvidence::parse(&projected).unwrap().matches_path("claude", "http://127.0.0.1:7890", &policy, Some("ctx"), 101.0, 10.0), Err("legacy_network_backend_removed"));
+    }
+
+    #[test]
+    fn desktop_and_cli_reject_legacy_or_unready_context_without_native_launch_fallback() {
+        let root = PathBuf::from("/private/tmp").join(format!("cw-entry-no-ne-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let storage = StateStore::new(Paths::new(&root).unwrap());
+        let helper = root.join("watch-process-control");
+        fs::write(&helper, b"fixture never executed").unwrap();
+        // Deliberately nonexecutable: reaching the launcher would be a test failure.
+        fs::write(root.join("watch-sandbox-launcher"), b"fixture never executed").unwrap();
+        let mut desktop = NativeDesktop::new(NoHostAccess, helper, Authority::ExplicitPermit).unwrap();
+        let mut system = NoHostAccess;
+        let mut runtime = DesktopRuntime {
+            desktop: &mut desktop,
+            system: &mut system,
+            network: NetworkClient::new(Arc::new(NoHostAccess), None).unwrap(),
+            storage: storage.clone(), started: Instant::now(), cli: Some(NativeCliState::new(None)),
+        };
+        for (config, expected) in [
+            (serde_json::json!({"schema":1}), "legacy_config_migration_required"),
+            (serde_json::json!({"schema":2,"network_backend":"network_extension"}), "legacy_config_migration_required"),
+            (Config::default_for_new_install().value().unwrap(), "seatbelt_daemon_unavailable"),
+        ] {
+            storage.atomic_json(&storage.paths.config(), &config).unwrap();
+            assert_eq!(runtime.open_desktop().unwrap_err().code, expected);
+            assert_eq!(runtime.spawn_cli(&["literal-argument".into()]).err().unwrap().code, expected);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -4,6 +4,8 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd -P)
 PROJECT=$(cd "$ROOT/.." && pwd -P)
+source "$ROOT/network-backend.sh"
+cw_require_seatbelt_backend
 if [[ $# -lt 2 ]]; then
   printf 'usage: %s <version> <build> [--dry-run]\n' "${0##*/}" >&2
   exit 2

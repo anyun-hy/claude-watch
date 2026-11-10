@@ -55,24 +55,13 @@ bash /Users/anyun/Desktop/bash/monitor/reinstall.sh 3.0.0 314
 
 打包脚本在支持时使用 `diskutil image`，其他系统回退到 `hdiutil`；出现警告时保留原始输出并检查具体原因。DMG 内的 `安装或更新后台.command` 是保留现有 Watch 数据的普通安装入口，不能代替完整重置。
 
-### 系统网络扩展的正式构建条件
+### 免费本机签名与网络后端
 
-以下条件仅适用于明确选择的历史 `network-extension` 后端。当前默认是 Rust＋nono/Seatbelt，使用免费的本机 ad-hoc 签名，无需开发者会员或 Developer ID 证书；不能把本节作为默认重装流程的前置要求。
+唯一支持的网络后端为 Rust＋nono/Seatbelt。构建默认使用免费的本机 ad-hoc 签名，无需开发者会员、Developer ID 证书或 NetworkExtension 权限；系统托管网关的身份核验仍保留，免费签名不等于省略身份校验。
 
-默认 `monitor/build.sh` 仍生成临时签名的开发产物，适合编译与隔离验证，不能视为系统网络接管可用。正式构建支持以下环境变量；重装入口会向构建进程继承这些变量，但设置变量本身不授权安装：
+`CW_NETWORK_BACKEND` 只接受 `seatbelt`（或别名 `nono`）。旧 NetworkExtension 后端、扩展 profile 和要求扩展权限的构建参数会明确拒绝，不能静默切换或降级。新包不再包含或激活系统网络扩展。旧用户配置由 Rust 迁移流程处理，迁移和新鲜网关证据未确认时不得显示保护成功。
 
-| 变量 | 用途 |
-|---|---|
-| `CW_SIGNING_IDENTITY` | 本机可用的 Developer ID Application 签名身份；默认 `-` 表示开发签名。 |
-| `CW_HOST_PROVISION_PROFILE` | `io.local.watchpanel` 的有效 Developer ID profile，须含 Network Extension 与 System Extension 安装能力。 |
-| `CW_EXTENSION_PROVISION_PROFILE` | `io.local.watchpanel.network-extension` 的有效 Developer ID profile，须含 `app-proxy-provider-systemextension`。 |
-| `CW_REQUIRE_ENTITLED_NETWORK_EXTENSION` | 设为 `1` 时要求正式权限构建；签名身份缺失或为 `-` 时立即失败，不能降级为开发产物。默认 `0`，只接受 `0/1`。 |
-
-兼容变量名 `CW_CODESIGN_IDENTITY`、`CW_HOST_PROFILE`、`CW_EXTENSION_PROFILE`，以及旧版本的 `CW_SIGN_IDENTITY`、`CW_APP_PROVISIONING_PROFILE`、`CW_EXTENSION_PROVISIONING_PROFILE`；同一用途的变量同时设置且值不一致时停止构建。Entitlement 模板统一位于 `monitor/Signing/`，构建时生成带 Team ID 的签名输入。
-
-构建时检查两个 profile 的应用标识、有效期、同一 Team ID 与所需 entitlement，签名内部组件、扩展与宿主，再核验签名。宿主显式配置当前用户的控制目录，Rust 不从 UI 状态缓存认定接管生效。能力和 profile 的平台要求参见 [Apple 的 Network Extensions entitlement 文档](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.networking.networkextension)。
-
-这条正式签名构建路径不自动执行公证或系统批准，也不证明扩展已运行。实际交付仍须具备相应证书、profile、必要公证和用户批准，并核验扩展新鲜心跳、匹配命令的执行回执及真实应用流量。本轮只完成源码与静态构建入口核对，未执行正式签名、安装或激活。
+通用签名身份仍可通过 `CW_SIGNING_IDENTITY` 指定，兼容 `CW_CODESIGN_IDENTITY` 和 `CW_SIGN_IDENTITY`；未指定时为 `-`，同一用途的别名冲突会停止构建。打包和签名成功不等于网关安装、真实应用兼容或断流保护验收通过。
 
 ## 5. 安装后核验
 

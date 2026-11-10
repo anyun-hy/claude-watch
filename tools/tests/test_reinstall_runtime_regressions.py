@@ -19,7 +19,7 @@ class ReinstallBuildRegression(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="cw-build-entry-")
         self.root = Path(self.temp.name).resolve()
-        for name in ("monitor/reinstall.sh", "tools/build-rust-components.sh", "monitor/macos-minimum.txt", "tools/reinstall_log.py"):
+        for name in ("monitor/reinstall.sh", "monitor/network-backend.sh", "tools/build-rust-components.sh", "monitor/macos-minimum.txt", "tools/reinstall_log.py"):
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / name, target)
@@ -110,6 +110,21 @@ for name in ("watch-native-observer", "watch-process-control", "watch-sandbox-la
         self.assertEqual(value["status"], "failed")
         self.assertEqual(value["phases"][-1]["exit_code"], 23)
         self.assertIn("fixture compiler failure", (summaries[0].parent / "build.log").read_text())
+
+    def test_retired_backend_stops_before_build_logging_or_installer(self):
+        self.env["CW_NETWORK_BACKEND"] = "network-extension"
+        result = self.run_script("monitor/reinstall.sh", "3.0.0", "378", "--dry-run")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("only nono/Seatbelt is available", result.stderr)
+        self.assertFalse(self.trace.exists(), "retired backend must not compile or invoke the installer")
+        self.assertFalse((Path(self.env["HOME"]) / "Library/Logs/ClaudeWatchInstaller").exists())
+
+    def test_retired_profile_stops_before_build_or_installer(self):
+        self.env["CW_HOST_PROFILE"] = "/unused/fixture.profile"
+        result = self.run_script("monitor/reinstall.sh", "3.0.0", "378", "--dry-run")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Retired NetworkExtension option", result.stderr)
+        self.assertFalse(self.trace.exists(), "retired profile must not compile or invoke the installer")
 
     def test_build_only_does_not_stage_or_run_the_engine(self):
         build = self.run_script("tools/build-rust-components.sh", "--build-only")

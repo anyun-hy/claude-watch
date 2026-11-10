@@ -88,26 +88,6 @@ pub fn child_has_exited(child: &std::process::Child) -> std::io::Result<bool> {
     }
 }
 
-/// TCP headers cannot establish the forwarding process. Only a connected Unix
-/// socket's kernel audit token, validated by Security.framework, can do so.
-pub fn is_authenticated_extension(stream: &UnixStream) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        macos::verify(stream.as_raw_fd())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = stream;
-        false
-    }
-}
-
-/// Never accept a team supplied by a peer or a user-writable configuration.
-pub fn extension_peer_requirement(team: &str) -> Option<String> {
-    (team.len() == 10 && team.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()))
-        .then(|| format!("anchor apple generic and identifier \"io.local.watchpanel.network-extension\" and certificate leaf[subject.OU] = \"{team}\""))
-}
-
 pub fn process_audit_token(pid: u32, uid: u32, seconds: u64, micros: u32, executable: &str) -> Option<[u32; 8]> {
     #[cfg(target_os = "macos")]
     { macos::process_token(pid, uid, seconds, micros, Some(executable)) }
@@ -316,12 +296,7 @@ pub fn sha256_bytes_hex(data: &[u8]) -> String {
     out
 }
 
-/// Darwin notifications wake the consumer on execution receipts; the bounded
-/// timeout also drives liveness expiry when the producer has stopped entirely.
-pub struct ObservationSignal {
-    fd: i32,
-    token: i32,
-}
+// Shared Darwin notification boundary used by the current network event watcher.
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn notify_register_file_descriptor(
@@ -331,62 +306,6 @@ unsafe extern "C" {
         token: *mut i32,
     ) -> u32;
     fn notify_cancel(token: i32) -> u32;
-}
-impl ObservationSignal {
-    pub fn new() -> Self {
-        let mut value = Self { fd: -1, token: -1 };
-        #[cfg(target_os = "macos")]
-        unsafe {
-            let status = notify_register_file_descriptor(
-                c"io.local.claudewatch.extension-observation".as_ptr(),
-                &mut value.fd,
-                0,
-                &mut value.token,
-            );
-            if status != 0 {
-                // On failure the API may have already closed the output FD.
-                // It is not ours to read/close; another thread can reuse it.
-                value.fd = -1;
-                value.token = -1;
-            } else if libc::fcntl(value.fd, libc::F_SETFL, libc::O_NONBLOCK) < 0 {
-                notify_cancel(value.token);
-                value.fd = -1;
-                value.token = -1;
-            }
-        }
-        value
-    }
-    pub fn wait(&mut self, timeout: std::time::Duration) {
-        if self.fd < 0 {
-            std::thread::sleep(timeout);
-            return;
-        }
-        let mut fd = libc::pollfd {
-            fd: self.fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        unsafe {
-            if libc::poll(&mut fd, 1, timeout.as_millis().min(i32::MAX as u128) as i32) <= 0
-                || fd.revents & libc::POLLIN == 0
-            {
-                return;
-            }
-            let mut bytes = [0u8; 256];
-            while libc::read(self.fd, bytes.as_mut_ptr().cast(), bytes.len()) > 0 {}
-        }
-    }
-}
-impl Drop for ObservationSignal {
-    fn drop(&mut self) {
-        #[cfg(target_os = "macos")]
-        // notify_cancel owns closing its FD. A separate close races FD reuse.
-        if self.token >= 0 {
-            unsafe {
-                notify_cancel(self.token);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -412,32 +331,6 @@ mod tests {
         assert!(get(info.pbi_uid, info.pbi_start_tvsec + 1, path).is_none());
         assert!(get(info.pbi_uid + 1, info.pbi_start_tvsec, path).is_none());
         assert!(get(info.pbi_uid, info.pbi_start_tvsec, "/not-this-executable").is_none());
-    }
-    #[test]
-    fn peer_requirement_pins_the_validated_team_and_rejects_injection() {
-        let requirement = super::extension_peer_requirement("ABCDE12345").unwrap();
-        assert!(requirement.contains("identifier \"io.local.watchpanel.network-extension\""));
-        assert!(requirement.contains("certificate leaf[subject.OU] = \"ABCDE12345\""));
-        for invalid in ["", "abcde12345", "ABCDE1234\" or true", "ABCDE123456"] {
-            assert!(super::extension_peer_requirement(invalid).is_none());
-        }
-    }
-    #[test]
-    fn notification_registration_and_drop_do_not_consume_unrelated_descriptors() {
-        use std::io::{Read, Write};
-        for _ in 0..16 {
-            let mut signal = super::ObservationSignal::new();
-            let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
-            writer.write_all(b"unchanged").unwrap();
-            signal.wait(std::time::Duration::from_millis(1));
-            drop(signal);
-            reader
-                .set_read_timeout(Some(std::time::Duration::from_millis(100)))
-                .unwrap();
-            let mut bytes = [0; 9];
-            reader.read_exact(&mut bytes).unwrap();
-            assert_eq!(&bytes, b"unchanged");
-        }
     }
     #[test]
     #[cfg(target_os = "macos")]
@@ -568,16 +461,10 @@ mod macos {
             values_cb: Ref,
         ) -> Ref;
         fn CFRelease(value: Ref);
-        fn CFDictionaryGetValue(dictionary: Ref, key: Ref) -> Ref;
-        fn CFGetTypeID(value: Ref) -> usize;
-        fn CFStringGetTypeID() -> usize;
-        fn CFStringGetCString(value: Ref, bytes: *mut c_char, size: isize, encoding: u32) -> bool;
     }
     #[link(name = "Security", kind = "framework")]
     unsafe extern "C" {
         static kSecGuestAttributeAudit: Ref;
-        static kSecCodeInfoTeamIdentifier: Ref;
-        fn SecCodeCopySelf(flags: u32, code: *mut Ref) -> i32;
         fn SecCodeCopyStaticCode(code: Ref, flags: u32, static_code: *mut Ref) -> i32;
         fn SecCodeCopySigningInformation(code: Ref, flags: u32, info: *mut Ref) -> i32;
         fn SecCodeCopyGuestWithAttributes(
@@ -608,68 +495,6 @@ mod macos {
             SecCodeCheckValidity(code, 0, requirement.0) == 0
         }
     }
-    fn own_team() -> Option<String> {
-        // Cache only this executable's validated signing identity, never peer data.
-        static TEAM: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        TEAM.get_or_init(|| unsafe {
-            let mut code = ptr::null();
-            if SecCodeCopySelf(0, &mut code) != 0 { return None; }
-            let code = Owned(code);
-            if !satisfies(code.0, "anchor apple generic and identifier \"io.local.watchpanel.engine\"") { return None; }
-            let mut static_code = ptr::null();
-            if SecCodeCopyStaticCode(code.0, 0, &mut static_code) != 0 { return None; }
-            let static_code = Owned(static_code);
-            let mut info = ptr::null();
-            // kSecCSSigningInformation
-            if SecCodeCopySigningInformation(static_code.0, 1 << 1, &mut info) != 0 { return None; }
-            let info = Owned(info);
-            let team = CFDictionaryGetValue(info.0, kSecCodeInfoTeamIdentifier);
-            if team.is_null() || CFGetTypeID(team) != CFStringGetTypeID() { return None; }
-            let mut text = [0i8; 11];
-            if !CFStringGetCString(team, text.as_mut_ptr(), text.len() as isize, 0x08000100) { return None; }
-            let team = std::ffi::CStr::from_ptr(text.as_ptr()).to_str().ok()?.to_owned();
-            super::extension_peer_requirement(&team)?;
-            Some(team)
-        }).clone()
-    }
-    pub fn verify(fd: i32) -> bool {
-        let Some(requirement) = own_team().and_then(|team| super::extension_peer_requirement(&team)) else { return false; };
-        let mut token = [0u32; 8];
-        let mut len = std::mem::size_of_val(&token) as libc::socklen_t;
-        // LOCAL_PEERTOKEN is defined by the macOS SDK's sys/un.h. It includes
-        // pidversion, avoiding the PID-reuse race of ps/lsof lookups.
-        if unsafe { libc::getsockopt(fd, 0, 0x006, token.as_mut_ptr().cast(), &mut len) } != 0
-            || len as usize != std::mem::size_of_val(&token)
-            || token[1] != 0
-            || token[5] <= 1
-        {
-            return false;
-        }
-        unsafe {
-            let data = Owned(CFDataCreate(ptr::null(), token.as_ptr().cast(), 32));
-            if data.0.is_null() {
-                return false;
-            }
-            let attrs = Owned(CFDictionaryCreate(
-                ptr::null(),
-                &kSecGuestAttributeAudit,
-                &data.0,
-                1,
-                ptr::null(),
-                ptr::null(),
-            ));
-            if attrs.0.is_null() {
-                return false;
-            }
-            let mut code = ptr::null();
-            if SecCodeCopyGuestWithAttributes(ptr::null(), attrs.0, 0, &mut code) != 0 {
-                return false;
-            }
-            let code = Owned(code);
-            satisfies(code.0, &requirement)
-        }
-    }
-
     pub fn inspect_process(pid: u32) -> Option<super::ProcessKernelIdentity> {
         let before = raw_process_token(pid)?;
         unsafe {

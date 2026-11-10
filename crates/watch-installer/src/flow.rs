@@ -725,6 +725,7 @@ fn check_build_inputs(layout: &Layout, runner: &dyn Runner, cargo: &Path) -> Res
     let required = [
         "monitor/package-dmg.sh",
         "monitor/build.sh",
+        "monitor/network-backend.sh",
         "tools/build-rust-components.sh",
         "Cargo.toml",
         "Cargo.lock",
@@ -818,22 +819,43 @@ fn tag(runner: &dyn Runner) -> Result<String> {
     Ok(format!("{trimmed}-{}", &unique[..8]))
 }
 
+fn validate_network_build_environment(env: &BTreeMap<String, String>) -> Result<()> {
+    let backend = env.get("CW_NETWORK_BACKEND").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("seatbelt");
+    require(
+        matches!(backend, "seatbelt" | "nono"),
+        "网络后端已统一为 nono/Seatbelt；旧 NetworkExtension 或未知构建选项不受支持，未执行重装。",
+    )?;
+    require(
+        env.get("CW_REQUIRE_ENTITLED_NETWORK_EXTENSION").map(String::as_str)
+            .filter(|s| !s.is_empty()).unwrap_or("0") == "0",
+        "NetworkExtension 构建已停用；请移除旧扩展权限选项后重试，未执行重装。",
+    )?;
+    for key in [
+        "CW_HOST_PROVISION_PROFILE", "CW_HOST_PROFILE", "CW_APP_PROVISIONING_PROFILE",
+        "CW_EXTENSION_PROVISION_PROFILE", "CW_EXTENSION_PROFILE", "CW_EXTENSION_PROVISIONING_PROFILE",
+    ] {
+        require(
+            env.get(key).is_none_or(String::is_empty),
+            &format!("NetworkExtension 构建选项 {key} 已停用；请移除后重试，未执行重装。"),
+        )?;
+    }
+    Ok(())
+}
+
 fn package_environment(
+    build_environment: &BTreeMap<String, String>,
     version: &str,
     build: &str,
     app_out: &Path,
     dmg_name: &str,
 ) -> BTreeMap<String, String> {
-    let mut env: BTreeMap<String, String> = std::env::vars().collect();
+    let mut env = build_environment.clone();
     for (key, value) in [
         ("APP_VERSION", version.to_string()),
         ("BUILD_NUMBER", build.to_string()),
         ("CW_BUILD_ARCH", "arm64".to_string()),
         ("CW_BACKEND_VARIANT", "rust-candidate".to_string()),
-        (
-            "CW_NETWORK_BACKEND",
-            std::env::var("CW_NETWORK_BACKEND").unwrap_or_else(|_| "seatbelt".to_string()),
-        ),
+        ("CW_NETWORK_BACKEND", "seatbelt".to_string()),
         ("CW_CARGO_BIN", "cargo".to_string()),
         ("CW_APP_OUTPUT", app_out.display().to_string()),
         ("DMG_NAME", dmg_name.to_string()),
@@ -890,7 +912,26 @@ pub fn perform(
     cargo: &Path,
     sleep: &dyn Fn(Duration),
 ) -> Result<Outcome> {
+    perform_with_environment(layout, runner, version, build, dry_run, confirm, uid, cargo,
+        sleep, std::env::vars().collect())
+}
+
+fn perform_with_environment(
+    layout: &Layout,
+    runner: &dyn Runner,
+    version: &str,
+    build: &str,
+    dry_run: bool,
+    confirm: &mut dyn FnMut(&str) -> Result<String>,
+    uid: u32,
+    cargo: &Path,
+    sleep: &dyn Fn(Duration),
+    build_environment: BTreeMap<String, String>,
+) -> Result<Outcome> {
     validate_arguments(version, build)?;
+    // Check even when the engine is invoked directly, before any command,
+    // confirmation or uninstall. Packaging consumes this validated snapshot.
+    validate_network_build_environment(&build_environment)?;
     check_build_inputs(layout, runner, cargo)?;
     let stamp = tag(runner)?;
     let app_out = layout.project.join("monitor/build").join(format!(
@@ -1002,7 +1043,7 @@ pub fn perform(
     if [&app_out, &dmg, &sha].iter().any(|path| exists(path)) {
         return Err(blocked("本次输出路径已存在，未覆盖。"));
     }
-    let env = package_environment(version, build, &app_out, &dmg_name);
+    let env = package_environment(&build_environment, version, build, &app_out, &dmg_name);
     println!("正在打包 {version} / build {build}。");
     let packaged = runner.run(
         &[
@@ -1115,4 +1156,66 @@ pub fn perform(
     println!("已安装 {version} / build {build}；安装包：{}", dmg.display());
     println!("请按 macOS 提示授权；实际后台和保护功能仍需打开应用后核验。");
     Ok(Outcome::Installed)
+}
+
+#[cfg(test)]
+mod network_backend_tests {
+    use super::*;
+    use crate::runner::Output;
+    use std::cell::Cell;
+
+    struct NoCommands(Cell<usize>);
+    impl Runner for NoCommands {
+        fn locate(&self, _: &str) -> Option<PathBuf> {
+            self.0.set(self.0.get() + 1);
+            None
+        }
+        fn run(&self, _: &[String], _: Option<&BTreeMap<String, String>>, _: RunMode) -> Result<Output> {
+            self.0.set(self.0.get() + 1);
+            Err(blocked("unexpected runner invocation"))
+        }
+    }
+
+    #[test]
+    fn retired_network_options_fail_before_any_reinstall_action() {
+        // No filesystem setup and no global environment mutation: invalid
+        // options must fail before the layout or runner is even inspected.
+        let root = PathBuf::from("/unused-watch-installer-fixture");
+        let layout = Layout::new(root.join("home"), root.join("app"), root.join("system"),
+            root.join("daemon.plist"), root.join("project"), root.join("temp"), 501);
+        let cases = [
+            ("CW_NETWORK_BACKEND", "network-extension"), ("CW_NETWORK_BACKEND", "network_extension"),
+            ("CW_NETWORK_BACKEND", "ne"), ("CW_NETWORK_BACKEND", "legacy_ne"),
+            ("CW_NETWORK_BACKEND", "unknown"), ("CW_REQUIRE_ENTITLED_NETWORK_EXTENSION", "1"),
+            ("CW_REQUIRE_ENTITLED_NETWORK_EXTENSION", "true"),
+            ("CW_HOST_PROVISION_PROFILE", "fixture"), ("CW_HOST_PROFILE", "fixture"),
+            ("CW_APP_PROVISIONING_PROFILE", "fixture"), ("CW_EXTENSION_PROVISION_PROFILE", "fixture"),
+            ("CW_EXTENSION_PROFILE", "fixture"), ("CW_EXTENSION_PROVISIONING_PROFILE", "fixture"),
+        ];
+        for (key, value) in cases {
+            let runner = NoCommands(Cell::new(0));
+            let env = BTreeMap::from([(key.to_string(), value.to_string())]);
+            let error = perform_with_environment(&layout, &runner, "3.0.0", "380", false,
+                &mut |_| panic!("must not request installation confirmation"), 501,
+                Path::new("/unused-cargo"), &|_| panic!("must not wait"), env).unwrap_err();
+            assert!(error.message.contains("未执行重装"), "{key}={value}: {error:?}");
+            assert_eq!(runner.0.get(), 0, "{key}={value} ran an external command");
+        }
+    }
+
+    #[test]
+    fn supported_network_options_preserve_free_signing_and_normalize_package_backend() {
+        for backend in [None, Some(""), Some("seatbelt"), Some("nono")] {
+            let mut env = BTreeMap::new();
+            if let Some(value) = backend { env.insert("CW_NETWORK_BACKEND".into(), value.into()); }
+            validate_network_build_environment(&env).unwrap();
+            let package = package_environment(&env, "3.0.0", "380", Path::new("/fixture/app"), "fixture.dmg");
+            assert_eq!(package["CW_NETWORK_BACKEND"], "seatbelt");
+            assert!(!package.contains_key("CW_SIGNING_IDENTITY"), "default remains free ad-hoc in build.sh");
+            env.insert("CW_SIGNING_IDENTITY".into(), "optional local identity".into());
+            validate_network_build_environment(&env).unwrap();
+            let package = package_environment(&env, "3.0.0", "380", Path::new("/fixture/app"), "fixture.dmg");
+            assert_eq!(package["CW_SIGNING_IDENTITY"], "optional local identity");
+        }
+    }
 }
