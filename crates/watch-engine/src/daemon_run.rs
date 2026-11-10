@@ -931,6 +931,8 @@ where
 }
 pub fn run(request: &Request, paths: Paths) -> Result<Value> {
     request.require_apply()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let _shutdown_signals = claude_watch_runtime::daemon::shutdown_signals(stop.clone())?;
     let runner = super::runtime::runner()?;
     let inventory = Observer {
         runner: runner.as_ref(),
@@ -948,14 +950,22 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
         .map(|(pid, p)| (pid, p.identity))
         .collect();
     let storage = StateStore::new(paths.clone());
+    if stop.load(Ordering::Acquire) {
+        return Ok(json!({"status":"stopped","rounds":0}));
+    }
     let owner = DaemonLease::acquire(storage.clone(), producer.clone(), &identities)?;
+    // Authenticate/publish the native collector relationship first. Cold
+    // discovery must not hide an otherwise live, unready publisher for tens
+    // of seconds. The normal snapshot reader still verifies this producer.
+    runner.publish_listeners(&storage)?;
+    owner.publish_initial_inventory(&identities, native::now())?;
+    let sampler = Sampler::new(runner.clone(), paths.clone());
+    sampler.discovery().cancel_pending_when(stop.clone());
     let mut publisher = SnapshotPublisher::new(
         storage.clone(),
-        Sampler::new(runner.clone(), paths.clone()),
+        sampler,
         producer,
     )?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let _shutdown_signals = claude_watch_runtime::daemon::shutdown_signals(stop.clone())?;
     let alerts = if request.flag("observe-only") {
         None
     } else {

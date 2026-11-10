@@ -21,7 +21,7 @@ use std::{
     os::unix::fs::{symlink, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -31,6 +31,40 @@ use std::{
 struct Registry {
     urls: Mutex<BTreeMap<String, Vec<PathBuf>>>,
     calls: AtomicUsize,
+}
+
+#[test]
+fn shutdown_cancels_cold_discovery_between_reads_without_accepting_partial_success() {
+    let fixture = Fixture::new();
+    for index in 0..24 {
+        let id = if index == 0 { "com.anthropic.claudefordesktop" } else { "example.ordinary" };
+        fixture.app(&fixture.home.join(format!("Applications/Private {index:02}.app")), id, "PrivateMain");
+    }
+    struct StopAfterRead<'a> { inner: &'a SystemRunner, stop: Arc<AtomicBool>, reads: AtomicUsize }
+    impl ReadRunner for StopAfterRead<'_> {
+        fn run(&self, command: ReadCommand, input: &[u8], timeout: Duration, limit: usize) -> Result<Output> {
+            let plist = matches!(&command, ReadCommand::Plist(_));
+            let output = self.inner.run(command, input, timeout, limit);
+            if plist {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.stop.store(true, Ordering::Release);
+            }
+            output
+        }
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = fixture.handle();
+    handle.cancel_pending_when(stop.clone());
+    let reader = StopAfterRead { inner: &fixture.reader, stop: stop.clone(), reads: AtomicUsize::new(0) };
+    let pending = handle.refresh(&reader, native::now());
+    assert_eq!(reader.reads.load(Ordering::SeqCst), 1, "must not finish all remaining app reads after shutdown");
+    assert!(!pending.complete);
+    assert_eq!(pending.issues, ["target_discovery_cancelled"]);
+    assert!(handle.approved_manifest(&pending).is_err(), "an interrupted scan is not accepted authority");
+    stop.store(false, Ordering::Release);
+    let recovered = handle.refresh(&fixture.reader, native::now());
+    assert!(recovered.complete, "cancellation must not cache incomplete discovery as success");
+    assert_eq!(recovered.targets.iter().filter(|record| record.valid()).count(), 1);
 }
 impl ApplicationRegistry for Registry {
     fn locations(&self, id: &str) -> Result<ApplicationLocations> {

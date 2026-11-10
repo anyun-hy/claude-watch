@@ -8,6 +8,7 @@
 # only; Rust validates and interprets every record.
 
 setopt pipefail
+unsetopt bgnice # The owned Rust worker keeps the foreground version's priority.
 unset BASH_ENV ENV
 export PATH='/usr/bin:/bin:/usr/sbin:/sbin'
 export LC_ALL=C
@@ -140,8 +141,42 @@ supervise() {
   # parent remains alive for the entire worker lifetime, so macOS grants this
   # fixed collector its native listener view.
   exec 3< <("$script_path" --collect "$$")
-  "$engine" "$@" <&3
-  local worker_rc=$?
+  zmodload zsh/parameter || fail 'owned worker job table unavailable'
+  local worker_pid='' stop_requested=0 signal_generation=0
+  stop_supervised_worker() {
+    stop_requested=1
+    (( signal_generation += 1 ))
+    # Only signal an unreaped job owned by this shell. A removed launchd job
+    # must not leave its Rust worker behind, or target a reused numeric PID.
+    local job_state
+    for job_state in "${(@v)jobstates}"; do
+      if [[ "$worker_pid" == <-> && ( "$job_state" == *":${worker_pid}=running"* || "$job_state" == *":${worker_pid}=stopped"* ) ]]; then
+        /bin/kill -TERM "$worker_pid" 2>/dev/null || true
+      fi
+    done
+  }
+  trap 'stop_supervised_worker' HUP INT TERM
+  "$engine" "$@" <&3 &
+  worker_pid=$!
+  if (( stop_requested )); then stop_supervised_worker; fi
+  local worker_rc=0 before_signal
+  while true; do
+    before_signal=$signal_generation
+    wait "$worker_pid"
+    worker_rc=$?
+    # A trapped signal can interrupt wait before the child exits. Keep this
+    # registered parent alive until the actual worker has been reaped.
+    (( before_signal == signal_generation || worker_rc < 128 )) && break
+    # If wait already consumed a completed child's status while the trap ran,
+    # waiting again would replace its real result with "not a child" (127).
+    local pending_job=0 job_state
+    for job_state in "${(@v)jobstates}"; do
+      [[ "$job_state" == *":${worker_pid}="* ]] && pending_job=1
+    done
+    (( pending_job )) || break
+  done
+  trap - HUP INT TERM
+  worker_pid=''
   exec 3<&-
   # zsh does not expose a process-substitution PID through $!, and killing
   # that value can target the caller's process group. Closing fd 3 makes the

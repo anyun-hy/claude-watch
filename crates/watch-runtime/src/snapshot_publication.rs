@@ -578,6 +578,42 @@ mod tests {
         );
         fs::remove_dir_all(path).unwrap();
     }
+    #[test]
+    fn cold_start_publishes_native_inventory_without_claiming_network_or_protection_ready() {
+        let (path, store) = temp();
+        let id = identity();
+        let inventory = std::collections::BTreeMap::from([(id.pid, id.clone())]);
+        let owner = crate::daemon::DaemonLease::acquire(store.clone(), id.clone(), &inventory).unwrap();
+        let mut wrong_inventory = inventory.clone();
+        wrong_inventory.get_mut(&id.pid).unwrap().start_microseconds += 1;
+        assert_eq!(owner.publish_initial_inventory(&wrong_inventory, native::now()).unwrap_err().code, "daemon_identity_invalid");
+        assert!(!monitor_snapshot::published_path(&store).exists());
+        owner.publish_initial_inventory(&inventory, native::now()).unwrap();
+        let fake = Fake { wrong: AtomicBool::new(false) };
+        let snapshot = read(&store, &fake).unwrap();
+        assert_eq!(snapshot["health"]["state"], "degraded");
+        assert_eq!(snapshot["health"]["pid"], id.pid);
+        assert_eq!(snapshot["health"]["started"], id.start_stamp);
+        assert_eq!(snapshot["backendVersion"], monitor_snapshot::VERSION);
+        assert_eq!(snapshot["initialObservation"]["native_inventory_count"], 1);
+        assert_eq!(snapshot["initialObservation"]["application_discovery"], "pending");
+        assert_eq!(snapshot["samplingDiagnostics"]["process_complete"], false);
+        assert!(snapshot["samplingDiagnostics"]["network_quality"].is_null());
+        assert!(snapshot["proxy"].is_null() && snapshot["processes"].as_array().unwrap().is_empty());
+        assert_eq!(snapshot["grants_launch_permission"], false);
+        assert!(!snapshot["channelSupervision"].is_object());
+        let heartbeat = String::from_utf8(store.read_bytes(&store.paths.watch().join("state/heartbeat"), 4096).unwrap().unwrap()).unwrap();
+        assert!(heartbeat.contains("|error|UNKNOWN"), "initial inventory is not a healthy network heartbeat");
+        fake.wrong.store(true, Ordering::Relaxed);
+        assert_eq!(read(&store, &fake).unwrap()["health"]["state"], "unavailable", "startup must use the existing producer verifier");
+        fake.wrong.store(false, Ordering::Relaxed);
+        let mut stale = snapshot;
+        stale["capturedAt"] = json!(native::now() - 31.0);
+        monitor_snapshot::publish(&store, &stale, &id).unwrap();
+        assert_eq!(read(&store, &fake).unwrap()["health"]["state"], "unavailable", "startup evidence cannot remain current indefinitely");
+        drop(owner);
+        fs::remove_dir_all(path).unwrap();
+    }
     struct PipelineFake { incomplete: AtomicBool, bundle:std::path::PathBuf }
     impl ReadRunner for PipelineFake {
         fn run(&self, command: ReadCommand, input: &[u8], timeout: Duration, limit: usize) -> Result<Output> {

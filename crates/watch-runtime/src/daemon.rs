@@ -95,6 +95,29 @@ impl DaemonLease {
     pub fn publish(&self, sample: Result<Value>, now: f64) -> Result<Value> {
         self.publish_with_log_health(sample, now, None)
     }
+    /// Publish the already collected native inventory before cold application
+    /// discovery or network diagnostics. This proves a live publisher only;
+    /// target coverage, network health and launch permission remain unknown.
+    pub fn publish_initial_inventory(&self, inventory: &BTreeMap<u32, Identity>, now: f64) -> Result<Value> {
+        if !inventory.get(&self.producer.pid).is_some_and(|p| p.same_process(&self.producer)) {
+            return Err(CoreError::new("daemon_identity_invalid", "首次采样的后台身份不匹配"));
+        }
+        let mut snapshot = monitor_snapshot::empty(&self.storage, now, "原生进程身份已核验；应用发现和网络采样仍在初始化");
+        snapshot["backendVersion"] = json!(monitor_snapshot::VERSION);
+        snapshot["health"] = json!({"state":"degraded","mode":"UNKNOWN","pid":self.producer.pid,
+            "heartbeatAge":0.0,"started":self.producer.start_stamp,
+            "detail":"原生进程身份已核验；应用发现和网络采样仍在初始化","alerts":"未知"});
+        snapshot["samplingDiagnostics"] = json!({"process_complete":false,"process_reasons":{},
+            "process_confirmed_exited_count":0,"process_sampled_at":now,"network_quality":null,
+            "network_round_id":null,"network_sampled_at":null,"network_reused":null,
+            "activity_state":"unknown","bytes_state":"unknown","activity_reasons":{},
+            "activity_sampled_at":null,"publisher_error_code":null});
+        snapshot["initialObservation"] = json!({"native_inventory_count":inventory.len(),
+            "observed_at":now,"application_discovery":"pending","network_observation":"pending"});
+        snapshot["targetDiscovery"] = json!({"revision":"","complete":false,"issues":["initial_discovery_pending"]});
+        snapshot["grants_launch_permission"] = json!(false);
+        self.publish(Ok(snapshot), now)
+    }
     pub fn publish_with_log_health(&self, sample: Result<Value>, now: f64, log_error: Option<&str>) -> Result<Value> {
         if !now.is_finite() || now <= 0.0 {
             return Err(CoreError::new("invalid_clock", "后台时钟无效"));

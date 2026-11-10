@@ -76,6 +76,14 @@ orphan PID.
 
 Failures remain visible in the original result directory. Corrective reruns
 are separate evidence and do not overwrite an earlier whole-suite result.
+The Python build-entry regressions compare the actual Cargo arguments and
+environment used by the bootstrap and staging scripts using a private Cargo
+fixture. The native startup regression copies the already-built engine and
+read-only helpers into a private directory, runs an unregistered observe-only
+daemon, verifies its first unready observation and kernel producer identity,
+then confirms the original worker has exited after stopping its owned parent.
+It checks that this private publisher cannot pass the normal launchd verifier.
+It installs no service, launches no AI, and modifies no VPN configuration.
 The graph fixtures now check the existing desktop grouping while retaining
 PID, actual connection and independent CLI distinctions. The live listener
 diagnostic uses the production lsof-first/netstat-fallback collection path with

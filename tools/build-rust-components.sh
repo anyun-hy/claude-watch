@@ -6,20 +6,27 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage: tools/build-rust-components.sh --output <directory>
+       tools/build-rust-components.sh --build-only
 
 Builds the local arm64 Rust candidate runtime and writes components.json plus:
   watch-engine, watch-native-observer, watch-process-control, watch-sandbox-launcher,
   watch-gateway-broker (staged only; no system service installation)
+--build-only compiles the same component set without staging or running it.
 USAGE
 }
 
 OUTPUT=''
+BUILD_ONLY=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output)
       [[ $# -ge 2 ]] || { echo 'Missing value for --output' >&2; exit 2; }
       OUTPUT=$2
       shift 2
+      ;;
+    --build-only)
+      BUILD_ONLY=1
+      shift
       ;;
     --help|-h)
       usage
@@ -33,7 +40,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$OUTPUT" ]] || { usage >&2; exit 2; }
+if [[ "$BUILD_ONLY" == 1 ]]; then
+  [[ -z "$OUTPUT" ]] || { echo '--build-only cannot be combined with --output.' >&2; exit 2; }
+else
+  [[ -n "$OUTPUT" ]] || { usage >&2; exit 2; }
+fi
 [[ "$(uname -m)" == 'arm64' ]] || { echo 'Rust candidate packaging requires an arm64 host.' >&2; exit 1; }
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
@@ -57,6 +68,8 @@ CC_aarch64_apple_darwin="$CW_APPLE_CLANG" MACOSX_DEPLOYMENT_TARGET="$CW_MACOS_MI
   --package claude-watch-engine --bin claude-watch-engine \
   --package claude-watch-sandbox-launcher --bin watch-sandbox-launcher \
   --package claude-watch-gateway-broker --bin watch-gateway-broker
+
+[[ "$BUILD_ONLY" == 0 ]] || exit 0
 
 ENGINE="$REPOSITORY_ROOT/target/aarch64-apple-darwin/release/claude-watch-engine"
 [[ -x "$ENGINE" ]] || { echo "Cargo did not produce executable engine: $ENGINE" >&2; exit 1; }

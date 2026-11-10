@@ -17,7 +17,7 @@ use std::{
     io::Read,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
 
@@ -338,6 +338,7 @@ pub struct DiscoveryCache {
     base_overrides: BTreeMap<String, PathBuf>,
     hint_issues: Vec<String>,
     directories: BTreeMap<PathBuf, DirectoryBatch>,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 impl DiscoveryCache {
     pub fn new(inputs: DiscoveryInputs) -> Self {
@@ -359,6 +360,7 @@ impl DiscoveryCache {
             base_overrides,
             hint_issues: vec![],
             directories: BTreeMap::new(),
+            cancellation: None,
         }
     }
     fn input_issue(&mut self, code: &str, present: bool) {
@@ -375,6 +377,7 @@ impl DiscoveryCache {
         registry: &dyn ApplicationRegistry,
         now: f64,
     ) -> Arc<DiscoverySnapshot> {
+        if self.cancelled() { return self.pending_snapshot("target_discovery_cancelled"); }
         let store = StateStore::new(Paths {
             home: self.inputs.home.clone(),
         });
@@ -475,6 +478,7 @@ impl DiscoveryCache {
             let prior_issues = self.registry_issues.clone();
             self.registry_issues.clear();
             for (id, _) in DESKTOP_IDS {
+                if self.cancelled() { return self.pending_snapshot("target_discovery_cancelled"); }
                 self.counters.registry_queries += 1;
                 match registry.locations(id) {
                     Ok(mut batch) => {
@@ -519,6 +523,7 @@ impl DiscoveryCache {
         });
         for _ in 0..4 {
             let (mut snapshot, signature) = self.scan(reader);
+            if self.cancelled() { return self.pending_snapshot("target_discovery_cancelled"); }
             if !signature
                 .iter()
                 .all(|(path, facts, canonical)| stamp(path) == (facts.clone(), canonical.clone()))
@@ -554,6 +559,12 @@ impl DiscoveryCache {
         }
         // An unstable scan never becomes a successful cached signature. Keep
         // only still-readable previous evidence for unrelated sources.
+        self.pending_snapshot("target_discovery_unstable")
+    }
+    fn cancelled(&self) -> bool {
+        self.cancellation.as_ref().is_some_and(|stop| stop.load(Ordering::Acquire))
+    }
+    fn pending_snapshot(&mut self, reason: &str) -> Arc<DiscoverySnapshot> {
         let mut snapshot = self
             .snapshot
             .as_deref()
@@ -567,14 +578,14 @@ impl DiscoveryCache {
                 preferred_sources: BTreeMap::new(),
             });
         snapshot.complete = false;
-        snapshot.issues = vec!["target_discovery_unstable".into()];
+        snapshot.issues = vec![reason.into()];
         snapshot
             .targets
             .retain(|r| self.record_is_current(r) && self.source_is_configured(r));
         snapshot.prior_revision = Some(snapshot.revision.clone());
         snapshot.revision = crate::storage::sha256(
             &serde_json::to_vec(
-                &json!({"pending_from":snapshot.prior_revision,"targets":snapshot.targets}),
+                &json!({"pending_from":snapshot.prior_revision,"targets":snapshot.targets,"reason":reason}),
             )
             .unwrap(),
         );
@@ -630,6 +641,7 @@ impl DiscoveryCache {
             next_offsets: BTreeMap::new(),
             batched: BTreeSet::new(),
             directories: &mut self.directories,
+            cancellation: self.cancellation.clone(),
         };
         for root in &self.inputs.application_roots {
             for path in scan.entries(root) {
@@ -811,14 +823,19 @@ struct Scan<'a, R: ReadRunner + ?Sized> {
     next_offsets: BTreeMap<PathBuf, usize>,
     batched: BTreeSet<PathBuf>,
     directories: &'a mut BTreeMap<PathBuf, DirectoryBatch>,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 impl<R: ReadRunner + ?Sized> Scan<'_, R> {
+    fn cancelled(&self) -> bool {
+        self.cancellation.as_ref().is_some_and(|stop| stop.load(Ordering::Acquire))
+    }
     fn watch(&mut self, path: &Path) {
         self.watched
             .entry(path.into())
             .or_insert_with(|| stamp(path));
     }
     fn entries(&mut self, path: &Path) -> Vec<PathBuf> {
+        if self.cancelled() { return vec![]; }
         if path.to_str().is_none() {
             self.issues.push("discovery_path_encoding".into());
             return vec![];
@@ -880,6 +897,7 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
         let mut consumed = 0;
         let mut failed = false;
         for (index, item) in entries.take(offset + limit + 1).enumerate() {
+            if self.cancelled() { break; }
             self.counters.directory_entries += 1;
             if index < offset {
                 continue;
@@ -941,6 +959,7 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
         source: &str,
         expected: Option<&str>,
     ) -> Option<DiscoveredTarget> {
+        if self.cancelled() { return None; }
         if path.to_str().is_none() {
             self.issues.push("discovery_path_encoding".into());
             return None;
@@ -1076,6 +1095,7 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
         Some(record)
     }
     fn cli(&mut self, path: PathBuf, target: LaunchTarget, source: &str, known_alias: bool) {
+        if self.cancelled() { return; }
         if path.to_str().is_none() {
             self.issues.push("discovery_path_encoding".into());
             return;
@@ -1512,6 +1532,11 @@ impl DiscoveryHandle {
     }
     pub fn refresh<R: ReadRunner + ?Sized>(&self, reader: &R, now: f64) -> Arc<DiscoverySnapshot> {
         self.0.lock().unwrap().refresh(reader, self.1.as_ref(), now)
+    }
+    /// The daemon's stop flag bounds cold discovery between system reads.
+    /// Cancellation publishes no successful revision and grants no authority.
+    pub fn cancel_pending_when(&self, stop: Arc<AtomicBool>) {
+        self.0.lock().unwrap().cancellation = Some(stop);
     }
     pub fn managed_spec(
         &self,
