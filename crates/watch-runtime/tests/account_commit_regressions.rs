@@ -222,3 +222,26 @@ fn successful_switch_and_same_target_idempotence_are_unchanged() {
     assert_eq!((f.store.os.launches, f.store.os.quits), count);
     assert_eq!(f.state()["current"], "B"); assert!(!f.store.storage.paths.journal().exists());
 }
+#[test]
+fn interrupted_transaction_blocks_new_switch_until_recovery_cleans_journal() {
+    let mut f = Fixture::new(true, true);
+    // 1. Simulate process being interrupted / terminated at commit_prepared stage
+    f.interrupt("commit_prepared");
+    assert!(f.store.storage.paths.journal().exists(), "journal must remain after interruption");
+
+    // 2. A subsequent switch attempt while journal is present is strictly rejected with recovery_required
+    assert_eq!(
+        f.store.switch("B", &config(), false).unwrap_err().code,
+        "recovery_required",
+        "concurrent or re-triggered switch must be blocked while journal is present"
+    );
+
+    // 3. Recovery cleanly rolls back the interrupted transaction without corrupting data
+    f.recover_without_process_actions().unwrap();
+    assert!(!f.store.storage.paths.journal().exists(), "journal cleaned up after recovery");
+    assert_eq!(f.state()["current"], "A", "state remains safely at A");
+
+    // 4. Now a fresh switch proceeds without error
+    assert_eq!(f.store.switch("B", &config(), false).unwrap().current, "B");
+    assert_eq!(f.state()["current"], "B");
+}

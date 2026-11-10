@@ -31,7 +31,7 @@ fn allowed(key: &str) -> bool {
         | "written" | "scope" | "shutdown_flush_guaranteed" | "log_health" | "eventError"
         | "active_flows" | "active_flows_count" | "new_connections_blocked" | "terminated_flows_count"
         | "blocked_new_connections" | "direct_fallback_blocked" | "channels" | "families"
-        | "authoritative_permits" | "enforcement_receipts" | "claude" | "codex" | "chatgpt"
+        | "authoritative_permits" | "enforcement_receipts" | "claude" | "codex" | "chatgpt" | "openai"
         | "process_complete" | "process_confirmed_exited_count" | "process_sampled_at"
         | "network_quality" | "network_round_id" | "network_sampled_at" | "network_reused"
         | "activity_state" | "bytes_state" | "activity_sampled_at" | "publisher_error_code"
@@ -51,24 +51,59 @@ fn allowed(key: &str) -> bool {
         | "proxy_api_available" | "proxy_port_covered" | "context_available" | "same_candidate_context"
         | "source_sample_advanced" | "deadline_remaining_seconds" | "differences" | "field"
         | "source_observed_at" | "recorded_at" | "writer_boot_id" | "component_version" | "os_error" | "target_version" | "target_build" | "binary_sha256"
-        | "dropped_queue_records" | "failed_write_records" | "counts_saturated")
+        | "dropped_queue_records" | "failed_write_records" | "counts_saturated"
+        | "truncation" | "file_or_records" | "object_fields" | "array_items" | "depth_limit")
+        || claude_watch_core::policy::PolicyCatalog::families().iter().any(|f| f.id == key)
 }
 fn safe_label(value: &str) -> bool {
     !value.is_empty() && value.len() <= 192
         && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
         && !value.contains("http:") && !value.contains("https:")
 }
-fn project(value: &Value, depth: usize) -> Option<Value> {
-    if depth > 10 { return None; }
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+struct TruncationTracker {
+    object_fields: bool,
+    array_items: bool,
+    depth_limit: bool,
+}
+
+impl TruncationTracker {
+    fn any(&self) -> bool {
+        self.object_fields || self.array_items || self.depth_limit
+    }
+}
+
+fn project(value: &Value, depth: usize, tracker: &mut TruncationTracker) -> Option<Value> {
+    if depth > 10 {
+        tracker.depth_limit = true;
+        return None;
+    }
     match value {
         Value::Object(object) => {
             let mut result = Map::new();
-            for (key, child) in object.iter().filter(|(key, _)| allowed(key)).take(96) {
-                if let Some(child) = project(child, depth + 1) { result.insert(key.clone(), child); }
+            let filtered: Vec<(&String, &Value)> = object.iter().filter(|(key, _)| allowed(key)).collect();
+            if filtered.len() > 96 {
+                tracker.object_fields = true;
+            }
+            for (key, child) in filtered.into_iter().take(96) {
+                if let Some(child) = project(child, depth + 1, tracker) {
+                    result.insert(key.clone(), child);
+                }
             }
             Some(Value::Object(result))
         }
-        Value::Array(array) => Some(Value::Array(array.iter().take(64).filter_map(|v| project(v, depth + 1)).collect())),
+        Value::Array(array) => {
+            if array.len() > 64 {
+                tracker.array_items = true;
+            }
+            Some(Value::Array(
+                array
+                    .iter()
+                    .take(64)
+                    .filter_map(|v| project(v, depth + 1, tracker))
+                    .collect(),
+            ))
+        }
         Value::String(s) if safe_label(s) => Some(value.clone()),
         Value::Bool(_) | Value::Number(_) | Value::Null => Some(value.clone()),
         _ => None,
@@ -106,22 +141,39 @@ fn read_bounded(path: &Path, tail: bool) -> Result<(Vec<u8>, bool), &'static str
 }
 
 fn source(path: &Path, label: &str, json_lines: bool) -> Value {
-    let (bytes, mut truncated) = match read_bounded(path, json_lines) {
+    let (bytes, mut file_truncated) = match read_bounded(path, json_lines) {
         Ok(result) => result,
         Err(reason) => return json!({"source":label,"status":reason}),
     };
     let mut invalid = 0;
     let mut records = Vec::new();
     let lines: Vec<&[u8]> = if json_lines { bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()).collect() } else { vec![&bytes] };
-    if lines.len() > MAX_RECORDS { truncated = true; }
+    if lines.len() > MAX_RECORDS { file_truncated = true; }
+    let mut tracker = TruncationTracker::default();
     for line in lines.iter().rev().take(MAX_RECORDS).rev() {
         if json_lines && line.len() > 64 * 1024 { invalid += 1; continue; }
         match serde_json::from_slice::<Value>(line) {
-            Ok(value) => if let Some(safe) = project(&value, 0) { records.push(safe); },
+            Ok(value) => if let Some(safe) = project(&value, 0, &mut tracker) { records.push(safe); },
             Err(_) => invalid += 1,
         }
     }
-    json!({"source":label,"status":"read","truncated":truncated,"invalid_records":invalid,"records":records})
+    let overall_truncated = file_truncated || tracker.any();
+    let mut result = json!({
+        "source": label,
+        "status": "read",
+        "truncated": overall_truncated,
+        "invalid_records": invalid,
+        "records": records
+    });
+    if overall_truncated {
+        result["truncation"] = json!({
+            "file_or_records": file_truncated,
+            "object_fields": tracker.object_fields,
+            "array_items": tracker.array_items,
+            "depth_limit": tracker.depth_limit
+        });
+    }
+    result
 }
 
 fn recent(dir: &Path, prefix: &str, suffix: &str, limit: usize) -> (Vec<PathBuf>, &'static str) {
@@ -215,19 +267,75 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let root = fs::canonicalize(root).unwrap();
         let path = root.join("snapshot.json");
-        let data = serde_json::to_vec(&json!({"families":{"claude":{"reason_code":"vpn_expectation_mismatched","command_seq":71}},
-            "private_padding":"private-network-address".repeat(4000)})).unwrap();
+        let data = serde_json::to_vec(&json!({
+            "families": {
+                "claude": {"reason_code": "vpn_expectation_mismatched", "command_seq": 71},
+                "openai": {"reason_code": "vpn_expectation_mismatched", "command_seq": 99}
+            },
+            "authoritative_permits": {
+                "claude": {"permit_generation": 1},
+                "openai": {"permit_generation": 2}
+            },
+            "enforcement_receipts": {
+                "claude": {"action": "disconnect-and-force-quit"},
+                "openai": {"action": "disconnect-channel"}
+            },
+            "private_padding": "private-network-address".repeat(4000)
+        })).unwrap();
         assert!(data.len() > 64 * 1024 && data.len() < FILE_LIMIT);
         fs::write(&path, &data).unwrap();
         let snapshot = source(&path, "snapshot", false);
         assert_eq!(snapshot["invalid_records"], 0, "{snapshot}");
         assert_eq!(snapshot["records"][0]["families"]["claude"]["command_seq"], 71);
+        assert_eq!(snapshot["records"][0]["families"]["openai"]["command_seq"], 99);
+        assert_eq!(snapshot["records"][0]["authoritative_permits"]["openai"]["permit_generation"], 2);
+        assert_eq!(snapshot["records"][0]["enforcement_receipts"]["openai"]["action"], "disconnect-channel");
         assert!(!snapshot.to_string().contains("private-network-address"));
         let old = root.join("initialization-flow-zzz.jsonl");
         let new = root.join("initialization-flow-aaa.jsonl");
         fs::write(&old, b"{}\n").unwrap(); fs::write(&new, b"{}\n").unwrap();
         fs::File::options().write(true).open(&old).unwrap().set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1))).unwrap();
         assert_eq!(recent(&root, "initialization-flow-", ".jsonl", 1).0, vec![new]);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn truncation_metadata_is_reported_when_arrays_objects_or_depth_exceed_limits() {
+        let root = std::env::temp_dir().join(format!("cw-truncation-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+
+        // 1. Array with 65 items (exceeding 64 limit)
+        let array_path = root.join("oversize_array.json");
+        let array_data = json!({
+            "stage": "sampling",
+            "reasons": (0..65).map(|i| format!("code_{i}")).collect::<Vec<_>>()
+        });
+        fs::write(&array_path, serde_json::to_vec(&array_data).unwrap()).unwrap();
+        let array_source = source(&array_path, "oversize_array", false);
+        assert_eq!(array_source["truncated"], true);
+        assert_eq!(array_source["truncation"]["array_items"], true);
+        assert_eq!(array_source["truncation"]["file_or_records"], false);
+        assert_eq!(array_source["records"][0]["reasons"].as_array().unwrap().len(), 64);
+
+        // 2. Normal small record without any truncation
+        let normal_path = root.join("normal.json");
+        let normal_data = json!({"status": "ok", "component": "enforcer"});
+        fs::write(&normal_path, serde_json::to_vec(&normal_data).unwrap()).unwrap();
+        let normal_source = source(&normal_path, "normal", false);
+        assert_eq!(normal_source["truncated"], false);
+        assert!(normal_source.get("truncation").is_none());
+
+        // 3. Deeply nested structure exceeding depth 10
+        let mut deep = json!({"status": "ok"});
+        for _ in 0..12 {
+            deep = json!({"state": deep});
+        }
+        let deep_path = root.join("deep.json");
+        fs::write(&deep_path, serde_json::to_vec(&deep).unwrap()).unwrap();
+        let deep_source = source(&deep_path, "deep", false);
+        assert_eq!(deep_source["truncated"], true);
+        assert_eq!(deep_source["truncation"]["depth_limit"], true);
+
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
