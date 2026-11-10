@@ -422,10 +422,28 @@ enum SwitcherCommandRunner {
         if let cancellation { try cancellation.start(task) } else { try task.run() }
         if let input { incoming.fileHandleForWriting.write(input) }
         try? incoming.fileHandleForWriting.close()
-        // Mutating transactions have their own recovery journal. Never kill one
-        // because a GUI timer expired between two directory renames.
+        // Guard against hung child processes with a bounded watchdog timeout
+        let isLongRunning = task.arguments?.first == "setup" || task.arguments?.first == "update"
+        let timeoutSeconds: TimeInterval = isLongRunning ? 60.0 : 25.0
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+        var timedOut = false
+        timer.schedule(deadline: .now() + timeoutSeconds)
+        timer.setEventHandler {
+            timedOut = true
+            task.terminate()
+        }
+        timer.resume()
+        defer { timer.cancel() }
+
         let data = output.fileHandleForReading.readDataToEndOfFile()
         task.waitUntilExit()
+        if timedOut {
+            throw NSError(
+                domain: "Switcher",
+                code: 124,
+                userInfo: [NSLocalizedDescriptionKey: "后台命令执行超时（超过 \(Int(timeoutSeconds)) 秒），已强制终止以防挂死。"]
+            )
+        }
         if cancellation?.isCancelled == true { throw CancellationError() }
         guard data.count <= 4_000_000,
               (try? JSONSerialization.jsonObject(with: data)) is [String: Any] else {

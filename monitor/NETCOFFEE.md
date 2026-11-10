@@ -1,6 +1,6 @@
 # Net.Coffee 数据接入
 
-实现入口为 `Sources/NetCoffeeStore.swift`、`NetCoffeeLeakRunner.swift`、`NetCoffeeScorePage.swift`，以及 `Resources/netcoffee_client.py` 和 `netcoffee_probe.*`。
+实现入口为 `Sources/NetCoffeeStore.swift`、`NetCoffeeLeakRunner.swift`、`NetCoffeeScorePage.swift`，以及 `Resources/netcoffee_probe.*` 与原生 Rust 采集引擎。
 
 ## 用途
 
@@ -15,7 +15,7 @@
 
 ## 验证与资料
 
-离线测试位于 `tests/test_netcoffee_client.py`、`test_netcoffee_probe.cjs`、`NetCoffeeTests.swift` 及相关泄漏回执测试。
+离线测试位于 `test_netcoffee_probe.cjs`、`NetCoffeeTests.swift` 及相关泄漏回执测试。
 
 `tests/run_netcoffee_live_check.sh` 是明确联网的原生开发验收入口，会写本机报告；需要单独授权运行。`tests/build_ui_review.sh` 使用隔离样本，历史样本保留原时间。
 

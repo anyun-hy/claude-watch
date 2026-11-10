@@ -25,7 +25,7 @@ GLOBAL 模式核对 GLOBAL 的完整选择链；规则模式按实际命中规�
 
 ## 受控启动与运行保护
 
-`System._launch_claude()` 先执行完整预检，`session_guard.begin_launch_session()` 再核对启动时实测出口与风险回执，随后绑定进程身份。启动失败保持回滚与异常记录。
+`watch-engine launch` 与 `watch-sandbox-launcher` 先执行完整预检，Rust 运行时的受控会话层核对启动时实测出口与风险回执，随后通过 Seatbelt 沙箱与内核令牌绑定进程身份。启动失败保持回滚与异常记录。
 
 会话 IP 基准不会随自动刷新改变。运行中 IP 改变（包括同国）、CN 出口、DNS / WebRTC 风险、必要身份连续无法核验或证据过期时，后台按既有规则请求退出 Claude。
 

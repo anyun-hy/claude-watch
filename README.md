@@ -67,7 +67,7 @@ Swift 测试、隔离界面与真实界面验收说明见 [原生应用开发说
 
 | 路径 | 内容 |
 | --- | --- |
-| `claude-watch.sh` | 采集后台、只读诊断与受控入口 |
+| `crates/watch-engine/` | 原生 Rust 命令行、采集后台、只读诊断与受控网关守护进程 |
 | `monitor/Sources/` | SwiftUI 界面、状态模型、连接关联展示 |
 | `monitor/Resources/` | WebView 检测页面、辅助脚本、图标资产（不携带已退役的 Python 后台） |
 | `monitor/Packaging/` | 完整安装、卸载与权限处理 |

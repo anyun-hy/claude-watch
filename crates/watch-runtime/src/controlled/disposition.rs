@@ -139,6 +139,19 @@ impl Controller {
                 }
             }
             Ok(StopOutcome::SkippedWarn)
+        } else if action == "force" && family.is_some_and(|f| f.performable("force")) {
+            // When user explicitly requested force (SIGKILL), respect it regardless of channel mode.
+            // In channel mode, also record that the network channel was cut.
+            if system.channel_mode() {
+                receipt["disposition_mode"] = json!("disconnect_channel_and_force_quit");
+                receipt["process_preserved"] = json!(false);
+                receipt["action"] = json!("disconnect-and-force-quit");
+            }
+            let mut forced = None;
+            let result = system.quit_for_confirmed_ip_risk(&mut forced);
+            receipt["stop_force_requested"] = json!(forced);
+            receipt["stop_force_reported"] = json!(forced.is_some());
+            result.map(|()| StopOutcome::Confirmed)
         } else if system.channel_mode() {
             // Channel supervision mode: default disposition cuts off the
             // target application's network channel and keeps its processes
@@ -150,12 +163,6 @@ impl Controller {
             receipt["stop_state"] = json!("disconnecting");
             // The executor receipt, not this request, establishes isolation.
             Ok(StopOutcome::SkippedWarn)
-        } else if action == "force" && family.is_some_and(|f| f.performable("force")) {
-            let mut forced = None;
-            let result = system.quit_for_confirmed_ip_risk(&mut forced);
-            receipt["stop_force_requested"] = json!(forced);
-            receipt["stop_force_reported"] = json!(forced.is_some());
-            result.map(|()| StopOutcome::Confirmed)
         } else {
             system.quit_desktop().map(|()| StopOutcome::Confirmed)
         };

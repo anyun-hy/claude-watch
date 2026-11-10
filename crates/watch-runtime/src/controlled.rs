@@ -4,6 +4,7 @@ use crate::{
     storage::StateStore,
 };
 use claude_watch_core::{
+    channel::NetworkBackendKind,
     error::{CoreError, Result},
     policy::PolicyCatalog,
     processes::{Identity as ProcessIdentity, LaunchTarget, Provider, Target},
@@ -899,130 +900,10 @@ impl Controller {
             )
         };
 
-        let mut candidate = ChannelPermit::from_guard_round(
-            family,
-            latest_session,
-            receipt,
-            policy_version.clone(),
-            base_gen,
-            next_cmd_seq,
-            now,
-            DEFAULT_PERMIT_TTL,
-        )?;
-        if candidate.state == ChannelPermitState::Permitted {
-            if let Some(exit) =
-                session::Egress::fresh(&system.egress(), now, session::GUARD_EGRESS_TTL)
-            {
-                let evidence_expires_at = exit.observed_at + session::GUARD_EGRESS_TTL;
-                if evidence_expires_at > now {
-                    candidate.valid_until = candidate.valid_until.min(evidence_expires_at);
-                } else if system.channel_mode() {
-                    candidate.state = ChannelPermitState::Revoked;
-                    candidate.reason_code = "egress_evidence_expired".into();
-                }
-            } else if system.channel_mode() {
-                candidate.state = ChannelPermitState::Revoked;
-                candidate.reason_code = "egress_evidence_expired".into();
-            }
-        }
-
-        if let Some(prev) = prev_permit.as_ref() {
-            let session_changed = prev.session_id != candidate.session_id;
-            let policy_changed = prev.policy_version != candidate.policy_version;
-            let state_changed = prev.state != candidate.state;
-            if session_changed || policy_changed || state_changed {
-                candidate.permit_generation = prev.permit_generation.saturating_add(1);
-            }
-            // If previously revoked under the same session, returning to
-            // Permitted requires passing `verify_channel_recovery` with fresh
-            // post-revocation evidence under the current policy version.
-            if prev.state == ChannelPermitState::Revoked
-                && candidate.state == ChannelPermitState::Permitted
-                && !session_changed
-            {
-                let audit_path = self.storage.paths.base().join("last-audit.json");
-                let stored_audit = self
-                    .storage
-                    .read_json(&audit_path, Value::Null)
-                    .unwrap_or(Value::Null);
-                let audit_ready = stored_audit["ready"] == true
-                    && stored_audit["grants_launch_permission"] == true;
-                let audit_observed_at = stored_audit["observed_at"]
-                    .as_f64()
-                    .or_else(|| latest_session.map(|s| s.created_at))
-                    .unwrap_or(0.0);
-                let egress = system.egress();
-                let context_id = candidate
-                    .context_id
-                    .clone()
-                    .unwrap_or_default();
-                match verify_channel_recovery(
-                    prev,
-                    prev_revoked_at.unwrap_or(prev.issued_at),
-                    candidate.session_id.as_deref(),
-                    audit_ready,
-                    audit_observed_at,
-                    &policy_version,
-                    &egress,
-                    candidate.session_id.as_deref(),
-                    &policy_version,
-                    &context_id,
-                    candidate.permit_generation,
-                    candidate.command_seq,
-                    now,
-                    DEFAULT_PERMIT_TTL,
-                ) {
-                    Ok(recovered) => candidate = recovered,
-                    Err(err) if system.channel_mode() => {
-                        candidate.state = ChannelPermitState::Revoked;
-                        candidate.reason_code = err.code;
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
-
-        let allowed_processes: Vec<BoundProcessToken> = {
-            let desktops = system.desktops().unwrap_or_default();
-            desktops
-                .into_iter()
-                .map(|(d, main, _)| {
-                    let real_uid = read_process_real_uid(d.pid);
-                    BoundProcessToken::with_system_identity(
-                        d.pid,
-                        real_uid,
-                        d.start_seconds,
-                        d.start_microseconds,
-                        if main {
-                            ProcessRole::DesktopMain
-                        } else {
-                            ProcessRole::DesktopHelper
-                        },
-                    )
-                })
-                .collect()
-        };
-
-        let upstream_endpoint = config.proxy_url.clone();
-
-        let command = ChannelEnforcementCommand {
-            family: family.into(),
-            session_id: candidate.session_id.clone(),
-            policy_version: policy_version.clone(),
-            permit_generation: candidate.permit_generation,
-            command_seq: candidate.command_seq,
-            permit: candidate.clone(),
-            allowed_processes,
-            upstream_endpoint,
-            target_executor_boot_id: None,
-            issued_at: now,
-        };
-
-        // Single authoritative entry point: In full supervisor mode,
-        // ChannelSupervisor is the sole command issuer. Controller synchronizes
-        // observations and reads the authoritative permit persisted by the supervisor,
-        // never inventing fake permits with hardcoded valid_until periods.
         let (effective_permit, enforcer_receipt, verdict) = if system.delegates_slow_audit_to_worker() {
+            // Production Supervisor mode: ChannelSupervisor is the SOLE authority for
+            // permit generation, revocation, generational advancement, and recovery.
+            // Controller NEVER constructs candidate permits or invents fake approvals.
             let r = system.channel_receipt(family)?;
             let supervisor_permit = self
                 .storage
@@ -1035,25 +916,170 @@ impl Controller {
                     val.get(family)
                         .and_then(|p| serde_json::from_value::<ChannelPermit>(p.clone()).ok())
                 });
-            if let Some(auth_permit) = supervisor_permit {
-                let v = evaluate_channel_supervision(&auth_permit, r.as_ref(), &policy_version, now);
-                (auth_permit, r, v)
+            let auth_permit = if let Some(p) = supervisor_permit {
+                p
             } else if let Some(ref receipt) = r {
-                let mut p = candidate.clone();
-                p.session_id = receipt.session_id.clone();
-                p.permit_generation = receipt.permit_generation;
-                p.command_seq = receipt.command_seq;
-                p.state = receipt.permit_state;
-                if let Some(ref err) = receipt.error_code {
-                    p.reason_code = err.clone();
+                // Fail-closed recovery strictly bound to receipt state
+                ChannelPermit {
+                    family: family.into(),
+                    session_id: receipt.session_id.clone(),
+                    context_id: None,
+                    policy_version: policy_version.clone(),
+                    permit_generation: receipt.permit_generation,
+                    command_seq: receipt.command_seq,
+                    state: receipt.permit_state,
+                    reason_code: receipt.error_code.clone().unwrap_or_else(|| "unconfirmed_supervisor_state".into()),
+                    issued_at: now,
+                    valid_until: now,
+                    baseline_ip: None,
+                    members: Vec::new(),
+                    backend: if system.channel_mode() { NetworkBackendKind::Seatbelt } else { NetworkBackendKind::NetworkExtension },
+                    vpn_epoch: None,
+                    coverage_scope: None,
                 }
-                let v = evaluate_channel_supervision(&p, Some(receipt), &policy_version, now);
-                (p, r, v)
             } else {
-                let v = evaluate_channel_supervision(&candidate, None, &policy_version, now);
-                (candidate, None, v)
-            }
+                // Fail-closed initial permit: unconfirmed state is PendingVerification
+                ChannelPermit {
+                    family: family.into(),
+                    session_id: latest_session.map(|s| s.session_id.clone()),
+                    context_id: None,
+                    policy_version: policy_version.clone(),
+                    permit_generation: base_gen,
+                    command_seq: next_cmd_seq,
+                    state: ChannelPermitState::PendingVerification,
+                    reason_code: "supervisor_initializing".into(),
+                    issued_at: now,
+                    valid_until: now,
+                    baseline_ip: None,
+                    members: Vec::new(),
+                    backend: if system.channel_mode() { NetworkBackendKind::Seatbelt } else { NetworkBackendKind::NetworkExtension },
+                    vpn_epoch: None,
+                    coverage_scope: None,
+                }
+            };
+            let v = evaluate_channel_supervision(&auth_permit, r.as_ref(), &policy_version, now);
+            (auth_permit, r, v)
         } else {
+            // Isolated / non-delegated test harness mode only:
+            let mut candidate = ChannelPermit::from_guard_round(
+                family,
+                latest_session,
+                receipt,
+                policy_version.clone(),
+                base_gen,
+                next_cmd_seq,
+                now,
+                DEFAULT_PERMIT_TTL,
+            )?;
+            if candidate.state == ChannelPermitState::Permitted {
+                if let Some(exit) =
+                    session::Egress::fresh(&system.egress(), now, session::GUARD_EGRESS_TTL)
+                {
+                    let evidence_expires_at = exit.observed_at + session::GUARD_EGRESS_TTL;
+                    if evidence_expires_at > now {
+                        candidate.valid_until = candidate.valid_until.min(evidence_expires_at);
+                    } else if system.channel_mode() {
+                        candidate.state = ChannelPermitState::Revoked;
+                        candidate.reason_code = "egress_evidence_expired".into();
+                    }
+                } else if system.channel_mode() {
+                    candidate.state = ChannelPermitState::Revoked;
+                    candidate.reason_code = "egress_evidence_expired".into();
+                }
+            }
+
+            if let Some(prev) = prev_permit.as_ref() {
+                let session_changed = prev.session_id != candidate.session_id;
+                let policy_changed = prev.policy_version != candidate.policy_version;
+                let state_changed = prev.state != candidate.state;
+                if session_changed || policy_changed || state_changed {
+                    candidate.permit_generation = prev.permit_generation.saturating_add(1);
+                }
+                // If previously revoked under the same session, returning to
+                // Permitted requires passing `verify_channel_recovery` with fresh
+                // post-revocation evidence under the current policy version.
+                if prev.state == ChannelPermitState::Revoked
+                    && candidate.state == ChannelPermitState::Permitted
+                    && !session_changed
+                {
+                    let audit_path = self.storage.paths.base().join("last-audit.json");
+                    let stored_audit = self
+                        .storage
+                        .read_json(&audit_path, Value::Null)
+                        .unwrap_or(Value::Null);
+                    let audit_ready = stored_audit["ready"] == true
+                        && stored_audit["grants_launch_permission"] == true;
+                    let audit_observed_at = stored_audit["observed_at"]
+                        .as_f64()
+                        .or_else(|| latest_session.map(|s| s.created_at))
+                        .unwrap_or(0.0);
+                    let egress = system.egress();
+                    let context_id = candidate
+                        .context_id
+                        .clone()
+                        .unwrap_or_default();
+                    match verify_channel_recovery(
+                        prev,
+                        prev_revoked_at.unwrap_or(prev.issued_at),
+                        candidate.session_id.as_deref(),
+                        audit_ready,
+                        audit_observed_at,
+                        &policy_version,
+                        &egress,
+                        candidate.session_id.as_deref(),
+                        &policy_version,
+                        &context_id,
+                        candidate.permit_generation,
+                        candidate.command_seq,
+                        now,
+                        DEFAULT_PERMIT_TTL,
+                    ) {
+                        Ok(recovered) => candidate = recovered,
+                        Err(err) if system.channel_mode() => {
+                            candidate.state = ChannelPermitState::Revoked;
+                            candidate.reason_code = err.code;
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+
+            let allowed_processes: Vec<BoundProcessToken> = {
+                let desktops = system.desktops().unwrap_or_default();
+                desktops
+                    .into_iter()
+                    .map(|(d, main, _)| {
+                        let real_uid = read_process_real_uid(d.pid);
+                        BoundProcessToken::with_system_identity(
+                            d.pid,
+                            real_uid,
+                            d.start_seconds,
+                            d.start_microseconds,
+                            if main {
+                                ProcessRole::DesktopMain
+                            } else {
+                                ProcessRole::DesktopHelper
+                            },
+                        )
+                    })
+                    .collect()
+            };
+
+            let upstream_endpoint = config.proxy_url.clone();
+
+            let command = ChannelEnforcementCommand {
+                family: family.into(),
+                session_id: candidate.session_id.clone(),
+                policy_version: policy_version.clone(),
+                permit_generation: candidate.permit_generation,
+                command_seq: candidate.command_seq,
+                permit: candidate.clone(),
+                allowed_processes,
+                upstream_endpoint,
+                target_executor_boot_id: None,
+                issued_at: now,
+            };
+
             let r = match system.enforce_channel(&command)? {
                 Some(r) => Some(r),
                 None => system.channel_receipt(family)?,
