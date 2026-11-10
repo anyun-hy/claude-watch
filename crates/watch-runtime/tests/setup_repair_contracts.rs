@@ -13,6 +13,9 @@ use std::{
 use uuid::Uuid;
 
 struct Fake {
+    packaged_backend: Option<claude_watch_core::channel::NetworkBackendKind>,
+    vpn: Option<claude_watch_core::vpn::VpnObservation>,
+    vpn_after_baseline: Option<claude_watch_core::vpn::VpnObservation>,
     now: f64,
     local: Value,
     applied: Vec<Value>,
@@ -83,6 +86,13 @@ impl RepairSystem for Fake {
     }
 }
 impl OnboardingSystem for Fake {
+    fn packaged_backend(&self) -> Option<claude_watch_core::channel::NetworkBackendKind> { self.packaged_backend }
+    fn vpn_observation(&self, _: &claude_watch_core::vpn::VpnExpectation) -> Result<claude_watch_core::vpn::VpnObservation> {
+        if self.baseline_read.get() {
+            if let Some(ref observed) = self.vpn_after_baseline { return Ok(observed.clone()); }
+        }
+        self.vpn.clone().ok_or_else(|| claude_watch_core::error::CoreError::new("vpn_observation_unavailable", "fixture no VPN sample"))
+    }
     fn progress(&self, phase: claude_watch_runtime::setup_progress::Phase) {
         self.progress.borrow_mut().push(phase);
     }
@@ -111,6 +121,9 @@ fn store() -> (PathBuf, StateStore) {
 }
 fn fake() -> Fake {
     Fake {
+        packaged_backend: None,
+        vpn: None,
+        vpn_after_baseline: None,
         now: 100.0,
         local: json!({"proxy":"ok","tun":"ok","backend_healthy":true,"guard_backend_healthy":true,"mode":"tag","context":"same","timezone":"America/New_York","locale":"en_US","language":"zh-CN","app_language":["zh-CN"],"ipv6":"ok","processes":[{"pid":7,"executable":"/TAG","uid":501,"start_stamp":"s"}],"tag":{"entry":{"state":"verified","public_listener":false,"owners":[{"pid":7,"executable":"/TAG","uid":501,"stamp":"s"}]},"api":{"state":"available","covers_7890":true,"mode":"rule"}}}),
         applied: vec![],
@@ -127,6 +140,124 @@ fn fake() -> Fake {
         egress_after_first_read: None,
         progress: RefCell::new(Vec::new()),
     }
+}
+
+fn seatbelt_fake() -> Fake {
+    use claude_watch_core::{channel::NetworkBackendKind, vpn::*};
+    let mut f = fake();
+    f.packaged_backend = Some(NetworkBackendKind::Seatbelt);
+    f.local["tag"]["expected_group"] = json!("AI");
+    f.local["tag"]["api"]["selected_node"] = json!("JP-1");
+    f.vpn = Some(VpnObservation {
+        source: "tag".into(), source_instance: Some("pid:7:10:0".into()), source_revision: Some("r1".into()),
+        upstream_endpoint: Some("http://127.0.0.1:7890".into()), upstream_protocol: ObservedField::Known(UpstreamProtocol::MixedHttp),
+        running_mode: ObservedField::Known("rule".into()), tun_enabled: ObservedField::Known(true), system_proxy_enabled: ObservedField::Known(false),
+        selected_group: ObservedField::Known("AI".into()), selected_node: ObservedField::Known("JP-1".into()),
+        proxy_chain: ObservedField::Known(vec!["AI".into(), "JP-1".into()]), rules_digest: ObservedField::Known("a".repeat(64)),
+        sample_started_at: 99.0, observed_at: 99.2, valid_until: 102.5, consistency: ObservationConsistency::BoundaryVerified,
+        source_error: None, sample_seq: 1, epoch: VpnEpoch {observer_boot_id:"fixture-vpn".into(),change_generation:1},
+    });
+    f
+}
+
+fn settings_only_options() -> Value {
+    json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false})
+}
+
+#[test]
+fn seatbelt_setup_saves_backend_and_confirmed_vpn_in_one_transaction_without_vpn_actions() {
+    let (home, store) = store(); let mut f = seatbelt_fake();
+    let c = onboarding::detect(&store, &f, "auto", true, &claude_watch_runtime::region_catalog::load_system_catalog()).unwrap();
+    assert!(!store.paths.config().exists(), "detection cannot save or migrate configuration");
+    assert_eq!(c["vpn_observation"]["observed_at"], 99.2, "retain actual source time");
+    assert_eq!(c["vpn_expectation"]["require_system_proxy"], false);
+    let options = settings_only_options();
+    let p = onboarding::preview(&store, &f, c["id"].as_str().unwrap(), &options, None).unwrap();
+    assert_eq!(p["desired_config"]["schema"], 2);
+    assert_eq!(p["desired_config"]["network_backend"], "seatbelt");
+    assert!(p["confirmation_lines"].as_array().unwrap().iter().any(|v| v.as_str().unwrap().contains("不修改 VPN")));
+    assert!(p["actions"].as_array().unwrap().iter().all(|v| matches!(v["id"].as_str(), Some("watchdog" | "updater"))));
+    onboarding::apply(&store, &mut f, c["id"].as_str().unwrap(), &options, p["id"].as_str().unwrap(), None).unwrap();
+    let saved = claude_watch_runtime::config_store::ConfigStore {storage:store.clone()}.load().unwrap();
+    assert_eq!(saved.schema, 2);
+    assert_eq!(saved.network_backend, Some(claude_watch_core::channel::NetworkBackendKind::Seatbelt));
+    assert_eq!(saved.vpn_expectation.unwrap().expected_node.as_deref(), Some("JP-1"));
+    assert!(f.applied.iter().all(|v| matches!(v["id"].as_str(), Some("watchdog" | "updater"))));
+    let repeated = onboarding::detect(&store, &f, "auto", true, &claude_watch_runtime::region_catalog::load_system_catalog()).unwrap();
+    let repeated_plan = onboarding::preview(&store, &f, repeated["id"].as_str().unwrap(), &options, None).unwrap();
+    assert_eq!(repeated_plan["confirmation_lines"], json!([]), "unchanged approved VPN expectations do not trigger another migration confirmation");
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn seatbelt_setup_rejects_replaced_source_after_candidate_creation() {
+    let (home, store) = store(); let mut f = seatbelt_fake();
+    let c = onboarding::detect(&store, &f, "auto", true, &claude_watch_runtime::region_catalog::load_system_catalog()).unwrap();
+    f.vpn.as_mut().unwrap().source_instance = Some("pid:8:11:0".into());
+    assert_eq!(onboarding::preview(&store, &f, c["id"].as_str().unwrap(), &settings_only_options(), None).unwrap_err().code, "stale_candidate");
+    assert!(!store.paths.config().exists());
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn seatbelt_setup_legacy_migration_requires_the_explicit_current_plan() {
+    let (home, store) = store(); let mut f = seatbelt_fake();
+    store.atomic_json(&store.paths.config(), &Config::default().value().unwrap()).unwrap();
+    let before = fs::read(store.paths.config()).unwrap();
+    let c = onboarding::detect(&store, &f, "auto", true, &claude_watch_runtime::region_catalog::load_system_catalog()).unwrap();
+    let options = settings_only_options();
+    let p = onboarding::preview(&store, &f, c["id"].as_str().unwrap(), &options, None).unwrap();
+    assert_eq!(fs::read(store.paths.config()).unwrap(), before);
+    assert_eq!(onboarding::apply(&store, &mut f, c["id"].as_str().unwrap(), &options, "unapproved", None).unwrap_err().code, "stale_plan");
+    assert_eq!(fs::read(store.paths.config()).unwrap(), before);
+    onboarding::apply(&store, &mut f, c["id"].as_str().unwrap(), &options, p["id"].as_str().unwrap(), None).unwrap();
+    assert_eq!(claude_watch_runtime::config_store::ConfigStore {storage:store.clone()}.load().unwrap().schema, 2);
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn seatbelt_setup_rejects_unknown_stale_inconsistent_and_different_source_evidence() {
+    use claude_watch_core::vpn::{ObservedField, ObservationConsistency};
+    for case in 0..5 {
+        let (home, store) = store(); let mut f = seatbelt_fake(); let sample = f.vpn.as_mut().unwrap();
+        match case {
+            0 => sample.valid_until = 99.9,
+            1 => sample.system_proxy_enabled = ObservedField::Unknown("unavailable".into()),
+            2 => sample.consistency = ObservationConsistency::InconsistentSnapshot("changed".into()),
+            3 => sample.source_instance = None,
+            _ => sample.upstream_endpoint = Some("http://127.0.0.1:7891".into()),
+        }
+        assert!(onboarding::detect(&store, &f, "auto", true, &claude_watch_runtime::region_catalog::load_system_catalog()).is_err(), "case {case}");
+        assert!(!store.paths.config().exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+}
+
+#[test]
+fn seatbelt_setup_rechecks_vpn_before_preview_and_final_save_preserving_saved_expectations() {
+    use claude_watch_core::vpn::ObservedField;
+    for at_final_save in [false, true] {
+        let (home, store) = store(); let mut f = seatbelt_fake();
+        let c = onboarding::detect(&store, &f, "auto", true, &claude_watch_runtime::region_catalog::load_system_catalog()).unwrap();
+        let options = settings_only_options();
+        let p = onboarding::preview(&store, &f, c["id"].as_str().unwrap(), &options, None).unwrap();
+        let mut changed = f.vpn.clone().unwrap(); changed.selected_node = ObservedField::Known("JP-2".into());
+        if at_final_save { f.vpn_after_baseline = Some(changed); } else { f.vpn = Some(changed); }
+        let failure = onboarding::apply(&store, &mut f, c["id"].as_str().unwrap(), &options, p["id"].as_str().unwrap(), None).unwrap_err();
+        assert_eq!(failure.code, if at_final_save { "setup_rolled_back" } else { "vpn_expectation_mismatched" });
+        assert!(failure.message.contains("JP-2"), "the actual VPN deviation survives transaction rollback reporting");
+        assert!(!store.paths.config().exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+    let (home, store) = store(); let mut f = seatbelt_fake();
+    let mut cfg = Config::default_for_new_install(); cfg.proxy_mode="tag".into(); cfg.proxy_url="http://127.0.0.1:7890".into(); cfg.proxy_group="AI".into();
+    cfg.vpn_expectation = Some(f.vpn.as_ref().unwrap().to_candidate_expectation().unwrap());
+    store.atomic_json(&store.paths.config(), &cfg.value().unwrap()).unwrap();
+    let before = fs::read(store.paths.config()).unwrap();
+    f.vpn.as_mut().unwrap().selected_node = ObservedField::Known("JP-2".into());
+    assert_eq!(onboarding::detect(&store, &f, "auto", true, &claude_watch_runtime::region_catalog::load_system_catalog()).unwrap_err().code, "vpn_expectation_mismatched");
+    assert_eq!(fs::read(store.paths.config()).unwrap(), before);
+    fs::remove_dir_all(home).unwrap();
 }
 
 #[test]

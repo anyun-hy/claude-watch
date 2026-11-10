@@ -523,3 +523,41 @@ fn seatbelt_backend_requires_and_installs_executable_sandbox_launcher() {
     assert!(!fake.calls.iter().any(|call| call.args.iter().any(|arg| arg == "system" || arg.starts_with("system/"))));
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn runtime_hook_verifies_final_location_before_bootstrap_and_failure_rolls_back() {
+    let (root,store,source,mut fake,uid)=fixture();
+    let mut observed=false;
+    let failure=agent_install::install_deferred_with_runtime_hook(&store,&source,uid,&mut fake,&mut |runtime,executor| {
+        assert_eq!(runtime,store.paths.watch().join("runtime"));
+        assert!(runtime.join("watch-engine").is_file());
+        assert_eq!(executor.bootstrap,0,"administrator refusal or failed endpoint verification must not start the new agent");
+        observed=true;
+        Err(claude_watch_core::error::CoreError::new("gateway_endpoint_unverified_i03","fixture endpoint verification failed"))
+    }).unwrap_err();
+    assert!(observed);assert_eq!(failure.code,"gateway_endpoint_unverified_i03");
+    assert_eq!(fake.bootstrap,0);assert!(!store.paths.watch().join("runtime").exists());
+    assert!(!store.paths.watch().join("agent-install-transaction.json").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn administrator_refusal_during_upgrade_restores_previous_runtime_identity() {
+    let (root,store,source,mut fake,uid)=fixture();
+    agent_install::install(&store,&source,uid,&mut fake).unwrap();
+    let runtime=store.paths.watch().join("runtime");
+    let previous=fs::read(runtime.join("watch-engine")).unwrap();
+    fs::write(source.join("watch-engine"),b"new fixture engine").unwrap();
+    fake.manifest["RuntimeHashes"]["watch-engine"]=json!(sha256(b"new fixture engine"));
+    let before=fake.bootstrap;
+    let failed=agent_install::install_deferred_with_runtime_hook(&store,&source,uid,&mut fake,&mut |path,executor| {
+        assert_eq!(fs::read(path.join("watch-engine")).unwrap(),b"new fixture engine");
+        assert_eq!(executor.bootstrap,before);
+        Err(claude_watch_core::error::CoreError::new("gateway_install_failed","administrator cancelled"))
+    }).unwrap_err();
+    assert_eq!(failed.code,"gateway_install_failed");
+    assert_eq!(fs::read(runtime.join("watch-engine")).unwrap(),previous);
+    assert_eq!(fake.bootstrap,before+1,"only the restored old daemon is bootstrapped");
+    assert!(fake.loaded);assert!(!store.paths.watch().join("agent-install-transaction.json").exists());
+    fs::remove_dir_all(root).unwrap();
+}

@@ -286,7 +286,8 @@ final class FirstRunChecks: InitializationChecking {
               !enableProtection || plan.actions.allSatisfy({ ["watchdog", "updater"].contains($0.id) }) else {
             return .failed(code: "setup_preview_invalid", detail: "环境预览不可用、已变化或包含范围外操作；未执行变更。请重新检查。")
         }
-        if setupWasApproved && approvedContext == boundContext && plan.actions.isEmpty && (!enableProtection || protectionSettingsEnabled) {
+        if setupWasApproved && approvedContext == boundContext && plan.actions.isEmpty
+            && (plan.confirmation_lines ?? []).isEmpty && (!enableProtection || protectionSettingsEnabled) {
             acceptedSettings = settingsData
             return .passed(enableProtection ? "已保存的两项守护开启设置保持一致，继续复核实际心跳。" : "已确认的环境设置保持一致。")
         }
@@ -297,8 +298,12 @@ final class FirstRunChecks: InitializationChecking {
         return .approval(.init(id: plan.id, action: enableProtection ? .protection : .environment,
             title: enableProtection ? "启用 Watch 自有守护" : "确认初始化环境",
             detail: description,
-            changes: (enableProtection ? ["开启 Watch 保镖与时区守护，保存重启后的自动恢复设置"] : ["保存本次实测环境及 Watch 启动策略"])
-                + plan.actions.map { $0.title + "：" + ($0.detail ?? $0.scope) }))
+            changes: Self.confirmationChanges(plan, enableProtection: enableProtection)))
+    }
+    static func confirmationChanges(_ plan: EnvironmentSetupPlan, enableProtection: Bool) -> [String] {
+        (enableProtection ? ["开启 Watch 保镖与时区守护，保存重启后的自动恢复设置"] : ["保存本次实测环境及 Watch 启动策略"])
+            + (plan.confirmation_lines ?? [])
+            + plan.actions.map { $0.title + "：" + ($0.detail ?? $0.scope) }
     }
     private func preProtectionEvidence() -> InitializationResult {
         guard contextMatches, snapshotIsCurrent, acceptedSettings != nil, acceptedSettings == settingsData else { return changedFailure }
@@ -539,10 +544,13 @@ final class FirstRunChecks: InitializationChecking {
         guard now.isFinite, value.observed_at.isFinite, (0..<30).contains(now - value.observed_at) else {
             return "后台状态已过期或时间异常，暂时无法确认保护是否运行；正在等待重新读取。"
         }
-        guard value.guard_backend_healthy == true else { return "采集后台身份或心跳当前未确认，无法确认保护状态。" }
-        guard let guardService = value.services.first(where: { $0.id == "guard" }), guardService.healthy, guardService.desired == true else {
+        guard let guardService = value.services.first(where: { $0.id == "guard" }) else {
             return "Watch 保镖的运行状态当前未确认。"
         }
+        if !guardService.healthy || guardService.desired != true {
+            return guardService.detail.isEmpty ? "Watch 保镖的运行状态当前未确认。" : guardService.detail
+        }
+        guard value.guard_backend_healthy == true else { return "采集后台身份或心跳当前未确认，无法确认保护状态。" }
         guard let watchdog = value.services.first(where: { $0.id == "watchdog" }), watchdog.healthy, watchdog.desired == true else {
             return "时区守护的运行状态当前未确认。"
         }

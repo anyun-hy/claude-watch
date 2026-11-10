@@ -15,6 +15,22 @@ struct Fixture {
 }
 
 #[test]
+fn multi_family_guard_heartbeat_remains_bounded_readable_and_unhealthy() {
+    let f = Fixture::new(); let config = Config::default();
+    let heartbeat = json!({"time":1000.0,"status":"protection_unavailable",
+        "guard_policy_v1":guard_policy_digest(&config).unwrap(),"family_receipts":[{"padding":"x".repeat(12_000)}]});
+    let path = f.store.paths.base().join("guard-heartbeat.json");
+    f.store.atomic_json(&path,&heartbeat).unwrap();
+    let phase = capture_phase(&f.store,&config,&json!({"guard_state":"unknown","guard_backend_healthy":true}),1001.0);
+    assert_eq!(phase.guard_heartbeat_status,"protection_unavailable");
+    assert_eq!(phase.policy_matches,Some(true)); assert_eq!(phase.decision,"unknown");
+    let round = GuardRound { observation_id:uuid::Uuid::new_v4().to_string(),before:phase.clone(),after:phase };
+    assert!(EventStore::new(f.store.clone()).record_guard_diagnostic(&round,1001.0).is_ok());
+    f.store.atomic_bytes(&path,&vec![b' ';2_000_001],0o600).unwrap();
+    assert_eq!(capture_phase(&f.store,&config,&json!({"guard_state":"unknown"}),1001.0).guard_heartbeat_status,"unreadable");
+}
+
+#[test]
 fn diagnostics_use_the_same_scoped_guard_policy_after_timezone_change() {
     let f = Fixture::new();
     let before = Config {

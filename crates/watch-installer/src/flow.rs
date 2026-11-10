@@ -28,6 +28,7 @@ pub struct LayoutPlan {
     pub old_identity: Option<(String, String)>,
     pub old_engine_hash: Option<String>,
     pub helper_hash: Option<String>,
+    pub gateway_preview: Value,
 }
 
 pub fn exists(path: &Path) -> bool {
@@ -426,10 +427,23 @@ fn preflight(layout: &Layout, runner: &dyn Runner, uid: u32) -> Result<LayoutPla
         require(!found, "废纸篓中有 Watch 卸载目录；请先核查归属。")?;
     }
     let helper_hash = check_helper(layout, runner, app_present)?;
+    let broker = layout.project.join("target/aarch64-apple-darwin/release/watch-gateway-broker");
+    require(is_executable(&broker), "缺少本轮构建的网关预检组件；请使用 monitor/reinstall.sh。")?;
+    let gateway_preview = json_command(runner, &[
+        broker.display().to_string(), "--service-preview".into(),
+        "--uid".into(), uid.to_string(), "--engine".into(),
+        layout.base().join("runtime/watch-engine").display().to_string(),
+    ])?;
+    require(gateway_preview["status"] == "preview"
+        && matches!(gateway_preview["action"].as_str(), Some("install" | "upgrade"))
+        && gateway_preview["administrator_required"] == true
+        && gateway_preview["gateway_port"].as_u64().is_some_and(|p| (1..1024).contains(&p)),
+        "系统网关预检未确认，未执行重装。")?;
     Ok(LayoutPlan {
         old_identity,
         old_engine_hash: engine_hash,
         helper_hash,
+        gateway_preview,
     })
 }
 
@@ -908,6 +922,8 @@ pub fn perform(
         .map(|(version, build)| format!("{version} / build {build}"))
         .unwrap_or_else(|| "当前未安装".into());
     println!("已安装：{old}");
+    println!("系统网关：{}；保留端口 {}；新组件最终落位后将请求管理员授权安装/更新 io.local.claudewatch.gateway。", if plan.gateway_preview["action"] == "upgrade" { "更新已确认属于本用户的 Watch 网关" } else { "首次安装" }, plan.gateway_preview["gateway_port"]);
+    println!("使用免费本机 ad-hoc 签名，不需要付费开发者签名；仅修改 Watch 网关及其 launchd 定义，不修改 VPN。旧网关在打包阶段保留端点，安装失败撤回本次网关变更。实际监听句柄验证成功后才启动后台。");
     println!("将永久删除 Claude Watch 的设置、日志、A/B 快照及其自有后台；保留 Claude 登录、TAG 配置和独立原版工具。");
     println!("流程先卸载再打包；如果打包失败，旧应用已卸载，请保留输出并检查当前状态。");
     // The confirmation prompt writes to stderr; without flushing stdout the
@@ -919,7 +935,7 @@ pub fn perform(
         let _ = std::io::stdout().flush();
         return Ok(Outcome::DryRun);
     }
-    if confirm("输入 y/N 重置并安装继续，其他输入取消：")?
+    if confirm("输入 y/N 确认重置、安装及上述管理员网关操作，其他输入取消：")?
         .trim()
         .to_lowercase()
         != "y"
@@ -1076,6 +1092,7 @@ pub fn perform(
         let _ = std::io::stdout().flush();
     }
     require(installed_ok, "安装结果未通过版本核对，请检查实际安装状态。")?;
+    if let Some(warning) = installed["gateway_cleanup_warning"].as_str() { eprintln!("{warning}"); }
     require(
         app_identity_with(runner, &layout.app)? == (version.to_string(), build.to_string())
             && verify_signature(runner, &layout.app)?,

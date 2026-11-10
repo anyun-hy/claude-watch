@@ -35,3 +35,43 @@ broker restarts, and treats inaccessible old owners as still active.
 Component tests of FD transfer are not system-launchd activation acceptance.
 During worker downtime, local TCP handshakes may queue in launchd's listener;
 the guarantee is no unauthorised external forwarding, not immediate TCP refusal.
+
+## Unified reinstall transaction
+
+`monitor/reinstall.sh` now previews the fixed system gateway before any reset.
+It distinguishes a first installation from an existing gateway belonging to the
+same user and final engine path. Unknown files, another user's installation or a
+loaded job with a different definition stop the flow. The confirmation names
+administrator installation/update; no VPN settings are written. Local ad-hoc
+signing with `runtime,library` is still the signing requirement; a paid Developer
+ID is not required by this backend.
+
+The former gateway keeps its reserved port during packaging. Once the new
+runtime is at its final path, installation pins its SHA-256/CDHash and the broker
+identity, stages a root-owned rollback record, updates only the fixed Watch
+service, and starts socket activation. The final user `runtime/watch-engine`
+then runs `gateway-endpoint-check`: it must receive the real root-created IPv4
+and IPv6 descriptors through authenticated IPC. File existence or successful
+`bootstrap` is insufficient. Only after that check may the user daemon start.
+The first installation uses reserved port 1023; updates keep the existing port.
+A conflict fails the install and restores the preceding known gateway.
+
+Failure before runtime commit rolls back both installations. After runtime
+commit, failure to clean the root transaction is reported as
+`gateway_cleanup_pending`; the new runtime/app are retained and no app-only
+rollback is attempted. Interrupted transactions are kept for explicit recovery.
+Administrator commands hold one root-owned kernel lock; a timeout in the caller
+does not permit recovery to race an administrator child that is still running.
+
+The broker supports `--service-preview --uid USER_UID --engine FINAL_ENGINE`
+(read-only), and administrator-only `--service-rollback` / `--service-commit`
+with the same scope and `--transaction TRANSACTION_ID`. For an already absent
+rollback record, `--previous-config` must match the preview's canonical identity
+(or `absent`) before a no-op recovery can be acknowledged. Explicit removal is
+`--service-remove --uid USER_UID --engine FINAL_ENGINE`; it refuses unknown
+content and incomplete transactions. These are recovery capabilities, not an
+automatic instruction to execute administrator changes.
+
+Code/isolated transaction tests do not prove actual launchd activation, root to
+user descriptor transfer or real AI protection. Those remain installation and
+real-host acceptance steps requiring separate authorization.

@@ -55,13 +55,18 @@ pub fn dispatch(request: &Request, paths: Paths, uid: u32) -> Result<Option<Valu
         return Ok(Some(json!({"status":"preview", "engine":"rust",
             "action":request.command,"source":plan.source,"installed":plan.installed,
             "reset_accessibility":plan.reset_accessibility,"preserves_account_and_policy_data":true,
-            "grants_launch_permission":false})));
+            "grants_launch_permission":false,
+            "gateway_install_requires_administrator":source.is_some(),
+            "gateway_signing":"local_adhoc_no_paid_membership",
+            "gateway_verification":"actual_ipv4_ipv6_listener_handoff_before_daemon_start"})));
     }
     let _operation = store.lock("operation", None)?;
     let result = if let Some(source) = source {
         let identity = lifecycle.apply(&source)?;
         json!({"status":"ok","engine":"rust","action":"app-install",
             "version":identity.version,"build":identity.build,"architecture":identity.architecture,
+            "gateway_cleanup_pending":lifecycle.os.gateway_cleanup_warning().is_some(),
+            "gateway_cleanup_warning":lifecycle.os.gateway_cleanup_warning(),
             "message":"应用与自有后台已更新；账号、代理和保护设置保留。打开新版后按 macOS 提示重新授权。"})
     } else {
         let previous = lifecycle.uninstall()?;

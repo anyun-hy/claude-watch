@@ -1084,6 +1084,11 @@ impl Controller {
                 Some(r) => Some(r),
                 None => system.channel_receipt(family)?,
             };
+            if r.is_none() && candidate.state == ChannelPermitState::Permitted {
+                // Fail-closed when executor is unavailable: never grant permit without executor receipt
+                candidate.state = ChannelPermitState::PendingVerification;
+                candidate.reason_code = "executor_missing".into();
+            }
             let v = evaluate_channel_supervision(&candidate, r.as_ref(), &policy_version, now);
             (candidate, r, v)
         };
@@ -1139,10 +1144,26 @@ impl Controller {
         }
 
         if system.channel_mode() {
-            receipt["disposition_mode"] = json!("disconnect_channel_keep_process");
-            receipt["process_preserved"] = json!(true);
+            let process_already_terminated = receipt.get("process_preserved") == Some(&json!(false))
+                || receipt.get("disposition_mode") == Some(&json!("disconnect_channel_and_force_quit"))
+                || receipt.get("action") == Some(&json!("disconnect-and-force-quit"))
+                || receipt.get("process_disposition") == Some(&json!("force_quit"));
+
+            if process_already_terminated {
+                receipt["disposition_mode"] = json!("disconnect_channel_and_force_quit");
+                receipt["process_preserved"] = json!(false);
+                receipt["action"] = json!("disconnect-and-force-quit");
+            } else {
+                receipt["disposition_mode"] = json!("disconnect_channel_keep_process");
+                receipt["process_preserved"] = json!(true);
+                if effective_permit.state == ChannelPermitState::Revoked {
+                    receipt["action"] = json!("disconnect-channel");
+                }
+            }
             if effective_permit.state == ChannelPermitState::Revoked {
-                receipt["action"] = json!("disconnect-channel");
+                if !process_already_terminated {
+                    receipt["action"] = json!("disconnect-channel");
+                }
                 match &verdict {
                     ChannelSupervisionVerdict::IsolatedKeepProcess => {
                         receipt["stop_state"] = json!("channel_blocked");

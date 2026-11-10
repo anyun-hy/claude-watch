@@ -192,7 +192,7 @@ fn fresh(at: f64, now: f64) -> bool {
         && now - at < MAX_ENFORCEMENT_RECEIPT_AGE
 }
 
-fn project_policy_sync_state(
+pub(crate) fn project_policy_sync_state(
     value: &Value,
     expected: &PolicyVersion,
     backend: NetworkBackendKind,

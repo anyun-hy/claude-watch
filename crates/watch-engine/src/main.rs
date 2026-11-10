@@ -6,6 +6,7 @@ mod evidence_run;
 mod diagnostics_dispatch;
 mod diagnostic_queue;
 mod dns_dispatch;
+mod gateway_endpoint_check;
 mod install_dispatch;
 mod maintenance_dispatch;
 mod reference_dispatch;
@@ -259,6 +260,9 @@ fn run() -> Result<EngineOutput> {
         if args.len() != 2 { return Err(CoreError::new("invalid_audit_request", "审计组件参数无效")); }
         let value = channel_audit::worker(&args[1], bounded_input(4096)?)?;
         return Ok(EngineOutput::json(value, 0));
+    }
+    if args.first().map(String::as_str) == Some("gateway-endpoint-check") {
+        return gateway_endpoint_check::run(&args).map(|value| EngineOutput::json(value, 0));
     }
     if args == ["--version"] {
         return Ok(EngineOutput::json(

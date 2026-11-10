@@ -99,6 +99,11 @@ fn verify_protected_path(path: &Path, socket_leaf: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// Installation inspection uses the same protected-path boundary as handoff.
+pub fn verify_gateway_install_path(path: &Path) -> io::Result<()> {
+    verify_protected_path(path, false)
+}
+
 fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
     let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)?;
     if !file.metadata()?.is_file() { return Err(invalid("expected a regular gateway record")); }
@@ -309,6 +314,28 @@ impl OwnerRecord {
             && self.start_microseconds == p.start_microseconds && self.audit_token == p.audit_token
     }
 }
+/// Lifecycle operations must not replace a listener that a live engine still
+/// owns. This checks the same kernel birth identity used by normal handoff.
+pub fn require_gateway_owner_gone() -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = Path::new(OWNER_PATH);
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => {
+                verify_protected_path(path, false)?;
+                let owner: OwnerRecord = serde_json::from_slice(&read_bounded(path)?)
+                    .map_err(|_| invalid("invalid gateway owner record"))?;
+                if platform::owner_definitely_gone(&owner) { Ok(()) }
+                else { Err(denied("a live or unconfirmed engine still owns the gateway; stop Watch before management")) }
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    Err(io::Error::new(io::ErrorKind::Unsupported, "gateway lifecycle requires macOS"))
+}
+
 #[cfg(target_os = "macos")]
 fn claim_owner(peer: &ProcessKernelIdentity) -> io::Result<()> {
     let path = Path::new(OWNER_PATH);

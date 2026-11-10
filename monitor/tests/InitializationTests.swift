@@ -50,6 +50,41 @@ struct InitializationTests {
         func passed(_ result: InitializationResult) -> Bool {
             if case .passed = result { return true }; return false
         }
+        func guardReceipt(at: Double, state: String = "error", detail: String = "受控网关尚未安装完整", native: Bool = true) throws -> BackgroundServiceReceipt {
+            let wire: [String: Any] = ["observed_at": at, "backend_healthy": native, "guard_backend_healthy": native,
+                "update_source_ready": false, "policy_issues": [], "services": [
+                    ["id":"guard","title":"Watch","state":state,"detail":detail,"source":"fixture",
+                     "desired":true,"execution_verified":state == "running","reason_code":"gateway_not_installed","evidence_observed_at":at],
+                    ["id":"watchdog","title":"Watch timezone","state":"scheduled","detail":"fixture","source":"fixture",
+                     "desired":true,"execution_verified":true]]]
+            return try JSONDecoder().decode(BackgroundServiceReceipt.self, from: JSONSerialization.data(withJSONObject: wire))
+        }
+        let missingGateway = try guardReceipt(at: 100)
+        expect(missingGateway.services[0].reason_code == "gateway_not_installed" && missingGateway.services[0].evidence_observed_at == 100,
+               "service reason and observation time survive the real Swift decode")
+        expect(FirstRunChecks.backgroundFailureDetail(missingGateway, error: "", settingsEnabled: true, now: 101) == "受控网关尚未安装完整",
+               "first-run verification shows the actual current gateway failure")
+        let absentDaemon = try guardReceipt(at: 100, native: false)
+        expect(FirstRunChecks.backgroundFailureDetail(absentDaemon, error: "", settingsEnabled: true, now: 101) == "受控网关尚未安装完整",
+               "a verified missing installation explains the failure before unavailable runtime evidence")
+        for at in [99.0, 130.0] {
+            expect(!FirstRunChecks.backgroundFailureDetail(missingGateway, error: "", settingsEnabled: true, now: at).contains("未安装"),
+                   "future or stale service errors are not presented as current")
+        }
+        expect(!FirstRunChecks.backgroundFailureDetail(missingGateway, error: "read failed", settingsEnabled: true, now: 101).contains("未安装"),
+               "a failed fresh read never reuses the previous detailed failure")
+        let recoveredGuard = try guardReceipt(at: 101, state: "running")
+        expect(!FirstRunChecks.backgroundFailureDetail(recoveredGuard, error: "", settingsEnabled: true, now: 102).contains("未安装"),
+               "old detail never overrides a recovered current guard state")
+        let planWire: [String: Any] = ["id":"preview","candidate_id":"candidate","actions":[],"rows":[],"expires_at":200,
+            "vpn_expectation":["configured":true,"proxy_mode":"tag","proxy_url":"http://127.0.0.1:7890","running_mode":"rule","require_tun":true],
+            "confirmation_lines":["使用免费 Seatbelt 保护","仅保存 Watch 的 VPN 预期，不修改 VPN","TUN：开启"]]
+        let confirmationPlan = try JSONDecoder().decode(EnvironmentSetupPlan.self, from: JSONSerialization.data(withJSONObject: planWire))
+        expect(confirmationPlan.vpn_expectation?.configured == true && confirmationPlan.vpn_expectation?.require_tun == true,
+               "setup plan decodes the actual VPN expectation independently from service success")
+        let confirmationChanges = FirstRunChecks.confirmationChanges(confirmationPlan, enableProtection: false)
+        expect(confirmationChanges.contains("仅保存 Watch 的 VPN 预期，不修改 VPN") && confirmationChanges.contains("TUN：开启"),
+               "initialization approval explicitly includes VPN expectations even with no system actions")
         expect(AppDelegate.notificationPage("events") == .events &&
                AppDelegate.notificationPage("environment") == .environment &&
                AppDelegate.notificationPage("protection") == .protection,

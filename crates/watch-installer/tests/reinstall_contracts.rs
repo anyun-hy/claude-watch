@@ -191,6 +191,7 @@ impl Fake {
             "monitor/package-dmg.sh",
             "monitor/build.sh",
             "tools/build-rust-components.sh",
+            "target/aarch64-apple-darwin/release/watch-gateway-broker",
             "Cargo.toml",
             "Cargo.lock",
             "monitor/Resources/AppIcon.icns",
@@ -200,6 +201,7 @@ impl Fake {
             std::fs::create_dir_all(path.parent().expect("build parent")).expect("build dir");
             std::fs::write(path, "fixture build input").expect("build input");
         }
+        set_mode(&self.layout.project.join("target/aarch64-apple-darwin/release/watch-gateway-broker"),0o700);
         std::fs::write(&self.cargo, "fixture cargo").expect("cargo");
         set_mode(&self.cargo, 0o700);
         let mut jobs = self.jobs.borrow_mut();
@@ -400,6 +402,10 @@ impl Runner for Fake {
                     .to_string(),
                     "",
                 ))
+            }
+            _ if args.get(1).map(String::as_str) == Some("--service-preview") => {
+                if fail == "gateway_unknown" { return Ok(result(78,"","unknown gateway identity")); }
+                Ok(result(0,&json!({"status":"preview","action":"install","administrator_required":true,"gateway_port":1023,"previous_config":"absent"}).to_string(),""))
             }
             _ if args.get(1).map(String::as_str) == Some("app-install") => {
                 let source = PathBuf::from(args.get(3).expect("source"));
@@ -926,4 +932,23 @@ fn leftovers_of_the_retired_copy_do_not_block_a_fresh_install() {
         h.fake.identity(&h.fake.layout.app),
         ("3.0.0".into(), "314".into())
     );
+}
+
+#[test]
+fn unknown_gateway_blocks_before_confirmation_uninstall_or_package() {
+    let h=Harness::new();h.fake.set_fail("gateway_unknown");
+    let mut asked=false;
+    let outcome=h.perform_with(&mut |_| {asked=true;Ok("y".into())});
+    assert!(outcome.is_err());assert!(!asked);
+    assert!(h.fake.layout.app.exists());h.assert_preserved();
+    assert!(!h.fake.calls().iter().any(|c| c.iter().any(|a|a=="--apply"||a.ends_with("package-dmg.sh"))));
+}
+
+#[test]
+fn reinstall_confirmation_explicitly_names_administrator_gateway_operations() {
+    let h=Harness::new();let mut prompt=String::new();
+    let outcome=h.perform_with(&mut |p|{prompt=p.into();Ok("n".into())}).unwrap();
+    assert!(matches!(outcome,flow::Outcome::Cancelled));assert!(prompt.contains("管理员网关操作"));
+    assert!(h.fake.calls().iter().any(|c| c.get(1).map(String::as_str)==Some("--service-preview")));
+    assert!(h.fake.layout.app.exists());h.assert_preserved();
 }

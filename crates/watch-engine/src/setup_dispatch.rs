@@ -127,7 +127,8 @@ fn value_rows(
         };
         let target = match id {
             "language" => json!(if config.require_english { "English" } else { "未限定" }),
-            "runtime_mode" => json!("只读实测，无需配置"),
+            "runtime_mode" => config.vpn_expectation.as_ref().and_then(|v| v.running_mode.as_ref()).map(|v| json!(runtime_mode_label(&json!(v)))).unwrap_or_else(|| json!("未配置监督预期")),
+            "node" if config.vpn_expectation.as_ref().and_then(|v| v.expected_node.as_ref()).is_some() => json!(config.vpn_expectation.as_ref().unwrap().expected_node),
             "node" if confirmed_matches => confirmed["values"][id].clone(),
             "ip" if !config.expected_egress.is_empty() => json!(config.expected_egress.join(", ")),
             "ip" if config.allow_ip_change => json!("检测历史变化仅提示；受控会话固定本次基准"),
@@ -160,10 +161,7 @@ fn unsupported_actions(plan: &mut Value) {
 
 fn setup_inspect(paths: Paths, mode: &str) -> Result<Value> {
     let host = host(paths, Authority::ReadOnly)?;
-    let config = ConfigStore {
-        storage: host.storage.clone(),
-    }
-    .load()?;
+    let config = onboarding::setup_config(&host.storage, &host)?;
     let facts = local(&host, &config)?;
     let confirmed = host.storage.read_json(
         &host.storage.paths.base().join("confirmed-environment.json"),
@@ -184,10 +182,7 @@ fn setup_detect(paths: Paths, request: &Request) -> Result<Value> {
         request.flag("online"),
         &load_system_catalog(),
     )?;
-    let config = ConfigStore {
-        storage: host.storage.clone(),
-    }
-    .load()?;
+    let config = onboarding::setup_config(&host.storage, &host)?;
     candidate["rows"] = json!(value_rows(
         &host,
         &config,
@@ -207,10 +202,7 @@ fn setup_preview(paths: Paths, request: &Request) -> Result<Value> {
     )?;
     let options = crate::bounded_input(request.input_limit())?;
     let mut plan = onboarding::preview(&host.storage, &host, id, &options, None)?;
-    let config = ConfigStore {
-        storage: host.storage.clone(),
-    }
-    .load()?;
+    let config = onboarding::setup_config(&host.storage, &host)?;
     plan["rows"] = json!(value_rows(&host, &config, None, Some(&plan["values"]))?);
     unsupported_actions(&mut plan);
     Ok(plan)

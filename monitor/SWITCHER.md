@@ -39,15 +39,15 @@ GLOBAL 模式核对 GLOBAL 的完整选择链；规则模式按实际命中规�
 
 ## 升级与权限
 
-`Packaging/app_lifecycle.py` 验证应用标识、签名、arm64 架构和组件哈希，等待旧后台退出后替换。旧应用移入废纸篓，失败恢复旧应用；不删除 Claude 资料、账号 A/B 或代理配置。
+原生安装器（`crates/watch-installer` 与 `watch-engine install`）验证应用标识、签名、arm64 架构和组件哈希，等待旧后台退出后替换。旧应用移入废纸篓，失败恢复旧应用；不删除 Claude 资料、账号 A/B 或代理配置。
 
 安装和卸载只清理 `io.local.watchpanel` 的 Accessibility 记录。新版首次打开请求系统授权；授权后自动重新读取登录状态。不会清理其他应用权限或编辑 TCC 数据库。签名更新器同样使用限定到本工具的权限清理。
 
-无本项目发布清单和公钥时，自动更新不可用。完整更新验证与恢复逻辑位于 `Resources/watch_switcher/update.py`。
+无本项目发布清单和公钥时，自动更新不可用。完整更新验证与恢复逻辑位于 `crates/watch-engine`（`watch-engine update`）。
 
 ## 维护边界
 
-- 后台与界面版本分别管理，版本默认值分别在 `claude-watch.sh` 和 `build.sh` / `package-dmg.sh` 中。
+- 后台与界面版本分别管理，版本默认值分别在 Cargo 清单及 `build.sh` / `package-dmg.sh` 中。
 - 原版保镖独立运行；正常应用升级保留两套服务及用户环境设置。
 - 实机验收记录留在忽略目录 `reports/`；当前记录为 `build297-install.json`。
 - 构建、模拟测试、实机验收、安装和 Git 发布分别记录，不相互代替。

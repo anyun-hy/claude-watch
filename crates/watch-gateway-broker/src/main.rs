@@ -1,3 +1,4 @@
+mod service;
 use claude_watch_system::launchd_gateway::{GatewayInstallConfig, INSTALL_DIR, BROKER_PATH, CONTROL_PATH, SERVICE_LABEL};
 use std::{fs, io, path::Path, process::Command};
 
@@ -12,6 +13,21 @@ fn code_hash(path: &Path) -> io::Result<String> {
     }
     details.lines().find_map(|line| line.strip_prefix("CDHash=")).map(str::to_owned)
         .ok_or_else(|| io::Error::other("component CDHash missing"))
+}
+
+fn plist(config: &GatewayInstallConfig) -> String {
+    format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>{SERVICE_LABEL}</string>
+<key>ProgramArguments</key><array><string>{BROKER_PATH}</string></array>
+<key>UserName</key><string>root</string>
+<key>Sockets</key><dict>
+<key>GatewayV4</key><dict><key>SockFamily</key><string>IPv4</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string><key>SockNodeName</key><string>0.0.0.0</string><key>SockServiceName</key><integer>{0}</integer></dict>
+<key>GatewayV6</key><dict><key>SockFamily</key><string>IPv6</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string><key>SockNodeName</key><string>::</string><key>SockServiceName</key><integer>{0}</integer></dict>
+<key>Control</key><dict><key>SockFamily</key><string>Unix</string><key>SockType</key><string>stream</string><key>SockPathName</key><string>{CONTROL_PATH}</string><key>SockPathMode</key><integer>438</integer></dict>
+</dict></dict></plist>
+"#, config.gateway_port)
 }
 
 fn prepare(args: &[String]) -> io::Result<()> {
@@ -35,18 +51,7 @@ fn prepare(args: &[String]) -> io::Result<()> {
     fs::create_dir(out)?; // Never overwrite a prior reviewable installation artifact.
     fs::copy(&broker, out.join("watch-gateway-broker"))?;
     fs::write(out.join("config.json"), serde_json::to_vec_pretty(&config)?)?;
-    let plist = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>{SERVICE_LABEL}</string>
-<key>ProgramArguments</key><array><string>{BROKER_PATH}</string></array>
-<key>UserName</key><string>root</string>
-<key>Sockets</key><dict>
-<key>GatewayV4</key><dict><key>SockFamily</key><string>IPv4</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string><key>SockNodeName</key><string>0.0.0.0</string><key>SockServiceName</key><integer>{0}</integer></dict>
-<key>GatewayV6</key><dict><key>SockFamily</key><string>IPv6</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string><key>SockNodeName</key><string>::</string><key>SockServiceName</key><integer>{0}</integer></dict>
-<key>Control</key><dict><key>SockFamily</key><string>Unix</string><key>SockType</key><string>stream</string><key>SockPathName</key><string>{CONTROL_PATH}</string><key>SockPathMode</key><integer>438</integer></dict>
-</dict></dict></plist>
-"#, config.gateway_port);
+    let plist = plist(&config);
     fs::write(out.join(format!("{SERVICE_LABEL}.plist")), plist)?;
     fs::write(out.join("install.sh"), include_str!("../../../monitor/GatewayBroker/install.sh"))?;
     fs::write(out.join("README.txt"), format!("Prepared only; not installed.\nBroker destination: {INSTALL_DIR}\nEngine must remain at: {}\nPort: {}\nReview config/plist/install.sh, then obtain explicit administrator installation authorization.\nChanging or re-signing the engine requires a new approved configuration.\n", config.engine_executable, config.gateway_port))?;
@@ -57,6 +62,7 @@ fn prepare(args: &[String]) -> io::Result<()> {
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = if args.first().map(String::as_str) == Some("--prepare") { prepare(&args[1..]) }
+        else if args.first().is_some_and(|v| v.starts_with("--service-")) { service::dispatch(&args) }
         else if args.is_empty() { claude_watch_system::launchd_gateway::run_gateway_broker() }
         else { Err(io::Error::other("unsupported broker command")) };
     match result {

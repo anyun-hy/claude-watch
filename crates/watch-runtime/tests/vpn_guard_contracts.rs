@@ -1971,6 +1971,7 @@ fn r3_verified_orphan_child_retains_gateway_permission_and_survives_revocation()
         while !echo_stop.load(Ordering::Acquire) {
             match upstream.accept() {
                 Ok((mut s, _)) => {
+                    s.set_nonblocking(false).unwrap();
                     thread::spawn(move || {
                         let mut b = [0; 1];
                         if s.read_exact(&mut b).is_err() {

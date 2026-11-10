@@ -6,7 +6,7 @@ struct PolicyAction: Identifiable, Hashable {
     let title: String
     static let force = PolicyAction(id: "force", title: "强制退出 (终止应用)")
     static let close = PolicyAction(id: "close", title: "断流保护 (保留应用)")
-    static let warn = PolicyAction(id: "warn", title: "仅提示 (不阻断)")
+    static let warn = PolicyAction(id: "warn", title: "仅提示 (不阻断，VPN节点异常硬门禁除外)")
 }
 
 /// One criterion of a service's disposition policy. Its config key is derived

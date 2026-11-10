@@ -500,8 +500,8 @@ struct SwitcherStoreTests {
         let claude = AIPolicyCatalog.services.first { $0.id == "claude" }
         let openAI = AIPolicyCatalog.services.first { $0.id == "openai" }
         expect(claude?.actions.count == 3 && claude?.criteria.filter { $0.id != "session" }.allSatisfy { policy in
-            claude?.setting(policy).fallback == "force"
-        } == true, "the supervised session keeps the full action set")
+            claude?.setting(policy).fallback == "close"
+        } == true, "the supervised session keeps the full action set and assumes close")
         expect(claude?.criteria.first { $0.id == "session" }?.fallback == "close",
                "an unestablished session keeps the historical normal exit for Claude")
         expect(openAI?.actions.map(\.id) == ["force", "close", "warn"]
@@ -564,6 +564,25 @@ struct SwitcherStoreTests {
         )
         expect(!scheduledUnverified.healthy && scheduledUnverified.statusLabel == "已加载（执行待确认）",
                "scheduled service with execution_verified=false is not reported as healthy")
+
+        // SwitcherCommandRunner bounded timeout categorization tests
+        let queryCategory = SwitcherCommandRunner.CommandCategory.classify(args: ["status"])
+        expect(queryCategory == .readOnlyQuery && queryCategory.timeoutSeconds == 20.0,
+               "read-only query command is classified with 20.0s bounded timeout")
+
+        let interactiveCategory = SwitcherCommandRunner.CommandCategory.classify(args: ["setup", "apply", "--mode", "auto"])
+        expect(interactiveCategory == .longRunningInteractive && interactiveCategory.timeoutSeconds == 60.0,
+               "setup/launch command is classified with 60.0s interactive timeout")
+
+        let mutatingCategory = SwitcherCommandRunner.CommandCategory.classify(args: ["account", "switch", "--apply", "slot-b"])
+        expect(mutatingCategory == .mutatingTransaction && mutatingCategory.timeoutSeconds == 120.0,
+               "mutating transaction command has 120.0s journal protection timeout")
+
+        let state = SwitcherCommandRunner.SafeExecutionState()
+        expect(!state.isTimedOut, "initial execution state is not timed out")
+        state.markTimedOut()
+        expect(state.isTimedOut, "thread-safe state correctly records timedOut under lock")
+
         print("SwitcherStore: \(checks) isolated assertions passed")
     }
 }

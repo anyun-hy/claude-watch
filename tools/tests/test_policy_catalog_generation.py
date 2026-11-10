@@ -21,7 +21,7 @@ class PolicyCatalogGeneration(unittest.TestCase):
         self.assertEqual([c["id"] for c in criteria], ["ip", "cn", "dns", "webrtc", "session"])
         self.assertEqual([f["id"] for f in families], ["claude", "openai"])
         self.assertEqual([f["prefix"] for f in families], ["claude", "gpt"])
-        self.assertEqual([f["default"] for f in families], ["force", "close"])
+        self.assertEqual([f["default"] for f in families], ["close", "close"])
         self.assertEqual({tuple(f["actions"]) for f in families}, {("force", "close", "warn")})
 
     def test_combined_risk_code_cannot_create_an_extra_ui_switch(self):

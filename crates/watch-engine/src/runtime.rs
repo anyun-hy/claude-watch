@@ -214,7 +214,9 @@ fn background(host: &Host) -> Result<Value> {
             (_, "error") => "实际后台健康未通过核对",
             _ => "尚未取得完整后台运行证据",
         };
-        row["detail"] = json!(detail);
+        if row["detail"].as_str().is_none_or(str::is_empty) {
+            row["detail"] = json!(detail);
+        }
         row["last_checked"] = at.clone();
     }
     value["session_guard"] = session_view(host);

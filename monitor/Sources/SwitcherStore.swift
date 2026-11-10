@@ -270,6 +270,8 @@ struct BackgroundServiceRow: Decodable, Identifiable {
     let last_checked: Double?
     var execution_verified: Bool? = nil
     var health_basis: String? = nil
+    var reason_code: String? = nil
+    var evidence_observed_at: Double? = nil
     var statusLabel: String {
         switch state {
         case "running": return "断线保护就绪"
@@ -331,12 +333,15 @@ struct EnvironmentCandidate: Decodable {
     let observed_at, expires_at: Double
     let rows: [EnvironmentValueRow]
     let message: String
+    var vpn_expectation: VpnExpectationModel? = nil
 }
 struct EnvironmentSetupPlan: Decodable {
     let id, candidate_id: String
     let actions: [SwitcherRepairAction]
     let rows: [EnvironmentValueRow]
     let expires_at: Double
+    var vpn_expectation: VpnExpectationModel? = nil
+    var confirmation_lines: [String]? = nil
 }
 
 struct ProxyDiagnosticCheck: Decodable, Identifiable {
@@ -401,8 +406,62 @@ enum SwitcherCommandRunner {
         task.environment = env
         return try execute(task, input: input, cancellation: cancellation, setupProgress: streamsProgress ? setupProgress : nil)
     }
+    enum CommandCategory {
+        case readOnlyQuery
+        case longRunningInteractive
+        case mutatingTransaction
+
+        static func classify(args: [String]?) -> CommandCategory {
+            guard let args, let first = args.first else { return .readOnlyQuery }
+            // Mutating transactions have their own recovery journal.
+            // Never aggressively kill one because of a short timeout during directory renames.
+            if first == "account" || args.contains("--apply") {
+                return .mutatingTransaction
+            }
+            if first == "setup" || first == "update" || first == "launch" || first == "environment" || first == "diagnose-proxy" {
+                return .longRunningInteractive
+            }
+            return .readOnlyQuery
+        }
+
+        var timeoutSeconds: TimeInterval {
+            switch self {
+            case .readOnlyQuery: return 20.0
+            case .longRunningInteractive: return 60.0
+            case .mutatingTransaction: return 120.0
+            }
+        }
+    }
+
+    final class SafeExecutionState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var timedOut = false
+        private var exitCode: Int32? = nil
+
+        var isTimedOut: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return timedOut
+        }
+
+        func markTimedOut() {
+            lock.lock()
+            timedOut = true
+            lock.unlock()
+        }
+
+        func setExitCode(_ code: Int32) {
+            lock.lock()
+            exitCode = code
+            lock.unlock()
+        }
+    }
+
     static func execute(_ task: Process, input: Data? = nil, cancellation: SwitcherReadCancellation? = nil,
                         setupProgress: SetupProgressReader? = nil) throws -> Data {
+        let category = CommandCategory.classify(args: task.arguments)
+        let timeoutSeconds = category.timeoutSeconds
+
         let output = Pipe(), progressOutput = Pipe()
         task.standardOutput = output
         if let setupProgress {
@@ -417,39 +476,82 @@ enum SwitcherCommandRunner {
             setupProgress?.finish()
             progressOutput.fileHandleForReading.readabilityHandler = nil
         }
+
         let incoming = Pipe()
         task.standardInput = incoming
-        if let cancellation { try cancellation.start(task) } else { try task.run() }
-        if let input { incoming.fileHandleForWriting.write(input) }
-        try? incoming.fileHandleForWriting.close()
-        // Guard against hung child processes with a bounded watchdog timeout
-        let isLongRunning = task.arguments?.first == "setup" || task.arguments?.first == "update"
-        let timeoutSeconds: TimeInterval = isLongRunning ? 60.0 : 25.0
-        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
-        var timedOut = false
-        timer.schedule(deadline: .now() + timeoutSeconds)
-        timer.setEventHandler {
-            timedOut = true
-            task.terminate()
-        }
-        timer.resume()
-        defer { timer.cancel() }
 
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        if timedOut {
+        let state = SafeExecutionState()
+
+        // 1. Start child process
+        if let cancellation { try cancellation.start(task) } else { try task.run() }
+
+        // 2. Safely stream input on background queue to prevent pipe deadlock
+        if let input, !input.isEmpty {
+            DispatchQueue.global(qos: .userInitiated).async {
+                try? incoming.fileHandleForWriting.write(contentsOf: input)
+                try? incoming.fileHandleForWriting.close()
+            }
+        } else {
+            try? incoming.fileHandleForWriting.close()
+        }
+
+        // 3. Asynchronously read stdout to prevent synchronous deadlock in readDataToEndOfFile
+        let outputGroup = DispatchGroup()
+        let readLock = NSLock()
+        var receivedData = Data()
+
+        outputGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { outputGroup.leave() }
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            readLock.lock()
+            receivedData = data
+            readLock.unlock()
+        }
+
+        // 4. Bounded wait on process output
+        let waitResult = outputGroup.wait(timeout: .now() + timeoutSeconds)
+
+        if waitResult == .timedOut {
+            state.markTimedOut()
+            // Close reader handle to unblock any hanging file descriptor
+            try? output.fileHandleForReading.close()
+
+            // Graceful SIGTERM with escalation to SIGKILL
+            task.terminate()
+            let pid = task.processIdentifier
+            if pid > 0 {
+                usleep(500_000)
+                if task.isRunning {
+                    kill(pid, SIGKILL)
+                }
+            }
+            task.waitUntilExit()
+
+            let errorMsg = category == .mutatingTransaction
+                ? "事务操作执行超时（超过 \(Int(timeoutSeconds)) 秒），已中断子进程以防挂死；请检查事务恢复日志并重试。"
+                : "后台命令执行超时（超过 \(Int(timeoutSeconds)) 秒），已强制终止以防挂死。"
             throw NSError(
                 domain: "Switcher",
                 code: 124,
-                userInfo: [NSLocalizedDescriptionKey: "后台命令执行超时（超过 \(Int(timeoutSeconds)) 秒），已强制终止以防挂死。"]
+                userInfo: [NSLocalizedDescriptionKey: errorMsg]
             )
         }
+
+        task.waitUntilExit()
+        state.setExitCode(task.terminationStatus)
+
         if cancellation?.isCancelled == true { throw CancellationError() }
-        guard data.count <= 4_000_000,
-              (try? JSONSerialization.jsonObject(with: data)) is [String: Any] else {
+
+        readLock.lock()
+        let finalData = receivedData
+        readLock.unlock()
+
+        guard finalData.count <= 4_000_000,
+              (try? JSONSerialization.jsonObject(with: finalData)) is [String: Any] else {
             throw NSError(domain: "Switcher", code: 2, userInfo: [NSLocalizedDescriptionKey: "运行组件未返回完整结果；没有将此状态视为成功。"])
         }
-        return data
+        return finalData
     }
 }
 

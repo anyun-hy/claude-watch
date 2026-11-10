@@ -17,14 +17,14 @@ enum GeneratedPolicyCatalog {
         .init(
             id: "claude", keyPrefix: "claude",
             criteria: [
-                .init(id: "ip", fallback: "force"),
-                .init(id: "cn", fallback: "force"),
-                .init(id: "dns", fallback: "force"),
-                .init(id: "webrtc", fallback: "force"),
+                .init(id: "ip", fallback: "close"),
+                .init(id: "cn", fallback: "close"),
+                .init(id: "dns", fallback: "close"),
+                .init(id: "webrtc", fallback: "close"),
                 .init(id: "session", fallback: "close"),
             ],
             actions: ["force", "close", "warn"],
-            defaultAction: "force"
+            defaultAction: "close"
         ),
         .init(
             id: "openai", keyPrefix: "gpt",

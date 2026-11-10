@@ -92,6 +92,7 @@ struct Mock {
     fail_quit: bool,
     replace_on_egress: Option<(StateStore, &'static str, Session)>,
     config_on_egress: Option<(StateStore, Value)>,
+    channel_mode: bool,
 }
 impl Mock {
     fn new(family: &str) -> Self {
@@ -100,11 +101,12 @@ impl Mock {
             now: 1002.0, running: true, ip: "1.1.1.1", country: "JP", age: 0.0,
             closes: 0, forces: 0, egress_calls: 0, fail_quit: false,
             replace_on_egress: None, config_on_egress: None,
+            channel_mode: false,
         }
     }
 }
 impl DesktopSystem for Mock {
-    fn channel_mode(&self) -> bool { false }
+    fn channel_mode(&self) -> bool { self.channel_mode }
     fn launch_target(&self) -> LaunchTarget { self.target }
     fn set_family(&mut self, family: &str) -> Result<()> {
         self.target = PolicyCatalog::family(family).and_then(PolicyCatalog::guard_target)
@@ -394,4 +396,35 @@ fn a_post_stop_log_failure_does_not_turn_an_actual_stop_into_a_warning() {
     assert_eq!(receipt["stop_state"], "confirmed");
     assert!(receipt["stop_log_error"].is_string());
     assert_eq!(system.forces, 1);
+}
+
+#[test]
+fn force_action_in_channel_mode_terminates_process_and_sets_unambiguous_receipt() {
+    let f = Fixture::new("claude", &[("claude_close_ip", "force")]);
+    let _session = f.active();
+    let mut system = Mock::new("claude");
+    system.channel_mode = true;
+    system.ip = "8.8.8.8"; // IP drift -> egress_ip_changed -> action = force
+    let receipt = f.tick(&mut system);
+    assert_eq!(system.forces, 1, "force must invoke quit_for_confirmed_ip_risk even in channel mode");
+    assert_eq!(receipt["process_preserved"], json!(false), "process must be marked as not preserved");
+    assert_eq!(receipt["disposition_mode"], "disconnect_channel_and_force_quit");
+    assert_eq!(receipt["action"], "disconnect-and-force-quit");
+    assert_eq!(receipt["process_disposition"], "force_quit");
+}
+
+#[test]
+fn close_action_in_channel_mode_preserves_process_and_cuts_channel() {
+    let f = Fixture::new("claude", &[("claude_close_ip", "close")]);
+    let _session = f.active();
+    let mut system = Mock::new("claude");
+    system.channel_mode = true;
+    system.ip = "8.8.8.8"; // IP drift -> egress_ip_changed -> action = close
+    let receipt = f.tick(&mut system);
+    assert_eq!(system.forces, 0, "close in channel mode must not terminate process");
+    assert_eq!(system.closes, 0, "close in channel mode must preserve process");
+    assert_eq!(receipt["process_preserved"], json!(true));
+    assert_eq!(receipt["disposition_mode"], "disconnect_channel_keep_process");
+    assert_eq!(receipt["action"], "disconnect-channel");
+    assert_eq!(receipt["process_disposition"], "preserved");
 }

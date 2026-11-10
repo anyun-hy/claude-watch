@@ -12,9 +12,11 @@ use crate::{
     storage::StateStore,
 };
 use claude_watch_core::{
+    channel::NetworkBackendKind,
     config::Config,
     error::{CoreError, Result},
     region,
+    vpn::{compare_vpn, VpnExpectation, VpnMatch, VpnObservation},
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -37,9 +39,120 @@ pub trait OnboardingSystem: RepairSystem {
     fn network(&self) -> Result<Value>;
     fn now(&self) -> f64;
     fn baseline_data(&self) -> Result<String>;
+    fn packaged_backend(&self) -> Option<NetworkBackendKind> { None }
+    fn vpn_observation(&self, _expectation: &VpnExpectation) -> Result<VpnObservation> {
+        Err(err("vpn_observation_unavailable", "当前运行组件无法读取 VPN 监督预期"))
+    }
     fn progress(&self, phase: Phase) {
         crate::setup_progress::emit(phase);
     }
+}
+
+/// Keep existing configurations unchanged until the user approves the setup
+/// plan. Only an actually packaged Seatbelt backend selects new-install defaults.
+pub fn setup_config<S: OnboardingSystem>(store: &StateStore, system: &S) -> Result<Config> {
+    let state = ConfigStore { storage: store.clone() }
+        .resolve_runtime_config_state(system.packaged_backend());
+    if let Some(code) = state.config_error {
+        return Err(err(&code, "当前 Watch 配置无效，未使用默认值覆盖"));
+    }
+    if state.package_mismatch {
+        return Err(err("backend_package_config_mismatch", "网络后端与安装组件不一致"));
+    }
+    Ok(state.config)
+}
+
+fn needs_vpn_setup<S: OnboardingSystem>(system: &S, config: &Config) -> bool {
+    system.packaged_backend() == Some(NetworkBackendKind::Seatbelt)
+        || config.effective_network_backend() == NetworkBackendKind::Seatbelt
+}
+
+fn verified_vpn_sample<S: OnboardingSystem>(system: &S, expectation: &VpnExpectation) -> Result<VpnObservation> {
+    let observed = system.vpn_observation(expectation)?;
+    let verdict = compare_vpn(expectation, &observed, system.now());
+    if !verdict.is_matched() {
+        let detail = match &verdict {
+            VpnMatch::Mismatched { differences } => differences.iter()
+                .map(|v| format!("{}：预期 {}，实测 {}", v.field, v.expected, v.observed)).collect::<Vec<_>>().join("；"),
+            VpnMatch::Unknown { reasons } => reasons.join("；"),
+            VpnMatch::Stale => "实际采样已过期或时间无效".into(),
+            VpnMatch::Matched => unreachable!(),
+        };
+        return Err(err(verdict.reason_code(), &format!("VPN 预期未通过复核：{detail}。未保存，请重新检测")));
+    }
+    Ok(observed)
+}
+
+fn vpn_candidate<S: OnboardingSystem>(system: &S, config: &Config, values: &Value) -> Result<Option<(VpnExpectation, VpnObservation)>> {
+    if !needs_vpn_setup(system, config) { return Ok(None); }
+    // An existing expectation remains authoritative. Re-running first-run
+    // checks must never adopt a deviation as the new expected VPN state.
+    if let Some(expected) = config.vpn_expectation.as_ref().filter(|v| v.configured) {
+        return Ok(Some((expected.clone(), verified_vpn_sample(system, expected)?)));
+    }
+    let seed = VpnExpectation {
+        configured: true,
+        proxy_mode: text(values, "proxy_mode").into(),
+        proxy_url: text(values, "proxy_url").into(),
+        proxy_group: text(values, "proxy_group").into(),
+        // Requests an actual system-proxy observation; this is not a saved
+        // expectation. The observed true/false value is shown for approval.
+        require_system_proxy: Some(false),
+        ..Default::default()
+    };
+    if seed.proxy_mode != "tag" {
+        return Err(err("vpn_observation_unavailable", "首次 VPN 预期确认目前仅支持已核验的 TAG 入口"));
+    }
+    if seed.proxy_group.is_empty() || text(values, "node").is_empty() {
+        return Err(err("vpn_observation_unknown", "本轮代理组或节点尚未确认，不能用默认选择生成 VPN 预期"));
+    }
+    let observed = system.vpn_observation(&seed)?;
+    if !observed.running_mode.is_known() || !observed.tun_enabled.is_known()
+        || !observed.system_proxy_enabled.is_known() || !observed.selected_group.is_known()
+        || !observed.selected_node.is_known() || !observed.proxy_chain.is_known()
+        || !observed.rules_digest.is_known() {
+        return Err(err("vpn_observation_unknown", "VPN 模式、TUN、系统代理、节点链或规则未完整确认；未生成预期"));
+    }
+    let expected = observed.to_candidate_expectation()?;
+    // Bind the read-only controller observation to the already verified
+    // application transport, rather than silently accepting a different port.
+    if expected.proxy_mode != seed.proxy_mode || expected.proxy_url != seed.proxy_url
+        || (!seed.proxy_group.is_empty() && expected.proxy_group != seed.proxy_group)
+        || expected.running_mode.as_deref() != values["runtime_mode"].as_str()
+        || values["node"].as_str().is_some_and(|node| expected.expected_node.as_deref() != Some(node)) {
+        return Err(err("vpn_expectation_mismatched", "VPN 观测与本轮已核验代理入口或节点不一致"));
+    }
+    let verdict = compare_vpn(&expected, &observed, system.now());
+    if !verdict.is_matched() {
+        return Err(err(verdict.reason_code(), "VPN 观测身份或实际采样时间未确认，未生成预期"));
+    }
+    Ok(Some((expected, observed)))
+}
+
+fn recheck_vpn<S: OnboardingSystem>(system: &S, candidate: &Value) -> Result<()> {
+    if candidate["vpn_expectation"].is_null() { return Ok(()); }
+    let expected: VpnExpectation = serde_json::from_value(candidate["vpn_expectation"].clone())
+        .map_err(|_| err("invalid_candidate", "VPN 预期候选无效"))?;
+    let observed = verified_vpn_sample(system, &expected)?;
+    if serde_json::to_value(&observed.source_instance).ok().as_ref()
+        != candidate.pointer("/vpn_observation/source_instance") {
+        return Err(err("stale_candidate", "VPN 进程身份已变化，请重新检测"));
+    }
+    Ok(())
+}
+
+fn vpn_switch_label(value: Option<bool>) -> &'static str {
+    match value { Some(true) => "开启", Some(false) => "关闭", None => "未限定" }
+}
+
+fn vpn_confirmation_lines(expected: &VpnExpectation) -> Vec<String> {
+    vec![
+        "更新 Watch 本机保护配置；仅保存 Watch 的 VPN 监督预期，不修改 VPN 配置。".into(),
+        format!("代理入口：{}；运行模式：{}；代理组：{}", expected.proxy_url, expected.running_mode.as_deref().unwrap_or("未限定"), expected.proxy_group),
+        format!("TUN：{}；系统代理：{}；节点：{}", vpn_switch_label(expected.require_tun), vpn_switch_label(expected.require_system_proxy), expected.expected_node.as_deref().unwrap_or("未限定")),
+        format!("节点链：{}；规则摘要：{}", expected.expected_chain.join(" → "), expected.expected_rules_digest.as_deref().unwrap_or("未限定")),
+        "启用保护后，VPN 与以上预期不一致或无法核实时，Watch 将断开受控 AI 流量并保留进程。".into(),
+    ]
 }
 /// Detection and confirmation must use identical country/timezone rules.
 /// A missing timezone can resolve only through a unique authoritative zone;
@@ -219,10 +332,7 @@ pub fn detect<S: OnboardingSystem>(
             "生成候选需要本次明确允许联网检测",
         ));
     }
-    let cfg = ConfigStore {
-        storage: store.clone(),
-    }
-    .load()?;
+    let cfg = setup_config(store, system)?;
     let net = system.network()?;
     let local = system.local(&cfg)?;
     if text(&net, "service").is_empty() {
@@ -237,10 +347,7 @@ pub fn detect<S: OnboardingSystem>(
             "检测到 CN 出口，自动初始化不接受此地区",
         ));
     }
-    let after_cfg = ConfigStore {
-        storage: store.clone(),
-    }
-    .load()?;
+    let after_cfg = setup_config(store, system)?;
     let after_net = system.network()?;
     let after = system.local(&after_cfg)?;
     require_transport(&after)?;
@@ -263,6 +370,11 @@ pub fn detect<S: OnboardingSystem>(
     let now = system.now();
     let body = json!({"schema":1,"observed_at":now,"expires_at":now+TTL,"mode":mode,"policy":policy_digest(&cfg.value()?)?,"context":context(&net,&local)?,"values":values,"sources":{"country":"cross-checked egress","ip":"cross-checked egress","timezone":"egress region","locale":"egress country convention","language":"independent English preference"}});
     let mut out = body;
+    out["packaged_backend"] = json!(system.packaged_backend());
+    if let Some((expected, observed)) = vpn_candidate(system, &cfg, &out["values"])? {
+        out["vpn_expectation"] = json!(expected);
+        out["vpn_observation"] = json!(observed);
+    }
     out["id"] = json!(policy_digest(&out)?);
     store.atomic_json(&candidate_path(store), &out)?;
     Ok(out)
@@ -287,10 +399,7 @@ pub fn checked_candidate<S: OnboardingSystem>(
     if policy_digest(&body)? != id {
         return Err(err("invalid_candidate", "候选校验失败，请重新检测"));
     }
-    let cfg = ConfigStore {
-        storage: store.clone(),
-    }
-    .load()?;
+    let cfg = setup_config(store, system)?;
     let net = system.network()?;
     let local = system.local(&cfg)?;
     require_transport(&local)?;
@@ -302,6 +411,13 @@ pub fn checked_candidate<S: OnboardingSystem>(
             "当前值、代理或已保存目标变化，请重新检测",
         ));
     }
+    if c["packaged_backend"] != json!(system.packaged_backend()) {
+        return Err(err("stale_candidate", "安装组件的网络后端发生变化，请重新检测"));
+    }
+    if needs_vpn_setup(system, &cfg) && c["vpn_expectation"].is_null() {
+        return Err(err("invalid_candidate", "候选缺少已确认的 VPN 预期，请重新检测"));
+    }
+    recheck_vpn(system, &c)?;
     Ok((c, cfg, net, local))
 }
 pub fn preview<S: OnboardingSystem>(
@@ -340,6 +456,11 @@ pub fn preview<S: OnboardingSystem>(
     desired["guard_enabled"] = options["guard_enabled"].clone();
     desired["timezone_watchdog"] = options["timezone_watchdog"].clone();
     desired["auto_update"] = options["auto_update"].clone();
+    if !c["vpn_expectation"].is_null() {
+        desired["schema"] = json!(2);
+        desired["network_backend"] = json!(NetworkBackendKind::Seatbelt);
+        desired["vpn_expectation"] = c["vpn_expectation"].clone();
+    }
     let desired = Config::from_value(desired)?;
     if desired.guard_enabled && !desired.enabled {
         return Err(err("policy_required", "启用断线保护时也需启用受控环境策略"));
@@ -357,6 +478,13 @@ pub fn preview<S: OnboardingSystem>(
         .cloned()
         .collect();
     let mut out = json!({"schema":1,"candidate_id":id,"options":options,"actions":actions,"desired_config":desired.value()?,"policy":c["policy"],"context":c["context"],"values":c["values"],"observed_at":c["observed_at"],"expires_at":c["expires_at"]});
+    if let Some(expected) = desired.vpn_expectation.as_ref() {
+        out["vpn_expectation"] = json!(expected);
+        out["confirmation_lines"] = if cfg.vpn_expectation != desired.vpn_expectation
+            || cfg.schema != desired.schema || cfg.network_backend != desired.network_backend {
+            json!(vpn_confirmation_lines(expected))
+        } else { json!([]) };
+    }
     out["id"] = json!(policy_digest(&out)?);
     Ok(out)
 }
@@ -421,10 +549,7 @@ fn apply_inner<S: OnboardingSystem>(
     let final_network = system.network()?;
     let final_local = system.local(&desired)?;
     require_transport(&final_local)?;
-    let current = ConfigStore {
-        storage: store.clone(),
-    }
-    .load()?;
+    let current = setup_config(store, system)?;
     if text(&local, "context") != text(&final_local, "context")
         || network != final_network
         || text(&c, "policy") != policy_digest(&current.value()?)?
@@ -491,7 +616,8 @@ fn apply_inner<S: OnboardingSystem>(
         }
         baseline.push_str(&format!("tag_group={group}\ntag_node={node}\n"));
     }
-    let confirmation = json!({"schema":1,"confirmed_at":system.now(),"observed_at":c["observed_at"],"policy":policy_digest(&desired.value()?)?,"values":c["values"],"sources":c["sources"]});
+    recheck_vpn(system, &c)?;
+    let confirmation = json!({"schema":1,"confirmed_at":system.now(),"observed_at":c["observed_at"],"policy":policy_digest(&desired.value()?)?,"values":c["values"],"sources":c["sources"],"vpn_expectation":c["vpn_expectation"],"vpn_observation":c["vpn_observation"]});
     let outputs = [
         (
             "config",

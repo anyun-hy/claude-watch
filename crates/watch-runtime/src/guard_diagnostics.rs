@@ -107,7 +107,10 @@ pub fn capture_phase(store: &StateStore, config: &Config, local: &Value, now: f6
             },
         };
     let (guard_status, guard_age, guard_code, matches_policy) =
-        match store.read_bytes(&store.paths.base().join("guard-heartbeat.json"), 4096) {
+        // Family permits and receipts are part of the heartbeat. Use the same
+        // bounded JSON size as StateStore::read_json, not the old tiny summary
+        // limit that misclassified valid multi-family heartbeats as unreadable.
+        match store.read_bytes(&store.paths.base().join("guard-heartbeat.json"), 2_000_000) {
             Ok(None) => ("missing", None, None, None),
             Err(_) => ("unreadable", None, None, None),
             Ok(Some(bytes)) => match strict_json(&bytes) {
@@ -118,6 +121,8 @@ pub fn capture_phase(store: &StateStore, config: &Config, local: &Value, now: f6
                         Some("unknown") => "unknown",
                         Some("disabled") => "disabled",
                         Some("protection_triggered") => "protection_triggered",
+                        Some("protection_unavailable") => "protection_unavailable",
+                        Some("pending") => "pending",
                         _ => "invalid",
                     };
                     let matches_policy = guard_heartbeat_policy_matches(&value, config);
@@ -198,7 +203,7 @@ impl GuardPhase {
             "ok" | "error" | "missing" | "unreadable" | "invalid"
         ) && matches!(
             self.guard_heartbeat_status.as_str(),
-            "ok" | "degraded" | "unknown" | "disabled" | "protection_triggered" | "missing" | "unreadable" | "invalid"
+            "ok" | "degraded" | "unknown" | "disabled" | "protection_triggered" | "protection_unavailable" | "pending" | "missing" | "unreadable" | "invalid"
         ) && self.guard_heartbeat_code.as_deref().is_none_or(|code| {
             matches!(
                 code,

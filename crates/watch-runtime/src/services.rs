@@ -160,6 +160,10 @@ pub fn service_status<S: ServiceSystem>(system: &S, config: &Config) -> Result<V
     } else {
         "error"
     };
+    let guard_reason = if guard_state == "running" { "guard_ready" }
+        else if guard_state == "inactive" { "guard_disabled" }
+        else { health.diagnostics["guard"]["reason_code"].as_str().unwrap_or("execution_not_confirmed") };
+    let guard_detail = crate::guard_readiness::detail(guard_reason);
     let original_state = if original["registered"].is_null()
         || (original["registered"] == true && original["trusted"] != true)
     {
@@ -211,7 +215,7 @@ pub fn service_status<S: ServiceSystem>(system: &S, config: &Config) -> Result<V
 
     Ok(
         json!({"status":"ok","observed_at":now,"backend_healthy":health.sampling_healthy,"guard_backend_healthy":health.guard_backend_healthy,"backend_diagnostics":health.diagnostics,"backend_sampling_state":if health.sampling_healthy{"complete"}else{"incomplete"},"admin_helper":helper,"update_source_ready":ready,"authority_arbitration":json!(arbitration),"policy_issues":Value::Array(issues),"services":[
-          {"id":"guard","title":"Claude Watch 保镖","state":guard_state,"desired":config.guard_enabled,"execution_verified":guard_state == "running","health_basis":"heartbeat_and_process_identity","source":"本工具保护心跳 / 后台进程身份"},
+          {"id":"guard","title":"Claude Watch 保镖","state":guard_state,"desired":config.guard_enabled,"execution_verified":guard_state == "running","health_basis":"heartbeat_and_process_identity","source":"本工具保护心跳 / 后台进程身份","reason_code":guard_reason,"detail":guard_detail,"evidence_observed_at":health.diagnostics["guard"]["evidence_observed_at"]},
           {"id":"original","title":"原版 Claude切换器保镖","state":original_state,"desired":null,"execution_verified":false,"health_basis":"launchd_registration_only","source":"system/local.claude-bodyguard / 原版任务定义"},
           {"id":"watchdog","title":"时区守护","state":watchdog_state,"desired":config.timezone_watchdog,"actual_target":watchdog["target"],"accepted_target":desired_target,"last_success_at":watchdog_last_success,"execution_verified":watchdog_verified,"health_basis":watchdog_basis,"source":"时区任务注册 / root 管理的目标文件"},
           {"id":"updater","title":"自动更新","state":update_state,"desired":config.auto_update,"interval_seconds":UPDATE_INTERVAL,"execution_verified":update_state == "scheduled","health_basis":"launchd_registration_and_manifest","source":"本项目发布配置 / 用户更新任务"}

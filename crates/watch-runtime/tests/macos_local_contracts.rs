@@ -95,6 +95,24 @@ fn guard_liveness_survives_a_degraded_monitoring_round_without_claiming_complete
         "initialization must use the same native liveness as service-status despite monitoring incompleteness");
 }
 struct NoNetwork;
+
+#[test]
+fn onboarding_uses_the_installed_backend_manifest_without_silent_legacy_migration() {
+    use claude_watch_core::channel::NetworkBackendKind;
+    use claude_watch_runtime::onboarding::{self, OnboardingSystem};
+    let home = Home::new();
+    let host = home.host("surge", None);
+    host.storage.atomic_json(&host.storage.paths.watch().join("runtime/components.json"), &json!({"network_backend":"seatbelt"})).unwrap();
+    assert_eq!(host.packaged_backend(), Some(NetworkBackendKind::Seatbelt));
+    assert_eq!(onboarding::setup_config(&host.storage, &host).unwrap().schema, 2);
+    assert!(!host.storage.paths.config().exists());
+    host.storage.atomic_json(&host.storage.paths.config(), &Config::default().value().unwrap()).unwrap();
+    assert_eq!(onboarding::setup_config(&host.storage, &host).unwrap().schema, 1);
+    assert!(onboarding::setup_config(&host.storage, &host).unwrap().network_backend.is_none());
+    host.storage.atomic_json(&host.storage.paths.watch().join("runtime/components.json"), &json!({"network_backend":"unknown"})).unwrap();
+    host.storage.atomic_json(&host.storage.paths.base().join("bin/components.json"), &json!({"network_backend":"seatbelt"})).unwrap();
+    assert_eq!(host.packaged_backend(), None, "an unknown active runtime cannot silently select another backend");
+}
 impl Transport for NoNetwork {
     fn get(&self, _: &Request) -> std::result::Result<Response, TransportError> {
         panic!("offline facts must not query external network")

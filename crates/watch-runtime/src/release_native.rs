@@ -146,8 +146,7 @@ pub(crate) fn stop_agent_for_runtime<E: FixedCommandExecutor>(
         "后台进程尚未退出；已保留组件及恢复记录",
     ))
 }
-impl FixedCommandExecutor for SystemExecutor {
-    fn run(&mut self, command: FixedCommand) -> Result<FixedOutput> {
+pub(crate) fn validate_fixed_command(command: &FixedCommand) -> Result<()> {
         if !command.program.is_absolute()
             || command.timeout.is_zero()
             || command.timeout > Duration::from_secs(125)
@@ -158,6 +157,11 @@ impl FixedCommandExecutor for SystemExecutor {
         {
             return Err(error("invalid_release_command", "固定系统命令参数无效"));
         }
+    Ok(())
+}
+impl FixedCommandExecutor for SystemExecutor {
+    fn run(&mut self, command: FixedCommand) -> Result<FixedOutput> {
+        validate_fixed_command(&command)?;
         let started = Instant::now();
         let mut job = Exec::cmd(&command.program)
             .args(&command.args)
@@ -251,6 +255,8 @@ pub struct NativeRelease<E> {
     pub paths: NativeReleasePaths,
     pub uid: u32,
     restart_observation: Option<Option<String>>,
+    gateway_transaction: Option<crate::release_gateway::GatewayTransaction>,
+    gateway_cleanup_warning: Option<String>,
 }
 impl NativeRelease<SystemExecutor> {
     /// Concrete engine construction for an eventually authorized desktop run.
@@ -264,12 +270,15 @@ impl NativeRelease<SystemExecutor> {
     }
 }
 impl<E> NativeRelease<E> {
+    pub fn gateway_cleanup_warning(&self) -> Option<&str> { self.gateway_cleanup_warning.as_deref() }
     pub fn new(executor: E, paths: NativeReleasePaths, uid: u32) -> Self {
         Self {
             executor,
             paths,
             uid,
             restart_observation: None,
+            gateway_transaction: None,
+            gateway_cleanup_warning: None,
         }
     }
 }
@@ -845,11 +854,21 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
                 "原生后台安装路径不属于本用户",
             ));
         }
-        crate::agent_install::install_deferred(
-            &store,
-            &installed.join("Contents/Resources"),
-            self.uid,
-            &mut self.executor,
+        let resources = installed.join("Contents/Resources");
+        let gateway_required = self.plist_json(&resources.join("BuildInfo.plist"))?["NetworkBackend"] == "seatbelt";
+        let gateway_transaction = &mut self.gateway_transaction;
+        let uid = self.uid;
+        crate::agent_install::install_deferred_with_runtime_hook(
+            &store, &resources, uid, &mut self.executor,
+            &mut |runtime, executor| {
+                if gateway_required {
+                    crate::release_gateway::prepare_and_verify(
+                        executor, &resources.join("watch-gateway-broker"), runtime,
+                        uid, gateway_transaction,
+                    )?;
+                }
+                Ok(())
+            },
         )?;
         self.wait_native_publication()
     }
@@ -861,7 +880,14 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
             .nth(3)
             .ok_or_else(|| error("invalid_install_path", "安装根目录无效"))?;
         let store = crate::storage::StateStore::new(crate::storage::Paths::new(home)?);
-        crate::agent_install::commit(&store, self.uid, &mut self.executor)?;
+        // The runtime commit is the point of no return. The broker is already
+        // active and its actual descriptors verified; deleting its rollback
+        // record afterward is cleanup, never a reason for app-only rollback.
+        let uid = self.uid;
+        self.gateway_cleanup_warning = crate::release_gateway::commit_after_runtime(
+            &mut self.executor, &mut self.gateway_transaction,
+            |executor| crate::agent_install::commit(&store, uid, executor).map(|_| ()),
+        )?;
         Ok(())
     }
     fn rollback_agent_install(&mut self) -> Result<()> {
@@ -872,7 +898,12 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
             .nth(3)
             .ok_or_else(|| error("invalid_install_path", "安装根目录无效"))?;
         let store = crate::storage::StateStore::new(crate::storage::Paths::new(home)?);
-        crate::agent_install::recover(&store, self.uid, &mut self.executor)?;
+        let gateway = crate::release_gateway::finish(&mut self.executor, &mut self.gateway_transaction, true);
+        let runtime = crate::agent_install::recover(&store, self.uid, &mut self.executor);
+        // A missing administrator receipt cannot prevent the user runtime's
+        // own rollback. If identities differ, handoff stays fail-closed.
+        gateway?;
+        runtime?;
         Ok(())
     }
     fn resume_agent(&mut self, _installed: &Path) -> Result<()> {

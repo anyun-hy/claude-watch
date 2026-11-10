@@ -16,6 +16,7 @@ struct Fake {
     runtime: bool,
     fail_after_apply: bool,
     native_healthy: bool,
+    guard_healthy: bool,
     diagnostics: Value,
 }
 impl ServiceSystem for Fake {
@@ -26,7 +27,7 @@ impl ServiceSystem for Fake {
         true
     }
     fn guard_status(&self, c: &Config) -> Result<bool> {
-        Ok(c.enabled && c.guard_enabled)
+        Ok(c.enabled && c.guard_enabled && self.guard_healthy)
     }
     fn backend_health_snapshot(&self, c: &Config) -> Result<services::BackendHealthSnapshot> {
         Ok(services::BackendHealthSnapshot {
@@ -95,6 +96,7 @@ fn fake() -> Fake {
         runtime: true,
         fail_after_apply: false,
         native_healthy: true,
+        guard_healthy: true,
         diagnostics: json!({"reason":"confirmed"}),
     }
 }
@@ -107,6 +109,22 @@ fn service_status_preserves_the_same_failed_backend_observation() {
     let status = services::service_status(&f, &Config::default()).unwrap();
     assert_eq!(status["guard_backend_healthy"], false);
     assert_eq!(status["backend_diagnostics"], f.diagnostics);
+}
+#[test]
+fn guard_service_reports_verified_failure_without_promoting_settings_to_readiness() {
+    let mut f = fake(); f.guard_healthy = false;
+    f.diagnostics["guard"] = json!({"reason_code":"gateway_not_installed","evidence_observed_at":100.0});
+    let config = Config { enabled:true, guard_enabled:true, ..Config::default_for_new_install() };
+    let failed = services::service_status(&f,&config).unwrap();
+    let row = &failed["services"][0];
+    assert_eq!(row["state"],"error"); assert_eq!(row["execution_verified"],false);
+    assert_eq!(row["reason_code"],"gateway_not_installed");
+    assert!(row["detail"].as_str().unwrap().contains("受控网关尚未安装完整"));
+    f.guard_healthy = true;
+    let recovered = services::service_status(&f,&config).unwrap();
+    assert_eq!(recovered["services"][0]["reason_code"],"guard_ready");
+    assert_eq!(recovered["services"][0]["state"],"running");
+    assert!(!recovered["services"][0]["detail"].as_str().unwrap().contains("未安装"));
 }
 #[test]
 fn saved_intent_is_not_actual_service() {

@@ -942,6 +942,30 @@ impl<R: ReadRunner, T: Transport, M: Mutator> RepairSystem for Macos<R, T, M> {
     }
 }
 impl<R: ReadRunner, T: Transport, M: Mutator> OnboardingSystem for Macos<R, T, M> {
+    fn packaged_backend(&self) -> Option<claude_watch_core::channel::NetworkBackendKind> {
+        let mut directories = vec![self.storage.paths.watch().join("runtime"), self.storage.paths.base().join("bin")];
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() { directories.push(parent.to_path_buf()); }
+        }
+        // Same precedence as daemon assembly: do not skip an installed but
+        // unrecognized runtime and silently select another backend.
+        directories.into_iter().find(|path| path.join("BuildInfo.plist").is_file()
+            || path.join("components.json").is_file() || path.join("watch-sandbox-launcher").is_file())
+            .and_then(|path| crate::sandbox_launch::lookup_packaged_network_backend(&path))
+    }
+    fn vpn_observation(&self, expectation: &claude_watch_core::vpn::VpnExpectation) -> Result<claude_watch_core::vpn::VpnObservation> {
+        use crate::vpn_observer::{resolve_vpn_controller_credentials, HttpControllerVpnReader, VpnSourceReader};
+        if expectation.proxy_mode != "tag" {
+            return Err(CoreError::new("vpn_observation_unavailable", "首次 VPN 预期确认目前仅支持已核验的 TAG 入口"));
+        }
+        let credentials = resolve_vpn_controller_credentials(&self.storage, &expectation.proxy_mode)?;
+        let reader = HttpControllerVpnReader::new_live(&expectation.proxy_mode, credentials);
+        // The reader records the real start time; slow or stale samples must
+        // expire instead of being renewed at the time setup receives them.
+        Ok(reader.read_observation(expectation, true, 1, claude_watch_core::vpn::VpnEpoch {
+            observer_boot_id: uuid::Uuid::new_v4().to_string(), change_generation: 1,
+        }, native::now()))
+    }
     fn network(&self) -> Result<Value> {
         AuditSystem::network(self)
     }
@@ -973,11 +997,15 @@ impl<R: ReadRunner, T: Transport, M: Mutator> ServiceSystem for Macos<R, T, M> {
         &self,
         config: &Config,
     ) -> Result<crate::services::BackendHealthSnapshot> {
-        let facts = self.backend_facts();
+        let mut facts = self.backend_facts();
+        let guard_healthy = self.guard_heartbeat(config, facts.guard_healthy);
+        facts.diagnostics["guard"] = crate::guard_readiness::read(
+            &self.storage, config, native::now(), facts.guard_healthy, guard_healthy,
+        );
         Ok(crate::services::BackendHealthSnapshot {
             sampling_healthy: facts.sampling_healthy,
             guard_backend_healthy: facts.guard_healthy,
-            guard_healthy: self.guard_heartbeat(config, facts.guard_healthy),
+            guard_healthy,
             diagnostics: facts.diagnostics,
         })
     }

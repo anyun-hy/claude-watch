@@ -141,10 +141,12 @@ impl Controller {
             Ok(StopOutcome::SkippedWarn)
         } else if action == "force" && family.is_some_and(|f| f.performable("force")) {
             // When user explicitly requested force (SIGKILL), respect it regardless of channel mode.
-            // In channel mode, also record that the network channel was cut.
+            // Explicitly separate process disposition from channel disposition.
+            receipt["process_disposition"] = json!("force_quit");
+            receipt["process_preserved"] = json!(false);
             if system.channel_mode() {
+                receipt["channel_disposition"] = json!("disconnect_channel");
                 receipt["disposition_mode"] = json!("disconnect_channel_and_force_quit");
-                receipt["process_preserved"] = json!(false);
                 receipt["action"] = json!("disconnect-and-force-quit");
             }
             let mut forced = None;
@@ -157,13 +159,18 @@ impl Controller {
             // target application's network channel and keeps its processes
             // alive (`断流保进程`). It never implicitly invokes legacy process
             // exit (`quit_desktop` / `quit_for_confirmed_ip_risk`).
-            receipt["disposition_mode"] = json!("disconnect_channel_keep_process");
+            receipt["process_disposition"] = json!("preserved");
             receipt["process_preserved"] = json!(true);
+            receipt["channel_disposition"] = json!("disconnect_channel");
+            receipt["disposition_mode"] = json!("disconnect_channel_keep_process");
             receipt["action"] = json!("disconnect-channel");
             receipt["stop_state"] = json!("disconnecting");
             // The executor receipt, not this request, establishes isolation.
             Ok(StopOutcome::SkippedWarn)
         } else {
+            receipt["process_disposition"] = json!("close_desktop");
+            receipt["process_preserved"] = json!(false);
+            receipt["channel_disposition"] = json!("not_applicable");
             system.quit_desktop().map(|()| StopOutcome::Confirmed)
         };
         receipt["stop_completed_at"] = json!(system.now());
@@ -210,7 +217,9 @@ impl Controller {
         match result {
             Ok(Some(StopOutcome::SkippedWarn)) => {}
             Ok(Some(StopOutcome::Confirmed)) => {
-                receipt["action"] = json!("close-desktop");
+                if receipt.get("action") != Some(&json!("disconnect-and-force-quit")) {
+                    receipt["action"] = json!("close-desktop");
+                }
                 receipt["stop_state"] = json!("confirmed");
                 if let Some(reason) = persist_reason {
                     self.persist_stop_record(system, expected_session, reason, receipt)?;

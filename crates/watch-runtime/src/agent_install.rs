@@ -289,7 +289,7 @@ pub fn install<E: FixedCommandExecutor>(
     uid: u32,
     executor: &mut E,
 ) -> Result<Value> {
-    install_mode(store, resources, uid, executor, false)
+    install_mode(store, resources, uid, executor, false, &mut |_, _| Ok(()))
 }
 pub fn install_deferred<E: FixedCommandExecutor>(
     store: &StateStore,
@@ -297,7 +297,15 @@ pub fn install_deferred<E: FixedCommandExecutor>(
     uid: u32,
     executor: &mut E,
 ) -> Result<Value> {
-    install_mode(store, resources, uid, executor, true)
+    install_mode(store, resources, uid, executor, true, &mut |_, _| Ok(()))
+}
+/// Run a release preparation step against the final signed runtime before
+/// bootstrap. A failed hook follows the existing runtime rollback path.
+pub fn install_deferred_with_runtime_hook<E: FixedCommandExecutor>(
+    store: &StateStore, resources: &Path, uid: u32, executor: &mut E,
+    before_bootstrap: &mut dyn FnMut(&Path, &mut E) -> Result<()>,
+) -> Result<Value> {
+    install_mode(store, resources, uid, executor, true, before_bootstrap)
 }
 fn install_mode<E: FixedCommandExecutor>(
     store: &StateStore,
@@ -305,6 +313,7 @@ fn install_mode<E: FixedCommandExecutor>(
     uid: u32,
     executor: &mut E,
     deferred: bool,
+    before_bootstrap: &mut dyn FnMut(&Path, &mut E) -> Result<()>,
 ) -> Result<Value> {
     if uid == 0
         || fs::metadata(&store.paths.home)
@@ -474,6 +483,7 @@ fn install_mode<E: FixedCommandExecutor>(
         {
             return Err(err("runtime_self_check_failed", "新运行组件自检失败"));
         }
+        before_bootstrap(&runtime, executor)?;
         store.atomic_bytes(&plist, &definition(&runtime.join("watch-engine"))?, 0o600)?;
         require(
             executor,

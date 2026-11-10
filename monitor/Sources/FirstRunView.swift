@@ -47,7 +47,7 @@ struct FirstRunView: View {
                         Surface(p) {
                             VStack(alignment: .leading, spacing: 12) {
                                 Text("最近一次环境检测的必检项目").font(WatchTypography.section)
-                                Text("以下为该次采样结果；当前保护是否就绪以第 8 项联合复核为准。")
+                                Text("以下保留该次采样结果，不代表设置变更后的状态。保护后台的当前结果见下方核对；能否进入仍以第 8 项联合复核为准。")
                                     .font(WatchTypography.caption).foregroundStyle(p.secondary)
                                 ForEach(policy.rows.filter(\.required)) { row in
                                     HStack(alignment: .top, spacing: 12) {
@@ -56,8 +56,8 @@ struct FirstRunView: View {
                                             .foregroundStyle(row.state == "ok" ? p.mint
                                                     : row.state == "fail" ? p.red : p.amber)
                                         VStack(alignment: .leading, spacing: 4) {
-                                            Text(row.name).font(WatchTypography.bodyStrong)
-                                            Text(row.detail).font(WatchTypography.caption).foregroundStyle(p.secondary)
+                                            Text(row.id == "guard" ? row.name + "（该次采样）" : row.name).font(WatchTypography.bodyStrong)
+                                            Text(row.id == "guard" ? "采样时：" + row.detail : row.detail).font(WatchTypography.caption).foregroundStyle(p.secondary)
                                                 .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
                                         }
                                         Spacer(minLength: 8)
@@ -65,6 +65,26 @@ struct FirstRunView: View {
                                             .foregroundStyle(row.state == "ok" ? p.mint
                                                     : row.state == "fail" ? p.red : p.amber)
                                     }.accessibilityElement(children: .combine)
+                                }
+                            }
+                        }
+                    }
+                    Surface(p) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("当前保护后台核对").font(WatchTypography.section)
+                            TimelineView(.periodic(from: .now, by: 1)) { context in
+                                let now = context.date.timeIntervalSince1970
+                                let background = switcher.background
+                                let ready = FirstRunChecks.backendEvidenceIsCurrent(background, error: switcher.backgroundError, now: now)
+                                    && background?.services.first(where: { $0.id == "guard" }).map { $0.healthy && $0.desired == true } == true
+                                Text(ready ? "保护心跳与后台身份已确认；其他必检项目仍需通过第 8 项联合复核。"
+                                    : FirstRunChecks.backgroundFailureDetail(background, error: switcher.backgroundError,
+                                        settingsEnabled: switcher.isOn(Setting.enabled) && switcher.isOn(Setting.guardEnabled), now: now))
+                                    .font(WatchTypography.body).foregroundStyle(ready ? p.mint : p.red)
+                                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                                if let at = background?.observed_at, at.isFinite {
+                                    Text("状态读取时间：" + Date(timeIntervalSince1970: at).formatted(date: .omitted, time: .standard))
+                                        .font(WatchTypography.caption).foregroundStyle(p.secondary)
                                 }
                             }
                         }
