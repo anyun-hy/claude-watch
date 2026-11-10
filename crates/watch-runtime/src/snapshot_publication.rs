@@ -578,16 +578,16 @@ mod tests {
         );
         fs::remove_dir_all(path).unwrap();
     }
-    struct PipelineFake { incomplete: AtomicBool }
+    struct PipelineFake { incomplete: AtomicBool, bundle:std::path::PathBuf }
     impl ReadRunner for PipelineFake {
-        fn run(&self, command: ReadCommand, input: &[u8], _: Duration, _: usize) -> Result<Output> {
+        fn run(&self, command: ReadCommand, input: &[u8], timeout: Duration, limit: usize) -> Result<Output> {
             let now = native::now();
             let producer = identity();
-            let mut target = identity(); target.pid = 88; target.start_stamp = "target".into(); target.executable = "/Applications/Claude.app/Contents/MacOS/Claude".into();
+            let mut target = identity(); target.pid = 88; target.start_stamp = "target".into(); target.executable = self.bundle.join("Contents/MacOS/PrivateMain").to_string_lossy().into_owned();
             let mut body = json!({"schema":1,"status":"ok","uid":501,"started_at":now,"finished_at":now});
             match command {
                 ReadCommand::Observer(ObserverAction::Inventory) => {
-                    let mut app = serde_json::to_value(&target).unwrap(); app["bundle_path"] = json!("/Applications/Claude.app"); app["bundle_id"] = json!("com.anthropic.claudefordesktop");
+                    let mut app = serde_json::to_value(&target).unwrap(); app["bundle_path"] = json!(self.bundle); app["bundle_id"] = json!("com.anthropic.claudefordesktop");
                     body["state"] = json!("ok"); body["truncated"] = json!(false); body["processes"] = json!([producer,app]); body["exited"] = json!([]);
                     let bad = self.incomplete.load(Ordering::Relaxed);
                     body["unavailable"] = if bad { json!([{"pid":90,"code":"identity_unavailable"}]) } else { json!([]) };
@@ -605,6 +605,10 @@ mod tests {
                 ReadCommand::LsofFiles {..} => return Ok(Output {status:0,stdout:vec![],stderr:vec![]}),
                 ReadCommand::NettopBytes {..} => return Ok(Output {status:0,stdout:b"name,bytes_in,bytes_out\n".to_vec(),stderr:vec![]}),
                 ReadCommand::LaunchctlList => return Ok(Output {status:0,stdout:vec![],stderr:vec![]}),
+                ReadCommand::Plist(path)=> {
+                    assert_eq!(path,self.bundle.join("Contents/Info.plist"));
+                    return crate::commands::SystemRunner::development()?.run(ReadCommand::Plist(path),input,timeout,limit);
+                }
                 _ => return Err(CoreError::new("fixture_unavailable", "fixture")),
             }
             Ok(Output {status:0,stdout:serde_json::to_vec(&body).unwrap(),stderr:vec![]})
@@ -613,7 +617,11 @@ mod tests {
     #[test]
     fn actual_publisher_preserves_process_activity_and_reused_network_evidence() {
         let (path, store) = temp();
-        let runner = std::sync::Arc::new(PipelineFake { incomplete: AtomicBool::new(true) });
+        use std::os::unix::fs::PermissionsExt;
+        let bundle=fs::canonicalize(&path).unwrap().join("Applications/Private Client.app");fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        let exe=bundle.join("Contents/MacOS/PrivateMain");fs::write(&exe,b"private fixture; never executed").unwrap();fs::set_permissions(exe,fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(bundle.join("Contents/Info.plist"),r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string><key>CFBundleExecutable</key><string>PrivateMain</string></dict></plist>"#).unwrap();
+        let runner = std::sync::Arc::new(PipelineFake { incomplete: AtomicBool::new(true),bundle });
         let mut sampler = Sampler::new(runner.clone(), store.paths.clone()); sampler.use_fixture_tag();
         let mut publisher = SnapshotPublisher::new(store.clone(), sampler, identity()).unwrap();
         let first = publisher.poll("", "", true).unwrap();

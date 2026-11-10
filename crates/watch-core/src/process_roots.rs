@@ -1,8 +1,8 @@
 //! AI roots require an observed executable/bundle or the actual interpreter entrypoint.
 use crate::policy::PolicyCatalog;
-use crate::processes::{Identity, Kind, Provider};
+use crate::processes::{Identity, Kind, MatchReason, Provider};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},
 };
 
@@ -55,6 +55,12 @@ pub struct RootEvidence<'a> {
 pub struct TrustedCliPaths {
     pub claude: BTreeSet<String>,
     pub codex: BTreeSet<String>,
+    /// Runtime-verified installations. None retains the legacy pure classifier
+    /// API; production discovery supplies Some, including an empty catalog.
+    pub desktop_catalog: Option<Vec<(PathBuf, String, PathBuf)>>,
+    pub pending_desktops:Vec<(PathBuf,String)>,
+    pub exact_cli_catalog: bool,
+    pub cli_reasons: BTreeMap<String, MatchReason>,
 }
 /// Supported installation aliases. Capture and inventory parity checks consume
 /// this list; an arbitrary same-named executable is not an AI root.
@@ -64,6 +70,7 @@ pub fn cli_aliases(home: &Path) -> Vec<(PathBuf, bool)> {
         (home.join(".claude/local/claude"), true),
         ("/opt/homebrew/bin/claude".into(), true),
         ("/usr/local/bin/claude".into(), true),
+        (home.join(".local/bin/codex"), false),
         ("/opt/homebrew/bin/codex".into(), false),
         ("/usr/local/bin/codex".into(), false),
     ]
@@ -146,35 +153,40 @@ fn node_entry(arguments: &[String]) -> Option<&str> {
         return (!token.starts_with('-')).then_some(token);
     }
 }
+pub fn node_script_entry(arguments:&[String],cwd:Option<&str>)->Option<PathBuf> {
+    lexical_path(node_entry(arguments)?,cwd)
+}
 pub fn desktop_kind(bundle: &str, id: &str, main: bool) -> Option<Kind> {
     let name = basename(bundle);
     match (id, name, main) {
         ("com.anthropic.claudefordesktop", _, true) => Some(Kind::ClaudeMain),
         ("com.anthropic.claudefordesktop", _, false) => Some(Kind::ClaudeHelper),
-        ("com.openai.codex", "Codex.app", true) => Some(Kind::CodexMain),
-        ("com.openai.codex", "Codex.app", false) => Some(Kind::CodexHelper),
-        ("com.openai.chat", "ChatGPT.app", true) => Some(Kind::ChatgptMain),
-        ("com.openai.chat", "ChatGPT.app", false) => Some(Kind::ChatgptHelper),
         ("com.openai.codex", "ChatGPT.app", true) => Some(Kind::OpenaiMain),
         ("com.openai.codex", "ChatGPT.app", false) => Some(Kind::OpenaiHelper),
+        ("com.openai.codex", _, true) => Some(Kind::CodexMain),
+        ("com.openai.codex", _, false) => Some(Kind::CodexHelper),
+        ("com.openai.chat", _, true) => Some(Kind::ChatgptMain),
+        ("com.openai.chat", _, false) => Some(Kind::ChatgptHelper),
         _ => None,
     }
 }
 
 pub fn cli_kind(path: &str, home: &Path, trusted: &TrustedCliPaths) -> Option<Kind> {
+    cli_kind_with_reason(path, home, trusted).map(|(kind, _)| kind)
+}
+fn cli_kind_with_reason(path: &str, home: &Path, trusted: &TrustedCliPaths) -> Option<(Kind, MatchReason)> {
+    let exact_reason=trusted.cli_reasons.get(path).copied().unwrap_or(MatchReason::SupportedCliAlias);
+    if trusted.claude.contains(path) { return Some((Kind::ClaudeCode, exact_reason)); }
+    if trusted.codex.contains(path) { return Some((Kind::CodexCli, exact_reason)); }
+    if trusted.exact_cli_catalog { return None; }
     let home = home.to_string_lossy();
-    if trusted.claude.contains(path)
-        || path.starts_with(&format!("{home}/.local/share/claude/versions/"))
-        || claude_script(path)
-    {
-        return Some(Kind::ClaudeCode);
+    if path.starts_with(&format!("{home}/.local/share/claude/versions/")) || claude_script(path) {
+        return Some((Kind::ClaudeCode, MatchReason::KnownCliLayout));
     }
-    if trusted.codex.contains(path)
-        || (path.contains("/Caskroom/codex/") && path.ends_with("/bin/codex"))
-        || codex_script(path)
-        || (path.contains("/node_modules/@openai/codex/") && path.ends_with("/codex"))
-    {
-        return Some(Kind::CodexCli);
+    if trusted.codex.contains(path) { return Some((Kind::CodexCli, MatchReason::SupportedCliAlias)); }
+    if (path.contains("/Caskroom/codex/") && path.ends_with("/bin/codex"))
+        || codex_script(path) || (path.contains("/node_modules/@openai/codex/") && path.ends_with("/codex")) {
+        return Some((Kind::CodexCli, MatchReason::KnownCliLayout));
     }
     None
 }
@@ -194,21 +206,38 @@ pub fn managed_codex_app_server(path: &str, home: &Path) -> bool {
     matches!(parts.as_slice(), [Component::Normal(_), Component::Normal(bin), Component::Normal(executable)] if *bin == "bin" && *executable == "codex")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootClassification {
+    pub classification: Classification,
+    pub reason: Option<MatchReason>,
+}
+impl RootClassification {
+    fn root(kind: Kind, reason: MatchReason) -> Self { Self { classification: Classification::Root(kind), reason: Some(reason) } }
+    fn other(classification: Classification) -> Self { Self { classification, reason: None } }
+}
+
 pub fn classify(
+    evidence: RootEvidence<'_>, home: &Path, trusted: &TrustedCliPaths,
+    resolve: impl Fn(&Path) -> Option<PathBuf>,
+) -> Classification {
+    classify_with_evidence(evidence, home, trusted, resolve).classification
+}
+
+pub fn classify_with_evidence(
     evidence: RootEvidence<'_>,
     home: &Path,
     trusted: &TrustedCliPaths,
     resolve: impl Fn(&Path) -> Option<PathBuf>,
-) -> Classification {
+) -> RootClassification {
     use Classification::*;
     let identity = evidence.identity;
     if !identity.valid() {
-        return NotTarget;
+        return RootClassification::other(NotTarget);
     }
     let path = &identity.executable;
     if managed_codex_app_server(path, home) {
         let Some(args) = evidence.arguments else {
-            return NeedArguments;
+            return RootClassification::other(NeedArguments);
         };
         return if args.first().is_some_and(|arg| basename(arg) == "codex")
             && args.get(1).is_some_and(|arg| arg == "app-server")
@@ -218,50 +247,59 @@ pub fn classify(
                         .get(3)
                         .is_some_and(|arg| !arg.is_empty() && !arg.starts_with('-'))))
         {
-            Root(Kind::CodexCli)
+            RootClassification::root(Kind::CodexCli, MatchReason::ManagedAppServer)
         } else {
-            NotTarget
+            RootClassification::other(NotTarget)
         };
     }
-    if let Some(kind) = cli_kind(path, home, trusted) {
-        return Root(kind);
+    if let Some((kind, reason)) = cli_kind_with_reason(path, home, trusted) {
+        return RootClassification::root(kind, reason);
     }
     if let Some((prefix, _)) = path.split_once(".app/Contents/") {
         let bundle = format!("{prefix}.app");
-        if evidence.bundle_path == Some(bundle.as_str()) {
-            let id = evidence.bundle_id.unwrap_or("");
+        let verified = trusted.desktop_catalog.as_ref().and_then(|catalog|catalog.iter().find(|(root,_,_)|
+            root == Path::new(&bundle)));
+        if verified.is_none() {
+            if let Some((root,id))=trusted.pending_desktops.iter().find(|(root,id)|root==Path::new(&bundle) && evidence.bundle_id.is_none_or(|actual|actual==id)) {
+                if let Some(kind)=desktop_kind(root.to_string_lossy().as_ref(),id,path.starts_with(&format!("{bundle}/Contents/MacOS/"))) {
+                    return RootClassification::root(kind,MatchReason::InstallationPending);
+                }
+            }
+        }
+        if verified.is_some() || (trusted.desktop_catalog.is_none() && evidence.bundle_path == Some(bundle.as_str())) {
+            let id = verified.map(|(_,id,_)|id.as_str()).or(evidence.bundle_id).unwrap_or("");
             if ["com.openai.codex", "com.openai.chat"].contains(&id)
                 && (path.ends_with("/Resources/codex")
                     || path.contains("/Resources/codex-cli/")
                     || path.ends_with("/CodexCLI.app/Contents/MacOS/codex"))
             {
-                return Root(Kind::CodexCli);
+                return RootClassification::root(Kind::CodexCli, MatchReason::VerifiedBundleComponent);
             }
-            let main = path.starts_with(&format!("{bundle}/Contents/MacOS/"));
+            let main = verified.map(|(_,_,exe)|Path::new(path)==exe).unwrap_or_else(||path.starts_with(&format!("{bundle}/Contents/MacOS/")));
             let kind = desktop_kind(&bundle, id, main);
             if let Some(kind) = kind {
-                return Root(kind);
+                return RootClassification::root(kind, MatchReason::VerifiedBundle);
             }
         }
     }
     if ["node", "nodejs", "bun"].contains(&basename(path)) {
         let Some(arguments) = evidence.arguments else {
-            return NeedArguments;
+            return RootClassification::other(NeedArguments);
         };
         let Some(script) = node_entry(arguments) else {
-            return NotTarget;
+            return RootClassification::other(NotTarget);
         };
         let Some(script) = lexical_path(script, evidence.cwd) else {
-            return NotTarget;
+            return RootClassification::other(NotTarget);
         };
         let script = resolve(&script).unwrap_or(script);
         let script = script.to_string_lossy();
-        if claude_script(&script) {
-            return Root(Kind::ClaudeCode);
+        if (trusted.exact_cli_catalog && trusted.claude.contains(script.as_ref())) || (!trusted.exact_cli_catalog && claude_script(&script)) {
+            return RootClassification::root(Kind::ClaudeCode, MatchReason::ScriptEntry);
         }
-        if codex_script(&script) {
-            return Root(Kind::CodexCli);
+        if (trusted.exact_cli_catalog && trusted.codex.contains(script.as_ref())) || (!trusted.exact_cli_catalog && codex_script(&script)) {
+            return RootClassification::root(Kind::CodexCli, MatchReason::ScriptEntry);
         }
     }
-    NotTarget
+    RootClassification::other(NotTarget)
 }

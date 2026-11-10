@@ -84,6 +84,71 @@
       "safety_notes": "Synthetic identities and action closures only. PROCESS_POLICY_TESTS excludes live inventory/AppKit implementation and avoids the test's MonitoredProduct type conflict."
     },
     {
+      "id": "swift.BackendCoverageScopeTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/BackendCoverageScopeTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [
+        "{run_dir}/artifacts/monitor-coverage-wire.json",
+        "{run_dir}/artifacts/managed-cli-unlinked-visible.json"
+      ],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [
+        "rust.monitor_coverage_fixture"
+      ],
+      "fixture_only": true,
+      "safety_notes": "Decodes production Rust Supervisor snapshot/events, process projection and a real live unlinked-image fixture row; no live host/VPN observation or configuration writes."
+    },
+    {
+      "id": "swift.TargetDiscoveryTests",
+      "kind": "swift",
+      "test_files": ["monitor/tests/TargetDiscoveryTests.swift"],
+      "sources": ["monitor/Sources/*.swift", "monitor/ControlledEntry/ControlledEntryApp.swift"],
+      "defines": ["UI_REVIEW", "CONTROLLED_ENTRY_BINDING_TESTS"],
+      "args": ["{run_dir}/artifacts/target-discovery-wire.json", "{run_dir}/artifacts/target-discovery-pending.json", "{run_dir}/artifacts/target-discovery-staging.json"],
+      "frameworks": ["SwiftUI", "AppKit", "WebKit", "ApplicationServices", "Carbon"],
+      "dependencies": ["rust.target_discovery_fixture"],
+      "fixture_only": true,
+      "safety_notes": "Decodes production Rust discovery/monitor/staging fixtures and calls the real wrapper argument binding only; no NSApplication, registration, real AI or configuration changes."
+    },
+    {
+      "id": "swift.ProcessProtectionDeadlineTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/ProcessProtectionDeadlineTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "args": [
+        "{run_dir}/artifacts/process-protection-deadlines.json"
+      ],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [
+        "rust.process_protection_fixture"
+      ],
+      "fixture_only": true,
+      "safety_notes": "Decodes production Rust per-process projection with synthetic receipt/sandbox/endpoint facts; checks independent blocking receipt and forwarding lease deadlines, without live host/VPN observation or protection acceptance."
+    },
+    {
       "id": "swift.BackendReceiptDecodeTests",
       "kind": "swift",
       "test_files": [

@@ -16,6 +16,46 @@ use std::{
     time::Duration,
 };
 use uuid::Uuid;
+#[path = "support/fixture_inventory.rs"]
+mod fixture_inventory;
+
+#[test]
+fn sampler_refreshes_supported_cli_aliases_without_broadening_ordinary_processes() {
+    use claude_watch_core::processes::MatchReason;
+    use fixture_inventory::{FixtureInventory, FixtureProcess};
+    use std::{os::unix::{fs::{symlink, PermissionsExt}}, sync::{Arc, Mutex}};
+    let home = PathBuf::from("/private/tmp").join(format!("cw-alias-{}", Uuid::new_v4()));
+    fs::create_dir_all(home.join(".local/bin")).unwrap();
+    let a = home.join("image-a"); let b = home.join("image-b");
+    for path in [&a, &b] { fs::write(path, b"private fixture").unwrap(); fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap(); }
+    let alias = home.join(".local/bin/codex");
+    let process = |pid, path: &Path| { let mut p = identity(); p.pid = pid; p.executable = path.to_string_lossy().into_owned(); FixtureProcess { identity:p, bundle:None, arguments:vec!["ordinary".into()] } };
+    let mut node = process(78, Path::new("/usr/local/bin/node"));
+    node.arguments = vec!["node".into(), "/other/script.js".into(), "/node_modules/@openai/codex/bin/codex.js".into()];
+    let ordinary = vec![node, process(79, Path::new("/usr/bin/python3")), process(80, Path::new("/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"))];
+    let records = Arc::new(Mutex::new(ordinary.clone()));
+    records.lock().unwrap().push(process(77, &a));
+    let mut sampler = Sampler::new(FixtureInventory(records.clone()), Paths::new(&home).unwrap());
+    assert!(sampler.processes().unwrap().targets.is_empty());
+    symlink(&a, &alias).unwrap();
+    let created = sampler.processes().unwrap();
+    assert_eq!(created.targets.len(), 1);
+    assert_eq!(created.match_evidence[&77].reason, MatchReason::SupportedCliAlias);
+    fs::remove_file(&alias).unwrap(); symlink(&b, &alias).unwrap();
+    records.lock().unwrap().extend([process(81, &b), process(82, &a)]);
+    let retargeted = sampler.processes().unwrap();
+    assert_eq!(retargeted.match_evidence[&81].reason, MatchReason::SupportedCliAlias);
+    assert_eq!(retargeted.match_evidence[&77].reason, MatchReason::RetainedLifetime);
+    assert!(!retargeted.targets.iter().any(|p| p.identity.pid == 82));
+    // New lifetimes cannot inherit either the old trusted alias or tracking.
+    fs::remove_file(&alias).unwrap(); symlink(home.join("missing"), &alias).unwrap();
+    *records.lock().unwrap() = ordinary.clone(); records.lock().unwrap().push(process(83, &b));
+    assert!(sampler.processes().unwrap().targets.is_empty());
+    fs::remove_file(&alias).unwrap();
+    *records.lock().unwrap() = ordinary; records.lock().unwrap().push(process(84, &b));
+    assert!(sampler.processes().unwrap().targets.is_empty());
+    fs::remove_dir_all(home).unwrap();
+}
 
 fn identity() -> Identity {
     Identity {
@@ -104,6 +144,31 @@ fn root_classification_requires_bundle_or_real_script_entry_not_argument_substri
         Classification::Root(Kind::ClaudeCode)
     );
 }
+
+#[test]
+fn root_classification_emits_the_reason_of_the_selected_branch() {
+    use claude_watch_core::processes::MatchReason;
+    let home = Path::new("/fixture");
+    let mut trusted = TrustedCliPaths::default(); trusted.codex.insert("/fixture/image".into());
+    let mut p = identity();
+    let cases = [
+        ("/fixture/image", None, None, vec![], MatchReason::SupportedCliAlias),
+        ("/opt/homebrew/Caskroom/codex/v/bin/codex", None, None, vec![], MatchReason::KnownCliLayout),
+        ("/Applications/Claude.app/Contents/MacOS/Claude", Some("/Applications/Claude.app"), Some("com.anthropic.claudefordesktop"), vec![], MatchReason::VerifiedBundle),
+        ("/Applications/Codex.app/Contents/Resources/codex", Some("/Applications/Codex.app"), Some("com.openai.codex"), vec![], MatchReason::VerifiedBundleComponent),
+        ("/usr/local/bin/node", None, None, vec!["node", "/fixture/node_modules/@openai/codex/bin/codex.js"], MatchReason::ScriptEntry),
+        ("/fixture/.codex/packages/app-server-daemon/releases/v/bin/codex", None, None, vec!["codex", "app-server", "daemon"], MatchReason::ManagedAppServer),
+    ];
+    for (path, bundle, id, args, reason) in cases {
+        p.executable = path.into(); let args: Vec<_> = args.into_iter().map(str::to_owned).collect();
+        let found = process_roots::classify_with_evidence(RootEvidence { identity:&p, bundle_path:bundle, bundle_id:id, arguments:Some(&args), cwd:Some("/fixture") }, home, &trusted, |_| None);
+        assert!(matches!(found.classification, Classification::Root(_))); assert_eq!(found.reason, Some(reason));
+    }
+    p.executable = "/usr/local/bin/node".into();
+    let args = vec!["node".into(), "-e".into(), "/fixture/node_modules/@openai/codex/bin/codex.js".into()];
+    let ordinary = process_roots::classify_with_evidence(RootEvidence { identity:&p, bundle_path:None, bundle_id:None, arguments:Some(&args), cwd:Some("/fixture") }, home, &trusted, |_| None);
+    assert_eq!(ordinary.classification, Classification::NotTarget); assert_eq!(ordinary.reason, None);
+}
 #[test]
 fn native_protocol_rejects_replay_foreign_identity_duplicates_and_conflicting_rounds() {
     let p = identity();
@@ -150,7 +215,18 @@ fn native_protocol_rejects_replay_foreign_identity_duplicates_and_conflicting_ro
     assert!(!changed.complete);
     assert!(changed.flows.is_empty());
 }
-struct FakeRunner;
+struct FakeRunner { bundle:PathBuf }
+impl FakeRunner {
+    fn new(home:&Path)->Self {
+        use std::os::unix::fs::PermissionsExt;
+        let bundle=fs::canonicalize(home).unwrap().join("Applications/Private Client.app");
+        fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        let file=bundle.join("Contents/MacOS/PrivateMain");fs::write(&file,b"private native fixture; never executed").unwrap();
+        fs::set_permissions(file,fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(bundle.join("Contents/Info.plist"),r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string><key>CFBundleExecutable</key><string>PrivateMain</string></dict></plist>"#).unwrap();
+        Self {bundle}
+    }
+}
 impl ReadRunner for FakeRunner {
     fn run(
         &self,
@@ -160,12 +236,12 @@ impl ReadRunner for FakeRunner {
         _limit: usize,
     ) -> claude_watch_core::error::Result<Output> {
         let now = native::now();
-        let p = identity();
+        let mut p = identity();p.executable=self.bundle.join("Contents/MacOS/PrivateMain").to_string_lossy().into_owned();
         let mut v = json!({"schema":1,"status":"ok","uid":501,"started_at":now,"finished_at":now});
         match command {
             ReadCommand::Observer(ObserverAction::Inventory) => {
                 let mut record = json!(p);
-                record["bundle_path"] = json!("/Applications/Claude.app");
+                record["bundle_path"] = json!(self.bundle);
                 record["bundle_id"] = json!("com.anthropic.claudefordesktop");
                 v["state"] = json!("ok");
                 v["truncated"] = json!(false);
@@ -185,6 +261,10 @@ impl ReadRunner for FakeRunner {
                 v["socket_samples"] =
                     json!([{"pid":77,"state":"ok","identity":p,"sockets":[],"dropped":{}}]);
             }
+            ReadCommand::Plist(path)=> {
+                assert_eq!(path,self.bundle.join("Contents/Info.plist"));
+                return SystemRunner::development()?.run(ReadCommand::Plist(path),input,_timeout,_limit);
+            }
             _ => panic!("unexpected native test command"),
         }
         Ok(Output {
@@ -198,7 +278,7 @@ impl ReadRunner for FakeRunner {
 fn sampler_strips_private_argv_and_empty_socket_sample_is_not_a_network_change() {
     let home = std::env::temp_dir().join(format!("cw-native-fixture-{}", Uuid::new_v4()));
     fs::create_dir(&home).unwrap();
-    let mut sampler = Sampler::new(FakeRunner, Paths::new(&home).unwrap());
+    let mut sampler = Sampler::new(FakeRunner::new(&home), Paths::new(&home).unwrap());
     let process = sampler.processes().unwrap();
     assert!(process.complete);
     assert_eq!(process.targets.len(), 1);
@@ -348,7 +428,7 @@ fn confirmed_exit_is_distinct_from_missing_or_unverified_target() {
     assert_eq!(missing.dropped["missing_target_sample"], 1);
 }
 
-struct ExitedRunner;
+struct ExitedRunner(FakeRunner);
 impl ReadRunner for ExitedRunner {
     fn run(
         &self,
@@ -358,7 +438,7 @@ impl ReadRunner for ExitedRunner {
         limit: usize,
     ) -> claude_watch_core::error::Result<Output> {
         let is_socket = matches!(command, ReadCommand::Observer(ObserverAction::Sockets));
-        let mut output = FakeRunner.run(command, input, timeout, limit)?;
+        let mut output = self.0.run(command, input, timeout, limit)?;
         if is_socket {
             let mut body: Value = serde_json::from_slice(&output.stdout).unwrap();
             body["socket_samples"] = json!([{"pid":77,"state":"unknown","code":"process_exited"}]);
@@ -371,7 +451,7 @@ impl ReadRunner for ExitedRunner {
 fn sampler_reports_confirmed_exit_without_claiming_incomplete_round() {
     let home = std::env::temp_dir().join(format!("cw-exit-fixture-{}", Uuid::new_v4()));
     fs::create_dir(&home).unwrap();
-    let mut sampler = Sampler::new(ExitedRunner, Paths::new(&home).unwrap());
+    let mut sampler = Sampler::new(ExitedRunner(FakeRunner::new(&home)), Paths::new(&home).unwrap());
     let process = sampler.processes().unwrap();
     let socket = sampler.sockets(&process).unwrap();
     assert_eq!(socket.receipt["collector_state"], "empty");
@@ -541,7 +621,7 @@ fn sampler_discovers_managed_codex_servers_with_bound_arguments() {
             let now = native::now();
             let mut front = identity();
             front.pid = 71;
-            front.executable = "/opt/homebrew/Caskroom/codex/v/bin/codex".into();
+            front.executable = self.home.join("independent-codex-image").to_string_lossy().into_owned();
             let mut daemon = identity();
             daemon.pid = 72;
             daemon.executable = self
@@ -588,7 +668,13 @@ fn sampler_discovers_managed_codex_servers_with_bound_arguments() {
     // The test home must match the executable's exact installation prefix.
     let temp = std::env::temp_dir().join(format!("cw-managed-{}", Uuid::new_v4()));
     fs::create_dir(&temp).unwrap();
-    // Process classification only reads managed home paths; fixture binaries need not exist.
+    let temp=fs::canonicalize(temp).unwrap();
+    use std::os::unix::fs::{symlink,PermissionsExt};
+    fs::create_dir_all(temp.join(".local/bin")).unwrap();
+    let front=temp.join("independent-codex-image");fs::write(&front,b"private independent CLI fixture; never executed").unwrap();
+    fs::set_permissions(&front,fs::Permissions::from_mode(0o755)).unwrap();symlink(&front,temp.join(".local/bin/codex")).unwrap();
+    // The independent CLI has real discovery evidence. Managed server paths
+    // keep the existing exact-path + actual-entrypoint classification contract.
     let paths = Paths::new(&temp).unwrap();
     let missing_arguments = Arc::new(AtomicBool::new(false));
     let mut sampler = Sampler::new(
@@ -627,11 +713,11 @@ fn sampler_discovers_managed_codex_servers_with_bound_arguments() {
 
 #[test]
 fn incomplete_process_round_keeps_causes_separate_from_complete_socket_sample() {
-    struct Incomplete;
+    struct Incomplete(FakeRunner);
     impl ReadRunner for Incomplete {
         fn run(&self, command: ReadCommand, input: &[u8], timeout: Duration, limit: usize) -> claude_watch_core::error::Result<Output> {
             let is_inventory = matches!(command, ReadCommand::Observer(ObserverAction::Inventory));
-            let mut output = FakeRunner.run(command, input, timeout, limit)?;
+            let mut output = self.0.run(command, input, timeout, limit)?;
             if is_inventory {
                 let mut body: Value = serde_json::from_slice(&output.stdout).unwrap();
                 body["unavailable"] = json!([{"pid":88,"code":"identity_unavailable"}]);
@@ -643,7 +729,7 @@ fn incomplete_process_round_keeps_causes_separate_from_complete_socket_sample() 
     }
     let home = std::env::temp_dir().join(format!("cw-partial-process-{}", Uuid::new_v4()));
     fs::create_dir(&home).unwrap();
-    let mut sampler = Sampler::new(Incomplete, Paths::new(&home).unwrap());
+    let mut sampler = Sampler::new(Incomplete(FakeRunner::new(&home)), Paths::new(&home).unwrap());
     let process = sampler.processes().unwrap();
     assert!(!process.complete);
     assert_eq!(process.diagnostic_reasons["identity_unavailable"], 1);

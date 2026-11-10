@@ -55,13 +55,25 @@ struct ChannelSupervisionTests {
         let replacement = root.appendingPathComponent("replacement-image")
         try Data("fixture".utf8).write(to: image)
         try Data("fixture".utf8).write(to: replacement)
-        let alias = root.appendingPathComponent(".local/bin/claude")
-        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: image)
-        expect(channelResolvedCLIAliases(home: root.path).contains(image.resolvingSymlinksInPath().path), "first flow resolves a supported native alias")
-        try FileManager.default.removeItem(at: alias)
-        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: replacement)
-        let refreshed = channelResolvedCLIAliases(home: root.path)
-        expect(refreshed.contains(replacement.resolvingSymlinksInPath().path) && !refreshed.contains(image.resolvingSymlinksInPath().path), "an updated alias is captured before the next inventory")
+        for cli in ["claude", "codex"] {
+            let alias = root.appendingPathComponent(".local/bin/" + cli)
+            let imagePath = image.resolvingSymlinksInPath().path
+            let replacementPath = replacement.resolvingSymlinksInPath().path
+            try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: image)
+            let initial = channelResolvedCLIAliases(home: root.path)
+            expect(initial.contains(imagePath), "\(cli): first flow resolves a supported native alias")
+            expect(channelIsManagedExecutable(imagePath, home: root.path, aliases: initial), "\(cli): resolved image is captured")
+            try FileManager.default.removeItem(at: alias)
+            try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: replacement)
+            let refreshed = channelResolvedCLIAliases(home: root.path)
+            expect(refreshed.contains(replacementPath) && !refreshed.contains(imagePath), "\(cli): an updated alias is captured before the next inventory")
+            expect(!channelIsManagedExecutable(imagePath, home: root.path, aliases: refreshed), "\(cli): old alias target cannot capture an independent process")
+            try FileManager.default.removeItem(at: alias)
+            let removed = channelResolvedCLIAliases(home: root.path)
+            expect(!removed.contains(replacementPath), "\(cli): deleted alias does not retain its target")
+            expect(!channelIsManagedExecutable(replacementPath, home: root.path, aliases: removed), "\(cli): unaliased ordinary image remains unmanaged")
+            expect(!channelIsManagedExecutable(root.appendingPathComponent("ordinary/" + cli).path, home: root.path, aliases: removed), "\(cli): an unrelated same-named executable is not captured")
+        }
         // No global uncertainty rule may capture ordinary unsigned programs.
         expect(channelOwnership(targetEvidence: false, identityConfirmed: false) == .unmanaged, "ordinary software remains usable during identity uncertainty")
         expect(channelOwnership(targetEvidence: true, identityConfirmed: false) == .uncertain, "positively identified AI remains held without verified identity")

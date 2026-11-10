@@ -461,12 +461,13 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                 uid,
                 targets: vec![],
                 identities: BTreeMap::new(),
-                roles: json!({}),
+                roles: json!({}), match_evidence: BTreeMap::new(),
                 unavailable: vec![],
                 diagnostic_reasons: BTreeMap::new(),
                 confirmed_exited_count: 0,
                 complete: true,
                 observed_at: native::now(),
+                discovery: None,
             };
             let sockets = SocketRound {
                 flows: vec![],

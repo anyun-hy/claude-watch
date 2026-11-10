@@ -127,6 +127,18 @@ def build_plan(run_dir: Path) -> tuple[list[Step], dict]:
         Step("rust.extension_capture_fixture", "prerequisite", dependencies=["rust.workspace"], prepare=[
             {"kind": "require_file", "path": "{run_dir}/artifacts/root-capture.json"}],
              notes=["Exported by the workspace test; no duplicate test run."]),
+        Step("rust.monitor_coverage_fixture", "prerequisite", dependencies=["rust.workspace"], prepare=[
+            {"kind": "require_file", "path": "{run_dir}/artifacts/monitor-coverage-wire.json"},
+            {"kind": "require_file", "path": "{run_dir}/artifacts/managed-cli-unlinked-visible.json"}],
+             notes=["Exported by the workspace test; no duplicate test run."]),
+        Step("rust.process_protection_fixture", "prerequisite", dependencies=["rust.workspace"], prepare=[
+            {"kind": "require_file", "path": "{run_dir}/artifacts/process-protection-deadlines.json"}],
+             notes=["Exported by the workspace process projection test; no duplicate test run."]),
+        Step("rust.target_discovery_fixture", "prerequisite", dependencies=["rust.workspace"], prepare=[
+            {"kind": "require_file", "path": "{run_dir}/artifacts/target-discovery-wire.json"},
+            {"kind": "require_file", "path": "{run_dir}/artifacts/target-discovery-pending.json"},
+            {"kind": "require_file", "path": "{run_dir}/artifacts/target-discovery-staging.json"}],
+             notes=["Exported by the workspace runtime/engine discovery tests; no duplicate Cargo invocation."]),
         Step("python.tools", "test", [[sys.executable, "-m", "unittest", "discover", "-s", "tools/tests",
               "-p", "test_*.py", "-v"]], test_files=sorted(str(p.relative_to(ROOT)) for p in (ROOT / "tools/tests").glob("test_*.py"))),
         Step("python.monitor", "test", [[sys.executable, "-m", "unittest", "discover", "-s", "monitor/tests",
@@ -195,7 +207,7 @@ def build_plan(run_dir: Path) -> tuple[list[Step], dict]:
         Step("rust.listener_readonly", "host_readonly", [["cargo", "test", "--locked", "-p", "claude-watch-runtime",
               "--test", "live_listener_diagnostics", "system_runner_reports_listener_evidence_without_mutation",
               "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"]], dependencies=["rust.build"],
-             notes=["Reads actual host listener diagnostics, never changes the listener or VPN."]),
+             notes=["Uses two owned ephemeral loopback listeners and real kernel collection; checks the exact selected endpoint, PID and birth identity. Does not require or modify the VPN listener."]),
         Step("webkit.resident_runtime", "test", [["bash", "monitor/tests/run_resident_worker_tests.sh", "--fixture"]],
              dependencies=["rust.build", "macos.gui_session"], timeout_seconds=600),
         Step("rust.signed_peer_build", "build", [["cargo", "test", "--locked", "-p", "claude-watch-system", "--lib",
@@ -444,7 +456,7 @@ class Runner:
             # A workspace assertion failure need not discard fresh fixture
             # exports from other passing tests. These steps verify the actual
             # files in this NEW run directory; they never reuse an older run.
-            if step.id in ("rust.extension_command_fixture", "rust.extension_capture_fixture"):
+            if step.id in ("rust.extension_command_fixture", "rust.extension_capture_fixture", "rust.monitor_coverage_fixture", "rust.process_protection_fixture", "rust.target_discovery_fixture"):
                 bad_deps = [dep for dep in bad_deps if prior.get(dep) != "failed"]
             if step.excluded_reason:
                 result.update(status="excluded", reason=step.excluded_reason)

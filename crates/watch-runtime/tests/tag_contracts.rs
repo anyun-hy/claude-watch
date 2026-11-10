@@ -452,6 +452,31 @@ fn same_core_dns_listener_requires_unique_matching_owner_and_stable_start_identi
         );
     }
 }
+
+#[test]
+fn selected_listener_port_never_accepts_a_different_port_or_incomplete_owner() {
+    let empty = CommandEvidence { status:1, stdout:String::new(), stderr:String::new(), source:"lsof".into() };
+    let kernel = CommandEvidence { status:0, stdout:
+        "tcp4 0 0 127.0.0.1.45678 *.* LISTEN 0 0 owned:123\ntcp4 0 0 127.0.0.1.7890 *.* LISTEN 0 0 proxy:456\n".into(),
+        stderr:String::new(), source:"netstat".into() };
+    let selected = tag_flow::listener_fallback_for_port(empty.clone(), Some(&kernel), 45678);
+    assert_eq!(selected.status, 0);
+    assert_eq!(selected.stdout, "p123\nn127.0.0.1:45678");
+    let legacy = tag_flow::listener_fallback(empty.clone(), Some(&kernel));
+    assert_eq!(legacy.status, 0);
+    assert_eq!(legacy.stdout, "p456\nn127.0.0.1:7890", "production default must retain its exact VPN endpoint");
+    assert_ne!(tag_flow::listener_fallback_for_port(empty.clone(), Some(&kernel), 45679).status, 0);
+    assert_ne!(tag_flow::listener_fallback_for_port(empty.clone(), Some(&kernel), 0).status, 0);
+    for stdout in ["", "tcp4 0 0 127.0.0.1.45678 *.* LISTEN 0 0 unknown:0\n",
+        "tcp4 0 0 127.0.0.1.45678 *.* LISTEN 0 0 owned:123 other:456\n"] {
+        let bad = CommandEvidence { stdout:stdout.into(), ..kernel.clone() };
+        assert_ne!(tag_flow::listener_fallback_for_port(empty.clone(), Some(&bad), 45678).status, 0);
+    }
+    let denied = CommandEvidence { status:1, stderr:"permission denied".into(), ..empty };
+    let result = tag_flow::listener_fallback_for_port(denied, Some(&kernel), 45678);
+    assert_ne!(result.status, 0);
+    assert_eq!(result.stderr, "permission denied", "fallback must not hide a real collection error");
+}
 #[test]
 fn api_snapshot_uses_actual_mode_and_rule_failure_does_not_erase_verified_selection() {
     let base = json!({"group":"AI","/configs":{"mode":"global","mixed-port":7890},"/proxies":{"proxies":{"GLOBAL":{"type":"Selector","now":"JP09"},"AI":{"type":"Selector","now":"JP11"},"JP09":{"type":"Shadowsocks"},"JP11":{"type":"Shadowsocks"}}},"/connections":{"connections":[]},"/rules":{"rules":[]}});

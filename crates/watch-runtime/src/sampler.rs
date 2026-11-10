@@ -10,7 +10,7 @@ use crate::{
 use claude_watch_core::{
     error::{CoreError, Result},
     process_roots::{self, Classification, RootEvidence, TrustedCliPaths},
-    processes::{self, Identity, McpSpec, Target},
+    processes::{self, Identity, MatchEvidence, McpSpec, Target},
     tag_config,
     tag_flow::{self, CommandEvidence, CorrelationInput},
 };
@@ -19,6 +19,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     net::{SocketAddr, TcpStream},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -38,12 +39,24 @@ fn command_path(command: &str, cwd: Option<&str>) -> Option<String> {
     };
     canonical(&path).map(|p| p.to_string_lossy().into_owned())
 }
-pub(crate) fn cli_paths(paths: &Paths) -> TrustedCliPaths {
+#[cfg(test)]
+fn cli_paths(paths: &Paths) -> TrustedCliPaths {
+    cli_alias_snapshot(paths, cli_alias_signature).map(|snapshot| snapshot.trusted).unwrap_or_default()
+}
+
+type CliAliasSignature = Vec<(PathBuf, bool, Vec<i128>, Option<PathBuf>)>;
+
+struct CliAliasSnapshot {
+    signature: CliAliasSignature,
+    trusted: TrustedCliPaths,
+}
+
+fn trusted_cli_paths(signature: &CliAliasSignature) -> TrustedCliPaths {
     let mut known = TrustedCliPaths::default();
-    for (file, claude) in process_roots::cli_aliases(&paths.home) {
-        if let Some(path) = canonical(&file) {
+    for (_, claude, _, resolved) in signature {
+        if let Some(path) = resolved {
             let path = path.to_string_lossy().into_owned();
-            if claude {
+            if *claude {
                 known.claude.insert(path);
             } else {
                 known.codex.insert(path);
@@ -51,6 +64,39 @@ pub(crate) fn cli_paths(paths: &Paths) -> TrustedCliPaths {
         }
     }
     known
+}
+
+fn cli_alias_snapshot(paths: &Paths, mut read: impl FnMut(&Paths) -> CliAliasSignature) -> Option<CliAliasSnapshot> {
+    // Equal consecutive observations bind link/target metadata and canonical
+    // resolution to the SAME trusted set. Bound retries under active upgrades;
+    // an unstable result is pending and must not retain cached alias success.
+    let mut signature = read(paths);
+    for _ in 0..3 {
+        let next = read(paths);
+        if signature == next {
+            let trusted = trusted_cli_paths(&next);
+            return Some(CliAliasSnapshot { signature: next, trusted });
+        }
+        signature = next;
+    }
+    None
+}
+
+// Watch only the supported aliases, including both link and target identity.
+// No directory-tree scan or process arguments are needed to invalidate this cache.
+fn cli_alias_signature(paths: &Paths) -> CliAliasSignature {
+    process_roots::cli_aliases(&paths.home).into_iter().map(|(path, claude)| {
+        let mut facts = Vec::new();
+        for metadata in [fs::symlink_metadata(&path), fs::metadata(&path)] {
+            if let Ok(m) = metadata {
+                facts.extend([m.dev() as i128, m.ino() as i128, m.len() as i128,
+                    m.mtime() as i128, m.mtime_nsec() as i128, m.ctime() as i128,
+                    m.ctime_nsec() as i128, m.mode() as i128]);
+            } else { facts.push(-1); }
+        }
+        let resolved = canonical(&path);
+        (path, claude, facts, resolved)
+    }).collect()
 }
 fn load_mcp_specs(paths: &Paths) -> Vec<McpSpec> {
     let store = StateStore::new(paths.clone());
@@ -101,16 +147,18 @@ pub struct ProcessRound {
     pub targets: Vec<Target>,
     pub identities: BTreeMap<u32, Identity>,
     pub roles: Value,
+    pub match_evidence: BTreeMap<u32, MatchEvidence>,
     pub unavailable: Vec<Value>,
     pub diagnostic_reasons: BTreeMap<String, u32>,
     pub confirmed_exited_count: u32,
     pub complete: bool,
     pub observed_at: f64,
+    pub discovery: Option<Value>,
 }
 impl ProcessRound {
     pub fn public_value(&self) -> Value {
         json!({"schema":1,"round_id":self.id,"uid":self.uid,"state":if self.complete{"ok"}else{"partial"},"observed_at":self.observed_at,
-        "targets":self.targets,"roles":self.roles,"unavailable":self.unavailable})
+        "targets":self.targets,"roles":self.roles,"unavailable":self.unavailable,"discovery":self.discovery})
     }
 }
 pub struct SocketRound {
@@ -121,7 +169,8 @@ pub struct Sampler<R: ReadRunner> {
     pub runner: R,
     pub paths: Paths,
     tracked: Vec<Target>,
-    trusted: TrustedCliPaths,
+    aliases: Option<CliAliasSnapshot>,
+    discovery: crate::target_discovery::DiscoveryHandle,
     #[cfg(test)]
     fixture_tag: bool,
 }
@@ -170,23 +219,51 @@ pub fn selection_drift(pin: &str, observed: &str) -> bool {
 
 impl<R: ReadRunner> Sampler<R> {
     pub fn new(runner: R, paths: Paths) -> Self {
-        let trusted = cli_paths(&paths);
+        Self::new_with_alias_reader(runner, paths, cli_alias_signature)
+    }
+    fn new_with_alias_reader(runner: R, paths: Paths, read: impl FnMut(&Paths) -> CliAliasSignature) -> Self {
+        let aliases = cli_alias_snapshot(&paths, read);
+        let discovery = crate::target_discovery::DiscoveryHandle::for_home(&paths.home);
         Self {
             runner,
             paths,
             tracked: Vec::new(),
-            trusted,
+            aliases,
+            discovery,
             #[cfg(test)]
             fixture_tag: false,
         }
     }
     #[cfg(test)]
     pub(crate) fn use_fixture_tag(&mut self) { self.fixture_tag = true; }
+    pub fn set_discovery(&mut self,discovery:crate::target_discovery::DiscoveryHandle) { self.discovery=discovery; }
+    pub fn discovery(&self)->crate::target_discovery::DiscoveryHandle { self.discovery.clone() }
     pub fn processes(&mut self) -> Result<ProcessRound> {
+        self.processes_with_alias_reader(cli_alias_signature)
+    }
+    fn processes_with_alias_reader(&mut self, read: impl FnMut(&Paths) -> CliAliasSignature) -> Result<ProcessRound> {
+        let snapshot = cli_alias_snapshot(&self.paths, read);
+        if snapshot.as_ref().map(|s| &s.signature) != self.aliases.as_ref().map(|s| &s.signature) {
+            self.aliases = snapshot;
+        }
         let observer = Observer {
             runner: &self.runner,
         };
         let inventory = observer.inventory()?;
+        self.discovery.observed_process_bundles(inventory.processes.values().filter_map(|p|p.bundle_path.as_ref().map(PathBuf::from)
+            .or_else(||p.identity.executable.split_once(".app/Contents/").map(|(prefix,_)|PathBuf::from(format!("{prefix}.app")))).map(|path|(path,p.bundle_id.clone()))));
+        let mut discovery_snapshot=self.discovery.refresh(&self.runner,native::now());
+        let merge_aliases=|snapshot:&crate::target_discovery::DiscoverySnapshot| {
+            let accepted=snapshot.cli_paths();let mut trusted=snapshot.process_paths(true);
+            if let Some(aliases)=&self.aliases {
+                // The P2 stability guard cannot add a path absent from the
+                // shared accepted revision used by staging and selection.
+                trusted.claude.extend(aliases.trusted.claude.intersection(&accepted.claude).cloned());
+                trusted.codex.extend(aliases.trusted.codex.intersection(&accepted.codex).cloned());
+            }
+            trusted
+        };
+        let mut trusted=merge_aliases(&discovery_snapshot);
         let id = Uuid::new_v4().to_string();
         let identities: BTreeMap<_, _> = inventory
             .processes
@@ -204,11 +281,15 @@ impl<R: ReadRunner> Sampler<R> {
         if self.tracked.is_empty() {
             self.tracked = leases.tracked()?;
         }
+        let mut match_evidence = BTreeMap::new();
         let mut need_args = BTreeSet::new();
         let mut unavailable = inventory.unavailable.clone();
-        let evidence = |pid: u32, args: Option<&Arguments>| {
+        if self.aliases.is_none() {
+            unavailable.push(json!({"code":"cli_alias_snapshot_unstable"}));
+        }
+        let evidence = |pid: u32, args: Option<&Arguments>, trusted:&TrustedCliPaths| {
             let record = &inventory.processes[&pid];
-            process_roots::classify(
+            process_roots::classify_with_evidence(
                 RootEvidence {
                     identity: &record.identity,
                     bundle_path: record.bundle_path.as_deref(),
@@ -217,16 +298,17 @@ impl<R: ReadRunner> Sampler<R> {
                     cwd: args.map(|a| a.cwd.as_str()),
                 },
                 &self.paths.home,
-                &self.trusted,
+                trusted,
                 canonical,
             )
         };
         for (pid, record) in &inventory.processes {
-            match evidence(*pid, None) {
-                Classification::Root(kind) => seeds.push(Target {
-                    identity: record.identity.clone(),
-                    kind,
-                }),
+            let classified = evidence(*pid, None, &trusted);
+            match classified.classification {
+                Classification::Root(kind) => {
+                    match_evidence.insert(*pid, MatchEvidence::direct(&record.identity, classified.reason.unwrap()));
+                    seeds.push(Target { identity: record.identity.clone(), kind });
+                },
                 Classification::NeedArguments => {
                     need_args.insert(*pid);
                 }
@@ -264,24 +346,42 @@ impl<R: ReadRunner> Sampler<R> {
             .take(2048)
             .collect();
         let arguments = observer.arguments(&requested, &id)?;
+        let entries=arguments.values().filter(|args|Path::new(&args.identity.executable).file_name().is_some_and(|n|n=="node" || n=="nodejs" || n=="bun"))
+            .filter_map(|args|process_roots::node_script_entry(&args.tokens,Some(&args.cwd)))
+            .filter_map(|path| {
+                let text=path.to_string_lossy();
+                if text.ends_with("/node_modules/@anthropic-ai/claude-code/cli.js") { Some((processes::LaunchTarget::ClaudeCli,path)) }
+                else if text.ends_with("/node_modules/@openai/codex/bin/codex.js") { Some((processes::LaunchTarget::CodexCli,path)) }
+                else { None }
+            }).collect::<Vec<_>>();
+        if !entries.is_empty() {
+            self.discovery.observe_interpreters(arguments.values().filter(|args|Path::new(&args.identity.executable).file_name().is_some_and(|n|n=="node" || n=="nodejs" || n=="bun"))
+                .filter_map(|args|process_roots::node_script_entry(&args.tokens,Some(&args.cwd)).map(|script|(script,PathBuf::from(&args.identity.executable)))));
+            self.discovery.observe_cli_entries(entries);
+            discovery_snapshot=self.discovery.refresh(&self.runner,native::now());
+            trusted=merge_aliases(&discovery_snapshot);
+        }
         for pid in need_args {
             let Some(args) = arguments.get(&pid) else {
                 unavailable.push(json!({"pid":pid,"code":"root_arguments_unavailable"}));
                 continue;
             };
-            if let Classification::Root(kind) = evidence(pid, Some(args)) {
+            let classified = evidence(pid, Some(args), &trusted);
+            if let Classification::Root(kind) = classified.classification {
+                match_evidence.insert(pid, MatchEvidence::direct(&identities[&pid], classified.reason.unwrap()));
                 seeds.push(Target {
                     identity: identities[&pid].clone(),
                     kind,
                 });
             }
         }
-        let targets = processes::targets(
+        let (targets, match_evidence) = processes::targets_with_evidence(
             &identities,
             &seeds,
             &self.tracked,
             inventory.uid,
             &protected,
+            &match_evidence,
         );
         let specs = load_mcp_specs(&self.paths);
         let mut roles = serde_json::Map::new();
@@ -293,7 +393,7 @@ impl<R: ReadRunner> Sampler<R> {
             // Presentation hint only: keep the existing process/lease kind and
             // connection sampling unchanged. Never infer a client from the daemon.
             if process_roots::managed_codex_app_server(&args.identity.executable, &self.paths.home)
-                && matches!(evidence(*pid, Some(args)), Classification::Root(processes::Kind::CodexCli))
+                && matches!(evidence(*pid, Some(args), &trusted).classification, Classification::Root(processes::Kind::CodexCli))
             {
                 roles.insert(pid.to_string(), json!({"runtimeRole":"codex_managed", "serviceName":"Codex 托管后台", "roleEvidence":"managed_app_server", "started":args.identity.start_stamp}));
                 continue;
@@ -345,7 +445,7 @@ impl<R: ReadRunner> Sampler<R> {
         }
         let mut diagnostic_reasons = inventory.diagnostic_reasons.clone();
         for row in unavailable.iter().skip(inventory.unavailable.len()) {
-            let key = match row["code"].as_str() { Some("bundle_identity_unavailable") => "bundle_identity_unavailable", Some("root_arguments_unavailable") => "root_arguments_unavailable", _ => "other" };
+            let key = match row["code"].as_str() { Some("bundle_identity_unavailable") => "bundle_identity_unavailable", Some("root_arguments_unavailable") => "root_arguments_unavailable", Some("cli_alias_snapshot_unstable") => "cli_alias_snapshot_unstable", _ => "other" };
             let count = diagnostic_reasons.entry(key.into()).or_default(); *count = count.saturating_add(1);
         }
         let complete = inventory.complete && unavailable.is_empty();
@@ -358,11 +458,13 @@ impl<R: ReadRunner> Sampler<R> {
             targets,
             identities,
             roles: Value::Object(roles),
+            match_evidence,
             unavailable,
             diagnostic_reasons,
             confirmed_exited_count: inventory.confirmed_exited_count,
             complete,
             observed_at: native::now(),
+            discovery: Some(json!({"revision":discovery_snapshot.revision,"complete":discovery_snapshot.complete,"issues":discovery_snapshot.issues})),
         })
     }
     pub(crate) fn retain_channel_targets(&mut self, tracked: &[Target]) {
@@ -609,6 +711,123 @@ impl<R: ReadRunner> Sampler<R> {
             ));
         }
         parse_process_table(out.text()?)
+    }
+}
+
+#[cfg(test)]
+mod alias_snapshot_tests {
+    use super::*;
+    use crate::commands::{ObserverAction, Output};
+    use claude_watch_core::processes::MatchReason;
+    use std::os::unix::fs::symlink;
+
+    struct FixtureInventory { records: Vec<Identity> }
+    impl ReadRunner for FixtureInventory {
+        fn run(&self, command: ReadCommand, input: &[u8], _: Duration, _: usize) -> Result<Output> {
+            let at = native::now();
+            let mut value = json!({"schema":1,"status":"ok","uid":501,"started_at":at,"finished_at":at});
+            match command {
+                ReadCommand::Plist(_) => return Ok(Output { status:1, stdout:vec![], stderr:vec![] }),
+                ReadCommand::Observer(ObserverAction::Inventory) => {
+                    value["state"] = json!("ok"); value["truncated"] = json!(false);
+                    value["requested_count"] = json!(self.records.len()); value["processes"] = json!(self.records);
+                    value["unavailable"] = json!([]); value["exited"] = json!([]);
+                }
+                ReadCommand::Observer(ObserverAction::Arguments) => {
+                    let request: Value = serde_json::from_slice(input).unwrap();
+                    value["round_id"] = request["round_id"].clone();
+                    value["argument_prefixes"] = json!(self.records.iter().filter(|r|
+                        request["targets"].as_array().unwrap().iter().any(|p| p["pid"] == r.pid)).map(|r|
+                        json!({"pid":r.pid,"state":"ok","identity":r,"arguments":[r.executable,"/ordinary/script.js","/node_modules/@openai/codex/bin/codex.js"],"cwd":"/fixture","truncated":false})).collect::<Vec<_>>());
+                }
+                _ => panic!("unexpected alias fixture command"),
+            }
+            Ok(Output { status:0, stdout:serde_json::to_vec(&value).unwrap(), stderr:vec![] })
+        }
+    }
+
+    struct AliasFixture { paths: Paths, alias: PathBuf, a: PathBuf, b: PathBuf }
+    impl AliasFixture {
+        fn new() -> Self {
+            let home = PathBuf::from("/private/tmp").join(format!("cw-alias-snapshot-{}", Uuid::new_v4()));
+            fs::create_dir_all(home.join(".local/bin")).unwrap();
+            fs::create_dir_all(home.join("ordinary")).unwrap();
+            let a = home.join("opaque-image-a"); let b = home.join("opaque-image-b");
+            for p in [&a, &b, &home.join("ordinary/codex")] {
+                fs::write(p, b"private discovery fixture, never executed").unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(p,fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let alias = home.join(".local/bin/codex"); symlink(&a, &alias).unwrap();
+            Self { paths: Paths::new(&home).unwrap(), alias, a, b }
+        }
+        fn retarget(&self, path: &Path) { fs::remove_file(&self.alias).unwrap(); symlink(path, &self.alias).unwrap(); }
+        fn runner(&self) -> FixtureInventory {
+            let records = [self.a.clone(), self.b.clone(), "/usr/local/bin/node".into(), "/usr/bin/python3".into(),
+                "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal".into(), self.paths.home.join("ordinary/codex")]
+                .into_iter().enumerate().map(|(index, path)| Identity { pid:7000+index as u32, parent:1, uid:501,
+                    executable:path.to_string_lossy().into_owned(), start_seconds:100, start_microseconds:1, start_stamp:"owned-fixture".into() }).collect();
+            FixtureInventory { records }
+        }
+    }
+    impl Drop for AliasFixture { fn drop(&mut self) { fs::remove_dir_all(&self.paths.home).unwrap(); } }
+
+    #[test]
+    fn sampler_initial_alias_retarget_uses_one_stable_snapshot() {
+        let fixture = AliasFixture::new();
+        let mut reads = 0;
+        let mut sampler = Sampler::new_with_alias_reader(fixture.runner(), fixture.paths.clone(), |paths| {
+            let observed = cli_alias_signature(paths);
+            // Exact seam: A has been read, but validation/signature acquisition
+            // has not. B has no known installation layout or AI file name.
+            if reads == 0 { fixture.retarget(&fixture.b); }
+            reads += 1;
+            observed
+        });
+        let round = sampler.processes().unwrap();
+        assert_eq!(round.targets.iter().map(|t| t.identity.pid).collect::<Vec<_>>(), [7001], "B must be discovered; ordinary programs and independent A must not");
+        assert_eq!(round.match_evidence[&7001].reason, MatchReason::SupportedCliAlias);
+        assert_eq!(reads, 3, "A, B, B is a bounded deterministic reread, not a timing race");
+        assert!(cli_paths(&fixture.paths).codex.contains(fixture.b.to_str().unwrap()));
+        println!("initial alias snapshot: A -> B -> B; opaque B discovered; A, Node, Python, Terminal and unrelated codex excluded");
+    }
+
+    #[test]
+    fn sampler_unstable_alias_snapshot_is_pending_and_retries_next_round() {
+        let fixture = AliasFixture::new();
+        let mut reads = 0;
+        let mut unstable = |paths: &Paths| {
+            let observed = cli_alias_signature(paths);
+            fixture.retarget(if reads % 2 == 0 { &fixture.b } else { &fixture.a });
+            reads += 1; observed
+        };
+        let mut sampler = Sampler::new_with_alias_reader(fixture.runner(), fixture.paths.clone(), &mut unstable);
+        assert!(sampler.aliases.is_none(), "unstable initialization must not cache success");
+        let pending = sampler.processes_with_alias_reader(&mut unstable).unwrap();
+        assert!(!pending.complete && pending.targets.is_empty());
+        assert_eq!(pending.diagnostic_reasons.get("cli_alias_snapshot_unstable"), Some(&1));
+        let receipt = sampler.sockets(&pending).unwrap().receipt;
+        assert_eq!(receipt["collector_state"], "unknown");
+        assert_eq!(crate::monitor_snapshot::connection_observation(&receipt, receipt["observed_at"].as_f64().unwrap())["processReasonCounts"]["cli_alias_snapshot_unstable"], 1);
+        drop(unstable);
+        assert_eq!(reads, 8, "initialization and refresh must each stop after four observations");
+        let recovered = sampler.processes().unwrap();
+        assert!(recovered.complete); assert_eq!(recovered.targets.len(), 1);
+        assert_eq!(recovered.match_evidence[&7000].reason, MatchReason::SupportedCliAlias);
+        // A later unstable refresh also drops the old alias success. New
+        // process lifetimes cannot inherit its cached discovery or tracking.
+        for record in &mut sampler.runner.records { record.start_seconds += 1; }
+        let mut refresh_reads = 0;
+        let pending = sampler.processes_with_alias_reader(|paths| {
+            let observed = cli_alias_signature(paths);
+            fixture.retarget(if refresh_reads % 2 == 0 { &fixture.b } else { &fixture.a });
+            refresh_reads += 1; observed
+        }).unwrap();
+        assert_eq!(refresh_reads, 4); assert!(sampler.aliases.is_none());
+        assert!(pending.targets.is_empty() && !pending.complete);
+        let recovered = sampler.processes().unwrap();
+        assert!(recovered.complete && recovered.targets.len() == 1);
+        println!("unstable snapshots: four reads per attempt, pending/unknown without cached success, recovered on stable next round");
     }
 }
 pub fn parse_process_table(text: &str) -> Result<BTreeMap<u32, Value>> {

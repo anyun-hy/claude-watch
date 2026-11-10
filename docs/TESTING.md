@@ -55,13 +55,16 @@ parity, JavaScript probe fixtures, production Swift typechecking, and every
 Swift test without adding a recipe fails inventory validation rather than
 silently omitting the file.
 
-The three normally ignored Rust cases have explicit preparation: read-only
-host listener diagnostics, the resident WebKit **fixture** runtime, and an
+The three normally ignored Rust cases have explicit preparation: kernel
+listener diagnostics using owned ephemeral loopback sockets, the resident WebKit **fixture** runtime, and an
 isolated copy of the gateway peer test executable signed ad hoc with
 `runtime,library`. This signing is free, affects only that test copy, and does
 not install or validate the production root service. The listener diagnostic
-may fail because host listener evidence is unavailable; it is not silently
-converted into a pass.
+requires the exact selected socket endpoint, its owning PID and stable kernel
+birth/audit identity. It fails if collection is unavailable or identities differ.
+It does not require a VPN on port 7890 and does not occupy that port. Production
+VPN-listener absence still fails its existing checks; this owned-socket fixture
+does not claim that the actual VPN endpoint or gateway protection was accepted.
 
 Live external probes, UI preview/image generators, real AI/Finder acceptance,
 root service installation, VPN changes and long-running production acceptance
@@ -75,8 +78,8 @@ Failures remain visible in the original result directory. Corrective reruns
 are separate evidence and do not overwrite an earlier whole-suite result.
 The graph fixtures now check the existing desktop grouping while retaining
 PID, actual connection and independent CLI distinctions. The live listener
-diagnostic accepts the production lsof-first/netstat-fallback collection path,
-requires usable owner/endpoint records and stable process metadata, and does
+diagnostic uses the production lsof-first/netstat-fallback collection path with
+an explicit temporary port, requires the exact owner/endpoint and stable process metadata, and does
 not claim TAG authentication, connection reachability or gateway protection.
 
 ## Inspect or rerun a narrow selection

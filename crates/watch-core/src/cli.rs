@@ -52,7 +52,7 @@ impl Request {
             "protection" => (&["preview", "apply"], &["apply"], &["plan-id"]),
             "environment" => (&[], &["online", "record"], &["mode"]),
             "dns-leak-record" | "webrtc-risk-record" => (&[], &["apply"], &[]),
-            "launch" => (&[], &["apply"], &["target"]),
+            "launch" => (&[], &["apply"], &["target", "target-bundle"]),
             "setup" => (
                 &["inspect", "detect", "preview", "apply", "recover"],
                 &["online", "apply"],
@@ -238,6 +238,10 @@ impl Request {
             return Err(invalid());
         }
         if delimiter.is_some() && (command != "launch" || !request.launch_target().cli()) {
+            return Err(invalid());
+        }
+        if request.value("target-bundle").is_some_and(|path|request.launch_target().cli()
+            || !std::path::Path::new(path).is_absolute() || path.chars().any(char::is_control)) {
             return Err(invalid());
         }
         if matches!(command, "setup" | "environment") {

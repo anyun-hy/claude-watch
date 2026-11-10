@@ -21,6 +21,43 @@ fn target(identity: &Identity, kind: Kind) -> Target {
         kind,
     }
 }
+
+#[test]
+fn selected_match_evidence_tracks_reclassification_exec_reuse_and_launcher_sources() {
+    use processes::{MatchEvidence, MatchReason};
+    let mut inventory: BTreeMap<_, _> = [identity(10, 1), identity(11, 10), identity(12, 11), identity(20, 1)]
+        .into_iter().map(|p| (p.pid, p)).collect();
+    let seeds = vec![target(&inventory[&10], Kind::ChatgptMain), target(&inventory[&11], Kind::CodexCli)];
+    let direct = BTreeMap::from([(10, MatchEvidence::direct(&inventory[&10], MatchReason::VerifiedBundle)),
+        (11, MatchEvidence::direct(&inventory[&11], MatchReason::SupportedCliAlias))]);
+    let (first, evidence) = processes::targets_with_evidence(&inventory, &seeds, &[], 501, &BTreeSet::new(), &direct);
+    assert_eq!(evidence[&11].reason, MatchReason::VerifiedBundleComponent);
+    assert_eq!(evidence[&11].root.as_ref().unwrap().pid, 10);
+    assert_eq!(evidence[&12].reason, MatchReason::VerifiedDescendant);
+    assert_eq!(evidence[&12].root_reason, MatchReason::VerifiedBundle);
+    // Ownership survives exec and orphaning; a direct-exec description does not.
+    inventory.get_mut(&11).unwrap().executable = "/bin/ordinary-after-exec".into();
+    inventory.get_mut(&12).unwrap().parent = 1;
+    let (_, retained) = processes::targets_with_evidence(&inventory, &[], &first, 501, &BTreeSet::new(), &BTreeMap::new());
+    assert_eq!(retained[&11].reason, MatchReason::RetainedLifetime);
+    assert_eq!(retained[&11].identity.executable, "/bin/ordinary-after-exec");
+    assert_eq!(retained[&12].reason, MatchReason::RetainedLifetime);
+    inventory.get_mut(&11).unwrap().start_microseconds += 1;
+    let (_, reused) = processes::targets_with_evidence(&inventory, &[], &first, 501, &BTreeSet::new(), &BTreeMap::new());
+    // It can be a NEW descendant of current root 10, never a retained old lifetime.
+    assert_eq!(reused[&11].reason, MatchReason::VerifiedDescendant);
+    assert_ne!(reused[&11].identity.start_microseconds, first.iter().find(|t| t.identity.pid == 11).unwrap().identity.start_microseconds);
+    let launcher = target(&inventory[&20], Kind::ClaudeLauncher);
+    inventory.insert(21, identity(21, 20));
+    let (_, launched) = processes::targets_with_evidence(&inventory, &[launcher], &[], 501, &BTreeSet::new(), &BTreeMap::new());
+    assert_eq!(launched[&21].root_reason, MatchReason::LauncherSeed);
+    let stale = target(&inventory[&20], Kind::ClaudeMain);
+    let fresh = target(&inventory[&20], Kind::CodexCli);
+    let direct = BTreeMap::from([(20, MatchEvidence::direct(&inventory[&20], MatchReason::KnownCliLayout))]);
+    let (chosen, chosen_evidence) = processes::targets_with_evidence(&inventory, &[fresh], &[stale], 501, &BTreeSet::new(), &direct);
+    assert_eq!(chosen.iter().find(|p| p.identity.pid == 20).unwrap().kind, Kind::CodexCli);
+    assert_eq!(chosen_evidence[&20].reason, MatchReason::KnownCliLayout);
+}
 #[test]
 fn argument_parser_matches_python_without_executing_or_emitting_payloads() {
     let mut cases = vec![];
@@ -544,12 +581,13 @@ fn provider_and_role_roundtrip_matches_all_18_kinds_and_root_classification_vect
     );
     assert_eq!(
         check(
-            "/Applications/Fake.app/Contents/MacOS/Fake",
-            Some("/Applications/Fake.app"),
+            "/Applications/Renamed.app/Contents/MacOS/Renamed",
+            Some("/Applications/Renamed.app"),
             Some("com.openai.chat"),
             None,
             None
         ),
-        Classification::NotTarget
+        Classification::Root(Kind::ChatgptMain)
     );
+    assert_eq!(check("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",Some("/Applications/ChatGPT.app"),Some("com.example.ordinary"),None,None),Classification::NotTarget);
 }

@@ -137,11 +137,22 @@ pub fn listener_fallback(
     lsof: CommandEvidence,
     kernel: Option<&CommandEvidence>,
 ) -> CommandEvidence {
+    listener_fallback_for_port(lsof, kernel, 7890)
+}
+pub fn listener_fallback_for_port(
+    lsof: CommandEvidence,
+    kernel: Option<&CommandEvidence>,
+    port: u16,
+) -> CommandEvidence {
+    if port == 0 {
+        return CommandEvidence { status:1, stdout:String::new(), stderr:"invalid listener port".into(), source:lsof.source };
+    }
     if lsof.status != 1 || !lsof.stdout.trim().is_empty() || !lsof.stderr.trim().is_empty() {
         return lsof;
     }
     let Some(kernel) = kernel else { return lsof };
-    let (_, mut failed) = kernel_listener_owners(kernel, 7890);
+    let (_, mut failed) = kernel_listener_owners(kernel, port);
+    let port_text = port.to_string();
     let mut output = Vec::new();
     if kernel.status == 0 && kernel.stderr.trim().is_empty() {
         for line in kernel.stdout.lines() {
@@ -152,10 +163,10 @@ pub fn listener_fallback(
             {
                 continue;
             }
-            let Some((host, port)) = fields[3].rsplit_once('.') else {
+            let Some((host, raw_port)) = fields[3].rsplit_once('.') else {
                 continue;
             };
-            if port != "7890" || !["127.0.0.1", "*", "0.0.0.0", "::"].contains(&host) {
+            if raw_port != port_text || !["127.0.0.1", "*", "0.0.0.0", "::"].contains(&host) {
                 continue;
             }
             let owners: Vec<_> = fields[6..]
@@ -168,7 +179,7 @@ pub fn listener_fallback(
             }
             output.push(format!("p{}", owners[0]));
             output.push(format!(
-                "n{}:7890",
+                "n{}:{port}",
                 if host == "::" { "[::]" } else { host }
             ));
         }

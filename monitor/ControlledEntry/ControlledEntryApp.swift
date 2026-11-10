@@ -4,6 +4,15 @@ import Carbon
 import Darwin
 import Foundation
 
+struct ControlledEntryLaunchBinding {
+    static func arguments(target: String, bundlePath: String) -> [String] {
+        var arguments = ["launch", "--target", target, "--apply"]
+        if !bundlePath.isEmpty { arguments += ["--target-bundle", bundlePath] }
+        return arguments
+    }
+}
+
+#if !CONTROLLED_ENTRY_BINDING_TESTS
 /// Controlled desktop wrapper entry (`io.local.watchpanel.entry.<target-id>`).
 ///
 /// Key invariants (`Section 四.3 & 四.4`, `R3`, `R5`, `D01`–`D06`):
@@ -73,6 +82,10 @@ final class ControlledEntryDelegate: NSObject, NSApplicationDelegate {
         env["CW_TARGET_EXECUTABLE"]
             ?? (info["CWTargetExecutable"] as? String)
             ?? ""
+    }()
+
+    lazy var targetBundlePath: String = {
+        env["CW_TARGET_BUNDLE_PATH"] ?? (info["CWTargetBundlePath"] as? String) ?? ""
     }()
 
     lazy var watchBin: String = {
@@ -615,7 +628,7 @@ final class ControlledEntryDelegate: NSObject, NSApplicationDelegate {
     func performControlledLaunch() async -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: watchBin)
-        process.arguments = ["launch", "--target", target, "--apply"]
+        process.arguments = ControlledEntryLaunchBinding.arguments(target: target, bundlePath: targetBundlePath)
         // Inherit the wrapper's streams. Do not wait before draining a bounded
         // pipe or block the AppKit event loop while the engine starts its child.
         process.standardOutput = FileHandle.standardOutput
@@ -796,3 +809,4 @@ struct ControlledEntryApp {
         app.run()
     }
 }
+#endif

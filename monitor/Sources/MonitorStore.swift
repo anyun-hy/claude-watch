@@ -296,8 +296,13 @@ final class MonitorStore: ObservableObject {
         channelState(for: product)?.unmanaged_member_pids ?? []
     }
     func isProcessUnmanaged(_ process: WatchedProcess) -> Bool {
-        guard let state = channelState(for: process.product) else { return false }
+        guard let state = channelState(for: process.product) else { return true }
         return state.isUnmanagedProcess(process)
+    }
+    func processEvidenceText(_ process: WatchedProcess) -> String {
+        "发现依据：\(process.discoveryExplanation)\n" + process.protectionExplanation(
+            state: channelState(for: process.product), executorBootId: snapshot?.channelSupervision?.executor_boot_id,
+            now: now.timeIntervalSince1970, live: live)
     }
     var vpnSupervision: VpnSupervisionSnapshotModel? {
         guard live else { return nil }

@@ -89,6 +89,8 @@ def production_models() -> str:
         (SWITCHER, "SwitcherAccountState"),
         (MODELS, "Health"),
         (MODELS, "WatchedProcess"),
+        (MODELS, "ProcessIdentityRefModel"),
+        (MODELS, "ProcessProtectionModel"),
         (MODELS, "ProcessSourceRole"),
         (MODELS, "MonitoredProduct"),
         (MODELS, "Event"),
@@ -111,6 +113,7 @@ def production_models() -> str:
         (MODELS, "VpnMatchModel"),
         (MODELS, "VpnSupervisionSnapshotModel"),
         (BACKEND_CAP, "NetworkBackendCapabilities"),
+        (MODELS, "TargetDiscoveryStatusModel"),
         (MODELS, "MonitorSnapshot"),
     )
     return "\n\n".join(declaration(path, name) for path, name in requested)
@@ -118,6 +121,7 @@ def production_models() -> str:
 
 HARNESS = r'''
 import Foundation
+import CryptoKit
 
 func fail(_ message: String) -> Never { fputs("FAIL: \(message)\n", stderr); exit(1) }
 func data(_ path: String) throws -> Data { try Data(contentsOf: URL(fileURLWithPath: path)) }
@@ -196,11 +200,13 @@ struct RustSwiftReceiptContract {
             vpn_epoch: VpnEpochModel(observer_boot_id: "vpn-1", change_generation: 3),
             coverage_scope: BackendCoverageScopeModel(
                 backend: "seatbelt",
-                covers_controlled_desktop_launch: true,
-                covers_controlled_cli_launch: true,
-                covers_direct_fork_exec_children: true,
-                covers_unmanaged_external_launch: false,
-                unmanaged_processes_visible: true
+                configured_entries: ["claude-cli"],
+                protected_pids: [1001],
+                unprotected_pids: [2002],
+                uncovered_boundaries: ["unmanaged_existing_processes"],
+                server_identity_verified: false,
+                gateway_endpoint_protection_verified: true,
+                gateway_endpoint_protection_method: "fixture"
             ),
             unmanaged_member_pids: [2002],
             sandbox_ready: true

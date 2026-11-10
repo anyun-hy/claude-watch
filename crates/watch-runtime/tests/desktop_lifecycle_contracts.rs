@@ -13,6 +13,7 @@ use claude_watch_runtime::{
 };
 use serde_json::{json, Value};
 use std::{
+    path::{Path, PathBuf},
     process::Command,
     thread,
     time::{Duration, Instant},
@@ -34,10 +35,16 @@ impl ReadRunner for FixtureRunner {
     fn run(
         &self,
         command: ReadCommand,
-        _: &[u8],
-        _: Duration,
-        _: usize,
+        input: &[u8],
+        timeout: Duration,
+        limit: usize,
     ) -> claude_watch_core::error::Result<Output> {
+        if let ReadCommand::Plist(path) = command {
+            let private_tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+            let path = std::fs::canonicalize(path).expect("fixture metadata must exist");
+            assert!(path.starts_with(private_tmp), "fixture must not read installed AI metadata");
+            return SystemRunner::development()?.run(ReadCommand::Plist(path), input, timeout, limit);
+        }
         assert!(matches!(
             command,
             ReadCommand::Observer(ObserverAction::Inventory)
@@ -53,6 +60,28 @@ impl ReadRunner for FixtureRunner {
             stderr: Vec::new(),
         })
     }
+}
+
+fn fixture_app(root: &Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let bundle = root.join("Applications/LifecycleFixture.app");
+    let main = bundle.join("Contents/MacOS/FixtureMain");
+    let helper = bundle.join("Contents/Frameworks/Fixture Helper.app/Contents/MacOS/Helper");
+    for path in [&main, &helper] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"private lifecycle metadata fixture; never executed").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(bundle.join("Contents/Info.plist"),
+        r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string><key>CFBundleExecutable</key><string>FixtureMain</string></dict></plist>"#).unwrap();
+    (std::fs::canonicalize(main).unwrap(), std::fs::canonicalize(helper).unwrap())
+}
+
+fn fixture_desktop(runner: FixtureRunner, helper: PathBuf, authority: Authority) -> Result<NativeDesktop<FixtureRunner>> {
+    let applications = std::fs::canonicalize(helper.parent().unwrap().join("Applications")).unwrap();
+    let mut desktop = NativeDesktop::new(runner, helper, authority)?;
+    desktop.set_applications_dir(applications);
+    Ok(desktop)
 }
 
 // Scope this fixture to the owned PID using real native identity receipts.
@@ -135,6 +164,7 @@ impl ReadRunner for OwnedIdentityRunner {
 fn incomplete_inventory_never_confirms_exit_and_helpers_remain_visible() {
     let root = std::env::temp_dir().join(format!("cw-desktop-lifecycle-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&root).unwrap();
+    let (main_image, helper_image) = fixture_app(&root);
     let helper = root.join("watch-process-control");
     std::fs::write(&helper, b"fixture").unwrap();
     let record = |pid: u32, path: &str| {
@@ -146,9 +176,9 @@ fn incomplete_inventory_never_confirms_exit_and_helpers_remain_visible() {
         start_seconds: 1000,
         start_microseconds: 1,
     };
-    let hidden = NativeDesktop::new(
+    let hidden = fixture_desktop(
         FixtureRunner {
-            records: vec![record(77, "/Applications/Claude.app/Contents/MacOS/Claude")],
+            records: vec![record(77, main_image.to_str().unwrap())],
             complete: false,
         },
         helper.clone(),
@@ -163,14 +193,14 @@ fn incomplete_inventory_never_confirms_exit_and_helpers_remain_visible() {
         hidden.desktop_tree_running().unwrap_err().code,
         "desktop_inventory_incomplete"
     );
-    let only_helper = NativeDesktop::new(FixtureRunner { records:vec![record(88,"/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper")], complete:true },helper.clone(),Authority::ReadOnly).unwrap();
+    let only_helper = fixture_desktop(FixtureRunner { records:vec![record(88,helper_image.to_str().unwrap())], complete:true },helper.clone(),Authority::ReadOnly).unwrap();
     assert!(!only_helper.desktop_alive(&expected).unwrap());
     assert!(only_helper.desktop_tree_running().unwrap());
-    let unrelated = NativeDesktop::new(
+    let unrelated = fixture_desktop(
         FixtureRunner {
             records: vec![record(
                 89,
-                "/Applications/Claude.app.fake/Contents/MacOS/other",
+                root.join("Applications/LifecycleFixture.app.fake/Contents/MacOS/other").to_str().unwrap(),
             )],
             complete: true,
         },
@@ -187,13 +217,14 @@ fn quit_is_confirmed_by_the_full_tree_even_when_the_request_was_accepted() {
     use std::os::unix::fs::PermissionsExt;
     let root = std::env::temp_dir().join(format!("cw-desktop-quit-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&root).unwrap();
+    let (_, helper_image) = fixture_app(&root);
     let helper = root.join("watch-process-control");
     std::fs::write(&helper, "#!/bin/sh\nprintf '%s\\n' '{\"schema\":1,\"product\":\"claude\",\"status\":\"ok\",\"code\":\"\",\"planned\":1,\"requested\":1,\"skipped\":0,\"failed\":0,\"remaining\":0,\"identity_unconfirmed\":0,\"force_requested\":0,\"force_skipped\":0,\"force_failed\":0}'\n").unwrap();
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let record = json!({"pid":88,"parent":1,"uid":501,
-        "executable":"/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper",
+        "executable":helper_image,
         "start_seconds":1000,"start_microseconds":1,"start_stamp":"fixture"});
-    let lingering = NativeDesktop::new(
+    let lingering = fixture_desktop(
         FixtureRunner {
             records: vec![record],
             complete: true,
@@ -233,7 +264,7 @@ fn quit_is_confirmed_by_the_full_tree_even_when_the_request_was_accepted() {
         Some(1),
         "a failed overall stop still reports force requests"
     );
-    let unknown = NativeDesktop::new(
+    let unknown = fixture_desktop(
         FixtureRunner {
             records: vec![],
             complete: false,
@@ -246,7 +277,7 @@ fn quit_is_confirmed_by_the_full_tree_even_when_the_request_was_accepted() {
         unknown.quit().unwrap_err().code,
         "desktop_inventory_incomplete"
     );
-    let gone = NativeDesktop::new(
+    let gone = fixture_desktop(
         FixtureRunner {
             records: vec![],
             complete: true,
@@ -275,6 +306,7 @@ fn forced_helper_entry_is_separate_and_rejected_without_explicit_authority() {
     use std::os::unix::fs::PermissionsExt;
     let root = std::env::temp_dir().join(format!("cw-force-routing-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&root).unwrap();
+    let (_, helper_image) = fixture_app(&root);
     let helper = root.join("watch-process-control");
     let calls = root.join("calls");
     let script = format!(
@@ -290,9 +322,9 @@ fn forced_helper_entry_is_separate_and_rejected_without_explicit_authority() {
     std::fs::write(&helper, script).unwrap();
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let record = json!({"pid":88,"parent":1,"uid":501,
-        "executable":"/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper",
+        "executable":helper_image,
         "start_seconds":1000,"start_microseconds":1,"start_stamp":"fixture"});
-    let adapter = NativeDesktop::new(
+    let adapter = fixture_desktop(
         FixtureRunner {
             records: vec![record.clone()],
             complete: true,
@@ -315,7 +347,7 @@ fn forced_helper_entry_is_separate_and_rejected_without_explicit_authority() {
         std::fs::read_to_string(&calls).unwrap(),
         "close-desktop\nguard-close-desktop\n"
     );
-    let readonly = NativeDesktop::new(
+    let readonly = fixture_desktop(
         FixtureRunner {
             records: vec![record],
             complete: true,

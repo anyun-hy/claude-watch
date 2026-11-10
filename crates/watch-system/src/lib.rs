@@ -1,6 +1,7 @@
 //! Narrow, safe OS boundary. Runtime policy and state machines remain unsafe-free.
 pub mod network_events;
 pub mod launchd_gateway;
+pub mod application_locations;
 
 use std::{
     net::SocketAddr,
@@ -121,6 +122,21 @@ pub fn process_audit_token_matches(pid: u32, uid: u32, seconds: u64, micros: u32
     { macos::process_token(pid, uid, seconds, micros, None).as_ref() == Some(token) }
     #[cfg(not(target_os = "macos"))]
     { let _ = (pid, uid, seconds, micros, token); false }
+}
+
+/// Presentation-only lifetime correlation when an unlinked image no longer has
+/// a readable path. This is not executable-file or sandbox/connection evidence.
+pub fn process_lifetime_audit_digest_matches(pid: u32, uid: u32, seconds: u64, micros: u32, digest: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if digest.len() != 64 { return false; }
+        macos::process_token(pid, uid, seconds, micros, None).is_some_and(|token| {
+            let bytes = token.iter().map(u32::to_string).collect::<Vec<_>>().join(":");
+            sha256_bytes_hex(bytes.as_bytes()) == digest
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = (pid, uid, seconds, micros, digest); false }
 }
 
 pub fn inspect_process_identity(pid: u32) -> Option<ProcessKernelIdentity> {

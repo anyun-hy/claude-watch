@@ -99,7 +99,7 @@ pub fn connection_observation(raw: &Value, observed: f64) -> Value {
         None => json!({}),
         Some(value) => {
             let Some(map) = value.as_object() else { return bad("进程采样原因无效") };
-            if map.iter().any(|(k,v)| !["inventory_partial","inventory_truncated","inventory_count_mismatch","identity_unavailable","inventory_deadline","bundle_identity_unavailable","root_arguments_unavailable","other"].contains(&k.as_str()) || v.as_u64().is_none_or(|n| n > u32::MAX as u64)) { return bad("进程采样原因无效"); }
+            if map.iter().any(|(k,v)| !["inventory_partial","inventory_truncated","inventory_count_mismatch","identity_unavailable","inventory_deadline","bundle_identity_unavailable","root_arguments_unavailable","cli_alias_snapshot_unstable","other"].contains(&k.as_str()) || v.as_u64().is_none_or(|n| n > u32::MAX as u64)) { return bad("进程采样原因无效"); }
             value.clone()
         }
     };
@@ -166,9 +166,45 @@ pub fn proxy(raw: &Value) -> Option<Value> {
 }
 pub fn process_rows(round: &ProcessRound, active: &[u32]) -> Vec<Value> {
     round.targets.iter().map(|p|{
-    let kind=serde_json::to_value(p.kind).unwrap_or(json!("unknown"));let mut row=json!({"id":format!("{}|{}",p.identity.pid,p.identity.start_stamp),"pid":p.identity.pid,"started":p.identity.start_stamp,"kind":kind,"authorized":active.contains(&p.identity.pid)});
+    let kind=serde_json::to_value(p.kind).unwrap_or(json!("unknown"));let mut row=json!({"id":format!("{}|{}",p.identity.pid,p.identity.start_stamp),"pid":p.identity.pid,"started":p.identity.start_stamp,"kind":kind,"authorized":active.contains(&p.identity.pid),
+        "uid":p.identity.uid,"startSeconds":p.identity.start_seconds,"startMicroseconds":p.identity.start_microseconds});
+    if let Some(found)=round.match_evidence.get(&p.identity.pid).filter(|found| found.identity.same_process(&p.identity)) {
+        row["matchReason"]=json!(found.reason); row["matchRootReason"]=json!(found.root_reason); row["matchParent"]=json!(found.parent); row["matchRoot"]=json!(found.root);
+    }
     if let Some(role)=round.roles.get(p.identity.pid.to_string()){if role["started"]==p.identity.start_stamp{for key in ["runtimeRole","serviceName","roleEvidence"]{row[key]=role[key].clone();}}}row
 }).collect()
+}
+
+fn append_live_failed_instances(store: &StateStore, authority: &Value, round: &ProcessRound, rows: &mut Vec<Value>, now: f64) {
+    use claude_watch_core::{controlled_launch::{ManagedInstanceState, ManagedLaunchInstance}, processes::{Kind, LaunchTarget}};
+    if !crate::channel_policy_status::producer_is_current(authority)
+        || !authority["captured_at"].as_f64().is_some_and(|at| now.is_finite() && now >= at - 1.0 && now - at < 10.0) { return; }
+    let raw = store.read_json(&store.paths.watch().join("state/managed-launch-instances.json"), json!([])).unwrap_or(json!([]));
+    for value in raw.as_array().into_iter().flatten() {
+        let Ok(instance) = serde_json::from_value::<ManagedLaunchInstance>(value.clone()) else { continue; };
+        if instance.uid != round.uid || authority["executor_boot_id"].as_str() != Some(instance.executor_boot_id.as_str()) { continue; }
+        let visibility = &value["process_visibility"];
+        let Some(at) = visibility["observed_at"].as_f64().filter(|at| at.is_finite() && now >= *at - 1.0 && now - *at < 10.0) else { continue; };
+        let root_kind = match instance.target {
+            LaunchTarget::ClaudeDesktop => Kind::ClaudeMain, LaunchTarget::CodexDesktop => Kind::CodexMain,
+            LaunchTarget::ChatgptDesktop => Kind::ChatgptMain, LaunchTarget::ClaudeCli => Kind::ClaudeCode, LaunchTarget::CodexCli => Kind::CodexCli,
+        };
+        for member in visibility["members"].as_array().into_iter().flatten() {
+            if member["currently_verified"] == true && instance.state != ManagedInstanceState::Failed { continue; }
+            let Some(pid) = member["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok()) else { continue; };
+            let Some(seconds) = member["start_seconds"].as_u64() else { continue; };
+            let Some(micros) = member["start_microseconds"].as_u64().and_then(|v| u32::try_from(v).ok()) else { continue; };
+            if member["uid"] != instance.uid || rows.iter().any(|row| row["pid"] == pid) { continue; }
+            let Some(digest) = member["audit_identity_digest"].as_str() else { continue; };
+            if !claude_watch_system::process_lifetime_audit_digest_matches(pid, instance.uid, seconds, micros, digest) { continue; }
+            let kind = if pid == instance.pid { root_kind } else { root_kind.child() };
+            rows.push(json!({"id":format!("{pid}|{seconds}:{micros}"),"pid":pid,
+                "started":format!("{seconds}.{micros:06}"),"kind":kind,"authorized":false,
+                "uid":instance.uid,"startSeconds":seconds,"startMicroseconds":micros,
+                "matchReason":"retained_lifetime","matchRootReason":"launcher_seed",
+                "protection":{"state":"unprotected","reason_code":instance.error_code.as_deref().unwrap_or("member_identity_or_file_evidence_changed"),"observed_at":at}}));
+        }
+    }
 }
 fn guard_phase_summary(name: &str, phase: &crate::guard_diagnostics::GuardPhase) -> String {
     let decision = match phase.decision.as_str() {
@@ -420,7 +456,7 @@ fn present_event(e: Event) -> Value {
     }
     if let Some(counts) = &fields.process_reason_counts {
         for (reason, count) in counts { if *count > 0 {
-            let label = match reason.as_str() { "identity_unavailable" => "进程身份不可读", "inventory_deadline" => "进程枚举超时", "inventory_truncated" => "进程列表截断", "inventory_count_mismatch" => "进程数量不一致", "inventory_partial" => "进程枚举不完整", "bundle_identity_unavailable" => "应用身份不可读", "root_arguments_unavailable" => "入口参数不可读", _ => "其他进程原因" };
+            let label = match reason.as_str() { "identity_unavailable" => "进程身份不可读", "inventory_deadline" => "进程枚举超时", "inventory_truncated" => "进程列表截断", "inventory_count_mismatch" => "进程数量不一致", "inventory_partial" => "进程枚举不完整", "bundle_identity_unavailable" => "应用身份不可读", "root_arguments_unavailable" => "入口参数不可读", "cli_alias_snapshot_unstable" => "CLI 别名变化中，待确认", _ => "其他进程原因" };
             summary.push(format!("{label}：{count}"));
         }}
     }
@@ -587,9 +623,14 @@ pub fn assemble(
             Value::Null,
         )
         .unwrap_or(Value::Null);
+    let mut rows = process_rows(round, &[]);
+    for (row, target) in rows.iter_mut().zip(&round.targets) {
+        row["protection"] = crate::channel_policy_status::process_protection(store, &channel_supervision, &target.identity, target.kind, at);
+    }
+    append_live_failed_instances(store, &channel_supervision, round, &mut rows, at);
     json!({"capturedAt":at,"health":{"state":if quality{"running"}else{"degraded"},"mode":mode,"pid":producer.pid,"heartbeatAge":0.0,"started":producer.start_stamp,"detail":if quality{"后台进程存活，采样心跳正常"}else{"部分监控采样需要检查"},"alerts":"开启"},
         "installed":installed,"autoStart":false,"keepAlive":false,"hasBaseline":has_session_reference(store,at),"stderrBytes":0,
-        "processes":process_rows(round,&[]),"events":events,"eventError":event_error,"proxy":proxy(tag),"proxyError":Value::Null,"channelSupervision":channel_supervision,"channelEvents":channel_events,"vpnSupervision":vpn_supervision,"backendVersion":VERSION,"monitoredApps":MONITORED,"logPath":store.paths.base().join("events.jsonl")})
+        "processes":rows,"targetDiscovery":round.discovery,"events":events,"eventError":event_error,"proxy":proxy(tag),"proxyError":Value::Null,"channelSupervision":channel_supervision,"channelEvents":channel_events,"vpnSupervision":vpn_supervision,"backendVersion":VERSION,"monitoredApps":MONITORED,"logPath":store.paths.base().join("events.jsonl")})
 }
 /// Applies independently verified LaunchAgent registration facts without changing
 /// the legacy monitor snapshot shape or its sampling-health interpretation.

@@ -283,6 +283,22 @@ pub fn resolve_real_cli_skipping_shim(
     shim_executable: &Path,
     search_paths: &[PathBuf],
 ) -> Result<(PathBuf, String)> {
+    resolve_real_cli_with_source(cli_name, shim_executable, search_paths)
+        .map(|resolved| (resolved.executable, resolved.fingerprint))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCliEntry {
+    pub entry_path: PathBuf,
+    pub executable: PathBuf,
+    pub fingerprint: String,
+}
+
+pub fn resolve_real_cli_with_source(
+    cli_name: &str,
+    shim_executable: &Path,
+    search_paths: &[PathBuf],
+) -> Result<ResolvedCliEntry> {
     let canon_shim = fs::canonicalize(shim_executable).ok();
     let shim_dir = canon_shim
         .as_ref()
@@ -313,7 +329,7 @@ pub fn resolve_real_cli_skipping_shim(
         let Some(sha) = sha256_file_hex(&canon_cand) else {
             continue;
         };
-        return Ok((canon_cand, sha));
+        return Ok(ResolvedCliEntry { entry_path: candidate, executable: canon_cand, fingerprint: sha });
     }
 
     Err(CoreError::new(
@@ -665,13 +681,13 @@ pub fn stage_desktop_entry_bundle(
         spec.entry_bundle_id,
         app_display_name.trim_end_matches(".app"),
         spec.target.as_str(),
-        spec.target_bundle_path.display(),
+        xml_text(&spec.target_bundle_path.to_string_lossy()),
         spec.target_bundle_id,
-        spec.target_executable.display(),
+        xml_text(&spec.target_executable.to_string_lossy()),
         spec.target_fingerprint,
-        watch_engine_bin.display(),
-        launcher_bin.display(),
-        state_dir.display(),
+        xml_text(&watch_engine_bin.to_string_lossy()),
+        xml_text(&launcher_bin.to_string_lossy()),
+        xml_text(&state_dir.to_string_lossy()),
     );
     fs::write(bundle_dir.join("Contents/Info.plist"), info_plist)
         .map_err(|_| CoreError::new("stage_entry_plist_failed", "无法写入受控入口 Info.plist"))?;
@@ -681,11 +697,12 @@ pub fn stage_desktop_entry_bundle(
             .map_err(|_| CoreError::new("stage_entry_copy_failed", "无法复制 ControlledEntry 二进制"))?;
     } else {
         let script = format!(
-            "#!/bin/sh\nexport CW_TARGET=\"{}\"\nexport CW_WATCH_BIN=\"{}\"\nexec \"{}\" launch --target \"{}\" --apply \"$@\"\n",
-            spec.target.as_str(),
-            watch_engine_bin.display(),
-            watch_engine_bin.display(),
-            spec.target.as_str(),
+            "#!/bin/sh\nexport CW_TARGET={}\nexport CW_WATCH_BIN={}\nexec {} launch --target {} --target-bundle {} --apply \"$@\"\n",
+            shell_word(spec.target.as_str()),
+            shell_word(&watch_engine_bin.to_string_lossy()),
+            shell_word(&watch_engine_bin.to_string_lossy()),
+            shell_word(spec.target.as_str()),
+            shell_word(&spec.target_bundle_path.to_string_lossy()),
         );
         fs::write(&exe_dst, script)
             .map_err(|_| CoreError::new("stage_entry_script_failed", "无法写入受控入口启动器"))?;
@@ -698,6 +715,9 @@ pub fn stage_desktop_entry_bundle(
         .map_err(|_| CoreError::new("stage_entry_chmod_failed", "无法设置受控入口执行权限"))?;
     Ok(bundle_dir)
 }
+
+fn xml_text(value:&str)->String { value.replace('&',"&amp;").replace('<',"&lt;").replace('>',"&gt;").replace('"',"&quot;").replace('\'',"&apos;") }
+fn shell_word(value:&str)->String { format!("'{}'",value.replace('\'',"'\\''")) }
 
 /// Stages a managed CLI shim (`claude` or `codex`) in `bin_dir` that sets
 /// `CW_SHIM_EXECUTABLE` (to prevent `PATH` self-recursion) and invokes `watch_engine_bin`.

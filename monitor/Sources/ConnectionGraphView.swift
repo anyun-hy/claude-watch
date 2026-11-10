@@ -647,16 +647,18 @@ struct ConnectionGraphView: View {
         let text: String
         switch selectedNode {
         case .code, .desktop, .managed:
+            let sourceProcess = selectedNode == .code ? codeProcess : selectedNode == .managed ? managedProcess : desktopProcess
+            let evidenceDetail = sourceProcess.map { store.processEvidenceText($0) + "\n" } ?? ""
             let sourceGraph = selectedNode == .code ? codeGraph : selectedNode == .managed ? managedGraph : desktopGraph
             let sourceDetail = selectedProduct == .openAI
-                ? (selectedNode == .desktop ? "按桌面应用名称跟踪；Chromium 组件与 MCP 工具独立分组。\n" : selectedNode == .managed ? "按托管服务身份显示；客户端归属待确认。\n" : "仅展示后台识别为独立 Codex CLI 的进程；桌面内置服务不重复计入。\n")
+                ? (selectedNode == .desktop ? "桌面应用来源；Chromium 组件与 MCP 工具独立分组。\n" : selectedNode == .managed ? "按托管服务身份显示；客户端归属待确认。\n" : "仅展示后台识别为独立 Codex CLI 的进程；桌面内置服务不重复计入。\n")
                 : ""
             if let sourceGraph, let flow = sourceGraph.flow {
-                text = sourceDetail + "PID \(flow.pid) · \(flow.transport) · 本地端点 \(flow.local)\n" + sourceGraph.summary
+                text = evidenceDetail + sourceDetail + "PID \(flow.pid) · \(flow.transport) · 本地端点 \(flow.local)\n" + sourceGraph.summary
             } else {
                 let role: ProcessSourceRole = selectedNode == .code ? .cli : selectedNode == .managed ? .managed : .desktop
                 let hasOtherPath = flows.contains { flow in processes.contains { $0.pid == flow.pid && $0.sourceRole == role } }
-                text = sourceDetail + (hasOtherPath ? "存在平台连接，但未归入当前显示的路径；可在连接列表中选择查看。" : "尚无与此进程关联的连接样本。出现连接后，图中才会显示对应路径。")
+                text = evidenceDetail + sourceDetail + (hasOtherPath ? "存在平台连接，但未归入当前显示的路径；可在连接列表中选择查看。" : "尚无与此进程关联的连接样本。出现连接后，图中才会显示对应路径。")
             }
         case .gateway:
             let unmanaged = store.unmanagedPids(for: selectedProduct)

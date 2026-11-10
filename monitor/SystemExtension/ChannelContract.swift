@@ -168,7 +168,7 @@ func channelIsManagedProcessName(_ value: String) -> Bool {
 
 func channelCLIAliases(home: String?) -> [String] {
     var paths = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude", "/opt/homebrew/bin/codex", "/usr/local/bin/codex"]
-    if let home { paths += [home + "/.local/bin/claude", home + "/.claude/local/claude"] }
+    if let home { paths += [home + "/.local/bin/claude", home + "/.claude/local/claude", home + "/.local/bin/codex"] }
     return paths
 }
 func channelResolvedCLIAliases(home: String?) -> Set<String> {

@@ -39,6 +39,8 @@ pub enum ReadCommand {
     Plist(PathBuf),
     Listeners,
     LsofListener,
+    /// Read the owner of one caller-selected TCP listening port, never mutate it.
+    LsofTcpListener { port: u16 },
     /// Fixed-pid file-descriptor sampling.  The caller must discard names before
     /// publishing; lsof paths are intentionally never a presentation contract.
     LsofFiles {
@@ -128,6 +130,7 @@ impl ReadCommand {
             Self::Plist(_) => Key::Plist,
             Self::Listeners => Key::Listeners,
             Self::LsofListener => Key::LsofListener,
+            Self::LsofTcpListener { .. } => Key::LsofListener,
             Self::LsofFiles { .. } => Key::LsofFiles,
             Self::NettopBytes { .. } => Key::NettopBytes,
             Self::LaunchctlList => Key::LaunchctlList,
@@ -180,13 +183,14 @@ impl ReadCommand {
                 "/usr/sbin/netstat".into(),
                 ["-anv", "-p", "tcp"].into_iter().map(Into::into).collect(),
             ),
-            Self::LsofListener => (
-                "/usr/sbin/lsof".into(),
-                ["-nP", "-a", "-iTCP:7890", "-sTCP:LISTEN", "-Fpn"]
-                    .into_iter()
-                    .map(Into::into)
-                    .collect(),
-            ),
+            Self::LsofListener => return Self::LsofTcpListener { port: 7890 }.spec(observer),
+            Self::LsofTcpListener { port } => {
+                if *port == 0 {
+                    return Err(CoreError::new("invalid_listener_port", "监听端口必须非零"));
+                }
+                ("/usr/sbin/lsof".into(), vec!["-nP".into(), "-a".into(),
+                    format!("-iTCP:{port}").into(), "-sTCP:LISTEN".into(), "-Fpn".into()])
+            }
             Self::LsofFiles { pids } => {
                 let pid_list = bounded_pid_list(pids, 1024)?;
                 (

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 struct Health: Decodable, Sendable {
     let state, mode: String
@@ -15,6 +16,68 @@ struct WatchedProcess: Decodable, Identifiable, Sendable {
     var runtimeRole: String? = nil
     var serviceName: String? = nil
     var roleEvidence: String? = nil
+    var uid: UInt32? = nil
+    var startSeconds: UInt64? = nil
+    var startMicroseconds: UInt64? = nil
+    var matchReason: String? = nil
+    var matchRootReason: String? = nil
+    var matchParent: ProcessIdentityRefModel? = nil
+    var matchRoot: ProcessIdentityRefModel? = nil
+    var protection: ProcessProtectionModel? = nil
+
+    var discoveryExplanation: String {
+        let label: String
+        switch matchReason {
+        case "installation_pending": label = "已发现，安装证据待确认"
+        case "supported_cli_alias": label = "受支持的 CLI 别名"
+        case "known_cli_layout": label = "已知 CLI 安装布局"
+        case "verified_bundle": label = "应用包身份"
+        case "verified_bundle_component": label = "桌面应用内置组件"
+        case "script_entry": label = "实际脚本入口"
+        case "managed_app_server": label = "托管 app-server 入口"
+        case "launcher_seed": label = "受控启动记录"
+        case "retained_lifetime": label = "同一进程生命期跟踪（当前执行程序未直接识别）"
+        case "verified_descendant": label = "已确认来源的后代进程"
+        default: label = "发现依据未取得"
+        }
+        return label + (matchParent.map { " · 来源 PID \($0.pid)" } ?? "")
+            + (matchRootReason == "launcher_seed" && matchReason != "launcher_seed" ? " · 来自受控启动记录" : "")
+    }
+
+    func protectionExplanation(state: FamilyChannelMonitorState?, executorBootId: String?, now: Double, live: Bool) -> String {
+        guard live, let proof = protection, now.isFinite, proof.observed_at.isFinite,
+              now >= proof.observed_at - 1, now - proof.observed_at < 10 else {
+            return "保护未知：未取得当前实例的新鲜证据"
+        }
+        guard proof.state == "protected" else { return proof.explanation }
+        let pending = "待验证：当前身份、策略或执行回执尚未对齐"
+        guard let state, state.matchesProcess(self), state.producer_boot_id == proof.producer_boot_id,
+              let executorBootId, !executorBootId.isEmpty, executorBootId == proof.executor_boot_id,
+              proof.policy_version == state.saved_policy_version, state.applied_policy_version == state.saved_policy_version,
+              proof.command_seq == state.command_seq, proof.permit_generation == state.permit_generation,
+              proof.vpn_epoch == state.vpn_epoch,
+              state.policy_sync_state == .applied,
+              let until = proof.valid_until, until.isFinite, until > now,
+              state.coverage_scope?.hasRequiredFacts == true, state.coverage_scope?.hasVerifiedEndpoint == true,
+              state.backend == "seatbelt", state.coverage_scope?.backend == state.backend,
+              state.coverage_scope?.protected_pids.contains(UInt32(max(0, pid))) == true else {
+            return pending
+        }
+        switch state.display_state {
+        case .forwarding:
+            // Forwarding needs a current permit as well as the Rust proof's
+            // receipt/registry/VPN deadline. A newer family state can expire it.
+            guard proof.reason_code == "forwarding_verified", state.isPermitted,
+                  let permitUntil = state.valid_until, permitUntil.isFinite, permitUntil > now else { return pending }
+        case .blocked:
+            // Rust bounds this proof by the fresh cutoff receipt and registry,
+            // not by the old revoke command's lease. Keep that evidence expiry.
+            guard proof.reason_code == "blocked_verified", state.isConfirmedFlowBlocked else { return pending }
+        default:
+            return pending
+        }
+        return proof.explanation
+    }
 
     /// Product ownership is derived solely from the stable backend kind contract.
     /// The three-field process records themselves remain unchanged.
@@ -71,6 +134,47 @@ struct WatchedProcess: Decodable, Identifiable, Sendable {
         case "openai-desktop-helper": return "ChatGPT 桌面辅助进程"
         case "openai-child": return "ChatGPT 桌面关联子进程"
         default: return "关联子进程"
+        }
+    }
+}
+
+struct ProcessIdentityRefModel: Codable, Equatable, Sendable {
+    let pid, uid: UInt32
+    let start_seconds, start_microseconds: UInt64
+}
+
+struct ProcessProtectionModel: Codable, Equatable, Sendable {
+    let state, reason_code: String
+    let observed_at: Double
+    let producer_boot_id: String?
+    let executor_boot_id: String?
+    let policy_version: ChannelPolicyVersionModel?
+    let valid_until: Double?
+    let audit_identity_digest: String?
+    let command_seq: UInt64?
+    let permit_generation: UInt64?
+    let vpn_epoch: VpnEpochModel?
+
+    var explanation: String {
+        switch reason_code {
+        case "external_unmanaged_process": return "发现但未保护：未经过受控入口"
+        case "target_approval_changed", "retained_policy_changed", "unexpected_exec_image_change", "executable_evidence_changed", "member_identity_or_file_evidence_changed": return "未保护：入口、身份、文件或批准证据已变化"
+        case "exec_audit_token_changed", "instance_birth_time_mismatch": return "未保护：执行身份已变化"
+        case "gateway_endpoint_proof_missing": return "待验证：网关端点证明缺失"
+        case "pending_apply": return "待验证：等待执行器应用"
+        case "current_vpn_path_evidence_unverified": return "待验证：当前 VPN 路径或周期证据未确认"
+        case "coverage_evidence_unverified": return "保护未知：当前覆盖范围证据未确认"
+        case "current_process_identity_unverified": return "保护未知：当前进程身份未确认"
+        case "authority_stale_or_mismatched": return "保护未知：监督器证据已过期或不匹配"
+        case "registry_evidence_unavailable": return "保护未知：未取得受控实例证据"
+        case "current_member_token_unverified": return "待验证：当前成员身份未确认"
+        case "current_permit_identity_or_epoch_unverified": return "待验证：当前许可或 VPN 周期未确认"
+        case "execution_receipt_missing", "execution_pending": return "待验证：执行回执尚未确认"
+        case "execution_failed": return "未保护：执行失败"
+        case "forwarding_verified": return "已保护：当前身份获准转发"
+        case "blocked_verified": return "已保护：已确认断流，进程保留"
+        case "sandbox_identity_pending_or_stale": return "待验证：沙箱或执行身份尚未确认"
+        default: return state == "unprotected" ? "未保护：\(reason_code)" : "保护未知：\(reason_code)"
         }
     }
 }
@@ -232,6 +336,12 @@ struct BoundProcessTokenModel: Codable, Equatable, Sendable {
     let start_microseconds: UInt64
     let role: String
     let audit_token: [UInt32]?
+
+    var auditIdentityDigest: String? {
+        guard let audit_token, audit_token.count == 8 else { return nil }
+        let data = Data(audit_token.map(String.init).joined(separator: ":").utf8)
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 struct VpnEpochModel: Codable, Equatable, Sendable {
@@ -241,11 +351,62 @@ struct VpnEpochModel: Codable, Equatable, Sendable {
 
 struct BackendCoverageScopeModel: Codable, Equatable, Sendable {
     let backend: String
-    let covers_controlled_desktop_launch: Bool
-    let covers_controlled_cli_launch: Bool
-    let covers_direct_fork_exec_children: Bool
-    let covers_unmanaged_external_launch: Bool
-    let unmanaged_processes_visible: Bool
+    let configured_entries: [String]
+    let protected_pids: [UInt32]
+    let unprotected_pids: [UInt32]
+    let uncovered_boundaries: [String]
+    let server_identity_verified: Bool
+    let gateway_endpoint_protection_verified: Bool
+    let gateway_endpoint_protection_method: String?
+    private(set) var hasRequiredFacts: Bool = true
+
+    enum CodingKeys: String, CodingKey {
+        case backend, configured_entries, protected_pids, unprotected_pids, uncovered_boundaries
+        case server_identity_verified, gateway_endpoint_protection_verified, gateway_endpoint_protection_method
+    }
+
+    init(backend: String, configured_entries: [String], protected_pids: [UInt32],
+         unprotected_pids: [UInt32], uncovered_boundaries: [String], server_identity_verified: Bool,
+         gateway_endpoint_protection_verified: Bool, gateway_endpoint_protection_method: String?) {
+        self.backend = backend
+        self.configured_entries = configured_entries
+        self.protected_pids = protected_pids
+        self.unprotected_pids = unprotected_pids
+        self.uncovered_boundaries = uncovered_boundaries
+        self.server_identity_verified = server_identity_verified
+        self.gateway_endpoint_protection_verified = gateway_endpoint_protection_verified
+        self.gateway_endpoint_protection_method = gateway_endpoint_protection_method
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        backend = try values.decodeIfPresent(String.self, forKey: .backend) ?? "unknown"
+        configured_entries = try values.decodeIfPresent([String].self, forKey: .configured_entries) ?? []
+        protected_pids = try values.decodeIfPresent([UInt32].self, forKey: .protected_pids) ?? []
+        unprotected_pids = try values.decodeIfPresent([UInt32].self, forKey: .unprotected_pids) ?? []
+        uncovered_boundaries = try values.decodeIfPresent([String].self, forKey: .uncovered_boundaries) ?? []
+        server_identity_verified = try values.decodeIfPresent(Bool.self, forKey: .server_identity_verified) ?? false
+        gateway_endpoint_protection_verified = try values.decodeIfPresent(Bool.self, forKey: .gateway_endpoint_protection_verified) ?? false
+        gateway_endpoint_protection_method = try values.decodeIfPresent(String.self, forKey: .gateway_endpoint_protection_method)
+        var complete = true
+        for key in [CodingKeys.backend, .configured_entries, .protected_pids, .unprotected_pids,
+                    .uncovered_boundaries, .server_identity_verified] {
+            if !values.contains(key) { complete = false; continue }
+            if try values.decodeNil(forKey: key) { complete = false }
+        }
+        hasRequiredFacts = complete
+    }
+
+    var hasVerifiedEndpoint: Bool {
+        server_identity_verified || (gateway_endpoint_protection_verified
+            && gateway_endpoint_protection_method?.isEmpty == false)
+    }
+
+    /// Coverage is an observed set, separate from backend capabilities and permits.
+    var allDiscoveredProtected: Bool {
+        hasRequiredFacts && ["seatbelt", "network_extension"].contains(backend)
+            && hasVerifiedEndpoint && !configured_entries.isEmpty && !protected_pids.isEmpty && unprotected_pids.isEmpty
+    }
 }
 
 struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
@@ -298,7 +459,12 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
     /// policy version so stale flows or another session's processes are never
     /// mixed with the current channel disposition.
     func matchesProcess(_ process: WatchedProcess) -> Bool {
-        active_member_pids.contains(UInt32(max(0, process.pid)))
+        guard let uid = process.uid, let seconds = process.startSeconds, let microseconds = process.startMicroseconds,
+              let digest = process.protection?.audit_identity_digest else { return false }
+        return active_members.contains { token in
+            token.pid == UInt32(max(0, process.pid)) && token.uid == uid && token.start_seconds == seconds
+                && token.start_microseconds == microseconds && token.auditIdentityDigest == digest
+        }
     }
 
     func isUnmanagedProcess(_ process: WatchedProcess) -> Bool {
@@ -306,7 +472,7 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
         if unmanaged_member_pids?.contains(pid) == true {
             return true
         }
-        return !active_member_pids.contains(pid)
+        return !matchesProcess(process)
     }
 }
 
@@ -316,6 +482,7 @@ struct ChannelMonitorSnapshot: Codable, Equatable, Sendable {
     let captured_at: Double
     let saved_policy_version: ChannelPolicyVersionModel
     let families: [String: FamilyChannelMonitorState]
+    var executor_boot_id: String? = nil
 }
 
 struct ChannelMonitorEvent: Codable, Equatable, Sendable {
@@ -417,7 +584,7 @@ struct ChannelMonitorSubscriptionStore: Sendable {
         guard let state = families[family] else {
             return nil
         }
-        let expired = !now.isFinite || !state.updated_at.isFinite || (now - state.updated_at) > maxAge
+        let expired = !now.isFinite || !state.updated_at.isFinite || now < state.updated_at - 1 || (now - state.updated_at) > maxAge
         if !live || needsResync || expired {
             return FamilyChannelMonitorState(
                 family: state.family,
@@ -510,6 +677,34 @@ struct VpnMatchModel: Codable, Equatable, Sendable {
     let state: String
     var differences: [VpnFieldDiffModel]? = nil
     var reasons: [String]? = nil
+
+    enum CodingKeys: String, CodingKey { case verdict, state, differences, reasons }
+
+    init(state: String, differences: [VpnFieldDiffModel]? = nil, reasons: [String]? = nil) {
+        self.state = state; self.differences = differences; self.reasons = reasons
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let verdict = try values.decodeIfPresent(String.self, forKey: .verdict)
+        let legacy = try values.decodeIfPresent(String.self, forKey: .state)
+        differences = try values.decodeIfPresent([VpnFieldDiffModel].self, forKey: .differences)
+        reasons = try values.decodeIfPresent([String].self, forKey: .reasons)
+        if let verdict, let legacy, verdict != legacy {
+            state = "unknown"; reasons = (reasons ?? []) + ["vpn_match_wire_conflict"]
+        } else if let value = verdict ?? legacy, ["matched", "mismatched", "unknown", "stale"].contains(value) {
+            state = value
+        } else {
+            state = "unknown"; reasons = (reasons ?? []) + ["vpn_match_verdict_missing_or_unsupported"]
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(state, forKey: .verdict)
+        try values.encodeIfPresent(differences, forKey: .differences)
+        try values.encodeIfPresent(reasons, forKey: .reasons)
+    }
 }
 
 struct VpnSupervisionSnapshotModel: Codable, Equatable, Sendable {
@@ -541,6 +736,13 @@ struct VpnSupervisionSnapshotModel: Codable, Equatable, Sendable {
     }
 }
 
+/// Discovery completeness describes installation evidence, never protection.
+struct TargetDiscoveryStatusModel: Decodable, Equatable, Sendable {
+    let revision: String
+    let complete: Bool
+    let issues: [String]
+}
+
 struct MonitorSnapshot: Decodable, Sendable {
     let capturedAt: Double
     let health: Health
@@ -553,6 +755,7 @@ struct MonitorSnapshot: Decodable, Sendable {
     var channelSupervision: ChannelMonitorSnapshot? = nil
     var channelEvents: [ChannelMonitorEvent]? = nil
     var vpnSupervision: VpnSupervisionSnapshotModel? = nil
+    var targetDiscovery: TargetDiscoveryStatusModel? = nil
     let logPath: String
     /// Absent when an older installed script has not yet published multi-product capability.
     let backendVersion: String?

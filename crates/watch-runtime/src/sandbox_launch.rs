@@ -16,6 +16,7 @@
 //!   descriptor the production backend remains fail-closed.
 
 use crate::storage::StateStore;
+use crate::executable_verification::VerificationKey;
 use claude_watch_core::{
     channel::{BoundProcessToken, NetworkBackendKind, PolicyVersion},
     controlled_launch::{
@@ -23,7 +24,7 @@ use claude_watch_core::{
         ManagedLaunchInstance, SandboxLaunchEvidence,
     },
     error::{CoreError, Result},
-    processes::ProcessRole,
+    processes::{LaunchTarget, ProcessRole},
 };
 use claude_watch_system::{
     attribute_loopback_tcp_peer, effective_uid, inspect_process_identity, list_descendant_pids,
@@ -32,7 +33,7 @@ use claude_watch_system::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{Read, Write},
     net::{Shutdown, SocketAddr},
     os::unix::{
@@ -163,12 +164,52 @@ pub struct PortTakeoverProbeOutcome {
     pub failure_reason: Option<String>,
 }
 
+/// Bound by the Rust inventory resolver, never by the launch helper's payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedCliSource {
+    pub entry_path: String,
+    pub target: LaunchTarget,
+    pub executable: String,
+    pub fingerprint: String,
+}
+impl ApprovedCliSource {
+    fn key(&self) -> String { format!("{:?}:{}", self.target, self.entry_path) }
+    fn valid(&self, targets: &BTreeMap<String, String>) -> bool {
+        matches!(self.target, LaunchTarget::ClaudeCli | LaunchTarget::CodexCli)
+            && Path::new(&self.entry_path).is_absolute()
+            && targets.get(&self.executable) == Some(&self.fingerprint)
+            && std::fs::canonicalize(&self.entry_path).ok().as_deref() == Some(Path::new(&self.executable))
+    }
+}
+
+#[derive(Clone)]
+struct RetainedCliApproval {
+    source_key: String,
+    // Only children already verified at the retarget may use the retired image.
+    children: BTreeMap<u32, (String, BoundProcessToken)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImageStatus { Verified, Pending, Invalid }
+
 struct RegistryInner {
     executor_boot_id: String,
     policy_version: PolicyVersion,
     verifier: SandboxPeerVerifier,
     approved_targets: BTreeMap<String, String>,
     approved_child_executables: BTreeMap<String, String>,
+    cli_sources: BTreeMap<String, ApprovedCliSource>,
+    instance_sources: BTreeMap<String, String>,
+    retained_cli_instances: BTreeMap<String, RetainedCliApproval>,
+    approval_revision: u64,
+    image_approvals: BTreeMap<String, (String, u64)>,
+    image_verifications: BTreeMap<VerificationKey, ImageStatus>,
+    verification_in_flight: BTreeSet<VerificationKey>,
+    content_reads: u64,
+    invalidated_families: BTreeSet<String>,
+    // Retain only a live kernel exec lifetime for visibility after file evidence
+    // fails. These tokens are never consulted by attribution or approvals.
+    visibility_tokens: BTreeMap<(String, u32), BoundProcessToken>,
     instances: BTreeMap<String, ManagedLaunchInstance>,
     pid_to_instance: BTreeMap<u32, String>,
     child_identities: BTreeMap<u32, (String, BoundProcessToken)>,
@@ -197,6 +238,16 @@ impl SandboxLaunchRegistry {
                 verifier,
                 approved_targets: BTreeMap::new(),
                 approved_child_executables: BTreeMap::new(),
+                cli_sources: BTreeMap::new(),
+                instance_sources: BTreeMap::new(),
+                retained_cli_instances: BTreeMap::new(),
+                approval_revision: 0,
+                image_approvals: BTreeMap::new(),
+                image_verifications: BTreeMap::new(),
+                verification_in_flight: BTreeSet::new(),
+                content_reads: 0,
+                invalidated_families: BTreeSet::new(),
+                visibility_tokens: BTreeMap::new(),
                 instances: BTreeMap::new(),
                 pid_to_instance: BTreeMap::new(),
                 child_identities: BTreeMap::new(),
@@ -216,7 +267,9 @@ impl SandboxLaunchRegistry {
             guard
                 .approved_targets
                 .insert(executable_path.into(), sha256_hex.into());
+            Self::rebuild_image_approvals(&mut guard);
         }
+        self.refresh_executable_verifications();
     }
 
     pub fn approve_child_executable(
@@ -228,7 +281,9 @@ impl SandboxLaunchRegistry {
             guard
                 .approved_child_executables
                 .insert(executable_path.into(), sha256_hex.into());
+            Self::rebuild_image_approvals(&mut guard);
         }
+        self.refresh_executable_verifications();
     }
 
     /// Atomically replaces the approved target executables and child executables maps.
@@ -239,60 +294,231 @@ impl SandboxLaunchRegistry {
         targets: BTreeMap<String, String>,
         children: BTreeMap<String, String>,
     ) -> Vec<String> {
-        let Ok(mut guard) = self.inner.lock() else { return Vec::new(); };
-        if guard.approved_targets == targets && guard.approved_child_executables == children {
-            return Vec::new();
+        // Explicit replacement keeps the original strict removal contract.
+        self.replace_approved_targets_with_cli_sources(targets, children, Vec::new())
+    }
+
+    pub fn replace_approved_targets_with_cli_sources(
+        &self,
+        targets: BTreeMap<String, String>,
+        children: BTreeMap<String, String>,
+        sources: Vec<ApprovedCliSource>,
+    ) -> Vec<String> {
+        let mut current_sources = BTreeMap::new();
+        let mut conflicts = BTreeSet::new();
+        for source in sources {
+            let key = source.key();
+            if !source.valid(&targets) { conflicts.insert(key); continue; }
+            if current_sources.get(&key).is_some_and(|old| old != &source) {
+                conflicts.insert(key.clone());
+            }
+            current_sources.insert(key, source);
         }
+        current_sources.retain(|key, _| !conflicts.contains(key));
+        {
+            let Ok(guard) = self.inner.lock() else { return Vec::new(); };
+            if guard.approved_targets == targets && guard.approved_child_executables == children
+                && guard.cli_sources == current_sources { return Vec::new(); }
+        }
+        // A normal, content-verified B is required before retaining any A.
+        // Inventory refresh is the only production caller; the rare transition
+        // read runs outside authority locks and is checked again at commit.
+        let mut source_proofs = BTreeMap::new();
+        for source in current_sources.values() {
+            source_proofs.entry(source.executable.clone()).or_insert_with(|| {
+                let key = VerificationKey::new(&source.executable, &source.fingerprint, 0);
+                let valid = key.as_ref().and_then(VerificationKey::verify) == Some(true);
+                (key, valid)
+            });
+        }
+        let Ok(mut guard) = self.inner.lock() else { return Vec::new(); };
+        guard.content_reads += source_proofs.len() as u64;
+        current_sources.retain(|_, source| source.valid(&targets) && source_proofs.get(&source.executable).is_some_and(|(key, valid)|
+            *valid && key.is_some() && *key == VerificationKey::new(&source.executable, &source.fingerprint, 0)));
+        if guard.approved_targets == targets && guard.approved_child_executables == children
+            && guard.cli_sources == current_sources { return Vec::new(); }
         let old_targets = std::mem::replace(&mut guard.approved_targets, targets);
         let old_children = std::mem::replace(&mut guard.approved_child_executables, children);
-        let mut invalidated_families = std::collections::BTreeSet::new();
-        let mut invalidated_pids = Vec::new();
+        let old_sources = std::mem::replace(&mut guard.cli_sources, current_sources);
         let ids: Vec<_> = guard.instances.keys().cloned().collect();
         for id in ids {
-            let inst = guard.instances.get(&id).unwrap().clone();
-            if matches!(inst.state, ManagedInstanceState::Failed | ManagedInstanceState::Exited) {
-                continue;
-            }
-            if guard.approved_targets.get(&inst.expected_executable) != Some(&inst.expected_fingerprint) {
-                let live = guard.instances.get_mut(&id).unwrap();
-                live.state = ManagedInstanceState::Failed;
-                live.error_code = Some("target_approval_changed".into());
-                live.exec_identity = None;
-                invalidated_pids.push(live.pid);
-                invalidated_pids.extend(std::mem::take(&mut live.controlled_subtree_pids));
-                invalidated_families.insert(inst.family.clone());
-                continue;
-            }
-            let mut removed = Vec::new();
-            for pid in &inst.controlled_subtree_pids {
-                let valid = guard.child_identities.get(pid).is_some_and(|(exe, _)| {
-                    let old_sha = old_children.get(exe).or_else(|| old_targets.get(exe));
-                    let new_sha = guard.approved_child_executables.get(exe)
-                        .or_else(|| guard.approved_targets.get(exe));
-                    old_sha.is_some() && old_sha == new_sha
+            let inst = guard.instances[&id].clone();
+            if matches!(inst.state, ManagedInstanceState::Failed | ManagedInstanceState::Exited) { continue; }
+            let current_approval = guard.approved_targets.get(&inst.expected_executable) == Some(&inst.expected_fingerprint);
+            if !current_approval {
+                let existing = guard.retained_cli_instances.get(&id).cloned();
+                let source_key = existing.as_ref().map(|r| &r.source_key).or_else(|| guard.instance_sources.get(&id)).cloned();
+                let proved_retarget = source_key.as_ref().is_some_and(|key| {
+                    let Some(new) = guard.cli_sources.get(key) else { return false; };
+                    if new.target != inst.target || new.executable == inst.expected_executable { return false; }
+                    existing.is_some() || old_sources.get(key).is_some_and(|old|
+                        old.executable == inst.expected_executable && old.fingerprint == inst.expected_fingerprint)
                 });
-                if !valid { removed.push(*pid); }
-            }
-            if !removed.is_empty() {
-                guard.instances.get_mut(&id).unwrap().controlled_subtree_pids
-                    .retain(|pid| !removed.contains(pid));
-                invalidated_pids.extend(removed);
-                invalidated_families.insert(inst.family);
+                let still_verified = proved_retarget
+                    && inst.has_verified_main_protection(&guard.executor_boot_id, &guard.policy_version)
+                    && Self::main_identity_matches(&inst)
+                    && Self::image_status(&mut guard, &inst.expected_executable, &inst.expected_fingerprint) == ImageStatus::Verified;
+                if !still_verified {
+                    Self::invalidate_instance(&mut guard, &id, "target_approval_changed");
+                    continue;
+                }
+                if existing.is_none() {
+                    let children = inst.controlled_subtree_pids.iter().filter_map(|pid|
+                        guard.child_identities.get(pid).cloned().map(|value| (*pid, value))).collect();
+                    guard.retained_cli_instances.insert(id.clone(), RetainedCliApproval { source_key: source_key.unwrap(), children });
+                }
+            } else { guard.retained_cli_instances.remove(&id); }
+            let retained = guard.retained_cli_instances.get(&id).cloned();
+            for pid in inst.controlled_subtree_pids {
+                let valid = guard.child_identities.get(&pid).is_some_and(|(exe, token)| {
+                    let old_sha = old_children.get(exe).or_else(|| old_targets.get(exe));
+                    let new_sha = guard.approved_child_executables.get(exe).or_else(|| guard.approved_targets.get(exe));
+                    (old_sha.is_some() && old_sha == new_sha)
+                        || retained.as_ref().is_some_and(|r| r.children.get(&pid) == Some(&(exe.clone(), token.clone()))
+                            && exe == &inst.expected_executable)
+                });
+                if !valid {
+                    guard.instances.get_mut(&id).unwrap().controlled_subtree_pids.retain(|p| *p != pid);
+                    guard.pid_to_instance.remove(&pid);
+                    guard.child_identities.remove(&pid);
+                    guard.invalidated_families.insert(inst.family.clone());
+                }
             }
         }
-        for pid in invalidated_pids {
-            guard.pid_to_instance.remove(&pid);
-            guard.child_identities.remove(&pid);
-        }
+        Self::rebuild_image_approvals(&mut guard);
+        let invalidated = std::mem::take(&mut guard.invalidated_families).into_iter().collect();
         drop(guard);
         self.persist_instances();
-        invalidated_families.into_iter().collect()
+        invalidated
     }
 
     pub fn update_policy_version(&self, policy_version: PolicyVersion) {
         if let Ok(mut guard) = self.inner.lock() {
+            if guard.policy_version == policy_version { return; }
+            let retired: Vec<_> = guard.retained_cli_instances.keys().cloned().collect();
+            for id in retired { Self::invalidate_instance(&mut guard, &id, "retained_policy_changed"); }
             guard.policy_version = policy_version;
+            guard.image_approvals.clear();
+            Self::rebuild_image_approvals(&mut guard);
         }
+    }
+    /// Compatibility callers without the Supervisor sender leave work for the
+    /// same existing inventory worker. This never emits a network command.
+    pub(crate) fn queue_inventory_invalidations(&self, families: Vec<String>) {
+        if let Ok(mut guard)=self.inner.lock() { guard.invalidated_families.extend(families); }
+    }
+
+    fn main_identity_matches(inst: &ManagedLaunchInstance) -> bool {
+        inspect_process_identity(inst.pid).is_some_and(|p| {
+            inst.exec_identity.as_ref().is_some_and(|token|
+                p.pid == token.pid && p.uid == token.uid && p.start_seconds == token.start_seconds
+                    && p.start_microseconds == token.start_microseconds && token.audit_token == Some(p.audit_token))
+                && p.executable_path == inst.expected_executable
+        })
+    }
+
+    fn invalidate_instance(guard: &mut RegistryInner, id: &str, reason: &str) {
+        if let Some(inst) = guard.instances.get_mut(id) {
+            if let Some(token) = inst.exec_identity.as_ref().filter(|token| token.has_verified_audit_token()) {
+                guard.visibility_tokens.insert((id.into(), token.pid), token.clone());
+            }
+            for pid in &inst.controlled_subtree_pids {
+                if let Some((_, token)) = guard.child_identities.get(pid).filter(|(_, token)| token.has_verified_audit_token()) {
+                    guard.visibility_tokens.insert((id.into(), *pid), token.clone());
+                }
+            }
+            inst.state = ManagedInstanceState::Failed;
+            inst.error_code = Some(reason.into());
+            inst.exec_identity = None;
+            guard.invalidated_families.insert(inst.family.clone());
+            guard.pid_to_instance.remove(&inst.pid);
+            for pid in std::mem::take(&mut inst.controlled_subtree_pids) {
+                guard.pid_to_instance.remove(&pid);
+                guard.child_identities.remove(&pid);
+            }
+        }
+        guard.retained_cli_instances.remove(id);
+        guard.instance_sources.remove(id);
+    }
+
+    fn rebuild_image_approvals(guard: &mut RegistryInner) {
+        let mut desired = guard.approved_child_executables.clone();
+        desired.extend(guard.approved_targets.clone());
+        for id in guard.retained_cli_instances.keys() {
+            if let Some(inst) = guard.instances.get(id) {
+                if inst.state == ManagedInstanceState::ExecVerified {
+                    desired.insert(inst.expected_executable.clone(), inst.expected_fingerprint.clone());
+                }
+            }
+        }
+        let mut approvals = BTreeMap::new();
+        for (path, sha) in desired {
+            let revision = if let Some((old_sha, revision)) = guard.image_approvals.get(&path).filter(|(old, _)| old == &sha) {
+                let _ = old_sha;
+                *revision
+            } else {
+                guard.approval_revision = guard.approval_revision.saturating_add(1);
+                guard.approval_revision
+            };
+            approvals.insert(path, (sha, revision));
+        }
+        guard.image_approvals = approvals;
+        guard.image_verifications.retain(|key, _| guard.image_approvals.get(&key.path) == Some(&(key.expected_sha.clone(), key.approval_revision)));
+        guard.verification_in_flight.retain(|key| guard.image_verifications.contains_key(key));
+    }
+
+    fn image_status(guard: &mut RegistryInner, path: &str, expected_sha: &str) -> ImageStatus {
+        let Some((sha, revision)) = guard.image_approvals.get(path) else { return ImageStatus::Invalid; };
+        if sha != expected_sha { return ImageStatus::Invalid; }
+        let Some(key) = VerificationKey::new(path, sha, *revision) else { return ImageStatus::Invalid; };
+        // At most one current key per approved/live image; mutations cannot accumulate history.
+        guard.image_verifications.retain(|old, _| old.path != path || old == &key);
+        *guard.image_verifications.entry(key).or_insert(ImageStatus::Pending)
+    }
+
+    /// Called by the existing target-refresh worker. All file content IO is outside
+    /// the authority lock; a superseded revision or changed file cannot commit.
+    pub fn refresh_executable_verifications(&self) -> Vec<String> {
+        self.refresh_executable_verifications_with(VerificationKey::verify)
+    }
+
+    fn refresh_executable_verifications_with(&self, verify: impl Fn(&VerificationKey) -> Option<bool>) -> Vec<String> {
+        let work = {
+            let Ok(mut guard) = self.inner.lock() else { return Vec::new(); };
+            Self::rebuild_image_approvals(&mut guard);
+            for (path, (sha, _)) in guard.image_approvals.clone() { let _ = Self::image_status(&mut guard, &path, &sha); }
+            let work: Vec<_> = guard.image_verifications.iter().filter(|(key, state)|
+                **state == ImageStatus::Pending && !guard.verification_in_flight.contains(*key)).map(|(key, _)| key.clone()).collect();
+            guard.verification_in_flight.extend(work.iter().cloned());
+            work
+        };
+        for key in work {
+            let result = verify(&key);
+            let Ok(mut guard) = self.inner.lock() else { continue; };
+            Self::commit_image_verification(&mut guard, key, result);
+        }
+        // Cheap identity/metadata reconciliation detects missing files too, and
+        // hands revocation to Supervisor rather than closing sockets in this registry.
+        self.reconcile_process_trees(crate::native::now());
+        self.take_invalidated_families()
+    }
+
+    fn commit_image_verification(guard: &mut RegistryInner, key: VerificationKey, result: Option<bool>) -> bool {
+        guard.content_reads += 1;
+        guard.verification_in_flight.remove(&key);
+        if guard.image_approvals.get(&key.path) != Some(&(key.expected_sha.clone(), key.approval_revision))
+            || VerificationKey::new(&key.path, &key.expected_sha, key.approval_revision).as_ref() != Some(&key) { return false; }
+        if let Some(valid) = result { guard.image_verifications.insert(key, if valid { ImageStatus::Verified } else { ImageStatus::Invalid }); }
+        true
+    }
+
+    pub fn take_invalidated_families(&self) -> Vec<String> {
+        self.inner.lock().map(|mut g| std::mem::take(&mut g.invalidated_families).into_iter().collect()).unwrap_or_default()
+    }
+
+    #[doc(hidden)]
+    pub fn executable_verification_counts(&self) -> (u64, usize, usize) {
+        self.inner.lock().map(|g| (g.content_reads, g.image_approvals.len(), g.image_verifications.len())).unwrap_or_default()
     }
 
     /// Only the OS boundary can construct this proof, after authenticating the
@@ -430,7 +656,7 @@ impl SandboxLaunchRegistry {
         wire: SandboxHelperWireRequest,
         now: f64,
     ) -> SandboxHelperWireResponse {
-        let mut guard = match self.inner.lock() {
+        let guard = match self.inner.lock() {
             Ok(g) => g,
             Err(_) => {
                 return SandboxHelperWireResponse {
@@ -538,8 +764,29 @@ impl SandboxLaunchRegistry {
                 message: "目标程序不在受控 AI 白名单内，拒绝冒充启动".into(),
             };
         };
-        let actual_target_sha =
-            sha256_file_hex(Path::new(&canon_target)).unwrap_or_default();
+        let revision = guard.image_approvals.get(&canon_target).map(|(_, revision)| *revision).unwrap_or(0);
+        let key = VerificationKey::new(&canon_target, &expected_target_sha, revision);
+        drop(guard);
+        // Registration always performs a real first-use content read, outside
+        // the authority lock, even if an inventory proof is already cached.
+        let verified = key.as_ref().and_then(VerificationKey::verify) == Some(true);
+        let mut guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(_) => return SandboxHelperWireResponse { accepted: false, instance_id: None, executor_boot_id: String::new(),
+                error_code: Some("registry_lock_poisoned".into()), message: "沙箱注册表锁异常".into() },
+        };
+        guard.content_reads += 1;
+        let current_key = VerificationKey::new(&canon_target, &expected_target_sha, revision);
+        if guard.executor_boot_id != wire.request.executor_boot_id || guard.policy_version != wire.request.policy_version
+            || guard.used_nonces.contains_key(&wire.request.launch_nonce)
+            || guard.approved_targets.get(&canon_target) != Some(&expected_target_sha)
+            || guard.image_approvals.get(&canon_target) != Some(&(expected_target_sha.clone(), revision))
+            || key.is_none() || key != current_key {
+            return SandboxHelperWireResponse { accepted: false, instance_id: None, executor_boot_id: guard.executor_boot_id.clone(),
+                error_code: Some("target_approval_changed_during_verification".into()), message: "内容核验期间目标批准或身份已变化".into() };
+        }
+        guard.image_verifications.insert(key.unwrap(), if verified { ImageStatus::Verified } else { ImageStatus::Invalid });
+        let actual_target_sha = if verified { expected_target_sha.clone() } else { String::new() };
         if actual_target_sha != expected_target_sha
             || wire.request.target_fingerprint != expected_target_sha
         {
@@ -624,6 +871,10 @@ impl SandboxLaunchRegistry {
             error_code: None,
         };
 
+        let sources: Vec<_> = guard.cli_sources.iter().filter(|(_, source)|
+            source.target == instance.target && source.executable == instance.expected_executable
+                && source.fingerprint == instance.expected_fingerprint).map(|(key, _)| key.clone()).collect();
+        if sources.len() == 1 { guard.instance_sources.insert(instance_id.clone(), sources[0].clone()); }
         guard.pid_to_instance.insert(peer.process.pid, instance_id.clone());
         guard.instances.insert(instance_id.clone(), instance);
         drop(guard);
@@ -643,30 +894,20 @@ impl SandboxLaunchRegistry {
     }
 
     fn verify_approved_child_executable_fingerprint(
+        guard: &mut RegistryInner,
         canon_child: &str,
+        child_token: &BoundProcessToken,
         inst: &ManagedLaunchInstance,
-        approved_targets: &BTreeMap<String, String>,
-        approved_children: &BTreeMap<String, String>,
     ) -> bool {
-        let Some(actual_sha) = sha256_file_hex(Path::new(canon_child)) else {
-            return false;
-        };
-        if canon_child == inst.expected_executable && actual_sha == inst.expected_fingerprint {
-            return true;
-        }
-        if approved_targets
-            .get(canon_child)
-            .is_some_and(|exp_sha| exp_sha == &actual_sha)
-        {
-            return true;
-        }
-        if approved_children
-            .get(canon_child)
-            .is_some_and(|exp_sha| exp_sha == &actual_sha)
-        {
-            return true;
-        }
-        false
+        let current_sha = guard.approved_targets.get(canon_child)
+            .or_else(|| guard.approved_child_executables.get(canon_child)).cloned();
+        let sha = current_sha.or_else(|| {
+            (canon_child == inst.expected_executable
+                && guard.retained_cli_instances.get(&inst.instance_id).is_some_and(|retained|
+                    retained.children.get(&child_token.pid) == Some(&(canon_child.into(), child_token.clone()))))
+                .then(|| inst.expected_fingerprint.clone())
+        });
+        sha.is_some_and(|sha| Self::image_status(guard, canon_child, &sha) == ImageStatus::Verified)
     }
 
     /// Reconciles all managed launch instances and their inherited child process trees (`D03`/`I02`):
@@ -681,8 +922,6 @@ impl SandboxLaunchRegistry {
             return Vec::new();
         };
         let expected_uid = guard.verifier.expected_uid;
-        let approved_targets = guard.approved_targets.clone();
-        let approved_children = guard.approved_child_executables.clone();
         let inst_ids: Vec<String> = guard.instances.keys().cloned().collect();
 
         for inst_id in inst_ids {
@@ -698,6 +937,12 @@ impl SandboxLaunchRegistry {
                     guard.pid_to_instance.remove(&child_pid);
                     guard.child_identities.remove(&child_pid);
                 }
+                continue;
+            }
+
+            if inst.state == ManagedInstanceState::ExecVerified
+                && Self::image_status(&mut guard, &inst.expected_executable, &inst.expected_fingerprint) != ImageStatus::Verified {
+                Self::invalidate_instance(&mut guard, &inst_id, "executable_evidence_changed");
                 continue;
             }
 
@@ -727,8 +972,7 @@ impl SandboxLaunchRegistry {
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| main_kernel.executable_path.clone());
-                let main_sha_ok = sha256_file_hex(Path::new(&canon_main)).as_deref()
-                    == Some(inst.expected_fingerprint.as_str());
+                let main_sha_ok = Self::image_status(&mut guard, &canon_main, &inst.expected_fingerprint) == ImageStatus::Verified;
                 if canon_main == inst.expected_executable && main_sha_ok {
                     let role = match inst.target {
                         claude_watch_core::processes::LaunchTarget::ClaudeDesktop
@@ -756,18 +1000,12 @@ impl SandboxLaunchRegistry {
                         } else if m.state == ManagedInstanceState::ExecVerified
                             && m.exec_identity.as_ref() != Some(&tok)
                         {
-                            m.state = ManagedInstanceState::Failed;
-                            m.error_code = Some("exec_audit_token_changed".into());
-                            m.updated_at = now;
+                            Self::invalidate_instance(&mut guard, &inst_id, "exec_audit_token_changed");
                             continue;
                         }
                     }
                 } else if inst.state == ManagedInstanceState::ExecVerified {
-                    if let Some(m) = guard.instances.get_mut(&inst_id) {
-                        m.state = ManagedInstanceState::Failed;
-                        m.error_code = Some("unexpected_exec_image_change".into());
-                        m.updated_at = now;
-                    }
+                    Self::invalidate_instance(&mut guard, &inst_id, "unexpected_exec_image_change");
                     continue;
                 }
             } else {
@@ -838,17 +1076,6 @@ impl SandboxLaunchRegistry {
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| child_kernel.executable_path.clone());
-                let is_allowed_child = Self::verify_approved_child_executable_fingerprint(
-                    &canon_child,
-                    &inst,
-                    &approved_targets,
-                    &approved_children,
-                );
-                if !is_allowed_child {
-                    guard.pid_to_instance.remove(&child_pid);
-                    guard.child_identities.remove(&child_pid);
-                    continue;
-                }
                 let child_tok = BoundProcessToken::with_system_identity(
                     child_kernel.pid,
                     child_kernel.uid,
@@ -857,6 +1084,15 @@ impl SandboxLaunchRegistry {
                     ProcessRole::Child,
                 )
                 .with_audit_token(child_kernel.audit_token);
+                let is_allowed_child = Self::verify_approved_child_executable_fingerprint(
+                    &mut guard, &canon_child, &child_tok, &inst,
+                );
+                if !is_allowed_child {
+                    if guard.child_identities.contains_key(&child_pid) { guard.invalidated_families.insert(inst.family.clone()); }
+                    guard.pid_to_instance.remove(&child_pid);
+                    guard.child_identities.remove(&child_pid);
+                    continue;
+                }
                 guard.pid_to_instance.insert(child_pid, inst_id.clone());
                 guard
                     .child_identities
@@ -865,6 +1101,7 @@ impl SandboxLaunchRegistry {
             }
 
             let old_children = if let Some(m) = guard.instances.get_mut(&inst_id) {
+                if m.state == ManagedInstanceState::ExecVerified { m.updated_at = now; }
                 if !main_alive_and_matching && valid_children.is_empty() {
                     m.state = ManagedInstanceState::Exited;
                     m.updated_at = now;
@@ -880,6 +1117,13 @@ impl SandboxLaunchRegistry {
                 }
             }
         }
+        let live_ids: BTreeSet<_> = guard.instances.values().filter(|inst|
+            !matches!(inst.state, ManagedInstanceState::Exited | ManagedInstanceState::Failed)).map(|inst| inst.instance_id.clone()).collect();
+        guard.retained_cli_instances.retain(|id, _| live_ids.contains(id));
+        guard.instance_sources.retain(|id, _| live_ids.contains(id));
+        guard.visibility_tokens.retain(|_, token| token.audit_token.as_ref().is_some_and(|audit|
+            claude_watch_system::process_audit_token_matches(token.pid, token.uid, token.start_seconds, token.start_microseconds, audit)));
+        Self::rebuild_image_approvals(&mut guard);
         let out: Vec<ManagedLaunchInstance> = guard.instances.values().cloned().collect();
         drop(guard);
         self.persist_instances();
@@ -933,7 +1177,6 @@ impl SandboxLaunchRegistry {
         ctx: &AcceptedConnectionContext,
         now: f64,
     ) -> Option<(String, BoundProcessToken)> {
-        let _ = self.reconcile_process_trees(now);
         let (boot_id, policy_version, candidate_pids) = {
             let guard = self.inner.lock().ok()?;
             if !ctx.is_valid_for_listener(&guard.executor_boot_id) {
@@ -961,11 +1204,15 @@ impl SandboxLaunchRegistry {
         }
 
         let mut guard = self.inner.lock().ok()?;
+        if guard.executor_boot_id != boot_id || guard.policy_version != policy_version { return None; }
         let inst_id = guard.pid_to_instance.get(&kernel_id.pid)?.clone();
-        let approved_targets = guard.approved_targets.clone();
-        let approved_children = guard.approved_child_executables.clone();
         let prev_child = guard.child_identities.get(&kernel_id.pid).cloned();
-        let inst = guard.instances.get_mut(&inst_id)?;
+        let original = guard.instances.get(&inst_id)?.clone();
+        if Self::image_status(&mut guard, &original.expected_executable, &original.expected_fingerprint) != ImageStatus::Verified {
+            if original.state == ManagedInstanceState::ExecVerified { Self::invalidate_instance(&mut guard, &inst_id, "executable_evidence_changed"); }
+            return None;
+        }
+        let mut inst = original;
 
         let canon_exec = std::fs::canonicalize(&kernel_id.executable_path)
             .ok()
@@ -978,16 +1225,14 @@ impl SandboxLaunchRegistry {
                 || inst.start_seconds != kernel_id.start_seconds
                 || inst.start_microseconds != kernel_id.start_microseconds
             {
-                inst.state = ManagedInstanceState::Failed;
-                inst.error_code = Some("instance_birth_time_mismatch".into());
+                Self::invalidate_instance(&mut guard, &inst_id, "instance_birth_time_mismatch");
                 return None;
             }
 
             if canon_exec != inst.expected_executable {
                 // If the process unexpectedly exec'd into an unapproved image, revoke/fail it!
                 if inst.state == ManagedInstanceState::ExecVerified {
-                    inst.state = ManagedInstanceState::Failed;
-                    inst.error_code = Some("unexpected_exec_image_change".into());
+                    Self::invalidate_instance(&mut guard, &inst_id, "unexpected_exec_image_change");
                 }
                 return None;
             }
@@ -1017,8 +1262,7 @@ impl SandboxLaunchRegistry {
                 inst.updated_at = now;
             } else if inst.state == ManagedInstanceState::ExecVerified {
                 if inst.exec_identity.as_ref() != Some(&verified_token) {
-                    inst.state = ManagedInstanceState::Failed;
-                    inst.error_code = Some("exec_audit_token_changed".into());
+                    Self::invalidate_instance(&mut guard, &inst_id, "exec_audit_token_changed");
                     return None;
                 }
             } else {
@@ -1030,6 +1274,7 @@ impl SandboxLaunchRegistry {
             }
 
             let family = inst.family.clone();
+            guard.instances.insert(inst_id.clone(), inst);
             drop(guard);
             self.persist_instances();
             Some((family, verified_token))
@@ -1041,29 +1286,24 @@ impl SandboxLaunchRegistry {
             {
                 return None;
             }
-            let is_allowed_child = Self::verify_approved_child_executable_fingerprint(
-                &canon_exec,
-                inst,
-                &approved_targets,
-                &approved_children,
-            );
-            if !is_allowed_child {
+            let instance = inst.clone();
+            let child_token = BoundProcessToken::with_system_identity(
+                kernel_id.pid, kernel_id.uid, kernel_id.start_seconds,
+                kernel_id.start_microseconds, ProcessRole::Child,
+            ).with_audit_token(kernel_id.audit_token);
+            if !Self::verify_approved_child_executable_fingerprint(&mut guard, &canon_exec, &child_token, &instance) {
+                guard.invalidated_families.insert(instance.family.clone());
+                guard.pid_to_instance.remove(&kernel_id.pid);
+                guard.child_identities.remove(&kernel_id.pid);
+                if let Some(live) = guard.instances.get_mut(&inst_id) { live.controlled_subtree_pids.retain(|pid| *pid != kernel_id.pid); }
                 return None;
             }
-            let child_token = BoundProcessToken::with_system_identity(
-                kernel_id.pid,
-                kernel_id.uid,
-                kernel_id.start_seconds,
-                kernel_id.start_microseconds,
-                ProcessRole::Child,
-            )
-            .with_audit_token(kernel_id.audit_token);
             if let Some((prev_exec, prev_tok)) = prev_child {
                 if prev_exec != canon_exec || prev_tok != child_token {
                     return None;
                 }
             }
-            let family = inst.family.clone();
+            let family = instance.family.clone();
             guard
                 .child_identities
                 .insert(kernel_id.pid, (canon_exec, child_token.clone()));
@@ -1128,8 +1368,35 @@ impl SandboxLaunchRegistry {
         let Some(ref store) = self.storage else {
             return;
         };
-        if let Ok(guard) = self.inner.lock() {
-            let list: Vec<&ManagedLaunchInstance> = guard.instances.values().collect();
+        if let Ok(mut guard) = self.inner.lock() {
+            let mut current = Vec::new();
+            for (id, instance) in &guard.instances {
+                if let Some(token) = instance.exec_identity.as_ref().filter(|token| token.has_verified_audit_token()) {
+                    current.push(((id.clone(), token.pid), token.clone()));
+                }
+                for pid in &instance.controlled_subtree_pids {
+                    if let Some((_, token)) = guard.child_identities.get(pid).filter(|(_, token)| token.has_verified_audit_token()) {
+                        current.push(((id.clone(), *pid), token.clone()));
+                    }
+                }
+            }
+            guard.visibility_tokens.extend(current);
+            // Projection rechecks the digest against the current kernel lifetime.
+            // Do not rescan every process from this per-connection persistence path.
+            let observed_at = crate::native::now();
+            let list: Vec<_> = guard.instances.iter().map(|(id, instance)| {
+                let mut row = json!(instance);
+                let members: Vec<_> = guard.visibility_tokens.range((id.clone(), 0)..=(id.clone(), u32::MAX)).map(|((_, pid), token)| {
+                    let bytes = token.audit_token.unwrap().iter().map(u32::to_string).collect::<Vec<_>>().join(":");
+                    let currently_verified = instance.state == ManagedInstanceState::ExecVerified &&
+                        (instance.exec_identity.as_ref() == Some(token) || (instance.controlled_subtree_pids.contains(pid)
+                            && guard.child_identities.get(pid).is_some_and(|(_, current)| current == token)));
+                    json!({"pid":token.pid,"uid":token.uid,"start_seconds":token.start_seconds,"start_microseconds":token.start_microseconds,
+                        "audit_identity_digest":sha256_bytes_hex(bytes.as_bytes()),"currently_verified":currently_verified})
+                }).collect();
+                if !members.is_empty() { row["process_visibility"] = json!({"observed_at":observed_at,"members":members}); }
+                row
+            }).collect();
             let _ = store.atomic_json(
                 &store.paths.watch().join("state/managed-launch-instances.json"),
                 &json!(list),
@@ -1352,6 +1619,76 @@ pub fn default_registration_socket_path(watch_dir: &Path) -> PathBuf {
 mod approval_refresh_tests {
     use super::*;
     use claude_watch_core::processes::LaunchTarget;
+
+    #[test]
+    fn content_work_releases_authority_lock_and_superseded_results_cannot_commit() {
+        use std::sync::mpsc;
+        let file = std::env::temp_dir().join(format!("cw-image-{}", Uuid::new_v4()));
+        std::fs::write(&file, b"image-v1").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::fs::canonicalize(&file).unwrap().to_string_lossy().into_owned();
+        let sha = sha256_file_hex(&file).unwrap();
+        let reg = Arc::new(SandboxLaunchRegistry::new("boot", PolicyVersion { policy_digest:"p".into(), guard_policy_digest:"g".into() },
+            SandboxPeerVerifier { expected_uid:effective_uid(), expected_helper_executable:"/fixture/helper".into(), expected_helper_sha256:"h".into(), require_code_signature_identifier:None }, None));
+        reg.replace_approved_targets(BTreeMap::from([(path.clone(), sha.clone())]), BTreeMap::new());
+        let (entered_tx, entered_rx) = mpsc::channel(); let (release_tx, release_rx) = mpsc::channel();
+        let worker_registry = reg.clone();
+        let worker = thread::spawn(move || worker_registry.refresh_executable_verifications_with(|key| {
+            entered_tx.send(()).unwrap(); release_rx.recv_timeout(Duration::from_secs(3)).unwrap(); key.verify()
+        }));
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        // Causal check: authority update completes while the content worker is explicitly paused.
+        reg.update_policy_version(PolicyVersion { policy_digest:"new".into(), guard_policy_digest:"g".into() });
+        release_tx.send(()).unwrap(); worker.join().unwrap();
+        let mut guard = reg.inner.lock().unwrap();
+        assert!(SandboxLaunchRegistry::image_status(&mut guard, &path, &sha) != ImageStatus::Verified);
+        assert!(guard.image_verifications.values().all(|status| *status != ImageStatus::Verified));
+        drop(guard);
+        reg.refresh_executable_verifications();
+        let mut guard = reg.inner.lock().unwrap();
+        assert!(SandboxLaunchRegistry::image_status(&mut guard, &path, &sha) == ImageStatus::Verified);
+        let old_key = guard.image_verifications.keys().next().unwrap().clone();
+        drop(guard);
+        std::fs::write(&file, b"image-v2").unwrap();
+        let mut guard = reg.inner.lock().unwrap();
+        assert!(SandboxLaunchRegistry::image_status(&mut guard, &path, &sha) == ImageStatus::Pending);
+        assert!(!SandboxLaunchRegistry::commit_image_verification(&mut guard, old_key, Some(true)));
+        drop(guard); reg.refresh_executable_verifications();
+        let mut guard = reg.inner.lock().unwrap();
+        assert!(SandboxLaunchRegistry::image_status(&mut guard, &path, &sha) == ImageStatus::Invalid);
+        assert!(guard.image_verifications.len() <= guard.image_approvals.len());
+        drop(guard);
+        std::fs::write(&file, b"image-v1").unwrap(); reg.refresh_executable_verifications();
+        let old_key = reg.inner.lock().unwrap().image_verifications.keys().next().unwrap().clone();
+        reg.replace_approved_targets(BTreeMap::new(), BTreeMap::new());
+        reg.replace_approved_targets(BTreeMap::from([(path.clone(), sha.clone())]), BTreeMap::new());
+        let mut guard = reg.inner.lock().unwrap();
+        assert!(!SandboxLaunchRegistry::commit_image_verification(&mut guard, old_key, Some(true)));
+        assert!(SandboxLaunchRegistry::image_status(&mut guard, &path, &sha) == ImageStatus::Pending);
+        drop(guard);
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn retained_identity_requires_live_birth_audit_and_current_executable() {
+        let live = inspect_process_identity(std::process::id()).unwrap();
+        let mut inst = instance("identity", "claude", live.pid, &live.executable_path, "fixture");
+        inst.uid = live.uid; inst.start_seconds = live.start_seconds; inst.start_microseconds = live.start_microseconds;
+        inst.exec_identity = Some(BoundProcessToken::with_system_identity(live.pid, live.uid, live.start_seconds, live.start_microseconds, ProcessRole::Cli).with_audit_token(live.audit_token));
+        assert!(SandboxLaunchRegistry::main_identity_matches(&inst));
+        let audit = live.audit_token.iter().map(u32::to_string).collect::<Vec<_>>().join(":");
+        let digest = sha256_bytes_hex(audit.as_bytes());
+        assert!(claude_watch_system::process_lifetime_audit_digest_matches(live.pid, live.uid, live.start_seconds, live.start_microseconds, &digest));
+        assert!(!claude_watch_system::process_lifetime_audit_digest_matches(live.pid, live.uid, live.start_seconds+1, live.start_microseconds, &digest));
+        assert!(!claude_watch_system::process_lifetime_audit_digest_matches(live.pid, live.uid, live.start_seconds, live.start_microseconds, &"0".repeat(64)));
+        let original = inst.clone();
+        inst.exec_identity.as_mut().unwrap().start_seconds += 1;
+        assert!(!SandboxLaunchRegistry::main_identity_matches(&inst));
+        inst = original.clone(); inst.exec_identity.as_mut().unwrap().audit_token.as_mut().unwrap()[7] ^= 1;
+        assert!(!SandboxLaunchRegistry::main_identity_matches(&inst));
+        inst = original; inst.expected_executable = "/fixture/changed-image".into();
+        assert!(!SandboxLaunchRegistry::main_identity_matches(&inst));
+    }
 
     fn instance(id: &str, family: &str, pid: u32, exe: &str, sha: &str) -> ManagedLaunchInstance {
         ManagedLaunchInstance {

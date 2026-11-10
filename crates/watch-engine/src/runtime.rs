@@ -544,11 +544,14 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
         Authority::ReadOnly
     };
     let mut desktop = NativeDesktop::new(host.runner.clone(), process_component()?, authority)?;
+    desktop.set_discovery(claude_watch_runtime::target_discovery::DiscoveryHandle::for_home(&storage.paths.home));
     if request.command == "launch" {
         if request.launch_target().cli() {
             desktop.select_cli(request.launch_target(), &storage.paths.home)?;
         } else {
-            desktop.select_target(request.launch_target())?;
+            if let Some(path)=request.value("target-bundle") {
+                desktop.select_target_source(request.launch_target(),std::path::Path::new(path))?;
+            } else { desktop.select_target(request.launch_target())?; }
         }
     }
     if account_action {

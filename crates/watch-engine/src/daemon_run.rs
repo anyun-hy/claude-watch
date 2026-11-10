@@ -74,132 +74,26 @@ fn refresh_and_stage_production_targets(
     registry: &SandboxLaunchRegistry,
     event_tx: &Sender<SupervisionEvent>,
 ) -> Result<()> {
-    use claude_watch_core::processes::LaunchTarget;
-    use claude_watch_runtime::managed_entry::{
-        resolve_real_cli_skipping_shim, stage_deliverable_entries, DesktopManagedEntrySpec,
-    };
+    use claude_watch_runtime::target_discovery::DiscoveryHandle;
+    let discovery = DiscoveryHandle::for_home(&storage.paths.home);
+    let runner = super::runtime::runner()?;
+    let snapshot = discovery.refresh(runner.as_ref(), native::now());
+    stage_discovery_snapshot(storage, resources_dir, registry, event_tx, &discovery, &snapshot)
+}
 
-    let is_isolated_temp_home = {
-        let home_str = storage.paths.home.to_string_lossy();
-        home_str.starts_with("/tmp/")
-            || home_str.starts_with("/private/tmp/")
-            || home_str.starts_with("/var/folders/")
-            || home_str.starts_with("/private/var/folders/")
-    };
-
-    let mut discovered_specs: Vec<DesktopManagedEntrySpec> = Vec::new();
-
-    // Resolve supported entries into a single manifest. Do not mutate approvals
-    // incrementally while a different thread is attributing live connections.
-    let mut app_dirs = Vec::new();
-    if let Some(env_dir) = std::env::var_os("CW_APPLICATIONS_DIR").map(PathBuf::from) {
-        if env_dir.is_dir() {
-            app_dirs.push(env_dir);
-        }
+fn stage_discovery_snapshot(
+    storage: &StateStore, resources_dir: Option<&std::path::Path>, registry: &SandboxLaunchRegistry,
+    event_tx: &Sender<SupervisionEvent>, discovery: &claude_watch_runtime::target_discovery::DiscoveryHandle,
+    snapshot: &claude_watch_runtime::target_discovery::DiscoverySnapshot,
+) -> Result<()> {
+    use claude_watch_runtime::managed_entry::stage_deliverable_entries;
+    let manifest = discovery.approved_manifest(snapshot)?;
+    for family in registry.replace_approved_targets_with_cli_sources(manifest.targets, manifest.children, manifest.cli_sources) {
+        // Only Supervisor emits network commands. Identity loss precedes disk staging.
+        let _ = event_tx.send(SupervisionEvent::ProcessInventoryUnavailable { family, observed_at: native::now() });
     }
-    let home_apps = storage.paths.home.join("Applications");
-    if home_apps.is_dir() {
-        app_dirs.push(home_apps);
-    }
-    if !is_isolated_temp_home {
-        app_dirs.push(PathBuf::from("/Applications"));
-    }
-
-    let mut new_approved_targets = std::collections::BTreeMap::new();
-    let mut new_approved_children = std::collections::BTreeMap::new();
-
-    for app_dir in &app_dirs {
-        for (target, bundle_name, bundle_id, exe_name) in [
-            (
-                LaunchTarget::ClaudeDesktop,
-                "Claude.app",
-                "com.anthropic.claudefordesktop",
-                "Claude",
-            ),
-            (
-                LaunchTarget::CodexDesktop,
-                "Codex.app",
-                "com.openai.codex",
-                "Codex",
-            ),
-            (
-                LaunchTarget::ChatgptDesktop,
-                "ChatGPT.app",
-                "com.openai.chat",
-                "ChatGPT",
-            ),
-        ] {
-            let bundle_path = app_dir.join(bundle_name);
-            if let Ok(spec) = DesktopManagedEntrySpec::resolve_from_app_bundle(
-                target,
-                &bundle_path,
-                bundle_id,
-                exe_name,
-            ) {
-                let target_exe_str = spec.target_executable.to_string_lossy().into_owned();
-                new_approved_targets.insert(target_exe_str.clone(), spec.target_fingerprint.clone());
-                new_approved_children.insert(target_exe_str.clone(), spec.target_fingerprint.clone());
-                for (child_exe, child_sha) in
-                    NativeDesktop::<claude_watch_runtime::commands::SystemRunner>::discover_bundle_child_executables(&spec.target_bundle_path)
-                {
-                    let child_str = child_exe.to_string_lossy().into_owned();
-                    new_approved_children.insert(child_str.clone(), child_sha.clone());
-                }
-                if !discovered_specs.iter().any(|s| s.target == spec.target) {
-                    discovered_specs.push(spec);
-                }
-            }
-        }
-    }
-
     let entries_root = storage.paths.watch().join("entries");
-    let entries_bin = entries_root.join("bin");
-    let watch_bin = storage.paths.watch().join("bin");
-    let mut search_paths: Vec<PathBuf> = if is_isolated_temp_home {
-        Vec::new()
-    } else {
-        std::env::var_os("PATH")
-            .map(|v| std::env::split_paths(&v).collect())
-            .unwrap_or_default()
-    };
-    search_paths.push(storage.paths.home.join(".local/bin"));
-    search_paths.push(storage.paths.home.join(".claude/local"));
-    if !is_isolated_temp_home {
-        search_paths.push(PathBuf::from("/opt/homebrew/bin"));
-        search_paths.push(PathBuf::from("/usr/local/bin"));
-    }
-    search_paths.retain(|p| p != &entries_bin && p != &watch_bin);
-
-    for (_cli_target, cli_name, override_env) in [
-        (LaunchTarget::ClaudeCli, "claude", "CLAUDE_CODE_BIN"),
-        (LaunchTarget::CodexCli, "codex", "CODEX_CLI_BIN"),
-    ] {
-        if let Some(override_path) = std::env::var_os(override_env).map(PathBuf::from) {
-            if let Ok(canon) = std::fs::canonicalize(&override_path) {
-                if let Some(sha) = claude_watch_system::sha256_file_hex(&canon) {
-                    let canon_str = canon.to_string_lossy().into_owned();
-                    new_approved_targets.insert(canon_str.clone(), sha.clone());
-                    new_approved_children.insert(canon_str.clone(), sha.clone());
-                }
-            }
-        }
-        let shim_exe = entries_bin.join(cli_name);
-        if let Ok((canon_cli, sha)) =
-            resolve_real_cli_skipping_shim(cli_name, &shim_exe, &search_paths)
-        {
-            let canon_str = canon_cli.to_string_lossy().into_owned();
-            new_approved_targets.insert(canon_str.clone(), sha.clone());
-            new_approved_children.insert(canon_str.clone(), sha.clone());
-        }
-    }
-    for family in registry.replace_approved_targets(new_approved_targets, new_approved_children) {
-        // Registry changes invalidate identities, but only Supervisor issues network commands.
-        // Send this before staging entries so disk IO cannot delay the revocation event.
-        let _ = event_tx.send(SupervisionEvent::ProcessInventoryUnavailable {
-            family, observed_at: native::now(),
-        });
-    }
-
+    let discovered_specs = manifest.desktop_specs;
     let watch_engine_bin = resources_dir
         .map(|d| d.join("watch-engine"))
         .filter(|p| p.is_file())
@@ -212,6 +106,8 @@ fn refresh_and_stage_production_targets(
     let controlled_entry_macho = resources_dir
         .map(|d| d.join("ControlledEntry"))
         .filter(|p| p.is_file());
+    storage.atomic_json(&storage.paths.watch().join("state/target-discovery.json"), &json!({"snapshot":snapshot,
+        "selection_issues":manifest.selection_issues,"verification_pending":manifest.needs_verification_retry}))?;
     stage_deliverable_entries(
         &entries_root,
         &discovered_specs,
@@ -219,77 +115,31 @@ fn refresh_and_stage_production_targets(
         &launcher_bin,
         controlled_entry_macho.as_deref(),
     )?;
+    if manifest.needs_verification_retry {
+        // Valid scopes and revocations above are already applied. Do not let
+        // the refresh worker cache this revision as fully staged: a temporary
+        // read failure can recover without any further metadata change.
+        return Err(CoreError::new("target_approval_pending", "部分安装文件待重新验证，其他目标已分别更新"));
+    }
     Ok(())
 }
 
-/// Cheap metadata snapshot of only supported entry paths and discovered executable directories.
-/// Content hashing and entry staging run in the background only when this snapshot changes.
-fn target_metadata_signature(storage: &StateStore, resources_dir: Option<&std::path::Path>) -> Vec<(PathBuf, Vec<i128>)> {
+/// Shared discovery revision plus exact runtime components; no private second
+/// scanner and no content hashing on an unchanged refresh round.
+fn target_metadata_signature(storage: &StateStore, resources_dir: Option<&std::path::Path>) -> Vec<(PathBuf, Vec<i128>, Option<PathBuf>)> {
     use std::os::unix::fs::MetadataExt;
-    fn record(path: PathBuf, out: &mut std::collections::BTreeMap<PathBuf, Vec<i128>>) {
-        let mut values = Vec::new();
-        for result in [std::fs::symlink_metadata(&path), std::fs::metadata(&path)] {
-            if let Ok(m) = result {
-                values.extend([m.dev() as i128, m.ino() as i128, m.len() as i128,
-                    m.mtime() as i128, m.mtime_nsec() as i128, m.ctime() as i128,
-                    m.ctime_nsec() as i128, m.mode() as i128]);
-            } else { values.push(-1); }
-        }
-        out.insert(path, values);
-    }
-    fn executable_dir(path: PathBuf, out: &mut std::collections::BTreeMap<PathBuf, Vec<i128>>) {
-        record(path.clone(), out);
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() { record(entry.path(), out); }
+    let discovery=claude_watch_runtime::target_discovery::DiscoveryHandle::for_home(&storage.paths.home);
+    let revision=super::runtime::runner().map(|runner|discovery.refresh(runner.as_ref(),native::now()).revision.clone()).unwrap_or_default();
+    let mut out=vec![(storage.paths.watch().join("state/target-discovery-revision"),revision.bytes().map(i128::from).collect(),None)];
+    if let Some(resources)=resources_dir {
+        for name in ["watch-engine","watch-sandbox-launcher","ControlledEntry"] {
+            let path=resources.join(name);
+            let values=std::fs::metadata(&path).map(|m|vec![m.dev() as i128,m.ino() as i128,m.len() as i128,m.mtime() as i128,
+                m.mtime_nsec() as i128,m.ctime() as i128,m.ctime_nsec() as i128,m.mode() as i128]).unwrap_or_else(|_|vec![-1]);
+            out.push((path.clone(),values,std::fs::canonicalize(path).ok()));
         }
     }
-    let mut out = std::collections::BTreeMap::new();
-    let isolated = ["/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/"]
-        .iter().any(|p| storage.paths.home.to_string_lossy().starts_with(p));
-    let mut app_dirs = vec![storage.paths.home.join("Applications")];
-    if let Some(path) = std::env::var_os("CW_APPLICATIONS_DIR") { app_dirs.push(path.into()); }
-    if !isolated { app_dirs.push("/Applications".into()); }
-    for root in app_dirs {
-        for name in ["Claude.app", "Codex.app", "ChatGPT.app"] {
-            let app = root.join(name);
-            record(app.clone(), &mut out);
-            record(app.join("Contents/Info.plist"), &mut out);
-            executable_dir(app.join("Contents/MacOS"), &mut out);
-            let frameworks = app.join("Contents/Frameworks");
-            record(frameworks.clone(), &mut out);
-            if let Ok(entries) = std::fs::read_dir(frameworks) {
-                for entry in entries.flatten() {
-                    if entry.path().extension().is_some_and(|e| e == "app") {
-                        record(entry.path(), &mut out);
-                        executable_dir(entry.path().join("Contents/MacOS"), &mut out);
-                    }
-                }
-            }
-            for rel in ["Contents/Resources/codex", "Contents/Resources/codex-cli/bin/codex",
-                "Contents/Resources/CodexCLI.app/Contents/MacOS/codex",
-                "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"] {
-                record(app.join(rel), &mut out);
-            }
-        }
-    }
-    let mut cli_dirs = vec![storage.paths.home.join(".local/bin"), storage.paths.home.join(".claude/local")];
-    if !isolated {
-        cli_dirs.extend(std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default());
-        cli_dirs.extend([PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")]);
-    }
-    for dir in cli_dirs {
-        if dir == storage.paths.watch().join("entries/bin") || dir == storage.paths.watch().join("bin") { continue; }
-        for name in ["claude", "codex"] { record(dir.join(name), &mut out); }
-    }
-    for key in ["CLAUDE_CODE_BIN", "CODEX_CLI_BIN"] {
-        if let Some(path) = std::env::var_os(key) { record(path.into(), &mut out); }
-    }
-    if let Some(resources) = resources_dir {
-        for name in ["watch-engine", "watch-sandbox-launcher", "ControlledEntry"] {
-            record(resources.join(name), &mut out);
-        }
-    }
-    out.into_iter().collect()
+    out
 }
 
 fn spawn_target_refresh_worker(
@@ -300,13 +150,24 @@ fn spawn_target_refresh_worker(
     event_tx: Sender<SupervisionEvent>,
 ) -> Result<thread::JoinHandle<()>> {
     thread::Builder::new().name("channel-target-refresh".into()).spawn(move || {
+        let _discovery = claude_watch_runtime::target_discovery::DiscoveryHandle::for_home(&storage.paths.home);
         let mut previous = None;
         while !stop.load(Ordering::Acquire) {
+            // Publish already-known identity/metadata loss before any slow content read.
+            registry.reconcile_process_trees(native::now());
+            for family in registry.take_invalidated_families() {
+                let _ = event_tx.send(SupervisionEvent::ProcessInventoryUnavailable { family, observed_at: native::now() });
+            }
             let current = target_metadata_signature(&storage, resources_dir.as_deref());
             if previous.as_ref() != Some(&current) {
                 if refresh_and_stage_production_targets(&storage, resources_dir.as_deref(), &registry, &event_tx).is_ok() {
                     previous = Some(current);
                 }
+            }
+            for family in registry.refresh_executable_verifications() {
+                let _ = event_tx.send(SupervisionEvent::ProcessInventoryUnavailable {
+                    family, observed_at: native::now(),
+                });
             }
             for _ in 0..4 {
                 if stop.load(Ordering::Acquire) { return; }
@@ -339,6 +200,96 @@ fn locate_runtime_resources_dir(storage: &StateStore) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod m5_tests {
+    use super::*;
+    use claude_watch_core::processes::{Identity,LaunchTarget};
+    use claude_watch_runtime::{commands::{ReadCommand,ReadRunner,ObserverAction,Output,SystemRunner},
+        managed_entry::{prepare_desktop_managed_launch,DesktopEntryPreparation},target_discovery::*};
+    use std::{fs,os::unix::fs::PermissionsExt,time::Duration};
+    struct Registry(PathBuf);
+    impl ApplicationRegistry for Registry {
+        fn locations(&self,id:&str)->Result<claude_watch_system::application_locations::ApplicationLocations> {
+            Ok(claude_watch_system::application_locations::ApplicationLocations { paths:if id==DESKTOP_IDS[0].0{vec![self.0.clone()]}else{vec![]},complete:true })
+        }
+    }
+    struct Reader { metadata:SystemRunner, identity:Identity,bundle:PathBuf }
+    impl ReadRunner for Reader {
+        fn run(&self,command:ReadCommand,input:&[u8],timeout:Duration,limit:usize)->Result<Output> {
+            let now=native::now();let mut value=json!({"schema":1,"status":"ok","uid":self.identity.uid,"started_at":now,"finished_at":now});
+            match command {
+                ReadCommand::Plist(path)=>return self.metadata.run(ReadCommand::Plist(path),input,timeout,limit),
+                ReadCommand::Observer(ObserverAction::Inventory)=>{
+                    let mut row=json!(self.identity);row["bundle_path"]=json!(self.bundle);row["bundle_id"]=Value::Null;
+                    value["state"]=json!("ok");value["truncated"]=json!(false);value["requested_count"]=json!(1);
+                    value["processes"]=json!([row]);value["unavailable"]=json!([]);value["exited"]=json!([]);
+                }
+                ReadCommand::Observer(ObserverAction::Arguments)=>{
+                    let request:Value=serde_json::from_slice(input).unwrap();value["round_id"]=request["round_id"].clone();
+                    value["argument_prefixes"]=json!([{"pid":self.identity.pid,"state":"ok","identity":self.identity,
+                        "arguments":[self.identity.executable],"cwd":"/fixture","truncated":false}]);
+                }
+                _=>panic!("M5 staging fixture must not run AI, user shell, VPN or process control"),
+            }
+            Ok(Output {status:0,stdout:serde_json::to_vec(&value).unwrap(),stderr:vec![]})
+        }
+    }
+    #[test]
+    fn shared_discovery_stages_custom_claude_and_binds_the_controlled_request() {
+        let root=PathBuf::from("/private/tmp").join(format!("cw-m5-stage-{}",uuid::Uuid::new_v4()));
+        let home=root.join("home");fs::create_dir_all(&home).unwrap();
+        let bundle=root.join("Custom & Sources/Claude 'Renamed'.app");fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        let executable=bundle.join("Contents/MacOS/Agent & Main");fs::write(&executable,b"private native discovery fixture").unwrap();
+        fs::set_permissions(&executable,fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(bundle.join("Contents/Info.plist"),r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string><key>CFBundleExecutable</key><string>Agent &amp; Main</string></dict></plist>"#).unwrap();
+        let store=StateStore::new(Paths::new(&home).unwrap());
+        let reader=Reader {metadata:SystemRunner::new(native::built_observer_path().unwrap()).unwrap(),bundle:bundle.clone(),
+            identity:Identity {pid:4100,parent:1,uid:claude_watch_system::effective_uid(),executable:executable.to_string_lossy().into_owned(),
+                start_seconds:100,start_microseconds:1,start_stamp:"private-stage".into()} };
+        let mut inputs=DiscoveryInputs::for_home(&home);inputs.application_roots.clear();inputs.query_registry=true;
+        let discovery=DiscoveryHandle::with_registry(inputs,Arc::new(Registry(bundle.clone())));
+        discovery.observed_process_bundles([(bundle.clone(),None)]);
+        let snapshot=discovery.refresh(&reader,native::now());
+        let policy=PolicyVersion {policy_digest:"m5-policy".into(),guard_policy_digest:"m5-guard".into()};
+        let registry=SandboxLaunchRegistry::new("m5-boot",policy.clone(),claude_watch_system::SandboxPeerVerifier {
+            expected_uid:claude_watch_system::effective_uid(),expected_helper_executable:"/fixture/helper".into(),
+            expected_helper_sha256:"fixture".into(),require_code_signature_identifier:None },None);
+        let (tx,rx)=std::sync::mpsc::channel();
+        stage_discovery_snapshot(&store,None,&registry,&tx,&discovery,&snapshot).unwrap();
+        assert!(rx.try_recv().is_err());registry.refresh_executable_verifications();assert_eq!(registry.executable_verification_counts().1,1);
+        let mut desktop=NativeDesktop::new(&reader,native::built_process_control_path().unwrap().into(),Authority::ReadOnly).unwrap();
+        desktop.set_discovery(discovery.clone());desktop.select_target(LaunchTarget::ClaudeDesktop).unwrap();
+        let spec=desktop.build_managed_entry_spec().unwrap();assert_eq!(spec.target_executable,executable);
+        let request=match prepare_desktop_managed_launch(&spec,&[],&registry,"m5-boot",&policy,None,"127.0.0.1:1021".parse().unwrap(),vec![]).unwrap() {
+            DesktopEntryPreparation::ReadyToLaunch {request}=>request,other=>panic!("unexpected preparation: {other:?}"),
+        };
+        assert_eq!(request.target_executable,executable.to_string_lossy());assert_eq!(request.target_fingerprint,claude_watch_system::sha256_file_hex(&executable).unwrap());
+        let mut sampler=Sampler::new(&reader,store.paths.clone());sampler.set_discovery(discovery.clone());let round=sampler.processes().unwrap();
+        assert_eq!(round.targets.len(),1);assert_eq!(round.targets[0].identity.executable,request.target_executable);
+        assert_eq!(round.discovery.as_ref().unwrap()["revision"],snapshot.revision);
+        assert_eq!(desktop.desktops().unwrap().len(),1,"actual validated path works without NSRunningApplication bundle-id presentation");
+        let staged=store.paths.watch().join("entries/apps/Claude (Controlled).app");
+        let info=reader.run(ReadCommand::Plist(staged.join("Contents/Info.plist")),&[],Duration::from_secs(3),128*1024).unwrap();
+        let info:Value=serde_json::from_slice(&info.stdout).unwrap();
+        assert_eq!(info["CWTargetBundlePath"],json!(bundle));assert_eq!(info["CWTargetExecutable"],request.target_executable);
+        let script=fs::read_to_string(staged.join("Contents/MacOS/ControlledEntry")).unwrap();
+        assert!(script.contains("--target-bundle") && script.contains("'\\''Renamed'\\''"));
+        let parsed=claude_watch_core::cli::Request::parse(&["launch".into(),"--target".into(),"claude-desktop".into(),"--target-bundle".into(),bundle.to_string_lossy().into_owned(),"--apply".into()]).unwrap();
+        assert_eq!(parsed.value("target-bundle"),bundle.to_str());
+        for (target,path) in [("claude-cli",bundle.to_string_lossy().into_owned()),("claude-desktop","relative.app".into()),("claude-desktop","/tmp/control\n.app".into())] {
+            assert!(claude_watch_core::cli::Request::parse(&["launch".into(),"--target".into(),target.into(),"--target-bundle".into(),path,"--apply".into()]).is_err(),"bundle binding requires a desktop target and an absolute, non-control path");
+        }
+        let enforcer=LocalTunnelEnforcer::new("m5-boot",None);enforcer.configure_seatbelt_backend(false,native::now()).unwrap();
+        assert!(!enforcer.sandbox_ready().unwrap());assert!(registry.instances().is_empty(),"discovery/staging/preparation creates no sandbox or protected instance");
+        if let Some(dir)=std::env::var_os("CW_CHANNEL_CONTRACT_DIR") {
+            fs::create_dir_all(&dir).unwrap();fs::write(std::path::Path::new(&dir).join("target-discovery-staging.json"),
+                serde_json::to_vec_pretty(&json!({"snapshot":snapshot.as_ref(),"entry_info":info,"request":request,"i03_ready":false})).unwrap()).unwrap();
+        }
+        println!("M5 production vertical: registered custom renamed Claude -> production staging and content approval -> same NativeDesktop/Sampler revision -> bound controlled request; I03 remains closed");
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn spawn_vpn_observation_worker(
@@ -1889,6 +1840,52 @@ mod r1_tests {
     use claude_watch_core::config::Config;
     use std::{fs, os::unix::fs::PermissionsExt};
 
+    #[test]
+    fn cli_metadata_and_inventory_share_local_codex_retarget_and_removal() {
+        use std::{collections::BTreeMap, os::unix::fs::symlink};
+        let root = PathBuf::from("/private/tmp").join(format!("cwm-cli-meta-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        fs::create_dir_all(root.join(".local/bin")).unwrap();
+        let store = StateStore::new(Paths::new(&root).unwrap());
+        let registry = SandboxLaunchRegistry::new("metadata", PolicyVersion { policy_digest:"p".into(), guard_policy_digest:"g".into() },
+            claude_watch_system::SandboxPeerVerifier { expected_uid:claude_watch_system::effective_uid(), expected_helper_executable:"/fixture/helper".into(),
+                expected_helper_sha256:"fixture".into(), require_code_signature_identifier:None }, None);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let a = root.join("image-a"); let b = root.join("image-b");
+        for (path, bytes) in [(&a, b"a"), (&b, b"b")] { fs::write(path, bytes).unwrap(); fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap(); }
+        let alias = root.join(".local/bin/codex");
+        let absent = target_metadata_signature(&store, None);
+        symlink(&a, &alias).unwrap();
+        let first = target_metadata_signature(&store, None); assert_ne!(first, absent);
+        refresh_and_stage_production_targets(&store, None, &registry, &tx).unwrap(); registry.refresh_executable_verifications();
+        assert_eq!(registry.executable_verification_counts().1, 1);
+        fs::remove_file(&alias).unwrap(); symlink(&b, &alias).unwrap();
+        assert_ne!(first, target_metadata_signature(&store, None));
+        refresh_and_stage_production_targets(&store, None, &registry, &tx).unwrap(); registry.refresh_executable_verifications();
+        assert_eq!(registry.executable_verification_counts().1, 1, "old canonical path must not accumulate");
+        fs::remove_file(&alias).unwrap();
+        refresh_and_stage_production_targets(&store, None, &registry, &tx).unwrap(); registry.refresh_executable_verifications();
+        assert_eq!(registry.executable_verification_counts(), (registry.executable_verification_counts().0, 0, 0));
+        assert!(registry.replace_approved_targets(BTreeMap::new(), BTreeMap::new()).is_empty());
+        let broken=root.join("Applications/Unreadable.app/Contents/MacOS/Main");
+        fs::create_dir_all(broken.parent().unwrap()).unwrap();fs::write(&broken,b"private native fixture").unwrap();
+        fs::set_permissions(&broken,fs::Permissions::from_mode(0o111)).unwrap();
+        assert!(fs::File::open(&broken).is_err());
+        fs::write(broken.parent().unwrap().parent().unwrap().join("Info.plist"),
+            r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string><key>CFBundleExecutable</key><string>Main</string></dict></plist>"#).unwrap();
+        symlink(&b,&alias).unwrap();
+        assert_eq!(refresh_and_stage_production_targets(&store,None,&registry,&tx).unwrap_err().code,"target_approval_pending");
+        registry.refresh_executable_verifications();
+        assert_eq!(registry.executable_verification_counts().1,1,"normal Codex must stage despite unreadable Claude");
+        let state=store.read_json(&store.paths.watch().join("state/target-discovery.json"),Value::Null).unwrap();
+        assert_eq!(state["verification_pending"],true);
+        assert!(state["selection_issues"].as_array().unwrap().contains(&json!("claude-desktop:target_fingerprint_failed")));
+        fs::set_permissions(&broken,fs::Permissions::from_mode(0o755)).unwrap();
+        refresh_and_stage_production_targets(&store,None,&registry,&tx).unwrap();registry.refresh_executable_verifications();
+        assert_eq!(registry.executable_verification_counts().1,2,"recovered image must become verifiable on retry");
+        assert_eq!(store.read_json(&store.paths.watch().join("state/target-discovery.json"),Value::Null).unwrap()["verification_pending"],false);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     struct Fixture { root: PathBuf, stack: Option<ProductionChannelStack>, store: StateStore }
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -1981,6 +1978,8 @@ mod r1_tests {
         let f = fixture(false);
         let target = f.root.join("Applications/Claude.app/Contents/MacOS/Claude");
         fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(f.root.join("Applications/Claude.app/Contents/Info.plist"),
+            r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string><key>CFBundleExecutable</key><string>Claude</string></dict></plist>"#).unwrap();
         fs::write(&target, b"fixture-a").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
         let signature = target_metadata_signature(&f.store, Some(&f.store.paths.watch().join("runtime")));

@@ -104,9 +104,9 @@ pub struct NativeDesktop<R: ReadRunner> {
     target: LaunchTarget,
     selected: Option<SelectedApplication>,
     applications: PathBuf,
-    cask_roots: Vec<PathBuf>,
     cli: Option<SelectedCli>,
     channel_tracked: Vec<Target>,
+    discovery: std::sync::Mutex<Option<crate::target_discovery::DiscoveryHandle>>,
 }
 #[derive(Clone, PartialEq, Eq)]
 struct SelectedApplication {
@@ -115,6 +115,7 @@ struct SelectedApplication {
     executable: PathBuf,
     bundle_id: String,
     kind: Kind,
+    source_id: String,
 }
 struct SelectedCli {
     path: PathBuf,
@@ -255,19 +256,19 @@ impl<R: ReadRunner> NativeDesktop<R> {
             target: LaunchTarget::ClaudeDesktop,
             selected: None,
             applications,
-            cask_roots: vec![
-                "/opt/homebrew/Caskroom".into(),
-                "/usr/local/Caskroom".into(),
-            ],
             cli: None,
             channel_tracked: Vec::new(),
+            discovery: std::sync::Mutex::new(None),
         })
     }
     pub fn target(&self) -> LaunchTarget {
         self.target
     }
     pub fn set_applications_dir(&mut self, dir: PathBuf) {
-        self.applications = dir;
+        self.applications = dir.clone();
+        let mut inputs = crate::target_discovery::DiscoveryInputs::for_home(&dir);
+        inputs.application_roots = vec![dir]; inputs.query_registry = false; inputs.prefixes.clear();
+        self.set_discovery(crate::target_discovery::DiscoveryHandle::new(inputs));
     }
     pub fn sandbox_launcher_binary(&self) -> Result<PathBuf> {
         if let Some(override_bin) = std::env::var_os("CW_SANDBOX_LAUNCHER_BIN") {
@@ -297,126 +298,54 @@ impl<R: ReadRunner> NativeDesktop<R> {
     pub fn selected_cli_path(&self) -> Option<&Path> {
         self.cli.as_ref().map(|c| c.path.as_path())
     }
-    pub fn build_managed_entry_spec(
-        &self,
-    ) -> Result<crate::managed_entry::DesktopManagedEntrySpec> {
-        if let Some(ref sel) = self.selected {
-            let exe_name = sel
-                .executable
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            return crate::managed_entry::DesktopManagedEntrySpec::resolve_from_app_bundle(
-                self.target,
-                &sel.bundle,
-                &sel.bundle_id,
-                exe_name,
-            );
-        }
-        let claude_bundle = self.applications.join("Claude.app");
-        crate::managed_entry::DesktopManagedEntrySpec::resolve_from_app_bundle(
-            LaunchTarget::ClaudeDesktop,
-            &claude_bundle,
-            "com.anthropic.claudefordesktop",
-            "Claude",
-        )
+    pub fn set_discovery(&mut self, discovery: crate::target_discovery::DiscoveryHandle) {
+        *self.discovery.lock().unwrap() = Some(discovery);
     }
-    /// Discovers installed desktop `.app` targets and CLI targets, registering their
-    /// canonical executables and SHA-256 fingerprints in `SandboxLaunchRegistry`
-    /// along with verified app-bundle helper executables (`Contents/Frameworks/*.app/Contents/MacOS/*`
-    /// and `Contents/Resources/**/codex`). Never whitelists generic `node` or `python` interpreters.
+    fn discovery_for(&self, home: Option<&Path>) -> crate::target_discovery::DiscoveryHandle {
+        let mut current = self.discovery.lock().unwrap();
+        if let Some(handle) = current.as_ref() { return handle.clone(); }
+        let home = home.map(Path::to_path_buf).or_else(||std::env::var_os("HOME").map(PathBuf::from)).unwrap_or_else(||self.applications.clone());
+        let handle = crate::target_discovery::DiscoveryHandle::for_home(&home);
+        *current = Some(handle.clone()); handle
+    }
+    pub fn build_managed_entry_spec(&self) -> Result<crate::managed_entry::DesktopManagedEntrySpec> {
+        let discovery = self.discovery_for(None);
+        let snapshot = discovery.refresh(&self.runner, native::now());
+        let record = snapshot.select(self.target, self.selected.as_ref().map(|s|s.source_id.as_str()))?;
+        discovery.managed_spec(&snapshot, record, self.target)
+    }
     pub fn refresh_approved_targets_in_registry(
-        &mut self,
-        home: &Path,
-        registry: &crate::sandbox_launch::SandboxLaunchRegistry,
+        &mut self, home: &Path, registry: &crate::sandbox_launch::SandboxLaunchRegistry,
     ) -> Vec<crate::managed_entry::DesktopManagedEntrySpec> {
-        let orig_target = self.target;
-        let orig_selected = self.selected.clone();
-        let orig_cli = self.cli.take();
-        let mut discovered_desktop_specs = Vec::new();
-
-        for desktop_target in [
-            LaunchTarget::ClaudeDesktop,
-            LaunchTarget::CodexDesktop,
-            LaunchTarget::ChatgptDesktop,
-        ] {
-            let spec_res = if desktop_target.protected() {
-                let claude_bundle = self.applications.join("Claude.app");
-                crate::managed_entry::DesktopManagedEntrySpec::resolve_from_app_bundle(
-                    LaunchTarget::ClaudeDesktop,
-                    &claude_bundle,
-                    "com.anthropic.claudefordesktop",
-                    "Claude",
-                )
-            } else {
-                self.resolve_target(desktop_target).and_then(|sel| {
-                    let exe_name = sel
-                        .executable
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
-                    crate::managed_entry::DesktopManagedEntrySpec::resolve_from_app_bundle(
-                        desktop_target,
-                        &sel.bundle,
-                        &sel.bundle_id,
-                        exe_name,
-                    )
-                })
-            };
-            if let Ok(spec) = spec_res {
-                let target_exe_str = spec.target_executable.to_string_lossy().into_owned();
-                registry.approve_target_executable(&target_exe_str, &spec.target_fingerprint);
-                registry.approve_child_executable(&target_exe_str, &spec.target_fingerprint);
-                for (child_exe, child_sha) in
-                    Self::discover_bundle_child_executables(&spec.target_bundle_path)
-                {
-                    registry.approve_child_executable(
-                        child_exe.to_string_lossy().into_owned(),
-                        &child_sha,
-                    );
-                }
-                discovered_desktop_specs.push(spec);
-            }
-        }
-
-        for cli_target in [LaunchTarget::ClaudeCli, LaunchTarget::CodexCli] {
-            if self.select_cli(cli_target, home).is_ok() {
-                if let Some(ref sel_cli) = self.cli {
-                    if let Some(sha) = claude_watch_system::sha256_file_hex(&sel_cli.path) {
-                        let cli_path_str = sel_cli.path.to_string_lossy().into_owned();
-                        registry.approve_target_executable(&cli_path_str, &sha);
-                        registry.approve_child_executable(&cli_path_str, &sha);
-                    }
-                }
-            }
-        }
-
-        self.target = orig_target;
-        self.selected = orig_selected;
-        self.cli = orig_cli;
-        discovered_desktop_specs
+        let discovery = self.discovery_for(Some(home));
+        let snapshot = discovery.refresh(&self.runner, native::now());
+        let Ok(manifest) = discovery.approved_manifest(&snapshot) else { return Vec::new(); };
+        let invalidated=registry.replace_approved_targets_with_cli_sources(manifest.targets, manifest.children, manifest.cli_sources);
+        registry.queue_inventory_invalidations(invalidated);
+        manifest.desktop_specs
     }
 
-    pub fn discover_bundle_child_executables(bundle_root: &Path) -> Vec<(PathBuf, String)> {
+    pub fn discover_bundle_child_paths(bundle_root: &Path) -> Result<Vec<PathBuf>> {
         let mut results = Vec::new();
         let frameworks_dir = bundle_root.join("Contents/Frameworks");
         if let Ok(entries) = fs::read_dir(&frameworks_dir) {
-            for entry in entries.flatten() {
+            for (index, entry) in entries.enumerate() {
+                if index >= 256 { return Err(CoreError::new("discovery_budget_exhausted", "应用辅助程序目录超过发现预算")); }
+                let Ok(entry) = entry else { continue };
                 let path = entry.path();
                 if path.extension().and_then(|s| s.to_str()) == Some("app") {
                     let macos_dir = path.join("Contents/MacOS");
                     if let Ok(bins) = fs::read_dir(&macos_dir) {
-                        for bin_entry in bins.flatten() {
+                        for (index, bin_entry) in bins.enumerate() {
+                            if index >= 256 { return Err(CoreError::new("discovery_budget_exhausted", "应用辅助程序目录超过发现预算")); }
+                            let Ok(bin_entry) = bin_entry else { continue };
                             if let Ok(canon) = fs::canonicalize(bin_entry.path()) {
                                 if canon.starts_with(bundle_root)
                                     && fs::metadata(&canon).is_ok_and(|m| {
                                         m.is_file() && (m.permissions().mode() & 0o111 != 0)
                                     })
                                 {
-                                    if let Some(sha) = claude_watch_system::sha256_file_hex(&canon)
-                                    {
-                                        results.push((canon, sha));
-                                    }
+                                    results.push(canon);
                                 }
                             }
                         }
@@ -435,22 +364,35 @@ impl<R: ReadRunner> NativeDesktop<R> {
                     && fs::metadata(&canon)
                         .is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
                 {
-                    if let Some(sha) = claude_watch_system::sha256_file_hex(&canon) {
-                        results.push((canon, sha));
-                    }
+                    results.push(canon);
                 }
             }
         }
-        results
+        results.sort(); results.dedup(); Ok(results)
+    }
+    pub fn discover_bundle_child_executables(bundle_root: &Path) -> Vec<(PathBuf, String)> {
+        Self::discover_bundle_child_paths(bundle_root).unwrap_or_default().into_iter().filter_map(|path|
+            claude_watch_system::sha256_file_hex(&path).map(|sha|(path,sha))).collect()
     }
     pub fn select_target(&mut self, target: LaunchTarget) -> Result<()> {
-        self.selected = if target.protected() {
-            None
-        } else {
-            Some(self.resolve_target(target)?)
-        };
+        self.selected = Some(self.resolve_target(target)?);
         self.target = target;
         Ok(())
+    }
+    /// Explicit source selection is separate from discovery and must still pass
+    /// current metadata/content, registry, sandbox and permit gates.
+    pub fn select_target_source(&mut self, target: LaunchTarget, path: &Path) -> Result<()> {
+        let discovery = self.discovery_for(None);
+        discovery.refresh(&self.runner, native::now());
+        discovery.desktop_source(target,path);
+        let snapshot = discovery.refresh(&self.runner, native::now());
+        let record = snapshot.targets.iter().find(|r|r.entry_path == path && r.valid() && r.kind().is_some_and(|kind|target.accepts(kind)))
+            .ok_or_else(||CoreError::new("selected_source_unavailable", "指定应用来源尚未验证"))?;
+        discovery.choose_source(target, &record.source_id);
+        if self.authority==Authority::ExplicitPermit { discovery.publish_caller_hint(target)?; }
+        self.selected = Some(SelectedApplication { path:record.entry_path.clone(),bundle:record.bundle.clone().unwrap(),
+            executable:record.executable.clone().unwrap(),bundle_id:record.bundle_id.clone().unwrap(),kind:record.kind().unwrap(),source_id:record.source_id.clone() });
+        self.target = target; Ok(())
     }
     /// Point the guard's supervised family at a target without resolving or
     /// binding an application. The guard's observation and exit paths derive
@@ -493,122 +435,13 @@ impl<R: ReadRunner> NativeDesktop<R> {
         if !target.cli() {
             return Err(CoreError::new("invalid_target", "目标不是CLI"));
         }
-        let (name, key) = if target == LaunchTarget::ClaudeCli {
-            ("claude", "CLAUDE_CODE_BIN")
-        } else {
-            ("codex", "CODEX_CLI_BIN")
-        };
-        let paths = crate::storage::Paths::new(home)?;
-        let home = paths.home.as_path();
-        let trusted = crate::sampler::cli_paths(&paths);
-        let mut bundled = std::collections::BTreeSet::new();
-        if target == LaunchTarget::CodexCli {
-            for request in [LaunchTarget::CodexDesktop, LaunchTarget::ChatgptDesktop] {
-                if let Ok(app) = self.resolve_target(request) {
-                    for relative in [
-                        "Contents/Resources/codex",
-                        "Contents/Resources/codex-cli/bin/codex",
-                        "Contents/Resources/CodexCLI.app/Contents/MacOS/codex",
-                        "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
-                    ] {
-                        if let Ok(path) = fs::canonicalize(app.bundle.join(relative)) {
-                            if path.starts_with(&app.bundle) {
-                                bundled.insert(path);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let mut candidates = Vec::new();
-        if let Some(value) = env.get(key).filter(|v| !v.is_empty()) {
-            let p = PathBuf::from(value);
-            if !p.is_absolute() {
-                return Err(CoreError::new(
-                    "cli_source_unverified",
-                    "CLI覆盖路径必须为已识别来源的绝对路径",
-                ));
-            }
-            candidates.push(p);
-        } else {
-            let shim_exe = env
-                .get("CW_SHIM_EXECUTABLE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| paths.watch().join("bin").join(name));
-            let shim_canon = fs::canonicalize(&shim_exe).ok();
-            let shim_dir_canon = shim_canon
-                .as_ref()
-                .and_then(|p| p.parent().map(Path::to_path_buf))
-                .or_else(|| shim_exe.parent().and_then(|p| fs::canonicalize(p).ok()));
-            let watch_bin_canon = fs::canonicalize(paths.watch().join("bin")).ok();
-            if let Some(path) = env.get("PATH").and_then(|v| {
-                std::env::split_paths(v)
-                    .filter(|dir| {
-                        let canon_dir = fs::canonicalize(dir).ok();
-                        canon_dir.is_none()
-                            || (canon_dir != shim_dir_canon && canon_dir != watch_bin_canon)
-                    })
-                    .map(|p| p.join(name))
-                    .find(|p| {
-                        let Ok(meta) = fs::metadata(p) else {
-                            return false;
-                        };
-                        if !meta.is_file() || (meta.permissions().mode() & 0o111 == 0) {
-                            return false;
-                        }
-                        if let (Some(ref sc), Ok(ref pc)) = (&shim_canon, fs::canonicalize(p)) {
-                            if sc == pc {
-                                return false;
-                            }
-                        }
-                        true
-                    })
-            }) {
-                candidates.push(path);
-            } else {
-                candidates.extend(if target == LaunchTarget::ClaudeCli {
-                    vec![
-                        home.join(".local/bin/claude"),
-                        home.join(".claude/local/claude"),
-                        "/opt/homebrew/bin/claude".into(),
-                        "/usr/local/bin/claude".into(),
-                    ]
-                } else {
-                    vec![
-                        "/opt/homebrew/bin/codex".into(),
-                        "/usr/local/bin/codex".into(),
-                    ]
-                });
-            }
-        }
-        if !env.get(key).is_some_and(|v| !v.is_empty()) {
-            candidates.extend(bundled.iter().cloned());
-        }
-        for path in candidates {
-            let Ok(path) = fs::canonicalize(path) else {
-                continue;
-            };
-            if !bundled.contains(&path)
-                && !path.to_str().is_some_and(|p| {
-                    claude_watch_core::process_roots::cli_kind(p, home, &trusted)
-                        .is_some_and(|kind| target.accepts(kind))
-                })
-            {
-                return Err(CoreError::new(
-                    "cli_source_unverified",
-                    "同名CLI来源未通过现有进程身份规则，未启动",
-                ));
-            }
-            let fingerprint = cli_fingerprint(&path)?;
-            self.cli = Some(SelectedCli { path, fingerprint });
-            self.selected = None;
-            self.target = target;
-            return Ok(());
-        }
-        Err(CoreError::new(
-            "cli_unavailable",
-            "没有找到受支持来源的CLI可执行文件",
-        ))
+        let discovery = self.discovery_for(Some(home));
+        let (_, record) = discovery.select_cli(&self.runner, target, env, native::now())?;
+        if self.authority == Authority::ExplicitPermit { discovery.publish_caller_hint(target)?; }
+        let path = record.executable.unwrap();
+        let fingerprint = cli_fingerprint(&path)?;
+        self.cli = Some(SelectedCli { path, fingerprint });
+        self.selected = None; self.target = target; Ok(())
     }
     fn spawn_cli(&self, args: &[String], state: &NativeCliState) -> Result<Box<dyn CliProcess>> {
         if self.authority != Authority::ExplicitPermit || !self.target.cli() {
@@ -745,84 +578,14 @@ impl<R: ReadRunner> NativeDesktop<R> {
         }))
     }
     fn resolve_target(&self, target: LaunchTarget) -> Result<SelectedApplication> {
-        let names: &[&str] = match target {
-            LaunchTarget::CodexDesktop => &["Codex.app", "ChatGPT.app"],
-            LaunchTarget::ChatgptDesktop => &["ChatGPT.app"],
-            _ => return Err(CoreError::new("invalid_target", "目标使用现有Claude适配器")),
-        };
-        let mut reasons = Vec::new();
-        for name in names {
-            let path = self.applications.join(name);
-            let Ok(bundle) = fs::canonicalize(&path) else {
-                reasons.push(format!("{name} 不存在"));
-                continue;
-            };
-            let standard =
-                fs::canonicalize(&self.applications).is_ok_and(|root| bundle == root.join(name));
-            let cask = self
-                .cask_roots
-                .iter()
-                .any(|root| fs::canonicalize(root).is_ok_and(|root| bundle.starts_with(root)))
-                && bundle.file_name().is_some_and(|actual| actual == *name);
-            if !standard && !cask {
-                reasons.push(format!("{name} 安装链接不在应用目录或已知Homebrew安装范围"));
-                continue;
-            }
-            let info = self
-                .runner
-                .run(
-                    crate::commands::ReadCommand::Plist(path.join("Contents/Info.plist")),
-                    &[],
-                    Duration::from_secs(3),
-                    128 * 1024,
-                )
-                .ok()
-                .filter(|o| o.status == 0)
-                .and_then(|o| crate::storage::strict_json(&o.stdout).ok());
-            let Some(info) = info else {
-                reasons.push(format!("{name} 元数据无法读取"));
-                continue;
-            };
-            let id = info["CFBundleIdentifier"].as_str().unwrap_or("");
-            let kind = claude_watch_core::process_roots::desktop_kind(name, id, true);
-            let Some(kind) = kind.filter(|kind| target.accepts(*kind)) else {
-                reasons.push(format!("{name} bundle标识与目标不符"));
-                continue;
-            };
-            let exe = info["CFBundleExecutable"].as_str().unwrap_or("");
-            if exe.is_empty()
-                || exe.len() > 256
-                || exe.contains(['/', '\\'])
-                || matches!(exe, "." | "..")
-                || exe.chars().any(char::is_control)
-            {
-                reasons.push(format!("{name} 可执行文件名称无效"));
-                continue;
-            }
-            let executable = bundle.join("Contents/MacOS").join(exe);
-            let Ok(executable) = fs::canonicalize(executable) else {
-                reasons.push(format!("{name} 可执行文件不存在"));
-                continue;
-            };
-            if !executable.starts_with(bundle.join("Contents/MacOS"))
-                || !fs::metadata(&executable)
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            {
-                reasons.push(format!("{name} 可执行文件范围或权限无效"));
-                continue;
-            }
-            return Ok(SelectedApplication {
-                path,
-                bundle,
-                executable,
-                bundle_id: id.into(),
-                kind,
-            });
-        }
-        Err(CoreError::new(
-            "target_app_unavailable",
-            &format!("未找到经验证的目标应用：{}", reasons.join("；")),
-        ))
+        if target.cli() { return Err(CoreError::new("invalid_target", "CLI 使用独立受控入口")); }
+        let discovery = self.discovery_for(None);
+        let snapshot = discovery.refresh(&self.runner, native::now());
+        let source = if self.target == target { self.selected.as_ref().map(|s|s.source_id.as_str()) } else { None };
+        let record = snapshot.select(target, source)?;
+        discovery.choose_source(target, &record.source_id);
+        Ok(SelectedApplication { path:record.entry_path.clone(),bundle:record.bundle.clone().unwrap(),executable:record.executable.clone().unwrap(),
+            bundle_id:record.bundle_id.clone().unwrap(),kind:record.kind().unwrap(),source_id:record.source_id.clone() })
     }
     pub fn observation_owner(&self) -> Result<ProcessIdentity> {
         let inventory = Observer {
@@ -856,43 +619,20 @@ impl<R: ReadRunner> NativeDesktop<R> {
                 "进程清单不完整，未假定目标已关闭",
             ));
         }
+        let catalog = self.catalog_for_inventory(&inventory);
         let mut roots = Vec::new();
-        for p in inventory.processes.values() {
-            if p.identity.uid != inventory.uid
-                || p.bundle_id.as_deref() != Some(&selected.bundle_id)
-            {
-                continue;
+        for process in inventory.processes.values() {
+            let installed=catalog.targets.iter().filter(|r|r.valid() && !r.target.cli() && r.bundle_id.as_deref()==Some(selected.bundle_id.as_str()))
+                .find(|r|r.executable.as_ref().is_some_and(|exe|exe==Path::new(&process.identity.executable)));
+            if let Some(installed)=installed {
+                if installed.bundle.as_ref()!=Some(&selected.bundle) || installed.executable.as_ref()!=Some(&selected.executable) {
+                    return Err(CoreError::new("target_running_elsewhere", "同类目标正在其他安装位置运行，未补登记"));
+                }
+                roots.push(Target { identity:process.identity.clone(), kind:selected.kind });
+            } else if process.bundle_id.as_deref()==Some(selected.bundle_id.as_str()) && process.bundle_path.as_ref().is_some_and(|bundle|
+                process.identity.executable.starts_with(&format!("{bundle}/Contents/MacOS/"))) {
+                return Err(CoreError::new("target_identity_unavailable", "已有目标安装身份待确认，未重复启动"));
             }
-            let Some(bundle) = &p.bundle_path else {
-                continue;
-            };
-            if !p
-                .identity
-                .executable
-                .starts_with(&format!("{bundle}/Contents/MacOS/"))
-            {
-                continue;
-            }
-            if claude_watch_core::process_roots::desktop_kind(bundle, &selected.bundle_id, true)
-                != Some(selected.kind)
-            {
-                continue;
-            }
-            let path = fs::canonicalize(&p.identity.executable).map_err(|_| {
-                CoreError::new("target_identity_unavailable", "目标可执行文件无法复核")
-            })?;
-            if path != selected.executable
-                || fs::canonicalize(bundle).ok().as_ref() != Some(&selected.bundle)
-            {
-                return Err(CoreError::new(
-                    "target_running_elsewhere",
-                    "同类目标正在其他安装位置运行，未补登记",
-                ));
-            }
-            roots.push(Target {
-                identity: p.identity.clone(),
-                kind: selected.kind,
-            });
         }
         Ok(roots)
     }
@@ -915,31 +655,17 @@ impl<R: ReadRunner> NativeDesktop<R> {
         // whatever the configuration supervises.
         let (bundle_ids, _) =
             claude_watch_core::process_roots::family_desktop_scopes(self.target.provider());
+        let catalog = self.catalog_for_inventory(&inventory);
         let mut result = Vec::new();
         for record in inventory.processes.values() {
-            if !record
-                .bundle_id
-                .as_deref()
-                .is_some_and(|id| bundle_ids.contains(&id))
-            {
-                continue;
+            let installed=catalog.targets.iter().filter(|r|!r.target.cli() && r.valid() && r.bundle_id.as_deref().is_some_and(|id|bundle_ids.contains(&id)))
+                .find(|r|r.bundle.as_ref().is_some_and(|bundle|Path::new(&record.identity.executable).starts_with(bundle.join("Contents"))));
+            if let Some(installed)=installed {
+                result.push((Desktop { pid:record.identity.pid,start_seconds:record.identity.start_seconds,start_microseconds:record.identity.start_microseconds },
+                    installed.executable.as_ref().is_some_and(|exe|exe==Path::new(&record.identity.executable)),record.identity.start_stamp.clone()));
+            } else if record.bundle_id.as_deref().is_some_and(|id|bundle_ids.contains(&id)) {
+                return Err(CoreError::new("desktop_installation_pending", "已有应用的安装身份待确认，未假定其已退出"));
             }
-            let Some(bundle) = &record.bundle_path else {
-                continue;
-            };
-            let main = record
-                .identity
-                .executable
-                .starts_with(&format!("{bundle}/Contents/MacOS/"));
-            result.push((
-                Desktop {
-                    pid: record.identity.pid,
-                    start_seconds: record.identity.start_seconds,
-                    start_microseconds: record.identity.start_microseconds,
-                },
-                main,
-                record.identity.start_stamp.clone(),
-            ));
         }
         if !inventory.complete {
             return Err(CoreError::new(
@@ -981,17 +707,18 @@ impl<R: ReadRunner> NativeDesktop<R> {
                 "进程清单不完整，无法确认目标是否完全退出",
             ));
         }
-        let (bundle_ids, app_prefixes) =
-            claude_watch_core::process_roots::family_desktop_scopes(self.target.provider());
-        Ok(inventory.processes.values().any(|record| {
-            record
-                .bundle_id
-                .as_deref()
-                .is_some_and(|id| bundle_ids.contains(&id))
-                || app_prefixes
-                    .iter()
-                    .any(|prefix| record.identity.executable.starts_with(prefix))
-        }))
+        let catalog=self.catalog_for_inventory(&inventory);
+        let (bundle_ids, _) = claude_watch_core::process_roots::family_desktop_scopes(self.target.provider());
+        Ok(inventory.processes.values().any(|record|record.bundle_id.as_deref().is_some_and(|id|bundle_ids.contains(&id))
+            || catalog.targets.iter().any(|r|!r.target.cli() && r.valid() && r.bundle_id.as_deref().is_some_and(|id|bundle_ids.contains(&id))
+                && r.bundle.as_ref().is_some_and(|bundle|Path::new(&record.identity.executable).starts_with(bundle.join("Contents"))))))
+    }
+    fn catalog_for_inventory(&self,inventory:&crate::native::Inventory)->std::sync::Arc<crate::target_discovery::DiscoverySnapshot> {
+        let discovery=self.discovery_for(None);
+        discovery.observed_process_bundles(inventory.processes.values().filter_map(|process|
+            process.bundle_path.as_ref().map(PathBuf::from).or_else(||process.identity.executable.split_once(".app/Contents/")
+                .map(|(prefix,_)|PathBuf::from(format!("{prefix}.app")))).map(|path|(path,process.bundle_id.clone()))));
+        discovery.refresh(&self.runner,native::now())
     }
     pub fn launcher(&self) -> Result<Launcher> {
         let inventory = Observer {
@@ -1024,46 +751,11 @@ impl<R: ReadRunner> NativeDesktop<R> {
                 "只读运行入口不启动应用",
             ));
         }
-        if !self.target.protected() {
-            let selected = self
-                .selected
-                .as_ref()
-                .ok_or_else(|| CoreError::new("target_identity_unavailable", "目标尚未绑定"))?;
-            if &self.resolve_target(self.target)? != selected {
-                return Err(CoreError::new(
-                    "target_install_changed",
-                    "预检期间目标应用安装身份变化，未启动",
-                ));
-            }
-            return execute(
-                Path::new("/usr/bin/open"),
-                &[
-                    "-a",
-                    selected
-                        .path
-                        .to_str()
-                        .ok_or_else(|| CoreError::new("invalid_target_path", "目标路径编码无效"))?,
-                ],
-                Duration::from_secs(15),
-            );
+        let selected = self.selected.as_ref().ok_or_else(||CoreError::new("target_identity_unavailable", "目标尚未绑定"))?;
+        if &self.resolve_target(self.target)? != selected {
+            return Err(CoreError::new("target_install_changed", "预检期间目标应用安装身份变化，未启动"));
         }
-        let env = Observer {
-            runner: &self.runner,
-        }
-        .environment()?;
-        if env.pointer("/claude_app/bundle_id").and_then(Value::as_str)
-            != Some("com.anthropic.claudefordesktop")
-        {
-            return Err(CoreError::new(
-                "claude_identity_unavailable",
-                "Claude应用安装身份未验证",
-            ));
-        }
-        execute(
-            Path::new("/usr/bin/open"),
-            &["-a", "/Applications/Claude.app"],
-            Duration::from_secs(15),
-        )
+        execute(Path::new("/usr/bin/open"), &["-a",selected.path.to_str().ok_or_else(||CoreError::new("invalid_target_path", "目标路径编码无效"))?],Duration::from_secs(15))
     }
     pub fn open_via_sandbox_launcher(
         &self,
@@ -1080,29 +772,9 @@ impl<R: ReadRunner> NativeDesktop<R> {
                 "只读运行入口不启动应用",
             ));
         }
-        if !self.target.protected() {
-            let selected = self
-                .selected
-                .as_ref()
-                .ok_or_else(|| CoreError::new("target_identity_unavailable", "目标尚未绑定"))?;
+        if let Some(selected) = self.selected.as_ref() {
             if &self.resolve_target(self.target)? != selected {
-                return Err(CoreError::new(
-                    "target_install_changed",
-                    "预检期间目标应用安装身份变化，未启动",
-                ));
-            }
-        } else {
-            let env = Observer {
-                runner: &self.runner,
-            }
-            .environment()?;
-            if env.pointer("/claude_app/bundle_id").and_then(Value::as_str)
-                != Some("com.anthropic.claudefordesktop")
-            {
-                return Err(CoreError::new(
-                    "claude_identity_unavailable",
-                    "Claude应用安装身份未验证",
-                ));
+                return Err(CoreError::new("target_install_changed", "预检期间目标应用安装身份变化，未启动"));
             }
         }
         let spec = self.build_managed_entry_spec()?;
@@ -1406,6 +1078,7 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
         // Reuse the monitor's native root/CLI/descendant classification. A
         // desktop-only fallback would silently lose Code and orphan children.
         let mut sampler = crate::sampler::Sampler::new(&self.desktop.runner, self.storage.paths.clone());
+        sampler.set_discovery(self.desktop.discovery_for(Some(&self.storage.paths.home)));
         sampler.retain_channel_targets(&self.desktop.channel_tracked);
         let round = sampler.processes()?;
         if !round.complete {
@@ -1678,11 +1351,13 @@ mod target_contracts {
         app(&root, "ChatGPT.app", "com.openai.codex", "ChatGPT");
         app(&root, "Codex.app", "com.openai.codex", "Codex");
         let mut desktop = NativeDesktop::new(Reader, helper, Authority::ReadOnly).unwrap();
-        desktop.applications = root.clone();
-        desktop.select_target(LaunchTarget::CodexDesktop).unwrap();
+        desktop.set_applications_dir(root.clone());
+        assert_eq!(desktop.select_target(LaunchTarget::CodexDesktop).unwrap_err().code,"ambiguous_source");
+        desktop.select_target_source(LaunchTarget::CodexDesktop,&root.join("Codex.app")).unwrap();
         assert_eq!(desktop.selected.as_ref().unwrap().kind, Kind::CodexMain);
         fs::remove_dir_all(root.join("Codex.app")).unwrap();
-        desktop.select_target(LaunchTarget::CodexDesktop).unwrap();
+        assert_eq!(desktop.select_target(LaunchTarget::CodexDesktop).unwrap_err().code,"selected_source_unavailable");
+        desktop.select_target_source(LaunchTarget::CodexDesktop,&root.join("ChatGPT.app")).unwrap();
         assert_eq!(desktop.selected.as_ref().unwrap().kind, Kind::OpenaiMain);
         desktop.select_target(LaunchTarget::ChatgptDesktop).unwrap();
         assert_eq!(desktop.selected.as_ref().unwrap().kind, Kind::OpenaiMain);
@@ -1696,7 +1371,7 @@ mod target_contracts {
                 .select_target(LaunchTarget::ChatgptDesktop)
                 .unwrap_err()
                 .code,
-            "target_app_unavailable"
+            "selected_source_unavailable"
         );
         app(&root, "ChatGPT.app", "com.openai.chat", "../escape");
         assert_eq!(
@@ -1704,25 +1379,22 @@ mod target_contracts {
                 .select_target(LaunchTarget::ChatgptDesktop)
                 .unwrap_err()
                 .code,
-            "target_app_unavailable"
+            "selected_source_unavailable"
         );
         use std::os::unix::fs::symlink;
         fs::remove_dir_all(root.join("ChatGPT.app")).unwrap();
         let outside = root.join("outside");
         app(&outside, "ChatGPT.app", "com.openai.chat", "ChatGPT");
         symlink(outside.join("ChatGPT.app"), root.join("ChatGPT.app")).unwrap();
-        assert_eq!(
-            desktop
-                .select_target(LaunchTarget::ChatgptDesktop)
-                .unwrap_err()
-                .code,
-            "target_app_unavailable"
-        );
+        // A symlink to a custom installation is a candidate; its supported
+        // actual ID and executable containment, rather than a prefix, decide.
+        assert_eq!(desktop.select_target(LaunchTarget::ChatgptDesktop).unwrap_err().code,"selected_source_unavailable");
+        desktop.select_target_source(LaunchTarget::ChatgptDesktop,&root.join("ChatGPT.app")).unwrap();
+        assert_eq!(desktop.selected.as_ref().unwrap().bundle,fs::canonicalize(outside.join("ChatGPT.app")).unwrap());
         fs::remove_file(root.join("ChatGPT.app")).unwrap();
         let cask = root.join("Caskroom");
         let version = cask.join("chatgpt/1");
         app(&version, "ChatGPT.app", "com.openai.chat", "ChatGPT");
-        desktop.cask_roots = vec![cask];
         symlink(version.join("ChatGPT.app"), root.join("ChatGPT.app")).unwrap();
         desktop.select_target(LaunchTarget::ChatgptDesktop).unwrap();
         assert_eq!(desktop.selected.as_ref().unwrap().kind, Kind::ChatgptMain);
@@ -1736,7 +1408,7 @@ mod target_contracts {
         fs::write(&helper, b"fixture").unwrap();
         app(&root, "ChatGPT.app", "com.openai.codex", "ChatGPT");
         let mut desktop = NativeDesktop::new(Reader, helper, Authority::ReadOnly).unwrap();
-        desktop.applications = root.clone();
+        desktop.set_applications_dir(root.clone());
         for relative in [
             "Contents/Resources/codex-cli/bin/codex",
             "Contents/Resources/CodexCLI.app/Contents/MacOS/codex",
@@ -1800,13 +1472,25 @@ mod cli_process_contracts {
         let root = PathBuf::from(root);
         let (mut desktop, program) = desktop(&root);
         let mode = std::env::var("CW_NATIVE_CLI_FIXTURE_MODE").unwrap();
-        let script = if mode == "io" {
-            "#!/bin/sh\nprintf 'ARG:%s\\n' \"$@\"\nIFS= read -r input\nprintf 'INPUT:%s\\n' \"$input\"\nprintf 'PROXY:%s|%s|%s|%s\\n' \"$HTTP_PROXY\" \"$HTTPS_PROXY\" \"${ALL_PROXY-unset}\" \"$NO_PROXY\"\nexit 7\n"
-        } else {
-            "#!/bin/sh\ntrap 'exit 0' INT TERM\nprintf 'READY:%s\\n' \"$$\"\nfor n in 1 2 3 4 5 6 7 8 9 10; do /bin/sleep 1; done\n"
-        };
-        fs::write(&program, script).unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        // The launcher intentionally rejects scripts. Keep these stdio/signal
+        // contracts using an owned native image, without relaxing discovery.
+        let source=root.join("native-cli.c");
+        fs::write(&source,r#"#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+static const char *env(const char *key) { const char *v=getenv(key);return v?v:"unset"; }
+int main(int argc,char **argv) {
+ if (FIXTURE_IO) {
+  for(int i=1;i<argc;i++) printf("ARG:%s\n",argv[i]);
+  char line[1024];if(!fgets(line,sizeof(line),stdin))return 99;printf("INPUT:%s",line);
+  printf("PROXY:%s|%s|%s|%s\n",env("HTTP_PROXY"),env("HTTPS_PROXY"),env("ALL_PROXY"),env("NO_PROXY"));return 7;
+ }
+ printf("READY:%d\n",getpid());fflush(stdout);for(;;)pause();
+}
+"#).unwrap();
+        let compiled=Command::new("xcrun").args(["clang","-Wall","-Werror"]).arg(if mode=="io"{"-DFIXTURE_IO=1"}else{"-DFIXTURE_IO=0"})
+            .arg(&source).arg("-o").arg(&program).output().unwrap();
+        assert!(compiled.status.success(),"{}",String::from_utf8_lossy(&compiled.stderr));
         let env = BTreeMap::from([("CLAUDE_CODE_BIN".into(), program.to_str().unwrap().into())]);
         desktop
             .select_cli_environment(LaunchTarget::ClaudeCli, &root, &env)
@@ -1958,7 +1642,7 @@ mod cli_process_contracts {
         let root = std::env::temp_dir().join(format!("cli-identity-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
         let (mut desktop, program) = desktop(&root);
-        fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(&program, b"private native discovery image; never executed").unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
         let mut env =
             BTreeMap::from([("CLAUDE_CODE_BIN".into(), program.to_str().unwrap().into())]);

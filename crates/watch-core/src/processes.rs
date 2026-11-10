@@ -269,6 +269,34 @@ pub fn descendant(pid: u32, root: u32, inventory: &BTreeMap<u32, Identity>) -> b
     }
     false
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchReason {
+    InstallationPending,
+    SupportedCliAlias, KnownCliLayout, VerifiedBundle, VerifiedBundleComponent,
+    ScriptEntry, ManagedAppServer, LauncherSeed, RetainedLifetime, VerifiedDescendant,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIdentityRef {
+    pub pid: u32, pub uid: u32, pub start_seconds: u64, pub start_microseconds: u32,
+}
+impl From<&Identity> for ProcessIdentityRef {
+    fn from(p: &Identity) -> Self { Self { pid: p.pid, uid: p.uid, start_seconds: p.start_seconds, start_microseconds: p.start_microseconds } }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchEvidence {
+    pub identity: Identity,
+    pub reason: MatchReason,
+    pub parent: Option<ProcessIdentityRef>,
+    pub root: Option<ProcessIdentityRef>,
+    pub root_reason: MatchReason,
+}
+impl MatchEvidence {
+    pub fn direct(identity: &Identity, reason: MatchReason) -> Self {
+        Self { identity: identity.clone(), reason, parent: None, root: Some(identity.into()), root_reason: reason }
+    }
+}
+
 pub fn targets(
     inventory: &BTreeMap<u32, Identity>,
     seeds: &[Target],
@@ -276,6 +304,14 @@ pub fn targets(
     uid: u32,
     protected: &BTreeSet<u32>,
 ) -> Vec<Target> {
+    targets_with_evidence(inventory, seeds, tracked, uid, protected, &BTreeMap::new()).0
+}
+
+pub fn targets_with_evidence(
+    inventory: &BTreeMap<u32, Identity>, seeds: &[Target], tracked: &[Target], uid: u32,
+    protected: &BTreeSet<u32>, seed_evidence: &BTreeMap<u32, MatchEvidence>,
+) -> (Vec<Target>, BTreeMap<u32, MatchEvidence>) {
+    let mut evidence = BTreeMap::new();
     let owned: BTreeMap<_, _> = inventory
         .iter()
         .filter(|(pid, p)| **pid == p.pid && p.uid == uid && p.valid() && !protected.contains(pid))
@@ -286,14 +322,25 @@ pub fn targets(
     for seed in seeds {
         if let Some(current) = owned.get(&seed.identity.pid) {
             if current.same_process(&seed.identity) {
-                kinds.entry(seed.identity.pid).or_insert(seed.kind);
+                if let std::collections::btree_map::Entry::Vacant(entry) = kinds.entry(seed.identity.pid) {
+                    entry.insert(seed.kind);
+                    let reason = if seed.kind.launcher() { MatchEvidence::direct(current, MatchReason::LauncherSeed) } else {
+                        seed_evidence.get(&seed.identity.pid).filter(|e| e.identity.same_process(current)).cloned()
+                            .unwrap_or_else(|| MatchEvidence::direct(current, MatchReason::LauncherSeed))
+                    };
+                    evidence.insert(seed.identity.pid, reason);
+                }
             }
         }
     }
     for retained in tracked {
         if let Some(current) = owned.get(&retained.identity.pid) {
             if current.same_lifetime(&retained.identity) {
-                kinds.entry(retained.identity.pid).or_insert(retained.kind);
+                if let std::collections::btree_map::Entry::Vacant(entry) = kinds.entry(retained.identity.pid) {
+                    entry.insert(retained.kind);
+                    // Ownership may survive exec, but a previous direct match never does.
+                    evidence.insert(retained.identity.pid, MatchEvidence::direct(current, MatchReason::RetainedLifetime));
+                }
             }
         }
     }
@@ -314,6 +361,9 @@ pub fn targets(
             if let Some(&k) = kinds.get(&current) {
                 if k.desktop() && k.provider() != Provider::Claude {
                     changes.push((pid, k.child()));
+                    evidence.insert(pid, MatchEvidence { identity: owned[&pid].clone(), reason: MatchReason::VerifiedBundleComponent,
+                        parent: Some((*parent).into()), root: Some((*parent).into()),
+                        root_reason: evidence.get(&current).map(|e| e.root_reason).unwrap_or(MatchReason::VerifiedBundle) });
                     break;
                 }
             }
@@ -330,16 +380,25 @@ pub fn targets(
         if next.is_empty() {
             break;
         }
+        for (pid, _) in &next {
+            let current = owned[pid];
+            let parent = owned[&current.parent];
+            let root = evidence.get(&current.parent).and_then(|e| e.root.clone()).or_else(|| Some(parent.into()));
+            let root_reason = evidence.get(&current.parent).map(|e| e.root_reason).unwrap_or(MatchReason::LauncherSeed);
+            evidence.insert(*pid, MatchEvidence { identity: current.clone(), reason: MatchReason::VerifiedDescendant, parent: Some(parent.into()), root, root_reason });
+        }
         kinds.extend(next);
     }
-    kinds
+    let targets: Vec<_> = kinds
         .into_iter()
         .filter(|(_, k)| !k.launcher())
         .map(|(pid, kind)| Target {
             identity: owned[&pid].clone(),
             kind,
         })
-        .collect()
+        .collect();
+    evidence.retain(|pid, _| targets.iter().any(|target| target.identity.pid == *pid));
+    (targets, evidence)
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lease {
