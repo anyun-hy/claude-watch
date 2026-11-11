@@ -21,10 +21,10 @@ watch-gateway-broker --prepare --output /absolute/new/artifact-directory \
   --engine /absolute/final/watch-engine --uid USER_UID --port GATEWAY_PORT
 ```
 
-Preparation only writes the specified new directory. Review its config, plist,
-and `install.sh`. Installation needs separate administrator authorization; never
-run it as part of ordinary builds/tests. The installer refuses existing service
-files. Do not unload or replace the service while protected AI processes live:
+Preparation only writes the specified new directory for inspection. Prepared
+files do not provide an administrator entry point. Use the native release
+transaction for separately authorized installation. Do not unload or replace
+the service while protected AI processes live:
 administrator removal is outside the normal-process anti-substitution boundary.
 
 The root configuration pins both executable digests and live code identities;
@@ -47,8 +47,10 @@ signing with `runtime,library` is still the signing requirement; a paid Develope
 ID is not required by this backend.
 
 The former gateway keeps its reserved port during packaging. Once the new
-runtime is at its final path, installation pins its SHA-256/CDHash and the broker
-identity, stages a root-owned rollback record, updates only the fixed Watch
+runtime is at its final path, installation pins its SHA-256/CDHash, the approved
+broker digest and the exact prepared configuration before the administrator prompt.
+The fixed system bootstrap checks a private copy before executing it; the
+installer stages a root-owned rollback record and updates only the fixed Watch
 service, and starts socket activation. The final user `runtime/watch-engine`
 then runs `gateway-endpoint-check`: it must receive the real root-created IPv4
 and IPv6 descriptors through authenticated IPC. File existence or successful
@@ -60,8 +62,11 @@ Failure before runtime commit rolls back both installations. After runtime
 commit, failure to clean the root transaction is reported as
 `gateway_cleanup_pending`; the new runtime/app are retained and no app-only
 rollback is attempted. Interrupted transactions are kept for explicit recovery.
-Administrator commands hold one root-owned kernel lock; a timeout in the caller
-does not permit recovery to race an administrator child that is still running.
+Administrator service changes hold one root-owned kernel lock. Install also
+requires the approval generation captured by preview. A rollback can run
+before the elevated install finishes preparing its private snapshot; it
+invalidates that generation before acknowledging recovery, so the delayed
+install cannot apply afterward.
 
 The broker supports `--service-preview --uid USER_UID --engine FINAL_ENGINE`
 (read-only), and administrator-only `--service-rollback` / `--service-commit`

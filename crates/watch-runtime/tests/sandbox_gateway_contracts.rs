@@ -1,3 +1,6 @@
+#[path = "support/hardened_helper.rs"]
+mod hardened_helper;
+
 use claude_watch_core::{
     channel::{
         BoundProcessToken, ChannelEnforcementCommand, ChannelPermit, ChannelPermitState,
@@ -27,7 +30,7 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
     os::unix::net::{UnixListener, UnixStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -69,7 +72,7 @@ fn current_test_binary_verifier() -> (String, String, SandboxPeerVerifier) {
         expected_uid: effective_uid(),
         expected_helper_executable: exe_str.clone(),
         expected_helper_sha256: sha.clone(),
-        require_code_signature_identifier: None,
+        expected_helper_cdhash: hardened_helper::cdhash(&exe),
     };
     (exe_str, sha, verifier)
 }
@@ -78,9 +81,10 @@ fn current_test_binary_verifier() -> (String, String, SandboxPeerVerifier) {
 fn i01_manifest_bound_helper_verifier_rejects_unmanifested_or_tampered_helper() {
     use claude_watch_runtime::sandbox_launch::build_helper_verifier_from_manifest;
     let (tmp, _store) = make_temp_store("cw-sandbox-manifest-i01");
-    let (exe_str, exe_sha, _) = current_test_binary_verifier();
+    let (exe_str, _, _) = current_test_binary_verifier();
     let helper_copy = tmp.0.join("watch-sandbox-launcher");
-    fs::copy(&exe_str, &helper_copy).unwrap();
+    hardened_helper::copy_signed(Path::new(&exe_str), &helper_copy);
+    let exe_sha = sha256_file_hex(&helper_copy).unwrap();
 
     // 1. Missing manifest directory must fail closed (`helper_manifest_hash_missing`)
     let err_missing = build_helper_verifier_from_manifest(&tmp.0, &helper_copy).unwrap_err();
@@ -100,26 +104,59 @@ fn i01_manifest_bound_helper_verifier_rejects_unmanifested_or_tampered_helper() 
     let err_mismatch = build_helper_verifier_from_manifest(&tmp.0, &helper_copy).unwrap_err();
     assert_eq!(err_mismatch.code, "helper_manifest_hash_mismatch");
 
-    // 3. Trusted manifest matching the helper binary SHA-256 succeeds
+    // 3. A matching SHA without a CDHash is incomplete.
+    fs::write(tmp.0.join("components.json"), serde_json::json!({"hashes":{"watch-sandbox-launcher":exe_sha}}).to_string()).unwrap();
+    assert_eq!(build_helper_verifier_from_manifest(&tmp.0, &helper_copy).unwrap_err().code, "helper_manifest_cdhash_missing");
+    // 4. Both final-byte pins must match the same manifest.
     fs::write(
         tmp.0.join("components.json"),
-        serde_json::json!({
-            "hashes": {
-                "watch-sandbox-launcher": exe_sha
-            }
-        })
-        .to_string(),
+        hardened_helper::components(&helper_copy).to_string(),
     )
     .unwrap();
     let verifier = build_helper_verifier_from_manifest(&tmp.0, &helper_copy)
         .expect("manifest-bound verifier");
     assert_eq!(verifier.expected_helper_sha256, exe_sha);
+    let primary = tmp.0.join("BuildInfo.plist");
+    let hashes = format!("<key>RuntimeHashes</key><dict><key>watch-sandbox-launcher</key><string>{exe_sha}</string></dict>");
+    fs::write(&primary, format!("<plist version=\"1.0\"><dict>{hashes}</dict></plist>")).unwrap();
+    assert_eq!(build_helper_verifier_from_manifest(&tmp.0, &helper_copy).unwrap_err().code,
+        "helper_manifest_cdhash_missing", "incomplete primary may not borrow fallback signing identity");
+    let cdhash = hardened_helper::cdhash(&helper_copy);
+    fs::write(&primary, format!("<plist version=\"1.0\"><dict>{hashes}<key>RuntimeCDHashes</key><dict><key>watch-sandbox-launcher</key><string>{cdhash}</string></dict></dict></plist>")).unwrap();
+    assert_eq!(build_helper_verifier_from_manifest(&tmp.0, &helper_copy).unwrap().expected_helper_cdhash, cdhash);
+}
+
+#[test]
+fn weak_live_peer_with_matching_manifest_cannot_register_or_publish_evidence() {
+    use claude_watch_runtime::sandbox_launch::build_helper_verifier_from_manifest;
+    let (tmp, store) = make_temp_store("cw-weak-helper");
+    let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+    fs::write(tmp.0.join("components.json"), hardened_helper::components(&exe).to_string()).unwrap();
+    let verifier = build_helper_verifier_from_manifest(&tmp.0, &exe).unwrap();
+    let registry = Arc::new(SandboxLaunchRegistry::new("weak-peer", test_policy_version(), verifier, Some(store)));
+    let listener = UnixListener::bind(tmp.0.join("registration.sock")).unwrap();
+    let mut client = UnixStream::connect(tmp.0.join("registration.sock")).unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    let rejection = registry.handle_helper_registration_stream(server, 100.).unwrap();
+    assert_eq!(rejection.error_code.as_deref(), Some("untrusted_sandbox_helper_peer"));
+    assert!(!rejection.accepted && rejection.instance_id.is_none());
+    assert!(registry.instances().is_empty());
+    let mut wire = String::new();
+    client.read_to_string(&mut wire).unwrap();
+    assert!(wire.contains("untrusted_sandbox_helper_peer"));
+    println!("matching disk SHA/CDHash with default weak runtime rejected before request read; registry empty");
 }
 
 #[test]
 fn i01_and_i04_helper_registration_verifies_kernel_peer_and_rejects_spoofing_or_stale_boot_id() {
+    if !hardened_helper::hardened_test_process("i01_and_i04_helper_registration_verifies_kernel_peer_and_rejects_spoofing_or_stale_boot_id") { return; }
     let (tmp, store) = make_temp_store("cw-sandbox-i01");
     let (exe_str, exe_sha, verifier) = current_test_binary_verifier();
+    let (peer, _other) = UnixStream::pair().unwrap();
+    let mut incorrect = verifier.clone();
+    incorrect.expected_helper_cdhash = "0".repeat(40);
+    assert!(claude_watch_system::verify_sandbox_helper_peer(&peer, &incorrect).is_none());
     let pv = test_policy_version();
 
     let registry = Arc::new(SandboxLaunchRegistry::new(
@@ -153,6 +190,11 @@ fn i01_and_i04_helper_registration_verifies_kernel_peer_and_rejects_spoofing_or_
         vpn_epoch: Some(VpnEpoch::new("vpn-boot-1", 1)),
         launch_nonce: "nonce-valid-001".into(),
         executor_boot_id: "boot-epoch-1".into(),
+        script_entry: None,
+        script_fingerprint: None,
+        interpreter: None,
+        interpreter_fingerprint: None,
+        script_source: None,
     };
     let resp = register_helper_with_daemon(&sock_path, valid_req.clone(), true, &sbpl)
         .expect("register valid");
@@ -213,6 +255,7 @@ fn i01_and_i04_helper_registration_verifies_kernel_peer_and_rejects_spoofing_or_
 
 #[test]
 fn i02_and_p01_live_loopback_tcp_socket_attribution_and_protocol_relay() {
+    if !hardened_helper::hardened_test_process("i02_and_p01_live_loopback_tcp_socket_attribution_and_protocol_relay") { return; }
     let (tmp, store) = make_temp_store("cw-sandbox-i02-p01");
     let (exe_str, exe_sha, verifier) = current_test_binary_verifier();
     let pv = test_policy_version();
@@ -373,6 +416,11 @@ fn i02_and_p01_live_loopback_tcp_socket_attribution_and_protocol_relay() {
         vpn_epoch: Some(VpnEpoch::new("vpn-boot-p01", 1)),
         launch_nonce: "nonce-p01-001".into(),
         executor_boot_id: boot_id.clone(),
+        script_entry: None,
+        script_fingerprint: None,
+        interpreter: None,
+        interpreter_fingerprint: None,
+        script_source: None,
     };
     let reg_resp = register_helper_with_daemon(&sock_path, launch_req, true, &sbpl).expect("reg");
     assert!(reg_resp.accepted);
@@ -739,6 +787,7 @@ fn i03_gateway_port_takeover_probe_triggers_fail_closed_production_gate() {
 
 #[test]
 fn r4_p01_http_framing_validation_concurrent_connect_and_real_tls_https_wss_frames() {
+    if !hardened_helper::hardened_test_process("r4_p01_http_framing_validation_concurrent_connect_and_real_tls_https_wss_frames") { return; }
     let (tmp, store) = make_temp_store("cw-sandbox-r4-p01");
     let now = 1_700_002_000.0;
     let boot_id = "boot-r4-p01";
@@ -1017,6 +1066,11 @@ while True:
         vpn_epoch: Some(VpnEpoch::new("vpn-r4", 1)),
         launch_nonce: "nonce-r4-001".into(),
         executor_boot_id: boot_id.into(),
+        script_entry: None,
+        script_fingerprint: None,
+        interpreter: None,
+        interpreter_fingerprint: None,
+        script_source: None,
     };
     let wire_resp = register_helper_with_daemon(&reg_sock, launch_req, true, &sbpl).unwrap();
     assert!(wire_resp.accepted);

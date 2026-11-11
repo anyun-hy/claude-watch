@@ -2,7 +2,7 @@
 
 macOS 上的 Claude 受控启动、账号 A/B 切换与环境保护工具，同时观察 Claude、ChatGPT / Codex 的进程和代理连接。
 
-当前源码以 Git `main` 提交为准；**应用版本与构建号由构建时显式指定**，仓库不代表当前已安装版本。发行目标为 **Apple Silicon（arm64）**，部署最低版本以 `monitor/macos-minimum.txt` 为准。
+当前源码版本为 **4.0.0（v4.0）**，内容以 Git `main` 提交为准；**应用版本与构建号由构建时显式指定**，仓库不代表当前已安装版本。版本摘要见 [CHANGELOG](CHANGELOG.md)。发行目标为 **Apple Silicon（arm64）**，部署最低版本以 `monitor/macos-minimum.txt` 为准。
 
 运行组件采用 Rust `watch-engine`，界面为 SwiftUI。已登记功能缺陷完成对应源码修复与隔离回归，但**尚未完成同一提交上的完整构建、实际安装与持续运行验收**。源码状态与当前已安装版本分开核对。范围与历史验证证据见 [完整迁移清单](docs/RUST_MIGRATION_MATRIX.md)，Force 历史配置迁移见 [迁移说明](docs/OPENAI_FORCE_MIGRATION.md)。
 

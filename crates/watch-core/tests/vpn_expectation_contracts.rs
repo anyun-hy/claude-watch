@@ -406,6 +406,11 @@ fn controlled_launch_and_evidence_types_roundtrip_and_validate() {
         vpn_epoch: Some(sample_epoch(1)),
         launch_nonce: "nonce-1".into(),
         executor_boot_id: "boot-1".into(),
+        script_entry: None,
+        script_fingerprint: None,
+        interpreter: None,
+        interpreter_fingerprint: None,
+        script_source: None,
     };
     req.validate().unwrap();
     let raw = serde_json::to_value(&req).unwrap();
@@ -458,6 +463,8 @@ fn controlled_launch_and_evidence_types_roundtrip_and_validate() {
         sandbox_evidence: Some(ev),
         updated_at: 1001.5,
         error_code: None,
+        script_entry: None,
+        script_fingerprint: None,
     };
     assert!(instance.has_verified_protection("boot-1", &policy));
     assert!(instance.covers_process(101));

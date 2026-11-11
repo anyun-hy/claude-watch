@@ -11,7 +11,7 @@ use claude_watch_runtime::{
     config_store::ConfigStore,
     local_http::Client,
     macos::Mutator,
-    proxy_mutations::{self, ProxyCommand, ProxyCommandExecutor, ProxyMutationAdapter},
+    proxy_mutations::{self, ProxyMutationAdapter},
     repair,
     storage::{Paths, StateStore},
     vpn_observer::{HttpControllerVpnReader, VpnObserver},
@@ -338,13 +338,6 @@ fn mid_switch_inconsistency_between_two_phase_reads_fails_closed_as_unknown() {
     assert!(matches!(transition.verdict, VpnMatch::Unknown { .. }));
 }
 
-struct NoopProxyExecutor;
-impl ProxyCommandExecutor for NoopProxyExecutor {
-    fn execute(&mut self, _command: ProxyCommand) -> claude_watch_core::error::Result<()> {
-        panic!("ProxyCommandExecutor must never be invoked when VPN is read-only");
-    }
-}
-
 #[test]
 fn vpn_read_only_boundary_blocks_all_proxy_and_tun_mutations_and_omits_from_repair_plan() {
     let cfg = Config::default_for_new_install();
@@ -362,7 +355,7 @@ fn vpn_read_only_boundary_blocks_all_proxy_and_tun_mutations_and_omits_from_repa
     }
     .save(cfg.value().unwrap())
     .unwrap();
-    let mut adapter = ProxyMutationAdapter::with_executor(store, NoopProxyExecutor);
+    let mut adapter = ProxyMutationAdapter::native(store);
     for action_id in ["start_proxy", "reload_proxy", "enable_tun", "rules"] {
         let err = adapter
             .apply(&json!({

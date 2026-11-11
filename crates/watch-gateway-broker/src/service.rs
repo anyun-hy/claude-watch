@@ -1,7 +1,7 @@
 //! Fixed-path, administrator-authorized installation. No VPN or user process
 //! is modified. The transaction survives interruption and can be rolled back.
 use claude_watch_system::launchd_gateway::{
-    GatewayInstallConfig, BROKER_PATH, INSTALL_DIR, SERVICE_LABEL,
+    GatewayInstallConfig, BROKER_PATH, INSTALL_DIR, SERVICE_LABEL, TRANSACTION_DIR,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -13,7 +13,7 @@ use std::{
 };
 
 const PLIST: &str = "/Library/LaunchDaemons/io.local.claudewatch.gateway.plist";
-const TRANSACTION: &str = "/Library/PrivilegedHelperTools/io.local.claudewatch.gateway.transaction";
+const MAX_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
 fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
 }
@@ -57,7 +57,7 @@ impl Paths {
         Self {
             root: INSTALL_DIR.into(),
             plist: PLIST.into(),
-            transaction: TRANSACTION.into(),
+            transaction: TRANSACTION_DIR.into(),
             owner: 0,
         }
     }
@@ -85,7 +85,11 @@ impl Paths {
         if !exists(parent) {
             self.known_parent(parent)?;
             use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new().mode(0o755).create(parent)?;
+            match fs::DirBuilder::new().mode(0o755).create(parent) {
+                Ok(()) => fs::set_permissions(parent, fs::Permissions::from_mode(0o755))?,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {},
+                Err(e) => return Err(e),
+            }
         }
         self.known_parent(&self.root)
     }
@@ -98,6 +102,9 @@ impl Paths {
             return Err(invalid("gateway parent is not a directory"));
         }
         Ok(())
+    }
+    fn approval_generation(&self) -> PathBuf {
+        self.root.with_file_name("io.local.claudewatch.gateway.approval-generation")
     }
 }
 /// The administrator child may outlive its osascript parent after a timeout.
@@ -115,7 +122,7 @@ fn service_lock(paths: &Paths) -> io::Result<ServiceLock> {
         .write(true)
         .create(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(&lock_path)?;
     paths.secure(&lock_path)?;
     if !file.metadata()?.is_file() {
@@ -132,13 +139,17 @@ fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 fn bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    bounded_owned(path, limit, None)
+}
+fn bounded_owned(path: &Path, limit: u64, owner: Option<u32>) -> io::Result<Vec<u8>> {
     use std::{io::Read, os::unix::fs::OpenOptionsExt};
     let file = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(invalid("gateway record is not a regular file"));
+    let meta = file.metadata()?;
+    if !meta.is_file() || owner.is_some_and(|uid| meta.uid() != uid) || meta.len() > limit {
+        return Err(invalid("gateway record is not a bounded regular file with the expected owner"));
     }
     let mut bytes = Vec::new();
     file.take(limit + 1).read_to_end(&mut bytes)?;
@@ -159,7 +170,30 @@ fn write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     file.sync_all()
 }
 fn hash(path: &Path) -> io::Result<String> {
-    claude_watch_system::sha256_file_hex(path).ok_or_else(|| invalid("component hash unavailable"))
+    Ok(claude_watch_system::sha256_bytes_hex(&bounded(path, MAX_EXECUTABLE_BYTES)?))
+}
+fn approval_generation(paths: &Paths) -> io::Result<u64> {
+    let path = paths.approval_generation();
+    match paths.secure(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        result => result?,
+    }
+    let raw = bounded(&path, 20)?;
+    std::str::from_utf8(&raw).ok().and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| invalid("invalid gateway approval generation"))
+}
+/// Called while holding the service lock. Atomic publication lets preview read
+/// a complete generation without taking the administrator-only lock.
+fn advance_approval_generation(paths: &Paths, current: u64) -> io::Result<()> {
+    let next = current.checked_add(1).ok_or_else(|| invalid("gateway approval generation exhausted"))?;
+    let path = paths.approval_generation();
+    paths.known_parent(&path)?;
+    let temporary = path.with_extension(format!("approval-generation.{}.next", std::process::id()));
+    write(&temporary, next.to_string().as_bytes(), 0o644)?;
+    let result = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644))
+        .and_then(|()| fs::rename(&temporary, &path));
+    if result.is_err() { let _ = fs::remove_file(temporary); }
+    result
 }
 fn config(path: &Path) -> io::Result<GatewayInstallConfig> {
     let value: GatewayInstallConfig = serde_json::from_slice(&bounded(path, 16 * 1024)?)?;
@@ -430,34 +464,99 @@ fn rollback<H: Host>(
     host.log("service_rollback", "previous_gateway_restored", Some(id));
     Ok(())
 }
-fn install<H: Host>(paths: &Paths, host: &mut H, prepared: &Path, id: &str) -> io::Result<()> {
+/// Serialize with install and fence the generation even if the elevated
+/// installer has not started or is still copying its private snapshot.
+fn rollback_approved<H: Host>(
+    paths: &Paths, host: &mut H, id: &str, uid: u32, engine: &str, previous: Option<&str>,
+) -> io::Result<bool> {
+    token(id)?;
+    let generation = approval_generation(paths)?;
+    if !exists(&paths.transaction) {
+        let current = installed(paths, host, uid, engine)?;
+        if previous != Some(baseline(current.as_ref()).as_str()) {
+            return Err(invalid("no matching rollback transaction and current gateway identity differs from pre-install state"));
+        }
+        advance_approval_generation(paths, generation)?;
+        return Ok(true);
+    }
+    read_transaction(paths, id, uid, engine)?;
+    advance_approval_generation(paths, generation)?;
+    rollback(paths, host, id, uid, engine)?;
+    Ok(false)
+}
+struct ApprovedInstall {
+    next: GatewayInstallConfig,
+    payload: Vec<u8>,
+    previous_config: String,
+}
+fn approved_install(snapshot: &Path, config_sha: &str, broker_sha: &str, previous: &str) -> io::Result<ApprovedInstall> {
+    let raw = bounded(&snapshot.join("config.json"), 16 * 1024)?;
+    if claude_watch_system::sha256_bytes_hex(&raw) != config_sha {
+        return Err(invalid("approved gateway config changed"));
+    }
+    let next: GatewayInstallConfig = serde_json::from_slice(&raw)?;
+    next.validate()?;
+    let payload = bounded(&snapshot.join("watch-gateway-broker"), MAX_EXECUTABLE_BYTES)?;
+    if next.broker_sha256 != broker_sha || claude_watch_system::sha256_bytes_hex(&payload) != broker_sha {
+        return Err(invalid("approved gateway executable changed"));
+    }
+    Ok(ApprovedInstall { next, payload, previous_config: previous.into() })
+}
+fn verify_private_snapshot(snapshot: &Path) -> io::Result<()> {
+    if snapshot.parent() != Some(Path::new("/private/tmp"))
+        || !snapshot.file_name().and_then(|p| p.to_str()).is_some_and(|n| n.starts_with(".cw-gateway-"))
+    {
+        return Err(invalid("gateway installer requires a private authorization snapshot"));
+    }
+    let meta = fs::symlink_metadata(snapshot)?;
+    if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o077 != 0
+        || fs::canonicalize(std::env::current_exe()?)? != snapshot.join("watch-gateway-broker")
+    {
+        return Err(invalid("gateway installer is not the approved private executable"));
+    }
+    for name in ["config.json", "watch-gateway-broker"] {
+        let meta = fs::symlink_metadata(snapshot.join(name))?;
+        if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o077 != 0 || meta.nlink() != 1 {
+            return Err(invalid("gateway authorization snapshot is not private"));
+        }
+    }
+    Ok(())
+}
+fn install<H: Host>(paths: &Paths, host: &mut H, approved: ApprovedInstall, id: &str, generation: u64) -> io::Result<()> {
     token(id)?;
     paths.known_parent(&paths.root)?;
     paths.known_parent(&paths.plist)?;
+    if approval_generation(paths)? != generation {
+        return Err(invalid("gateway install approval is no longer current"));
+    }
     if exists(&paths.transaction) {
         return Err(invalid(
             "gateway transaction pending; explicitly recover it before another installation",
         ));
     }
-    let next = config(&prepared.join("config.json"))?;
+    let ApprovedInstall { next, payload, previous_config } = approved;
     let engine = Path::new(&next.engine_executable);
     if fs::canonicalize(engine)? != engine
-        || fs::metadata(engine)?.uid() != next.engine_uid
         || !next
             .engine_executable
             .ends_with("/Library/Application Support/ClaudeWatch/runtime/watch-engine")
-        || hash(engine)? != next.engine_sha256
+        || claude_watch_system::sha256_bytes_hex(&bounded_owned(engine, MAX_EXECUTABLE_BYTES, Some(next.engine_uid))?) != next.engine_sha256
         || host.signature(engine)? != next.engine_cdhash
     {
         return Err(invalid(
             "final runtime engine identity does not match prepared installation",
         ));
     }
-    // Read the prepared payload once and verify the root-owned copy again.
-    // The caller's writable preparation directory is never installed as root.
-    let payload = bounded(&prepared.join("watch-gateway-broker"), 256 * 1024 * 1024)?;
     let previous = installed(paths, host, next.engine_uid, &next.engine_executable)?;
+    if baseline(previous.as_ref()) != previous_config
+        || next.gateway_port != previous.as_ref().map_or(1023, |v| v.gateway_port)
+    {
+        return Err(invalid("gateway baseline changed after authorization; nothing replaced"));
+    }
     let was_loaded = loaded(host, paths)?;
+    // A consumed or cancelled approval cannot apply a second time, even if
+    // the installed configuration still matches the earlier preview.
+    advance_approval_generation(paths, generation)?;
     {
         use std::os::unix::fs::DirBuilderExt;
         fs::DirBuilder::new()
@@ -558,21 +657,28 @@ pub fn dispatch(args: &[String]) -> io::Result<()> {
     let command = args.first().map(String::as_str).unwrap_or("");
     let paths = Paths::production();
     let mut host = Native;
-    if command == "--service-install"
-        && args.len() == 5
-        && args[1] == "--prepared"
-        && args[3] == "--transaction"
-    {
+    if command == "--service-install" {
+        if args.len() != 13 || args[1] != "--snapshot" || args[3] != "--transaction"
+            || args[5] != "--config-sha256" || args[7] != "--broker-sha256"
+            || args[9] != "--previous-config" || args[11] != "--approval-generation"
+        {
+            return Err(invalid("gateway installation requires an authorization snapshot and independent pins"));
+        }
         if claude_watch_system::effective_uid() != 0 {
             return Err(invalid(
                 "gateway installation requires administrator authorization",
             ));
         }
+        token(&args[4])?;
+        let generation = args[12].parse().map_err(|_| invalid("invalid gateway approval generation"))?;
+        let snapshot = Path::new(&args[2]);
+        verify_private_snapshot(snapshot)?;
         paths.ensure_install_parent()?;
         let _lock = service_lock(&paths)?;
+        let approved = approved_install(snapshot, &args[6], &args[8], &args[10])?;
         host.prepare_logging();
         host.log("service_install", "installation_started", Some(&args[4]));
-        install(&paths, &mut host, Path::new(&args[2]), &args[4])?;
+        install(&paths, &mut host, approved, &args[4], generation)?;
         println!(
             "{}",
             json!({"status":"prepared","transaction":args[4],"endpoint_verified":false})
@@ -598,7 +704,7 @@ pub fn dispatch(args: &[String]) -> io::Result<()> {
         let value = installed(&paths, &mut host, uid, engine)?;
         println!(
             "{}",
-            json!({"status":"preview","action":if value.is_some(){"upgrade"}else{"install"},"gateway_port":value.as_ref().map(|v|v.gateway_port).unwrap_or(1023),"administrator_required":true,"endpoint_verified":false,"previous_config":baseline(value.as_ref())})
+            json!({"status":"preview","action":if value.is_some(){"upgrade"}else{"install"},"gateway_port":value.as_ref().map(|v|v.gateway_port).unwrap_or(1023),"administrator_required":true,"endpoint_verified":false,"previous_config":baseline(value.as_ref()),"approval_generation":approval_generation(&paths)?})
         );
         return Ok(());
     }
@@ -606,6 +712,10 @@ pub fn dispatch(args: &[String]) -> io::Result<()> {
         return Err(invalid(
             "gateway management requires administrator authorization",
         ));
+    }
+    if command == "--service-rollback" && matches!(args.len(), 7 | 9) && args[5] == "--transaction" {
+        token(&args[6])?;
+        paths.ensure_install_parent()?;
     }
     let _lock = service_lock(&paths)?;
     host.prepare_logging();
@@ -616,31 +726,22 @@ pub fn dispatch(args: &[String]) -> io::Result<()> {
     {
         let id = &args[6];
         token(id)?;
-        if command == "--service-rollback" && !exists(&paths.transaction) {
-            let current = installed(&paths, &mut host, uid, engine)?;
-            if args.len() != 9
-                || args[7] != "--previous-config"
-                || args[8] != baseline(current.as_ref())
-            {
-                return Err(invalid("no matching rollback transaction and current gateway identity differs from pre-install state"));
-            }
+        if command == "--service-rollback" {
+            let previous = (args.len() == 9 && args[7] == "--previous-config").then(|| args[8].as_str());
+            let already_absent = rollback_approved(&paths, &mut host, id, uid, engine, previous)?;
             println!(
                 "{}",
-                json!({"status":"ok","action":command,"transaction":id,"already_absent":true})
+                json!({"status":"ok","action":command,"transaction":id,"already_absent":already_absent})
             );
             return Ok(());
         }
         let tx = read_transaction(&paths, id, uid, engine)?;
-        if command == "--service-rollback" {
-            rollback(&paths, &mut host, id, uid, engine)?;
-        } else {
-            let actual = installed(&paths, &mut host, uid, engine)?
-                .ok_or_else(|| invalid("gateway not installed"))?;
-            if !same_config(&actual, &tx.next) || !loaded(&mut host, &paths)? {
-                return Err(invalid("gateway changed before transaction commit"));
-            }
-            fs::remove_dir_all(&paths.transaction)?;
+        let actual = installed(&paths, &mut host, uid, engine)?
+            .ok_or_else(|| invalid("gateway not installed"))?;
+        if !same_config(&actual, &tx.next) || !loaded(&mut host, &paths)? {
+            return Err(invalid("gateway changed before transaction commit"));
         }
+        fs::remove_dir_all(&paths.transaction)?;
         println!(
             "{}",
             json!({"status":"ok","action":command,"transaction":id})
@@ -769,10 +870,22 @@ mod tests {
         }
     }
     const ID: &str = "01234567890123456789012345678901";
+    fn fixture_install(f: &mut Fixture, previous: &str) -> io::Result<()> {
+        let generation = approval_generation(&f.paths)?;
+        fixture_install_at(f, previous, generation)
+    }
+    fn fixture_install_at(f: &mut Fixture, previous: &str, generation: u64) -> io::Result<()> {
+        let _lock = service_lock(&f.paths)?;
+        let raw = fs::read(f.prepared.join("config.json"))?;
+        let expected: GatewayInstallConfig = serde_json::from_slice(&raw)?;
+        let approved = approved_install(&f.prepared, &claude_watch_system::sha256_bytes_hex(&raw),
+            &expected.broker_sha256, previous)?;
+        install(&f.paths, &mut f.host, approved, ID, generation)
+    }
     #[test]
     fn fresh_install_is_pending_until_actual_handoff_and_can_be_revoked() {
         let mut f = fixture();
-        install(&f.paths, &mut f.host, &f.prepared, ID).unwrap();
+        fixture_install(&mut f, "absent").unwrap();
         assert!(f.host.active);
         assert!(f.paths.transaction.exists());
         assert!(installed(
@@ -810,7 +923,8 @@ mod tests {
         )
         .unwrap();
         f.host.fail_start = true;
-        assert!(install(&f.paths, &mut f.host, &f.prepared, ID)
+        let previous = baseline(Some(&f.value));
+        assert!(fixture_install(&mut f, &previous)
             .unwrap_err()
             .to_string()
             .contains("activation failed"));
@@ -824,7 +938,7 @@ mod tests {
         let mut f = fixture();
         copy_install(&f.paths, &f.prepared, &f.value).unwrap();
         fs::write(f.paths.root.join("foreign"), b"keep").unwrap();
-        assert!(install(&f.paths, &mut f.host, &f.prepared, ID).is_err());
+        assert!(fixture_install(&mut f, "absent").is_err());
         assert_eq!(fs::read(f.paths.root.join("foreign")).unwrap(), b"keep");
         assert!(!f
             .host
@@ -844,7 +958,7 @@ mod tests {
     fn bad_prepared_payload_cleans_only_its_own_preparation_transaction() {
         let mut f = fixture();
         fs::write(f.prepared.join("watch-gateway-broker"), b"tampered").unwrap();
-        assert!(install(&f.paths, &mut f.host, &f.prepared, ID).is_err());
+        assert!(fixture_install(&mut f, "absent").is_err());
         assert!(!f.paths.transaction.exists());
         assert!(!f.paths.root.exists());
         assert!(!f
@@ -852,6 +966,27 @@ mod tests {
             .calls
             .iter()
             .any(|c| c[0] == "bootout" || c[0] == "bootstrap"));
+    }
+    #[test]
+    fn changed_approval_and_legacy_install_arguments_cannot_reach_service_mutation() {
+        let mut f = fixture();
+        copy_install(&f.paths, &f.prepared, &f.value).unwrap();
+        f.host.active = true;
+        let old = fs::read(f.paths.broker()).unwrap();
+        let config_path = f.prepared.join("config.json");
+        let raw = fs::read(&config_path).unwrap();
+        let config_sha = claude_watch_system::sha256_bytes_hex(&raw);
+        fs::write(f.prepared.join("watch-gateway-broker"), b"changed inert fixture bytes").unwrap();
+        let mut changed = f.value.clone();
+        changed.broker_sha256 = hash(&f.prepared.join("watch-gateway-broker")).unwrap();
+        fs::write(&config_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(approved_install(&f.prepared, &config_sha, &f.value.broker_sha256, "absent").is_err());
+        assert!(dispatch(&["--service-install".into(), "--prepared".into(),
+            f.prepared.display().to_string(), "--transaction".into(), ID.into()]).unwrap_err()
+            .to_string().contains("authorization snapshot"));
+        assert!(f.host.active && f.host.calls.is_empty());
+        assert_eq!(fs::read(f.paths.broker()).unwrap(), old);
+        assert!(!f.paths.transaction.exists());
     }
     #[test]
     fn interrupted_preparation_is_recoverable_without_touching_live_service() {
@@ -894,10 +1029,43 @@ mod tests {
     fn changed_final_engine_and_unprotected_paths_are_rejected_before_root_changes() {
         let mut f = fixture();
         fs::write(&f.value.engine_executable, b"changed").unwrap();
-        assert!(install(&f.paths, &mut f.host, &f.prepared, ID).is_err());
+        assert!(fixture_install(&mut f, "absent").is_err());
         assert!(!f.paths.transaction.exists());
         fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(install(&f.paths, &mut f.host, &f.prepared, ID).is_err());
+        assert!(fixture_install(&mut f, "absent").is_err());
+    }
+    #[test]
+    fn final_engine_must_be_bounded_regular_bytes_before_signature_or_install() {
+        let mut f = fixture();
+        let engine = Path::new(&f.value.engine_executable);
+        fs::OpenOptions::new().write(true).open(engine).unwrap()
+            .set_len(MAX_EXECUTABLE_BYTES + 1).unwrap();
+        assert!(fixture_install(&mut f, "absent").unwrap_err().to_string().contains("bounded regular file"));
+        fs::remove_file(&f.value.engine_executable).unwrap();
+        fs::create_dir(&f.value.engine_executable).unwrap();
+        assert!(fixture_install(&mut f, "absent").unwrap_err().to_string().contains("bounded regular file"));
+        assert!(f.host.calls.is_empty() && !f.paths.root.exists() && !f.paths.transaction.exists());
+        assert_eq!(approval_generation(&f.paths).unwrap(), 0);
+    }
+    #[test]
+    fn rollback_before_late_install_fences_the_approved_generation() {
+        let mut f = fixture();
+        let delayed = approval_generation(&f.paths).unwrap();
+        {
+            let _lock = service_lock(&f.paths).unwrap();
+            let (uid, engine) = (f.value.engine_uid, &f.value.engine_executable);
+            assert!(rollback_approved(&f.paths, &mut f.host, ID, uid, engine, Some("wrong")).is_err());
+            assert_eq!(approval_generation(&f.paths).unwrap(), delayed);
+            assert!(rollback_approved(&f.paths, &mut f.host, ID, uid, engine, Some("absent")).unwrap());
+        }
+        assert_eq!(approval_generation(&f.paths).unwrap(), delayed + 1);
+        assert_eq!(fs::metadata(f.paths.approval_generation()).unwrap().mode() & 0o777, 0o644);
+        assert!(fixture_install_at(&mut f, "absent", delayed).unwrap_err().to_string().contains("approval is no longer current"));
+        assert!(!f.paths.transaction.exists() && !f.paths.root.exists());
+        assert!(!f.host.calls.iter().any(|c| c[0] == "bootout" || c[0] == "bootstrap"));
+        fixture_install(&mut f, "absent").unwrap();
+        assert!(f.host.active);
+        println!("acknowledged rollback rejected the delayed approved generation; fresh preview still installed in the fixture");
     }
     #[test]
     fn administrator_commands_are_serialized_even_when_the_caller_disappears() {

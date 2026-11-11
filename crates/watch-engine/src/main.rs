@@ -3,6 +3,7 @@ mod channel_audit;
 mod coffee_dispatch;
 mod daemon_run;
 mod evidence_run;
+mod entry_dispatch;
 mod diagnostics_dispatch;
 mod diagnostic_queue;
 mod dns_dispatch;
@@ -14,6 +15,9 @@ mod reinstall_dispatch;
 mod runtime;
 mod setup_dispatch;
 mod update_dispatch;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../tests/support/ready_entry_fixture.rs"]
+mod entry_ready_fixture;
 use claude_watch_core::error::{CoreError, Result};
 use claude_watch_runtime::{
     commands::SystemRunner,
@@ -213,6 +217,8 @@ fn local_command(request: &claude_watch_core::cli::Request, paths: Paths) -> Res
                 .record_guard_diagnostic(&input, claude_watch_runtime::native::now())?;
             Ok(Some(json!({"status":"ok","recorded":recorded})))
         }
+        ("entry", Some("preview" | "activate" | "status" | "deactivate")) =>
+            entry_dispatch::dispatch(request, storage).map(Some),
         _ => Ok(None),
     }
 }
@@ -344,6 +350,8 @@ fn run() -> Result<EngineOutput> {
         home.ok_or_else(|| CoreError::new("home_unavailable", "当前用户目录不可读取"))?,
     )?;
     paths.require_owner(uid)?;
+    #[cfg(all(test, target_os = "macos"))]
+    entry_ready_fixture::validate_child(&request, &paths)?;
     runtime::initialize_native_listener(&request)?;
     if let Some(value) = install_dispatch::dispatch(&request, paths.clone(), uid)? {
         return Ok(EngineOutput::json(value, 0));
@@ -478,6 +486,11 @@ fn emit(output: EngineOutput, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
 }
 fn main() {
+    #[cfg(all(test, target_os = "macos"))]
+    if !entry_ready_fixture::is_fixture_child() {
+        entry_ready_fixture::run_contract();
+        return;
+    }
     match run() {
         Ok(output) => {
             let code = emit(output, &mut std::io::stdout(), &mut std::io::stderr());

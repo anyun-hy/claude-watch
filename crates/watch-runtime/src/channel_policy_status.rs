@@ -332,7 +332,7 @@ mod tests {
             sandbox_evidence:Some(SandboxLaunchEvidence { applied:true, backend:NetworkBackendKind::Seatbelt, policy_version:policy.clone(),
                 allowed_gateway_endpoint:"127.0.0.1:1021".into(), direct_network_blocked:true, unix_relay_blocked:true, verified_helper_origin:true,
                 helper_cdhash:"unit-fixture".into(), helper_identity:token, executor_boot_id:"executor-1".into(), applied_at:now-1.0 }),
-            updated_at:now, error_code:None };
+            updated_at:now, error_code:None, script_entry:None, script_fingerprint:None };
         let registry_path = store.paths.watch().join("state/managed-launch-instances.json");
         store.atomic_json(&registry_path, &json!([instance])).unwrap();
         (store, config, identity, value, instance, now)
@@ -431,6 +431,8 @@ mod tests {
                 policy_sync_state: PolicySyncState::Applied, policy_sync_label_zh: "已应用".into(),
                 permit_generation: permit.permit_generation, command_seq: permit.command_seq, permit_state: permit.state,
                 display_state: display, display_label_zh: display.label_zh().into(), reason_code: permit.reason_code.clone(), process_preserved: true,
+                process_execution_state: None, process_disposition_action: None, process_disposition_receipt: None,
+                previous_process_disposition_receipts: Vec::new(),
                 active_member_pids: vec![identity.pid], active_members: serde_json::from_value(state["active_members"].clone()).unwrap(),
                 local_proxy_ready: receipt.local_proxy_ready, system_extension_active: false,
                 active_flows_count: receipt.active_flows_count, terminated_flows_count: receipt.terminated_flows_count,

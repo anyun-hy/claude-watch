@@ -32,7 +32,7 @@ impl SessionStore {
     fn session_path(&self) -> std::path::PathBuf {
         self.storage.paths.session_for(self.family)
     }
-    fn lock_name(&self) -> String {
+    pub(crate) fn lock_name(&self) -> String {
         if self.family == "claude" {
             "session-guard".to_string()
         } else {

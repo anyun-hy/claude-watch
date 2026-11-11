@@ -15,6 +15,7 @@ use std::{
 };
 
 pub const INSTALL_DIR: &str = "/Library/PrivilegedHelperTools/io.local.claudewatch.gateway";
+pub const TRANSACTION_DIR: &str = "/Library/PrivilegedHelperTools/io.local.claudewatch.gateway.transaction";
 pub const BROKER_PATH: &str = "/Library/PrivilegedHelperTools/io.local.claudewatch.gateway/watch-gateway-broker";
 pub const CONFIG_PATH: &str = "/Library/PrivilegedHelperTools/io.local.claudewatch.gateway/config.json";
 pub const CONTROL_PATH: &str = "/Library/PrivilegedHelperTools/io.local.claudewatch.gateway/control.sock";
@@ -22,6 +23,8 @@ const OWNER_PATH: &str = "/Library/PrivilegedHelperTools/io.local.claudewatch.ga
 pub const SERVICE_LABEL: &str = "io.local.claudewatch.gateway";
 const WIRE_MAGIC: &[u8; 8] = b"CWGW0001";
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
+#[cfg(target_os = "macos")]
+pub(crate) use platform::verify_code as verify_hardened_peer_code;
 
 fn invalid(message: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, message) }
 fn denied(message: &str) -> io::Error { io::Error::new(io::ErrorKind::PermissionDenied, message) }
@@ -530,7 +533,14 @@ mod platform {
         if inspect_token(token)? != before || peer_token(stream)? != token { return Err(denied("gateway peer changed")); }
         Ok(before)
     }
-    fn verify_code(mut token: [u32; 8], cdhash: &str) -> io::Result<()> {
+    pub(crate) fn verify_code(mut token: [u32; 8], cdhash: &str) -> io::Result<()> {
+        if cdhash.len() != 40 || !cdhash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(denied("invalid expected CDHash"));
+        }
+        let mut expected = [0u8; 20];
+        for (i, byte) in expected.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&cdhash[2*i..2*i+2], 16).map_err(|_| denied("invalid expected CDHash"))?;
+        }
         let mut flags: u32 = 0;
         // csops CS_OPS_STATUS, bound to pidversion by audit token.
         if unsafe { csops_audittoken(token[5] as i32, 0, (&mut flags as *mut u32).cast(), 4, &mut token) } != 0 {
@@ -539,6 +549,13 @@ mod platform {
         let required = 0x1 | 0x2000 | 0x10000; // VALID, REQUIRE_LV, RUNTIME
         let forbidden = 0x4 | 0x10000000; // GET_TASK_ALLOW, DEBUGGED
         if flags & required != required || flags & forbidden != 0 { return Err(denied("gateway peer lacks hardened library validation")); }
+        let mut live = [0u8; 20];
+        // CS_OPS_CDHASH reads the loaded code directory for this audit token.
+        if unsafe { csops_audittoken(token[5] as i32, 5, live.as_mut_ptr().cast(), live.len(), &mut token) } != 0
+            || live != expected
+        {
+            return Err(denied("live peer CDHash mismatch"));
+        }
         unsafe {
             let data = Owned(CFDataCreate(ptr::null(), token.as_ptr().cast(), 32));
             if data.0.is_null() { return Err(denied("audit data unavailable")); }

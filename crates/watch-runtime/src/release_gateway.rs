@@ -3,9 +3,12 @@
 //! the daemon can start. This module is never called by ordinary sampling.
 use crate::release_native::{FixedCommand, FixedCommandExecutor, FixedOutput};
 use claude_watch_core::error::{CoreError, Result};
+use claude_watch_system::launchd_gateway::{GatewayInstallConfig, TRANSACTION_DIR};
 use serde_json::Value;
 use std::{
     fs,
+    io::Read,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -15,10 +18,17 @@ fn error(code: &str, detail: &str) -> CoreError {
 #[derive(Clone)]
 pub(crate) struct GatewayTransaction {
     broker: PathBuf,
+    broker_sha: String,
     engine: PathBuf,
     uid: u32,
     id: String,
     previous_config: String,
+    approval_generation: u64,
+}
+#[derive(Clone)]
+pub(crate) struct GatewayComponentPins {
+    pub engine_sha: String,
+    pub broker_sha: String,
 }
 fn run<E: FixedCommandExecutor>(
     executor: &mut E,
@@ -52,30 +62,65 @@ fn run<E: FixedCommandExecutor>(
     }
     Ok(output)
 }
-fn quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+const BOOTSTRAP: &str = include_str!("release_gateway_bootstrap.pl");
+const ADMIN_SCRIPT: &[&str] = &[
+    "on run argv",
+    "set commandText to \"/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/perl\"",
+    "repeat with argumentValue in argv",
+    "set commandText to commandText & \" \" & quoted form of (contents of argumentValue)",
+    "end repeat",
+    "do shell script commandText with administrator privileges",
+    "end run",
+];
+fn bootstrap_args(request: &[String]) -> Vec<String> {
+    let mut args: Vec<_> = BOOTSTRAP.lines().map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .flat_map(|line| ["-e".into(), line.to_owned()])
+        .collect();
+    args.push("--".into());
+    args.extend_from_slice(request);
+    args
 }
 fn administrator<E: FixedCommandExecutor>(
     executor: &mut E,
-    program: &Path,
-    args: Vec<String>,
+    transaction: &GatewayTransaction,
+    action: &str,
+    prepared: Option<(&Path, &str)>,
 ) -> Result<FixedOutput> {
-    let mut parts = vec![quote(&program.display().to_string())];
-    parts.extend(args.iter().map(|s| quote(s)));
-    run(
-        executor,
-        Path::new("/usr/bin/osascript"),
-        vec![
-            "-e".into(),
-            "on run argv".into(),
-            "-e".into(),
-            "do shell script (item 1 of argv) with administrator privileges".into(),
-            "-e".into(),
-            "end run".into(),
-            "--".into(),
-            parts.join(" "),
-        ],
-    )
+    let (prepared, config_sha) = prepared.map_or((String::new(), String::new()), |(p, sha)| {
+        (p.display().to_string(), sha.to_owned())
+    });
+    let request = [
+        action.into(), transaction.broker.display().to_string(), transaction.broker_sha.clone(),
+        prepared, config_sha, format!("{TRANSACTION_DIR}/next/watch-gateway-broker"),
+        transaction.id.clone(), transaction.uid.to_string(), transaction.engine.display().to_string(),
+        transaction.previous_config.clone(),
+        transaction.approval_generation.to_string(),
+    ];
+    let mut args: Vec<_> = ADMIN_SCRIPT.iter().flat_map(|line| ["-e".into(), (*line).into()]).collect();
+    args.push("--".into());
+    args.extend(bootstrap_args(&request));
+    run(executor, Path::new("/usr/bin/osascript"), args)
+}
+fn regular_path(path: &Path) -> Result<PathBuf> {
+    if !fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()) {
+        return Err(error("gateway_authorization_mismatch", "批准的网关文件不是普通文件"));
+    }
+    fs::canonicalize(path).map_err(|_| error("gateway_authorization_mismatch", "批准的网关路径不可读取"))
+}
+fn prepared_config(path: &Path) -> Result<(GatewayInstallConfig, String)> {
+    const LIMIT: u64 = 16 * 1024;
+    let rejected = || error("gateway_authorization_mismatch", "网关准备配置不可核验");
+    let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path).map_err(|_| rejected())?;
+    if !file.metadata().is_ok_and(|m| m.is_file() && m.len() <= LIMIT) { return Err(rejected()); }
+    let mut raw = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut raw).map_err(|_| rejected())?;
+    if raw.len() as u64 > LIMIT { return Err(rejected()); }
+    let cfg: GatewayInstallConfig = crate::storage::strict_json(&raw)
+        .and_then(|v| serde_json::from_value(v).map_err(|_| rejected()))?;
+    cfg.validate().map_err(|_| rejected())?;
+    Ok((cfg, crate::storage::sha256(&raw)))
 }
 fn json(output: FixedOutput) -> Result<Value> {
     serde_json::from_str(&output.stdout)
@@ -86,9 +131,16 @@ pub(crate) fn prepare_and_verify<E: FixedCommandExecutor>(
     broker: &Path,
     runtime: &Path,
     uid: u32,
+    pins: &GatewayComponentPins,
     state: &mut Option<GatewayTransaction>,
 ) -> Result<()> {
-    let engine = runtime.join("watch-engine");
+    let broker = regular_path(broker)?;
+    let engine = regular_path(&runtime.join("watch-engine"))?;
+    if claude_watch_system::sha256_file_hex(&broker).as_deref() != Some(pins.broker_sha.as_str())
+        || claude_watch_system::sha256_file_hex(&engine).as_deref() != Some(pins.engine_sha.as_str())
+    {
+        return Err(error("gateway_authorization_mismatch", "待批准文件与已核验发行清单不符"));
+    }
     let scope = vec![
         "--uid".into(),
         uid.to_string(),
@@ -97,7 +149,7 @@ pub(crate) fn prepare_and_verify<E: FixedCommandExecutor>(
     ];
     let preview = json(run(
         executor,
-        broker,
+        &broker,
         [vec!["--service-preview".into()], scope].concat(),
     )?)?;
     let port = preview["gateway_port"]
@@ -118,6 +170,8 @@ pub(crate) fn prepare_and_verify<E: FixedCommandExecutor>(
         .filter(|v| *v == "absent" || (v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())))
         .ok_or_else(|| error("gateway_preview_invalid", "网关安装预演缺少原身份凭据"))?
         .to_string();
+    let approval_generation = preview["approval_generation"].as_u64()
+        .ok_or_else(|| error("gateway_preview_invalid", "网关安装预演缺少授权代次"))?;
     let id = uuid::Uuid::new_v4().simple().to_string();
     let prepared = runtime
         .parent()
@@ -125,7 +179,7 @@ pub(crate) fn prepare_and_verify<E: FixedCommandExecutor>(
         .join(format!(".gateway-prepare-{id}"));
     run(
         executor,
-        broker,
+        &broker,
         vec![
             "--prepare".into(),
             "--output".into(),
@@ -138,24 +192,33 @@ pub(crate) fn prepare_and_verify<E: FixedCommandExecutor>(
             port.to_string(),
         ],
     )?;
+    let captured = (|| {
+        if !fs::symlink_metadata(&prepared).is_ok_and(|m| m.is_dir()) {
+            return Err(error("gateway_authorization_mismatch", "网关准备路径不是普通目录"));
+        }
+        let (config, config_sha) = prepared_config(&prepared.join("config.json"))?;
+        if config.engine_uid != uid || Path::new(&config.engine_executable) != engine
+            || u64::from(config.gateway_port) != port || config.engine_sha256 != pins.engine_sha
+            || config.broker_sha256 != pins.broker_sha
+        {
+            return Err(error("gateway_authorization_mismatch", "准备配置与批准的用户、端口或发行组件不符"));
+        }
+        Ok((fs::canonicalize(&prepared).map_err(|_| error("gateway_authorization_mismatch", "准备路径不可核验"))?, config_sha))
+    })();
+    let (prepared_canonical, config_sha) = match captured {
+        Ok(v) => v,
+        Err(e) => { let _ = fs::remove_dir_all(&prepared); return Err(e); }
+    };
     *state = Some(GatewayTransaction {
-        broker: broker.into(),
+        broker,
+        broker_sha: pins.broker_sha.clone(),
         engine: engine.clone(),
         uid,
         id: id.clone(),
         previous_config,
+        approval_generation,
     });
-    let install = administrator(
-        executor,
-        broker,
-        vec![
-            "--service-install".into(),
-            "--prepared".into(),
-            prepared.display().to_string(),
-            "--transaction".into(),
-            id.clone(),
-        ],
-    );
+    let install = administrator(executor, state.as_ref().unwrap(), "install", Some((&prepared_canonical, &config_sha)));
     // Only this invocation's unprivileged preparation directory is cleaned.
     if prepared.is_dir() {
         let _ = fs::remove_dir_all(&prepared);
@@ -197,22 +260,7 @@ pub(crate) fn finish<E: FixedCommandExecutor>(
     } else {
         "--service-commit"
     };
-    let mut args = vec![
-        action.into(),
-        "--uid".into(),
-        transaction.uid.to_string(),
-        "--engine".into(),
-        transaction.engine.display().to_string(),
-        "--transaction".into(),
-        transaction.id.clone(),
-    ];
-    if rollback {
-        args.extend([
-            "--previous-config".into(),
-            transaction.previous_config.clone(),
-        ]);
-    }
-    let receipt = json(administrator(executor, &transaction.broker, args).map_err(
+    let receipt = json(administrator(executor, transaction, if rollback { "rollback" } else { "commit" }, None).map_err(
         |mut error| {
             error
                 .message
@@ -254,7 +302,17 @@ pub(crate) fn commit_after_runtime<E: FixedCommandExecutor>(
 mod tests {
     use super::*;
     use serde_json::json;
+    struct FixtureRoot(PathBuf);
+    impl Drop for FixtureRoot {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+    fn root() -> FixtureRoot {
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("cw-approval-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir(&dir).unwrap();
+        FixtureRoot(dir)
+    }
     struct Fake {
+        root: FixtureRoot,
         calls: Vec<FixedCommand>,
         lost_install_receipt: bool,
         wrong_endpoint: bool,
@@ -265,30 +323,32 @@ mod tests {
             crate::release_native::validate_fixed_command(&c)?;
             let mut status = 0;
             let value = if c.args.first().map(String::as_str) == Some("--service-preview") {
-                json!({"status":"preview","action":"install","gateway_port":1023,"administrator_required":true,"previous_config":"absent"})
+                json!({"status":"preview","action":"install","gateway_port":1023,"administrator_required":true,"previous_config":"absent","approval_generation":42})
             } else if c.args.first().map(String::as_str) == Some("--prepare") {
+                let prepared = Path::new(&c.args[2]);
+                let engine = Path::new(&c.args[4]);
+                fs::create_dir(prepared).unwrap();
+                fs::copy(&c.program, prepared.join("watch-gateway-broker")).unwrap();
+                fs::write(prepared.join("config.json"), json!({
+                    "schema_version":1,"gateway_port":1023,"engine_uid":501,"engine_executable":engine,
+                    "engine_sha256":claude_watch_system::sha256_file_hex(engine).unwrap(),"engine_cdhash":"1".repeat(40),
+                    "broker_sha256":claude_watch_system::sha256_file_hex(&c.program).unwrap(),"broker_cdhash":"2".repeat(40),
+                }).to_string()).unwrap();
                 json!({"prepared":true})
             } else if c.args.first().map(String::as_str) == Some("gateway-endpoint-check") {
                 json!({"status":"ok","gateway_endpoint":if self.wrong_endpoint {"127.0.0.1:7890"}else{"127.0.0.1:1023"},"ipv4_verified":true,"ipv6_verified":true})
             } else if c.program == Path::new("/usr/bin/osascript") {
-                let shell = c.args.last().unwrap();
-                let parts: Vec<_> = shell.split('\'').collect();
-                let id = parts
-                    .iter()
-                    .position(|v| *v == "--transaction")
-                    .map(|i| parts[i + 2])
-                    .unwrap();
-                if shell.contains("--service-install") {
+                let request = &c.args[c.args.len() - 11..];
+                let id = &request[6];
+                assert_eq!(request[2], claude_watch_system::sha256_file_hex(Path::new(&request[1])).unwrap());
+                assert_eq!(request[10], "42");
+                if request[0] == "install" {
                     if self.lost_install_receipt {
                         status = 1;
                     }
                     json!({"status":"prepared","transaction":id})
                 } else {
-                    let action = if shell.contains("--service-rollback") {
-                        "--service-rollback"
-                    } else {
-                        "--service-commit"
-                    };
+                    let action = format!("--service-{}", request[0]);
                     if self.fail_commit && action == "--service-commit" {
                         status = 1;
                     }
@@ -310,28 +370,92 @@ mod tests {
         }
     }
     fn fake() -> Fake {
+        let root = root();
+        fs::create_dir(root.0.join("runtime")).unwrap();
+        fs::write(root.0.join("broker"), b"broker fixture").unwrap();
+        fs::write(root.0.join("runtime/watch-engine"), b"engine fixture").unwrap();
         Fake {
+            root,
             calls: vec![],
             lost_install_receipt: false,
             wrong_endpoint: false,
             fail_commit: false,
         }
     }
+    fn fixture_prepare(executor: &mut Fake, state: &mut Option<GatewayTransaction>) -> Result<()> {
+        let broker = executor.root.0.join("broker");
+        let runtime = executor.root.0.join("runtime");
+        let pins = GatewayComponentPins {
+            engine_sha: claude_watch_system::sha256_file_hex(&runtime.join("watch-engine")).unwrap(),
+            broker_sha: claude_watch_system::sha256_file_hex(&broker).unwrap(),
+        };
+        prepare_and_verify(executor, &broker, &runtime, 501, &pins, state)
+    }
+    #[test]
+    fn fixed_bootstrap_executes_only_preapproved_private_snapshot() {
+        use std::os::unix::fs::symlink;
+        let dir = root();
+        let prepared = dir.0.join("prepared");
+        fs::create_dir(&prepared).unwrap();
+        let source = dir.0.join("broker");
+        let recovery = dir.0.join("saved");
+        let payload = prepared.join("watch-gateway-broker");
+        let config = prepared.join("config.json");
+        let bytes = b"#!/bin/sh\ncase \"$0\" in /private/tmp/.cw-gateway-*/watch-gateway-broker) ;; *) exit 77;; esac\ncase \"$(umask)\" in 0022|022) ;; *) exit 76;; esac\nif [ \"$1\" = --service-install ]; then [ \"${12}\" = --approval-generation ] && [ \"${13}\" = 42 ] || exit 75; fi\nprintf '%s\\n' \"$1\"\n";
+        let raw = b"{\"broker\":\"approved\"}";
+        let pin = crate::storage::sha256(bytes);
+        let cfg = crate::storage::sha256(raw);
+        let exec = |mode: &str| {
+            let request = [
+                mode.into(), source.display().to_string(), pin.clone(), prepared.display().to_string(),
+                cfg.clone(), recovery.display().to_string(), "c".repeat(32), "501".into(),
+                dir.0.join("engine").display().to_string(), "absent".into(), "42".into(),
+            ];
+            std::process::Command::new("/usr/bin/perl").env_clear()
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .args(bootstrap_args(&request)).current_dir(&dir.0).output().unwrap()
+        };
+        fs::write(&source, bytes).unwrap();
+        fs::write(&payload, bytes).unwrap();
+        fs::write(&config, raw).unwrap();
+        let clean = exec("install");
+        assert!(clean.status.success(), "{}", String::from_utf8_lossy(&clean.stderr));
+        assert_eq!(clean.stdout, b"--service-install\n");
+        let reject = |label| {
+            let result = exec("install");
+            assert!(!result.status.success() && result.stdout.is_empty(), "{label}");
+            assert!(String::from_utf8_lossy(&result.stderr).contains("gateway_authorization_mismatch"), "{label}");
+            println!("{label}: rejected before fixture execution");
+        };
+        fs::write(&source, b"changed executable data").unwrap();
+        reject("source changed after authorization");
+        fs::write(&source, bytes).unwrap();
+        fs::write(&payload, b"changed payload data").unwrap();
+        fs::write(&config, json!({"broker":crate::storage::sha256(b"changed payload data")}).to_string()).unwrap();
+        reject("payload and its self-reported pin changed together");
+        fs::write(&payload, bytes).unwrap();
+        reject("config alone changed");
+        fs::write(&config, raw).unwrap();
+        fs::remove_file(&payload).unwrap();
+        symlink(&source, &payload).unwrap();
+        reject("symbolic link to otherwise correct payload");
+        fs::write(&recovery, bytes).unwrap();
+        fs::remove_file(&source).unwrap();
+        for (mode, expected) in [("commit", b"--service-commit\n".as_slice()), ("rollback", b"--service-rollback\n".as_slice())] {
+            let output = exec(mode);
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(output.stdout, expected);
+        }
+    }
     #[test]
     fn final_engine_receives_actual_endpoint_check_before_install_is_accepted() {
         let mut executor = fake();
         let mut state = None;
-        prepare_and_verify(
-            &mut executor,
-            Path::new("/fixture/app/watch-gateway-broker"),
-            Path::new("/fixture/runtime"),
-            501,
-            &mut state,
-        )
+        fixture_prepare(&mut executor, &mut state)
         .unwrap();
         assert_eq!(
             executor.calls.last().unwrap().program,
-            Path::new("/fixture/runtime/watch-engine")
+            executor.root.0.join("runtime/watch-engine")
         );
         assert_eq!(
             executor.calls.last().unwrap().args,
@@ -345,19 +469,14 @@ mod tests {
         let mut executor = fake();
         executor.lost_install_receipt = true;
         let mut state = None;
-        assert!(prepare_and_verify(
-            &mut executor,
-            Path::new("/fixture/broker"),
-            Path::new("/fixture/runtime"),
-            501,
-            &mut state
-        )
+        assert!(fixture_prepare(&mut executor, &mut state)
         .is_err());
         assert!(state.is_some());
         finish(&mut executor, &mut state, true).unwrap();
-        let recovery = executor.calls.last().unwrap().args.last().unwrap();
-        assert!(recovery.contains("--service-rollback"));
-        assert!(recovery.contains("--previous-config' 'absent"));
+        let args = &executor.calls.last().unwrap().args;
+        assert_eq!(args[args.len() - 11], "rollback");
+        assert_eq!(args[args.len() - 2], "absent");
+        assert_eq!(args.last().unwrap(), "42");
         assert!(!executor
             .calls
             .iter()
@@ -369,13 +488,7 @@ mod tests {
         executor.wrong_endpoint = true;
         let mut state = None;
         assert_eq!(
-            prepare_and_verify(
-                &mut executor,
-                Path::new("/fixture/broker"),
-                Path::new("/fixture/runtime"),
-                501,
-                &mut state
-            )
+            fixture_prepare(&mut executor, &mut state)
             .unwrap_err()
             .code,
             "gateway_endpoint_unverified_i03"
@@ -390,13 +503,7 @@ mod tests {
     fn runtime_commit_failure_keeps_root_rollback_available() {
         let mut executor = fake();
         let mut state = None;
-        prepare_and_verify(
-            &mut executor,
-            Path::new("/fixture/broker"),
-            Path::new("/fixture/runtime"),
-            501,
-            &mut state,
-        )
+        fixture_prepare(&mut executor, &mut state)
         .unwrap();
         let before = executor.calls.len();
         assert!(
@@ -414,13 +521,7 @@ mod tests {
     fn cleanup_failure_after_runtime_commit_is_reported_without_rollback() {
         let mut executor = fake();
         let mut state = None;
-        prepare_and_verify(
-            &mut executor,
-            Path::new("/fixture/broker"),
-            Path::new("/fixture/runtime"),
-            501,
-            &mut state,
-        )
+        fixture_prepare(&mut executor, &mut state)
         .unwrap();
         executor.fail_commit = true;
         let warning = commit_after_runtime(&mut executor, &mut state, |_| Ok(()))
@@ -428,10 +529,8 @@ mod tests {
             .unwrap();
         assert!(warning.contains("清理待处理"));
         assert!(state.is_some());
-        assert!(!executor.calls.iter().any(|c| c
-            .args
-            .last()
-            .is_some_and(|a| a.contains("--service-rollback"))));
+        assert!(!executor.calls.iter().any(|c| c.program == Path::new("/usr/bin/osascript")
+            && c.args[c.args.len() - 11] == "rollback"));
     }
     #[test]
     fn endpoint_json_error_keeps_actual_reason_and_code() {

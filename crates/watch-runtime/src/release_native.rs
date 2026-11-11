@@ -256,6 +256,7 @@ pub struct NativeRelease<E> {
     pub uid: u32,
     restart_observation: Option<Option<String>>,
     gateway_transaction: Option<crate::release_gateway::GatewayTransaction>,
+    validated_gateway_pins: Option<crate::release_gateway::GatewayComponentPins>,
     gateway_cleanup_warning: Option<String>,
 }
 impl NativeRelease<SystemExecutor> {
@@ -278,6 +279,7 @@ impl<E> NativeRelease<E> {
             uid,
             restart_observation: None,
             gateway_transaction: None,
+            validated_gateway_pins: None,
             gateway_cleanup_warning: None,
         }
     }
@@ -636,6 +638,7 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
         Ok(())
     }
     fn validate_bundle(&mut self, path: &Path) -> Result<AppIdentity> {
+        self.validated_gateway_pins = None;
         let meta = fs::symlink_metadata(path)
             .map_err(|_| error("invalid_app_bundle", "应用路径不可读取"))?;
         if meta.file_type().is_symlink() || !meta.is_dir() {
@@ -784,6 +787,12 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
                 return Err(error("release_identity_mismatch", "原生组件校验失败"));
             }
         }
+        if manifest["NetworkBackend"] == "seatbelt" {
+            self.validated_gateway_pins = Some(crate::release_gateway::GatewayComponentPins {
+                engine_sha: hashes["watch-engine"].as_str().unwrap_or_default().to_owned(),
+                broker_sha: hashes["watch-gateway-broker"].as_str().unwrap_or_default().to_owned(),
+            });
+        }
         Ok(AppIdentity {
             bundle_id,
             executable,
@@ -840,6 +849,7 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
     }
     fn install_agent(&mut self, installed: &Path) -> Result<()> {
         self.validate_bundle(installed)?;
+        let gateway_pins = self.validated_gateway_pins.take();
         let home = self
             .paths
             .base
@@ -855,16 +865,15 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
             ));
         }
         let resources = installed.join("Contents/Resources");
-        let gateway_required = self.plist_json(&resources.join("BuildInfo.plist"))?["NetworkBackend"] == "seatbelt";
         let gateway_transaction = &mut self.gateway_transaction;
         let uid = self.uid;
         crate::agent_install::install_deferred_with_runtime_hook(
             &store, &resources, uid, &mut self.executor,
             &mut |runtime, executor| {
-                if gateway_required {
+                if let Some(pins) = &gateway_pins {
                     crate::release_gateway::prepare_and_verify(
                         executor, &resources.join("watch-gateway-broker"), runtime,
-                        uid, gateway_transaction,
+                        uid, pins, gateway_transaction,
                     )?;
                 }
                 Ok(())

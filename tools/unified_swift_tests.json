@@ -123,6 +123,41 @@
       "safety_notes": "Decodes production Rust discovery/monitor/staging fixtures and calls the real wrapper argument binding only; no NSApplication, registration, real AI or configuration changes."
     },
     {
+      "id": "swift.ProcessDispositionWireTests",
+      "kind": "swift",
+      "test_files": [
+        "monitor/tests/ProcessDispositionWireTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift",
+        "monitor/ControlledEntry/ControlledEntryApp.swift"
+      ],
+      "defines": [
+        "UI_REVIEW",
+        "CONTROLLED_ENTRY_BINDING_TESTS"
+      ],
+      "args": [
+        "{run_dir}/artifacts/process-disposition-wire.json",
+        "{run_dir}/artifacts/process-disposition-partial.json",
+        "{run_dir}/artifacts/process-disposition-network-failure.json",
+        "{run_dir}/artifacts/script-gateway-wire.json",
+        "{run_dir}/artifacts/entry-product-wire.json",
+        "{run_dir}/artifacts/process-disposition-delivery.json",
+        "{run_dir}/artifacts/process-disposition-deadline.json"
+      ],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit",
+        "Carbon"
+      ],
+      "dependencies": [
+        "rust.mechanism_review_fixtures"
+      ],
+      "fixture_only": true,
+      "safety_notes": "Decodes the production Rust receipt/snapshot/events and generated wrapper plist from owned fixtures; no host acceptance."
+    },
+    {
       "id": "swift.ProcessProtectionDeadlineTests",
       "kind": "swift",
       "test_files": [

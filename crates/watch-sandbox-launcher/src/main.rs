@@ -16,11 +16,12 @@ use claude_watch_runtime::sandbox_launch::{
 };
 use claude_watch_system::sha256_file_hex;
 mod network_policy;
+mod node_entry;
 use serde_json::json;
 use std::{
     net::SocketAddr,
     os::unix::{net::UnixStream, process::CommandExt},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, ExitCode},
 };
 
@@ -112,14 +113,30 @@ fn main() -> ExitCode {
             return ExitCode::from(66);
         }
     };
-    let Some(actual_sha) = sha256_file_hex(&canon_target) else {
-        eprintln!("target_fingerprint_read_failed");
-        return ExitCode::from(66);
+    let node = if req.script_source.is_some() {
+        if registration_socket.is_none() {
+            eprintln!("script_registration_required");
+            return ExitCode::from(65);
+        }
+        match node_entry::NodeEntry::capture(&req) {
+            Ok(entry) => Some(entry),
+            Err(code) => { eprintln!("{code}"); return ExitCode::from(67); }
+        }
+    } else {
+        if claude_watch_runtime::managed_entry::is_script_file(&canon_target) {
+            eprintln!("script_launch_contract_required");
+            return ExitCode::from(65);
+        }
+        let Some(actual_sha) = sha256_file_hex(&canon_target) else {
+            eprintln!("target_fingerprint_read_failed");
+            return ExitCode::from(66);
+        };
+        if actual_sha != req.target_fingerprint {
+            eprintln!("target_fingerprint_mismatch");
+            return ExitCode::from(67);
+        }
+        None
     };
-    if actual_sha != req.target_fingerprint {
-        eprintln!("target_fingerprint_mismatch");
-        return ExitCode::from(67);
-    }
 
     let gw_addr: SocketAddr = match req.gateway_endpoint.parse() {
         Ok(a) => a,
@@ -190,7 +207,17 @@ fn main() -> ExitCode {
     }
 
     let proxy_url = format!("http://{}", req.gateway_endpoint);
-    let mut cmd = Command::new(Path::new(&canon_target));
+    let mut cmd = if let Some(ref entry) = node {
+        match entry.command() {
+            Ok(cmd) => cmd,
+            Err(code) => { eprintln!("{code}"); return ExitCode::from(67); }
+        }
+    } else { Command::new(&canon_target) };
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(claude_watch_core::controlled_launch::loader_startup_input) {
+            cmd.env_remove(key);
+        }
+    }
     cmd.args(&req.args);
     if let Some(ref cwd) = req.cwd {
         cmd.current_dir(cwd);

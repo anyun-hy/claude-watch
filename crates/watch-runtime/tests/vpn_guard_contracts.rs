@@ -1,3 +1,6 @@
+#[path = "support/hardened_helper.rs"]
+mod hardened_helper;
+
 use claude_watch_core::{
     channel::{
         BoundProcessToken, ChannelEnforcementState, ChannelPermitState, NetworkBackendKind,
@@ -342,6 +345,43 @@ fn r1_target_inventory_invalidation_closes_live_flow_and_rejects_reconnect() {
     }
     stop.store(true, Ordering::Release);
     listener.join().unwrap();
+}
+
+#[test]
+fn queued_vpn_refresh_uses_delivery_clock_without_extending_sample_expiry() {
+    let (_tmp, _store, _cfg, enforcer, mut supervisor, _rx, _token, start) =
+        setup_active_session_and_supervisor(|_, _| {}, |_| {});
+    let mut delayed = sample_vpn_observation(start + 0.25, 1);
+    delayed.sample_seq = 2;
+    let delivered_at = start + 0.75;
+    enforcer.enforce_active_deadlines(delivered_at, false).unwrap();
+    let renewed = supervisor.handle_queued_event(SupervisionEvent::VpnObservationUpdated {
+        observed_at: delayed.observed_at,
+        observation: delayed.clone(),
+    }, delivered_at).unwrap();
+    assert_eq!(renewed.captured_at, delivered_at);
+    assert_eq!(supervisor.latest_vpn_observation(), Some(&delayed));
+    assert_eq!(renewed.families["claude"].permit_state, ChannelPermitState::Permitted);
+    let receipt = enforcer.receipt_for("claude", delivered_at).unwrap().unwrap();
+    assert_eq!(receipt.enforcement_state, ChannelEnforcementState::Forwarding);
+    assert_eq!(receipt.observed_at, delivered_at);
+    assert_eq!(renewed.families["claude"].valid_until, Some(delayed.valid_until));
+
+    let mut expired = sample_vpn_observation(start + 0.8, 1);
+    expired.sample_seq = 3;
+    expired.valid_until = start + 1.0;
+    let delivered_at = start + 1.1;
+    let blocked = supervisor.handle_queued_event(SupervisionEvent::VpnObservationUpdated {
+        observed_at: expired.observed_at,
+        observation: expired.clone(),
+    }, delivered_at).unwrap();
+    assert_eq!(supervisor.latest_vpn_observation(), Some(&expired));
+    let state = &blocked.families["claude"];
+    assert_eq!(state.vpn_match, Some(VpnMatch::Stale));
+    assert_eq!(state.permit_state, ChannelPermitState::Revoked);
+    assert_eq!(state.reason_code, "vpn_observation_stale");
+    assert!(state.process_preserved);
+    println!("queued refresh renewed at receiver time; a newer but expired sample was retained unchanged and revoked");
 }
 
 #[test]
@@ -1429,11 +1469,11 @@ fn f02_f03_gateway_process_crash_preserves_target_for_5s_and_stalled_supervisor_
             launcher.is_file(),
             "build production helper beside integration tests before F02/F03"
         );
-        let helper_hash = sha256_file_hex(&launcher).unwrap();
+        let launcher = hardened_helper::copy_signed(&launcher, &root.join("watch-sandbox-launcher"));
         fs::create_dir_all(root.join("manifest")).unwrap();
         fs::write(
             root.join("manifest/components.json"),
-            json!({"hashes":{"watch-sandbox-launcher":helper_hash}}).to_string(),
+            hardened_helper::components(&launcher).to_string(),
         )
         .unwrap();
         let verifier =
@@ -1509,6 +1549,11 @@ fn f02_f03_gateway_process_crash_preserves_target_for_5s_and_stalled_supervisor_
             vpn_epoch: Some(VpnEpoch::new("fault-vpn", 1)),
             launch_nonce: uuid::Uuid::new_v4().to_string(),
             executor_boot_id: boot.into(),
+            script_entry: None,
+            script_fingerprint: None,
+            interpreter: None,
+            interpreter_fingerprint: None,
+            script_source: None,
         };
         // Production helper owns apply -> verified registration -> exec. Standard streams
         // inherit through the host; killing that host must not close the child's copies.
@@ -1937,10 +1982,11 @@ fn r3_verified_orphan_child_retains_gateway_permission_and_survives_revocation()
         .unwrap()
         .join("watch-sandbox-launcher");
     assert!(helper.is_file(), "build actual helper before this test");
+    let helper = hardened_helper::copy_signed(&helper, &tmp.0.join("watch-sandbox-launcher"));
     fs::create_dir_all(tmp.0.join("manifest")).unwrap();
     fs::write(
         tmp.0.join("manifest/components.json"),
-        json!({"hashes":{"watch-sandbox-launcher":sha256_file_hex(&helper).unwrap()}}).to_string(),
+        hardened_helper::components(&helper).to_string(),
     )
     .unwrap();
     let verifier = build_helper_verifier_from_manifest(&tmp.0.join("manifest"), &helper).unwrap();
@@ -2039,6 +2085,11 @@ fn r3_verified_orphan_child_retains_gateway_permission_and_survives_revocation()
         vpn_epoch: Some(VpnEpoch::new("r3-vpn", 1)),
         launch_nonce: uuid::Uuid::new_v4().to_string(),
         executor_boot_id: boot.into(),
+        script_entry: None,
+        script_fingerprint: None,
+        interpreter: None,
+        interpreter_fingerprint: None,
+        script_source: None,
     };
     let mut parent = Command::new(helper)
         .arg("--launch-json")

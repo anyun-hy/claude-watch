@@ -127,6 +127,7 @@ pub trait DesktopSystem {
     /// Default disposition is cutting off the application's network channel
     /// while keeping its processes alive (`断流保进程`), rather than calling
     /// legacy process exit (`quit_desktop` / `quit_for_confirmed_ip_risk`).
+    fn delegates_process_disposition(&self) -> bool { false }
     fn channel_mode(&self) -> bool {
         true
     }
@@ -177,6 +178,26 @@ pub trait DesktopSystem {
             .collect();
         Ok(tokens)
     }
+    /// Terminate verified supervised process instances (such as managed CLI processes)
+    /// without family-wide blind scanning.
+    fn terminate_supervised_processes(
+        &mut self,
+        _tokens: &[claude_watch_core::channel::BoundProcessToken],
+        _forced: &mut Option<u32>,
+    ) -> Result<Vec<claude_watch_core::channel::TargetProcessDispositionResult>> {
+        Err(CoreError::new(
+            "process_adapter_unavailable",
+            "受监督进程处置适配不可用",
+        ))
+    }
+    /// Records a verified process disposition receipt so the supervisor and
+    /// monitor subscriber pipelines can reflect live process outcomes without fixed overwrites.
+    fn record_process_disposition_receipt(
+        &mut self,
+        _receipt: &claude_watch_core::channel::ProcessDispositionReceipt,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 pub trait CliProcess {
     fn wait(&mut self) -> Result<i32>;
@@ -225,6 +246,24 @@ impl FamilyTickPass {
 }
 
 impl Controller {
+    pub fn guard_tick_for_family<S: DesktopSystem>(
+        &self,
+        system: &mut S,
+        family: &'static str,
+    ) -> Result<Value> {
+        system.set_family(family)?;
+        match self.guard_tick_family(system, family, false)? {
+            FamilyTickPass::Complete(receipt) => Ok(receipt),
+            FamilyTickPass::DeferredSlowAdopt => match self.guard_tick_family(system, family, true)? {
+                FamilyTickPass::Complete(receipt) => Ok(receipt),
+                FamilyTickPass::DeferredSlowAdopt => Err(CoreError::new(
+                    "deferred_adoption_incomplete",
+                    "延后的首次接管未能完成",
+                )),
+            },
+        }
+    }
+
     pub fn guard_tick<S: DesktopSystem>(&self, system: &mut S) -> Result<Value> {
         // Which services the guard supervises is declared by the policy table,
         // not by the caller: one engine answers for every family the table
@@ -1144,13 +1183,44 @@ impl Controller {
         }
 
         if system.channel_mode() {
+            if let Some(session) = latest_session.filter(|s| s.extra.contains_key("channel_processes_v1")) {
+                let permit_matches_session = effective_permit
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|sid| sid == session.session_id);
+                let supervision_triggered = matches!(
+                    verdict,
+                    ChannelSupervisionVerdict::IsolatedKeepProcess
+                        | ChannelSupervisionVerdict::PendingIsolation { .. }
+                        | ChannelSupervisionVerdict::EnforcementFailed { .. }
+                ) || (permit_matches_session && effective_permit.state == ChannelPermitState::Revoked);
+
+                if supervision_triggered && !matches!(verdict, ChannelSupervisionVerdict::ForwardingVerified) {
+                    if permit_matches_session {
+                        self.describe_cli_channel_disposition(family, &effective_permit, receipt);
+                    } else {
+                        receipt["stop_state"] = json!("stale_permit_rejected");
+                        receipt["process_preserved"] = json!(true);
+                        receipt["process_execution_state"] = json!("session_mismatch");
+                    }
+                }
+            }
+
             let process_already_terminated = receipt.get("process_preserved") == Some(&json!(false))
-                && receipt.get("process_execution_state") == Some(&json!("confirmed"));
+                && matches!(receipt.get("process_execution_state").and_then(|v| v.as_str()), Some("confirmed" | "already_exited"));
+            let process_partially_terminated = receipt.get("process_execution_state") == Some(&json!("partially_terminated"));
 
             if process_already_terminated {
                 receipt["disposition_mode"] = json!("disconnect_channel_and_force_quit");
                 receipt["process_preserved"] = json!(false);
                 receipt["action"] = json!("disconnect-and-force-quit");
+            } else if process_partially_terminated {
+                receipt["disposition_mode"] = json!("partially_terminated_disconnect_channel");
+                receipt["process_preserved"] = json!(false);
+                receipt["action"] = json!("disconnect-and-partial-force-quit");
+            } else if receipt["process_execution_state"] == "awaiting_supervisor" {
+                receipt["disposition_mode"] = json!("awaiting_process_disposition");
+                receipt["process_preserved"] = Value::Null;
             } else {
                 receipt["disposition_mode"] = if receipt.get("process_requested_action") == Some(&json!("force_quit")) {
                     json!("force_quit_failed_disconnect_channel")
@@ -1164,7 +1234,7 @@ impl Controller {
             }
             if effective_permit.state == ChannelPermitState::Revoked {
                 receipt["channel_requested_action"] = json!("disconnect");
-                if !process_already_terminated {
+                if !process_already_terminated && !process_partially_terminated {
                     receipt["action"] = json!("disconnect-channel");
                 }
                 match &verdict {

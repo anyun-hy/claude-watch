@@ -20,6 +20,28 @@ pub enum ProxyAdaptationKind {
     ClaudeCodeProcessWrapper,
 }
 
+pub const NODE_ESM_ENTRY_FORMAT: &str = "node_esm_v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptSourceProof {
+    pub source_id: String,
+    pub source_revision: String,
+    pub launcher_format: String,
+}
+
+/// Remove only startup inputs that could load code ahead of the approved Node
+/// entry or replace the helper/interpreter's loaded libraries.
+pub fn script_startup_input(key: &str) -> bool {
+    loader_startup_input(key)
+        || matches!(key, "NODE_OPTIONS" | "NODE_PATH" | "NODE_COMPILE_CACHE" | "OPENSSL_CONF" | "OPENSSL_MODULES")
+}
+
+pub fn loader_startup_input(key: &str) -> bool {
+    key.starts_with("DYLD_") || key.starts_with("__XPC_DYLD_") || key.starts_with("LD_")
+        || matches!(key, "BASH_ENV" | "ENV")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlledLaunchRequest {
     pub entry_id: String,
@@ -37,6 +59,20 @@ pub struct ControlledLaunchRequest {
     pub vpn_epoch: Option<VpnEpoch>,
     pub launch_nonce: String,
     pub executor_boot_id: String,
+    /// Optional script file when executing an interpreter-bound script CLI (`N3`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_entry: Option<String>,
+    /// SHA-256 fingerprint of `script_entry`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_fingerprint: Option<String>,
+    /// Optional verified interpreter binary (e.g. `/usr/local/bin/node` or `/bin/sh`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<String>,
+    /// SHA-256 fingerprint of the interpreter
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpreter_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_source: Option<ScriptSourceProof>,
 }
 
 impl ControlledLaunchRequest {
@@ -61,6 +97,20 @@ impl ControlledLaunchRequest {
             || self.target_fingerprint.chars().any(char::is_control)
         {
             return Err(CoreError::new("invalid_launch_request", "目标程序指纹无效"));
+        }
+        match (&self.script_entry, &self.script_fingerprint, &self.interpreter,
+               &self.interpreter_fingerprint, &self.script_source) {
+            (None, None, None, None, None) => {}
+            (Some(script), Some(script_sha), Some(interpreter), Some(interpreter_sha), Some(source))
+                if self.target.cli() && self.proxy_adaptation == ProxyAdaptationKind::EnvOnly
+                    && script == &self.target_executable && script_sha == &self.target_fingerprint
+                    && interpreter != script && interpreter.starts_with('/') && interpreter.len() <= 1024
+                    && !interpreter.chars().any(char::is_control)
+                    && sha256_text(script_sha) && sha256_text(interpreter_sha)
+                    && source.launcher_format == NODE_ESM_ENTRY_FORMAT && sha256_text(&source.source_revision)
+                    && !source.source_id.is_empty() && source.source_id.len() <= 2048
+                    && !source.source_id.chars().any(char::is_control) => {}
+            _ => return Err(CoreError::new("invalid_script_launch_contract", "脚本、解释器、入口形式与来源修订必须完整且互相匹配")),
         }
         if self.launch_nonce.trim().is_empty()
             || self.launch_nonce.len() > 128
@@ -88,6 +138,10 @@ impl ControlledLaunchRequest {
         }
         Ok(())
     }
+}
+
+fn sha256_text(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +239,10 @@ pub struct ManagedLaunchInstance {
     pub updated_at: f64,
     #[serde(default)]
     pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_entry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_fingerprint: Option<String>,
 }
 
 impl ManagedLaunchInstance {
@@ -252,6 +310,36 @@ impl ManagedLaunchInstance {
 
     pub fn covers_process(&self, pid: u32) -> bool {
         self.pid == pid || self.controlled_subtree_pids.contains(&pid)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedScriptCombo {
+    pub target: LaunchTarget,
+    pub entry_path: String,
+    pub script_path: String,
+    pub script_fingerprint: String,
+    pub package_path: String,
+    pub package_fingerprint: String,
+    pub interpreter_entry_path: String,
+    pub interpreter_path: String,
+    pub interpreter_fingerprint: String,
+    pub source_id: String,
+    pub source_revision: String,
+    pub launcher_format: String,
+}
+
+impl ApprovedScriptCombo {
+    pub fn source_proof(&self) -> ScriptSourceProof {
+        ScriptSourceProof { source_id: self.source_id.clone(), source_revision: self.source_revision.clone(),
+            launcher_format: self.launcher_format.clone() }
+    }
+    pub fn matches_request(&self, req: &ControlledLaunchRequest) -> bool {
+        self.target == req.target && req.script_entry.as_ref() == Some(&self.script_path)
+            && req.script_fingerprint.as_ref() == Some(&self.script_fingerprint)
+            && req.interpreter.as_ref() == Some(&self.interpreter_path)
+            && req.interpreter_fingerprint.as_ref() == Some(&self.interpreter_fingerprint)
+            && req.script_source.as_ref() == Some(&self.source_proof())
     }
 }
 

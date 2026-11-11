@@ -99,6 +99,11 @@ impl Request {
             "proxy-check" => (&[], &[], &[]),
             "dns-check" => (&[], &["online"], &[]),
             "launch-desktop" => (&[], &["apply"], &[]),
+            "entry" => (
+                &["preview", "activate", "status", "deactivate"],
+                &["apply"],
+                &["target", "target-bundle", "shims-dir", "applications-dir", "shell"],
+            ),
             "uninstall" => (
                 &[],
                 &[

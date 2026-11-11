@@ -1,5 +1,12 @@
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+extern crate self as claude_watch_runtime;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../tests/support/managed_cli_supervisor.rs"]
+#[allow(dead_code)]
+mod managed_cli_supervisor_fixture;
+
 pub mod account_native;
 pub mod accounts;
 pub mod agent_install;
@@ -11,6 +18,7 @@ pub mod audit_process;
 pub mod background_evidence;
 pub mod build_identity;
 pub mod channel_enforcer;
+mod gateway_budget;
 pub mod channel_diagnostics;
 pub mod channel_policy_status;
 pub mod channel_supervisor;
@@ -34,6 +42,8 @@ pub mod local_http;
 pub mod macos;
 pub mod macos_mutations;
 pub mod managed_entry;
+pub mod managed_entry_activation;
+mod managed_entry_transaction;
 pub mod monitor_activity;
 pub mod monitor_snapshot;
 pub mod native;
@@ -43,6 +53,7 @@ pub mod network_client;
 pub mod onboarding;
 pub mod online_probes;
 pub mod platform_mutator;
+pub mod process_disposition;
 pub mod proxy_diagnostics;
 pub mod proxy_mutations;
 pub mod receipt_store;

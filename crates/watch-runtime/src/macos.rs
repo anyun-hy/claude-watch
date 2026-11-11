@@ -801,18 +801,10 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             a.get("id").and_then(Value::as_str),
             Some("start_proxy" | "reload_proxy" | "enable_tun" | "rules")
         ) {
-            if let Ok(cfg) = (crate::config_store::ConfigStore {
-                storage: self.storage.clone(),
-            })
-            .load()
-            {
-                if cfg.vpn_is_read_only() {
-                    return Err(CoreError::new(
-                        "vpn_managed_externally",
-                        "VPN 与代理配置由外部客户端管理，Watch 仅执行只读观测与通道断流",
-                    ));
-                }
-            }
+            return Err(CoreError::new(
+                "vpn_managed_externally",
+                "VPN 与代理配置由外部客户端管理，Watch 仅执行只读观测与通道断流",
+            ));
         }
         self.mutator.apply(a)
     }
@@ -937,6 +929,15 @@ impl<R: ReadRunner, T: Transport, M: Mutator> RepairSystem for Macos<R, T, M> {
     fn restore(&mut self, a: &Value) -> Result<bool> {
         if self.authority != Authority::ExplicitPermit {
             return Ok(false);
+        }
+        if matches!(
+            a.get("id").and_then(Value::as_str),
+            Some("start_proxy" | "reload_proxy" | "enable_tun" | "rules")
+        ) {
+            return Err(CoreError::new(
+                "vpn_managed_externally",
+                "VPN 与代理配置由外部客户端管理，Watch 仅执行只读观测与通道断流",
+            ));
         }
         self.mutator.restore(a)
     }

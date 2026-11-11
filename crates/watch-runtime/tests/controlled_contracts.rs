@@ -95,6 +95,12 @@ struct Fake {
     /// can drive its automatic disposition. Defaults false so the existing
     /// Claude-only contracts keep the OpenAI tick idle.
     supervise_openai: bool,
+    channel_mode_enabled: bool,
+    delegates_worker_enabled: bool,
+    terminated_supervised: Vec<claude_watch_core::channel::BoundProcessToken>,
+    fail_terminate_supervised: bool,
+    terminate_results_override: Option<Vec<claude_watch_core::channel::TargetProcessDispositionResult>>,
+    recorded_process_receipts: Vec<claude_watch_core::channel::ProcessDispositionReceipt>,
 }
 impl Default for Fake {
     fn default() -> Self {
@@ -138,6 +144,12 @@ impl Default for Fake {
             test_child: None,
             family: "claude",
             supervise_openai: false,
+            channel_mode_enabled: false,
+            delegates_worker_enabled: false,
+            terminated_supervised: Vec::new(),
+            fail_terminate_supervised: false,
+            terminate_results_override: None,
+            recorded_process_receipts: Vec::new(),
         }
     }
 }
@@ -200,7 +212,45 @@ impl claude_watch_runtime::controlled::CliProcess for FakeCliChild {
 }
 impl DesktopSystem for Fake {
     fn channel_mode(&self) -> bool {
-        false
+        self.channel_mode_enabled
+    }
+    fn delegates_slow_audit_to_worker(&self) -> bool {
+        self.delegates_worker_enabled
+    }
+    fn terminate_supervised_processes(
+        &mut self,
+        tokens: &[claude_watch_core::channel::BoundProcessToken],
+        forced: &mut Option<u32>,
+    ) -> Result<Vec<claude_watch_core::channel::TargetProcessDispositionResult>> {
+        if self.fail_terminate_supervised {
+            return Err(CoreError::new("target_still_running", "mock failed"));
+        }
+        if let Some(ref custom) = self.terminate_results_override {
+            self.terminated_supervised.extend_from_slice(tokens);
+            let killed = custom
+                .iter()
+                .filter(|r| r.terminated && r.process_state == "terminated")
+                .count() as u32;
+            if killed > 0 {
+                *forced = Some(killed);
+            } else {
+                *forced = None;
+            }
+            return Ok(custom.clone());
+        }
+        self.terminated_supervised.extend_from_slice(tokens);
+        *forced = Some(tokens.len() as u32);
+        Ok(tokens
+            .iter()
+            .map(|t| claude_watch_core::channel::TargetProcessDispositionResult {
+                pid: t.pid,
+                requested_action: "force_quit".into(),
+                terminated: true,
+                process_state: "terminated".into(),
+                timestamp: 1000.0,
+                signal_sent_at: None,
+            })
+            .collect())
     }
     fn prepare_cli(&mut self) -> Result<()> {
         Ok(())
@@ -468,6 +518,13 @@ impl DesktopSystem for Fake {
         let had_child = self.test_child.is_some();
         *forced = Some(u32::from(had_child));
         self.quit_desktop()
+    }
+    fn record_process_disposition_receipt(
+        &mut self,
+        receipt: &claude_watch_core::channel::ProcessDispositionReceipt,
+    ) -> Result<()> {
+        self.recorded_process_receipts.push(receipt.clone());
+        Ok(())
     }
 }
 
@@ -2298,4 +2355,520 @@ fn each_supervised_family_keeps_its_own_session_record() {
         fixture.storage.paths.session_for("claude"),
         fixture.storage.paths.session_for("openai")
     );
+}
+
+#[test]
+fn n0_cli_old_permit_cannot_authorize_process_signal() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake {
+        channel_mode_enabled: true,
+        delegates_worker_enabled: true,
+        ..Fake::default()
+    };
+    let mut config = claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.load().unwrap();
+    config.guard_enabled = true;
+    config.policy_actions.insert("claude_close_ip".into(), "force".into());
+    claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.save(config.value().unwrap()).unwrap();
+
+    let token = claude_watch_core::channel::BoundProcessToken::with_system_identity(
+        8822, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
+    ).with_audit_token([501, 501, 20, 501, 20, 8822, 0, 9]);
+    let session: claude_watch_core::session::Session = serde_json::from_value(json!({
+        "schema": 1,
+        "state": "locked",
+        "session_id": "s-cli-1",
+        "baseline": {
+            "ip": "1.1.1.1",
+            "country": "JP",
+            "observed_at": 1000.0,
+            "source": "fixture"
+        },
+        "reason": {
+            "code": "egress_ip_changed",
+            "detail": "IP changed",
+            "source": "fixture",
+            "observed_at": 1000.0
+        },
+        "channel_processes_v1": [token]
+    })).unwrap();
+    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &serde_json::to_value(&session).unwrap()).unwrap();
+
+    let permit = claude_watch_core::channel::ChannelPermit {
+        family: "claude".into(),
+        session_id: Some("s-cli-1".into()),
+        context_id: None,
+        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest: "p1".into(), guard_policy_digest: "g1".into() },
+        permit_generation: 1,
+        command_seq: 1,
+        state: claude_watch_core::channel::ChannelPermitState::Revoked,
+        reason_code: "egress_ip_changed".into(),
+        issued_at: 1000.0,
+        valid_until: 1000.0,
+        baseline_ip: None,
+        members: Vec::new(),
+        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt,
+        vpn_epoch: None,
+        coverage_scope: None,
+    };
+    fixture.storage.atomic_json(
+        &fixture.storage.paths.watch().join("state/channel-permits.json"),
+        &json!({"claude": permit}),
+    ).unwrap();
+
+    let receipt = controller.guard_tick_for_family(&mut system, "claude").unwrap();
+    eprintln!("DEBUG_RECEIPT_N2: {}", serde_json::to_string_pretty(&receipt).unwrap());
+
+
+    assert_eq!(receipt["action"], "disconnect-channel");
+    assert_eq!(receipt["process_execution_state"], "awaiting_supervisor");
+    assert!(receipt["process_preserved"].is_null());
+    assert!(system.terminated_supervised.is_empty());
+    assert!(system.recorded_process_receipts.is_empty());
+}
+
+#[test]
+fn n0_cli_old_permit_cannot_fabricate_force_failure() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake {
+        channel_mode_enabled: true,
+        delegates_worker_enabled: true,
+        fail_terminate_supervised: true,
+        ..Fake::default()
+    };
+    let mut config = claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.load().unwrap();
+    config.guard_enabled = true;
+    config.policy_actions.insert("claude_close_ip".into(), "force".into());
+    claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.save(config.value().unwrap()).unwrap();
+
+    let token = claude_watch_core::channel::BoundProcessToken::with_system_identity(
+        8823, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
+    ).with_audit_token([501, 501, 20, 501, 20, 8823, 0, 9]);
+    let session: claude_watch_core::session::Session = serde_json::from_value(json!({
+        "schema": 1,
+        "state": "locked",
+        "session_id": "s-cli-2",
+        "baseline": {
+            "ip": "1.1.1.1",
+            "country": "JP",
+            "observed_at": 1000.0,
+            "source": "fixture"
+        },
+        "reason": {
+            "code": "egress_ip_changed",
+            "detail": "IP changed",
+            "source": "fixture",
+            "observed_at": 1000.0
+        },
+        "channel_processes_v1": [token]
+    })).unwrap();
+    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &serde_json::to_value(&session).unwrap()).unwrap();
+
+    let permit = claude_watch_core::channel::ChannelPermit {
+        family: "claude".into(),
+        session_id: Some("s-cli-2".into()),
+        context_id: None,
+        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest: "p1".into(), guard_policy_digest: "g1".into() },
+        permit_generation: 1, command_seq: 1,
+        state: claude_watch_core::channel::ChannelPermitState::Revoked,
+        reason_code: "egress_ip_changed".into(),
+        issued_at: 1000.0, valid_until: 1000.0, baseline_ip: None, members: Vec::new(),
+        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt, vpn_epoch: None, coverage_scope: None,
+    };
+    fixture.storage.atomic_json(
+        &fixture.storage.paths.watch().join("state/channel-permits.json"),
+        &json!({"claude": permit}),
+    ).unwrap();
+
+    let receipt = controller.guard_tick_for_family(&mut system, "claude").unwrap();
+    eprintln!("DEBUG_RECEIPT_N2: {}", serde_json::to_string_pretty(&receipt).unwrap());
+
+
+    assert_eq!(receipt["action"], "disconnect-channel");
+    assert_eq!(receipt["process_execution_state"], "awaiting_supervisor");
+    assert!(receipt["process_preserved"].is_null());
+    assert!(system.terminated_supervised.is_empty());
+    assert!(system.recorded_process_receipts.is_empty());
+}
+
+#[test]
+fn n0_cli_channel_session_close_disposition_preserves_process_and_disconnects_channel() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake {
+        channel_mode_enabled: true,
+        delegates_worker_enabled: true,
+        ..Fake::default()
+    };
+    let mut config = claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.load().unwrap();
+    config.guard_enabled = true;
+    config.policy_actions.insert("claude_close_ip".into(), "close".into());
+    claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.save(config.value().unwrap()).unwrap();
+
+    let token = claude_watch_core::channel::BoundProcessToken::with_system_identity(
+        8824, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
+    ).with_audit_token([501, 501, 20, 501, 20, 8824, 0, 9]);
+    let session: claude_watch_core::session::Session = serde_json::from_value(json!({
+        "schema": 1,
+        "state": "locked",
+        "session_id": "s-cli-3",
+        "baseline": {
+            "ip": "1.1.1.1",
+            "country": "JP",
+            "observed_at": 1000.0,
+            "source": "fixture"
+        },
+        "reason": {
+            "code": "egress_ip_changed",
+            "detail": "IP changed",
+            "source": "fixture",
+            "observed_at": 1000.0
+        },
+        "channel_processes_v1": [token]
+    })).unwrap();
+    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &serde_json::to_value(&session).unwrap()).unwrap();
+
+    let permit = claude_watch_core::channel::ChannelPermit {
+        family: "claude".into(),
+        session_id: Some("s-cli-3".into()),
+        context_id: None,
+        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest: "p1".into(), guard_policy_digest: "g1".into() },
+        permit_generation: 1, command_seq: 1,
+        state: claude_watch_core::channel::ChannelPermitState::Revoked,
+        reason_code: "egress_ip_changed".into(),
+        issued_at: 1000.0, valid_until: 1000.0, baseline_ip: None, members: Vec::new(),
+        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt, vpn_epoch: None, coverage_scope: None,
+    };
+    fixture.storage.atomic_json(
+        &fixture.storage.paths.watch().join("state/channel-permits.json"),
+        &json!({"claude": permit}),
+    ).unwrap();
+
+    let receipt = controller.guard_tick_for_family(&mut system, "claude").unwrap();
+    eprintln!("DEBUG_RECEIPT_N2: {}", serde_json::to_string_pretty(&receipt).unwrap());
+
+
+    assert_eq!(receipt["action"], "disconnect-channel");
+    assert_eq!(receipt["disposition_mode"], "disconnect_channel_keep_process");
+    assert_eq!(receipt["process_preserved"], true);
+    assert_eq!(receipt["process_execution_state"], "preserved");
+    assert_eq!(system.terminated_supervised.len(), 0);
+}
+
+#[test]
+fn n0_openai_cli_channel_without_per_key_force_approval_falls_back_to_close() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake {
+        family: "openai",
+        supervise_openai: true,
+        channel_mode_enabled: true,
+        delegates_worker_enabled: true,
+        ..Fake::default()
+    };
+    let mut config = claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.load().unwrap();
+    config.guard_enabled = true;
+    claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.save(config.value().unwrap()).unwrap();
+    assert_eq!(config.close_action("egress_ip_changed", claude_watch_core::processes::Provider::Codex), "close");
+
+    let token = claude_watch_core::channel::BoundProcessToken::with_system_identity(
+        8825, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
+    ).with_audit_token([501, 501, 20, 501, 20, 8825, 0, 9]);
+    let session: claude_watch_core::session::Session = serde_json::from_value(json!({
+        "schema": 1,
+        "state": "locked",
+        "session_id": "s-cli-openai",
+        "baseline": {
+            "ip": "1.1.1.1",
+            "country": "JP",
+            "observed_at": 1000.0,
+            "source": "fixture"
+        },
+        "reason": {
+            "code": "egress_ip_changed",
+            "detail": "IP changed",
+            "source": "fixture",
+            "observed_at": 1000.0
+        },
+        "channel_processes_v1": [token]
+    })).unwrap();
+    fixture.storage.atomic_json(&fixture.storage.paths.session_for("openai"), &serde_json::to_value(&session).unwrap()).unwrap();
+
+    let permit = claude_watch_core::channel::ChannelPermit {
+        family: "openai".into(),
+        session_id: Some("s-cli-openai".into()),
+        context_id: None,
+        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest: "p1".into(), guard_policy_digest: "g1".into() },
+        permit_generation: 1, command_seq: 1,
+        state: claude_watch_core::channel::ChannelPermitState::Revoked,
+        reason_code: "egress_ip_changed".into(),
+        issued_at: 1000.0, valid_until: 1000.0, baseline_ip: None, members: Vec::new(),
+        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt, vpn_epoch: None, coverage_scope: None,
+    };
+    fixture.storage.atomic_json(
+        &fixture.storage.paths.watch().join("state/channel-permits.json"),
+        &json!({"openai": permit}),
+    ).unwrap();
+
+    let receipt = controller.guard_tick_for_family(&mut system, "openai").unwrap();
+
+    assert_eq!(receipt["action"], "disconnect-channel");
+    assert_eq!(receipt["disposition_mode"], "disconnect_channel_keep_process");
+    assert_eq!(receipt["process_preserved"], true);
+    assert_eq!(receipt["process_execution_state"], "preserved");
+    assert_eq!(system.terminated_supervised.len(), 0);
+}
+
+#[test]
+fn n1_stale_permit_session_mismatch_rejects_channel_disposition() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake {
+        channel_mode_enabled: true,
+        delegates_worker_enabled: true,
+        ..Fake::default()
+    };
+    let token = claude_watch_core::channel::BoundProcessToken::with_system_identity(
+        8901, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
+    ).with_audit_token([501, 501, 20, 501, 20, 8901, 0, 9]);
+    let session: claude_watch_core::session::Session = serde_json::from_value(json!({
+        "schema": 1,
+        "state": "locked",
+        "session_id": "session-active-new",
+        "baseline": {
+            "ip": "1.1.1.1",
+            "country": "JP",
+            "observed_at": 1000.0,
+            "source": "fixture"
+        },
+        "reason": {
+            "code": "egress_ip_changed",
+            "detail": "IP changed",
+            "source": "fixture",
+            "observed_at": 1000.0
+        },
+        "channel_processes_v1": [token]
+    })).unwrap();
+    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &serde_json::to_value(&session).unwrap()).unwrap();
+
+    // Permit belongs to an old/different session ID
+    let permit = claude_watch_core::channel::ChannelPermit {
+        family: "claude".into(),
+        session_id: Some("session-stale-old".into()),
+        context_id: None,
+        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest: "p1".into(), guard_policy_digest: "g1".into() },
+        permit_generation: 1, command_seq: 1,
+        state: claude_watch_core::channel::ChannelPermitState::Revoked,
+        reason_code: "egress_ip_changed".into(),
+        issued_at: 1000.0, valid_until: 1030.0, baseline_ip: None, members: Vec::new(),
+        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt, vpn_epoch: None, coverage_scope: None,
+    };
+    fixture.storage.atomic_json(
+        &fixture.storage.paths.watch().join("state/channel-permits.json"),
+        &json!({"claude": permit}),
+    ).unwrap();
+
+    let receipt = controller.guard_tick_for_family(&mut system, "claude").unwrap();
+
+    assert_eq!(receipt["action"], "disconnect-channel");
+    assert_eq!(receipt["disposition_mode"], "disconnect_channel_keep_process");
+    assert_eq!(receipt["process_execution_state"], "session_mismatch");
+    assert_eq!(receipt["process_preserved"], true);
+    assert_eq!(system.terminated_supervised.len(), 0);
+}
+
+#[test]
+fn n2_legacy_consumer_cannot_import_fake_partial_execution() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake {
+        channel_mode_enabled: true,
+        delegates_worker_enabled: true,
+        ..Fake::default()
+    };
+    let mut config = claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.load().unwrap();
+    config.guard_enabled = true;
+    config.policy_actions.insert("claude_close_ip".into(), "force".into());
+    claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.save(config.value().unwrap()).unwrap();
+
+    let t1 = claude_watch_core::channel::BoundProcessToken::with_system_identity(
+        9001, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
+    ).with_audit_token([501, 501, 20, 501, 20, 9001, 0, 9]);
+    let t2 = claude_watch_core::channel::BoundProcessToken::with_system_identity(
+        9002, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
+    ).with_audit_token([501, 501, 20, 501, 20, 9002, 0, 9]);
+    let session: claude_watch_core::session::Session = serde_json::from_value(json!({
+        "schema": 1,
+        "state": "locked",
+        "session_id": "session-dual-1",
+        "baseline": {
+            "ip": "1.1.1.1",
+            "country": "JP",
+            "observed_at": 1000.0,
+            "source": "fixture"
+        },
+        "reason": {
+            "code": "egress_ip_changed",
+            "detail": "IP changed",
+            "source": "fixture",
+            "observed_at": 1000.0
+        },
+        "channel_processes_v1": [t1, t2]
+    })).unwrap();
+    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &serde_json::to_value(&session).unwrap()).unwrap();
+
+    let permit = claude_watch_core::channel::ChannelPermit {
+        family: "claude".into(),
+        session_id: Some("session-dual-1".into()),
+        context_id: None,
+        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest: "p1".into(), guard_policy_digest: "g1".into() },
+        permit_generation: 1, command_seq: 1,
+        state: claude_watch_core::channel::ChannelPermitState::Revoked,
+        reason_code: "egress_ip_changed".into(),
+        issued_at: 1000.0, valid_until: 1030.0, baseline_ip: None, members: Vec::new(),
+        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt, vpn_epoch: None, coverage_scope: None,
+    };
+    fixture.storage.atomic_json(
+        &fixture.storage.paths.watch().join("state/channel-permits.json"),
+        &json!({"claude": permit}),
+    ).unwrap();
+
+    // Simulate 9001 being terminated, 9002 failing to terminate
+    system.terminate_results_override = Some(vec![
+        claude_watch_core::channel::TargetProcessDispositionResult {
+            pid: 9001,
+            requested_action: "force_quit".into(),
+            terminated: true,
+            process_state: "terminated".into(),
+            timestamp: 1000.0,
+            signal_sent_at: None,
+        },
+        claude_watch_core::channel::TargetProcessDispositionResult {
+            pid: 9002,
+            requested_action: "force_quit".into(),
+            terminated: false,
+            process_state: "still_running".into(),
+            timestamp: 1000.0,
+            signal_sent_at: None,
+        },
+    ]);
+
+    let receipt = controller.guard_tick_for_family(&mut system, "claude").unwrap();
+
+    assert_eq!(receipt["action"], "disconnect-channel");
+    assert_eq!(receipt["process_execution_state"], "awaiting_supervisor");
+    assert!(receipt["process_preserved"].is_null());
+    assert!(system.terminated_supervised.is_empty());
+    assert!(system.recorded_process_receipts.is_empty());
+}
+
+#[test]
+fn n3_already_exited_process_not_counted_in_forced() {
+    let fixture = Fixture::new();
+    let controller = Controller::new(fixture.storage.clone());
+    let mut system = Fake {
+        channel_mode_enabled: true,
+        delegates_worker_enabled: true,
+        ..Fake::default()
+    };
+    let mut config = claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.load().unwrap();
+    config.guard_enabled = true;
+    config.policy_actions.insert("claude_close_ip".into(), "force".into());
+    claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.save(config.value().unwrap()).unwrap();
+
+    let t = claude_watch_core::channel::BoundProcessToken::with_system_identity(
+        9003, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
+    ).with_audit_token([501, 501, 20, 501, 20, 9003, 0, 9]);
+    let session: claude_watch_core::session::Session = serde_json::from_value(json!({
+        "schema": 1,
+        "state": "locked",
+        "session_id": "session-exited-1",
+        "baseline": {
+            "ip": "1.1.1.1",
+            "country": "JP",
+            "observed_at": 1000.0,
+            "source": "fixture"
+        },
+        "reason": {
+            "code": "egress_ip_changed",
+            "detail": "IP changed",
+            "source": "fixture",
+            "observed_at": 1000.0
+        },
+        "channel_processes_v1": [t]
+    })).unwrap();
+    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &serde_json::to_value(&session).unwrap()).unwrap();
+
+    let permit = claude_watch_core::channel::ChannelPermit {
+        family: "claude".into(),
+        session_id: Some("session-exited-1".into()),
+        context_id: None,
+        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest: "p1".into(), guard_policy_digest: "g1".into() },
+        permit_generation: 1, command_seq: 1,
+        state: claude_watch_core::channel::ChannelPermitState::Revoked,
+        reason_code: "egress_ip_changed".into(),
+        issued_at: 1000.0, valid_until: 1030.0, baseline_ip: None, members: Vec::new(),
+        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt, vpn_epoch: None, coverage_scope: None,
+    };
+    fixture.storage.atomic_json(
+        &fixture.storage.paths.watch().join("state/channel-permits.json"),
+        &json!({"claude": permit}),
+    ).unwrap();
+
+    system.terminate_results_override = Some(vec![
+        claude_watch_core::channel::TargetProcessDispositionResult {
+            pid: 9003,
+            requested_action: "force_quit".into(),
+            terminated: false,
+            process_state: "already_exited".into(),
+            timestamp: 1000.0,
+            signal_sent_at: None,
+        },
+    ]);
+
+    let receipt = controller.guard_tick_for_family(&mut system, "claude").unwrap();
+
+    assert_eq!(receipt["action"], "disconnect-channel");
+    assert_eq!(receipt["process_execution_state"], "awaiting_supervisor");
+    assert!(receipt["process_preserved"].is_null());
+    assert!(system.terminated_supervised.is_empty());
+}
+
+#[test]
+fn n4_supervisor_does_not_import_disk_process_receipt() {
+    let fixture = Fixture::new();
+    let receipt = claude_watch_core::channel::ProcessDispositionReceipt {
+        intent_id: "intent-test-1".into(),
+        family: "claude".into(),
+        session_id: "s-1".into(),
+        action: "force_quit".into(),
+        process_execution_state: "terminated".into(),
+        process_preserved: false,
+        observed_at: 1000.0,
+        error_code: None,
+        authority: None,
+        target_results: vec![
+            claude_watch_core::channel::TargetProcessDispositionResult {
+                pid: 9999,
+                requested_action: "force_quit".into(),
+                terminated: true,
+                process_state: "terminated".into(),
+                timestamp: 1000.0,
+                signal_sent_at: None,
+            }
+        ],
+    };
+    fixture.storage.atomic_json(
+        &fixture.storage.paths.watch().join("state/process-receipt-claude.json"),
+        &serde_json::to_value(&receipt).unwrap(),
+    ).unwrap();
+
+    let supervisor = claude_watch_runtime::channel_supervisor::ChannelSupervisor::new(fixture.storage.clone(), None, None).unwrap();
+    let snapshot = supervisor.snapshot(1000.0);
+    let monitor = &snapshot.families["claude"];
+
+    assert!(monitor.process_disposition_receipt.is_none());
+    assert!(monitor.process_execution_state.is_none());
+    assert!(monitor.process_disposition_action.is_none());
 }

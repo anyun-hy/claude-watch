@@ -2,6 +2,7 @@
 pub mod network_events;
 pub mod launchd_gateway;
 pub mod application_locations;
+pub mod anchored_files;
 
 use std::{
     net::SocketAddr,
@@ -25,14 +26,14 @@ pub struct SandboxPeerVerifier {
     pub expected_uid: u32,
     pub expected_helper_executable: String,
     pub expected_helper_sha256: String,
-    pub require_code_signature_identifier: Option<String>,
+    pub expected_helper_cdhash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPeerIdentity {
     pub process: ProcessKernelIdentity,
     pub helper_sha256: String,
-    pub code_signature_verified: bool,
+    pub helper_cdhash: String,
 }
 pub fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
@@ -62,6 +63,90 @@ pub fn terminate_owned_group(child: &std::process::Child) {
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
+}
+/// Sends SIGKILL to a verified process PID. Returns Ok(()) if the process was terminated
+/// or was already dead (ESRCH).
+pub fn kill_process(pid: u32) -> std::io::Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
+    unsafe {
+        if libc::kill(pid as i32, libc::SIGKILL) != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// A request accepted by the kernel is not an exit receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundSignalResult { Sent, AlreadyExited, IdentityChanged, Failed }
+
+pub fn signal_bound_process(expected: &ProcessKernelIdentity) -> BoundSignalResult {
+    if expected.pid <= 1 || expected.pid > i32::MAX as u32 || expected.pid == std::process::id()
+        || expected.uid != effective_uid()
+    {
+        return BoundSignalResult::IdentityChanged;
+    }
+    if bound_lifetime_exited(expected) { return BoundSignalResult::AlreadyExited; }
+    let same = inspect_process_identity(expected.pid).is_some_and(|actual|
+        actual.uid == expected.uid && actual.start_seconds == expected.start_seconds
+        && actual.start_microseconds == expected.start_microseconds
+        && actual.audit_token == expected.audit_token && actual.executable_path == expected.executable_path);
+    if !same { return BoundSignalResult::IdentityChanged; }
+    if unsafe { libc::kill(expected.pid as i32, libc::SIGKILL) } == 0 {
+        BoundSignalResult::Sent
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        BoundSignalResult::AlreadyExited
+    } else {
+        BoundSignalResult::Failed
+    }
+}
+
+/// Observe the bound lifetime without reaping someone else's child. A zombie
+/// has exited even while its original parent still holds its PID.
+pub fn bound_lifetime_exited(expected: &ProcessKernelIdentity) -> bool {
+    if expected.pid <= 1 || expected.pid > i32::MAX as u32 { return false; }
+    if is_process_definitely_dead(expected.pid) { return true; }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as i32;
+        if unsafe { libc::proc_pidinfo(expected.pid as i32, libc::PROC_PIDTBSDINFO, 0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(), size) } == size
+        {
+            return info.pbi_start_tvsec != expected.start_seconds
+                || info.pbi_start_tvusec != u64::from(expected.start_microseconds)
+                || (info.pbi_uid == expected.uid && info.pbi_status == 5 /* SZOMB */);
+        }
+        // libproc omits unreaped zombies on macOS. KERN_PROC_PID exposes
+        // the exported extern_proc prefix even while the parent holds the PID.
+        #[repr(C)]
+        struct ProcPrefix {
+            start: libc::timeval,
+            vmspace: *mut libc::c_void,
+            sigacts: *mut libc::c_void,
+            flags: libc::c_int,
+            status: libc::c_char,
+            pid: libc::pid_t,
+        }
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, expected.pid as i32];
+        let mut bytes = [0u8; 4096];
+        let mut size = bytes.len();
+        if unsafe { libc::sysctl(mib.as_mut_ptr(), mib.len() as u32, bytes.as_mut_ptr().cast(),
+            &mut size, std::ptr::null_mut(), 0) } == 0 && size >= std::mem::size_of::<ProcPrefix>() {
+            let info = unsafe { bytes.as_ptr().cast::<ProcPrefix>().read_unaligned() };
+            if info.pid == expected.pid as i32 && info.status == 5
+                && u64::try_from(info.start.tv_sec).ok() == Some(expected.start_seconds)
+                && u32::try_from(info.start.tv_usec).ok() == Some(expected.start_microseconds)
+            { return true; }
+        }
+    }
+    is_process_definitely_dead(expected.pid)
 }
 /// Observe exit without reaping: keep the group leader's PID reserved until
 /// its owned helper processes have also been signalled.
@@ -102,6 +187,41 @@ pub fn process_audit_token_matches(pid: u32, uid: u32, seconds: u64, micros: u32
     { macos::process_token(pid, uid, seconds, micros, None).as_ref() == Some(token) }
     #[cfg(not(target_os = "macos"))]
     { let _ = (pid, uid, seconds, micros, token); false }
+}
+
+/// Check the kernel's per-lifetime exec flag, bound to the same audit token.
+/// A child that execs the same interpreter is not a fork-only descendant.
+pub fn bound_fork_only(process: &ProcessKernelIdentity) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if !process_audit_token_matches(process.pid, process.uid, process.start_seconds,
+            process.start_microseconds, &process.audit_token) { return false; }
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as i32;
+        (unsafe { libc::proc_pidinfo(process.pid as i32, libc::PROC_PIDTBSDINFO, 0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(), size) }) == size
+            && info.pbi_flags & 0x4000 == 0 /* PROC_FLAG_EXEC */
+            && info.pbi_uid == process.uid && info.pbi_start_tvsec == process.start_seconds
+            && info.pbi_start_tvusec == u64::from(process.start_microseconds)
+            && process_audit_token_matches(process.pid, process.uid, process.start_seconds,
+                process.start_microseconds, &process.audit_token)
+    }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = process; false }
+}
+
+pub fn executable_cdhash(path: &Path) -> Option<[u8; 20]> {
+    #[cfg(target_os = "macos")]
+    { macos::static_cdhash(path) }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = path; None }
+}
+
+pub fn bound_process_cdhash(process: &ProcessKernelIdentity) -> Option<[u8; 20]> {
+    #[cfg(target_os = "macos")]
+    { macos::loaded_cdhash(process) }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = process; None }
 }
 
 /// Presentation-only lifetime correlation when an unlinked image no longer has
@@ -146,6 +266,7 @@ pub fn verify_sandbox_helper_peer(
     }
 }
 
+pub const MAX_TCP_PEER_CANDIDATES: usize = 2048;
 pub fn attribute_loopback_tcp_peer(
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
@@ -346,18 +467,17 @@ mod tests {
             expected_uid: uid,
             expected_helper_executable: exe_str.clone(),
             expected_helper_sha256: sha.clone(),
-            require_code_signature_identifier: None,
+            expected_helper_cdhash: super::executable_cdhash(&exe).unwrap().iter()
+                .map(|byte| format!("{byte:02x}")).collect(),
         };
-        let peer = super::verify_sandbox_helper_peer(&s1, &verifier).expect("peer verified");
-        assert_eq!(peer.process.pid, pid);
-        assert_eq!(peer.process.uid, uid);
-        assert_eq!(peer.process.executable_path, exe_str);
-        drop(s2);
+        assert!(super::verify_sandbox_helper_peer(&s1, &verifier).is_none(),
+            "the default un-hardened test process must be rejected even with matching pins");
 
         // Wrong sha256 or wrong executable is rejected
         let mut bad_verifier = verifier.clone();
         bad_verifier.expected_helper_sha256 = "0".repeat(64);
         assert!(super::verify_sandbox_helper_peer(&s1, &bad_verifier).is_none());
+        drop(s2);
 
         // Live loopback TCP tuple attribution
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -396,6 +516,7 @@ mod macos {
             errorbuf: *mut *mut c_char,
         ) -> i32;
         fn sandbox_free_error(errorbuf: *mut c_char);
+        fn csops_audittoken(pid: i32, ops: u32, value: *mut c_void, size: usize, token: *mut [u32; 8]) -> i32;
     }
     pub fn apply_seatbelt(profile_sbpl: &str) -> std::result::Result<(), String> {
         let c_profile = CString::new(profile_sbpl)
@@ -450,31 +571,47 @@ mod macos {
     }
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
-        fn CFDataCreate(allocator: Ref, bytes: *const u8, length: isize) -> Ref;
-        fn CFStringCreateWithCString(allocator: Ref, text: *const c_char, encoding: u32) -> Ref;
-        fn CFDictionaryCreate(
-            allocator: Ref,
-            keys: *const Ref,
-            values: *const Ref,
-            count: isize,
-            keys_cb: Ref,
-            values_cb: Ref,
-        ) -> Ref;
         fn CFRelease(value: Ref);
+        fn CFURLCreateFromFileSystemRepresentation(allocator: Ref, path: *const u8, len: isize, directory: bool) -> Ref;
+        fn CFDictionaryGetValue(dictionary: Ref, key: Ref) -> Ref;
+        fn CFDataGetLength(data: Ref) -> isize;
+        fn CFDataGetBytePtr(data: Ref) -> *const u8;
     }
     #[link(name = "Security", kind = "framework")]
     unsafe extern "C" {
-        static kSecGuestAttributeAudit: Ref;
-        fn SecCodeCopyStaticCode(code: Ref, flags: u32, static_code: *mut Ref) -> i32;
+        static kSecCodeInfoUnique: Ref;
+        fn SecStaticCodeCreateWithPath(path: Ref, flags: u32, code: *mut Ref) -> i32;
         fn SecCodeCopySigningInformation(code: Ref, flags: u32, info: *mut Ref) -> i32;
-        fn SecCodeCopyGuestWithAttributes(
-            host: Ref,
-            attributes: Ref,
-            flags: u32,
-            code: *mut Ref,
-        ) -> i32;
-        fn SecRequirementCreateWithString(text: Ref, flags: u32, requirement: *mut Ref) -> i32;
-        fn SecCodeCheckValidity(code: Ref, flags: u32, requirement: Ref) -> i32;
+    }
+    pub fn static_cdhash(path: &std::path::Path) -> Option<[u8; 20]> {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        unsafe {
+            let url = Owned(CFURLCreateFromFileSystemRepresentation(ptr::null(), bytes.as_ptr(), bytes.len() as isize, false));
+            if url.0.is_null() { return None; }
+            let mut code = ptr::null();
+            if SecStaticCodeCreateWithPath(url.0, 0, &mut code) != 0 || code.is_null() { return None; }
+            let code = Owned(code);
+            let mut info = ptr::null();
+            if SecCodeCopySigningInformation(code.0, 0, &mut info) != 0 || info.is_null() { return None; }
+            let info = Owned(info);
+            let data = CFDictionaryGetValue(info.0, kSecCodeInfoUnique);
+            if data.is_null() || CFDataGetLength(data) != 20 { return None; }
+            let p = CFDataGetBytePtr(data);
+            if p.is_null() { return None; }
+            std::slice::from_raw_parts(p, 20).try_into().ok()
+        }
+    }
+    pub fn loaded_cdhash(process: &super::ProcessKernelIdentity) -> Option<[u8; 20]> {
+        let mut token = process.audit_token;
+        if process_token(process.pid, process.uid, process.start_seconds, process.start_microseconds,
+            Some(&process.executable_path))? != token { return None; }
+        let mut bytes = [0u8; 20];
+        // XNU CS_OPS_CDHASH reads the currently loaded code directory.
+        if unsafe { csops_audittoken(process.pid as i32, 5, bytes.as_mut_ptr().cast(), bytes.len(), &mut token) } != 0
+            || raw_process_token(process.pid)? != process.audit_token
+        { return None; }
+        Some(bytes)
     }
     struct Owned(Ref);
     impl Drop for Owned {
@@ -482,17 +619,6 @@ mod macos {
             if !self.0.is_null() {
                 unsafe { CFRelease(self.0) };
             }
-        }
-    }
-    fn satisfies(code: Ref, text: &str) -> bool {
-        let Ok(text) = CString::new(text) else { return false; };
-        unsafe {
-            let text = Owned(CFStringCreateWithCString(ptr::null(), text.as_ptr(), 0x08000100));
-            if text.0.is_null() { return false; }
-            let mut requirement = ptr::null();
-            if SecRequirementCreateWithString(text.0, 0, &mut requirement) != 0 { return false; }
-            let requirement = Owned(requirement);
-            SecCodeCheckValidity(code, 0, requirement.0) == 0
         }
     }
     pub fn inspect_process(pid: u32) -> Option<super::ProcessKernelIdentity> {
@@ -545,7 +671,8 @@ mod macos {
     ) -> Option<super::SandboxPeerIdentity> {
         if verifier.expected_uid == 0
             || verifier.expected_helper_executable.trim().is_empty()
-            || verifier.expected_helper_sha256.trim().is_empty()
+            || verifier.expected_helper_sha256.len() != 64
+            || verifier.expected_helper_cdhash.len() != 40
         {
             return None;
         }
@@ -577,53 +704,7 @@ mod macos {
         if actual_sha != verifier.expected_helper_sha256 {
             return None;
         }
-        let mut code_sig_verified = false;
-        unsafe {
-            let data = Owned(CFDataCreate(ptr::null(), token.as_ptr().cast(), 32));
-            if data.0.is_null() {
-                return None;
-            }
-            let attrs = Owned(CFDictionaryCreate(
-                ptr::null(),
-                &kSecGuestAttributeAudit,
-                &data.0,
-                1,
-                ptr::null(),
-                ptr::null(),
-            ));
-            if attrs.0.is_null() {
-                return None;
-            }
-            let mut code = ptr::null();
-            if SecCodeCopyGuestWithAttributes(ptr::null(), attrs.0, 0, &mut code) == 0
-                && !code.is_null()
-            {
-                let code = Owned(code);
-                if let Some(ref req_id) = verifier.require_code_signature_identifier {
-                    let req = format!("identifier \"{req_id}\"");
-                    if !satisfies(code.0, &req) {
-                        return None;
-                    }
-                    code_sig_verified = true;
-                } else {
-                    let mut static_code = ptr::null();
-                    if SecCodeCopyStaticCode(code.0, 0, &mut static_code) == 0
-                        && !static_code.is_null()
-                    {
-                        let static_code = Owned(static_code);
-                        let mut info = ptr::null();
-                        if SecCodeCopySigningInformation(static_code.0, 1 << 1, &mut info) == 0
-                            && !info.is_null()
-                        {
-                            let _info = Owned(info);
-                            code_sig_verified = true;
-                        }
-                    }
-                }
-            } else if verifier.require_code_signature_identifier.is_some() {
-                return None;
-            }
-        }
+        super::launchd_gateway::verify_hardened_peer_code(token, &verifier.expected_helper_cdhash).ok()?;
         // Re-check process token after file read & code check so no exec/race occurred
         if raw_process_token(pid)? != token {
             return None;
@@ -631,7 +712,7 @@ mod macos {
         Some(super::SandboxPeerIdentity {
             process: proc_id,
             helper_sha256: actual_sha,
-            code_signature_verified: code_sig_verified,
+            helper_cdhash: verifier.expected_helper_cdhash.clone(),
         })
     }
 
@@ -644,6 +725,7 @@ mod macos {
             || !local_addr.ip().is_loopback()
             || peer_addr.port() == 0
             || local_addr.port() == 0
+            || candidate_pids.len() > super::MAX_TCP_PEER_CANDIDATES
         {
             return None;
         }
@@ -658,12 +740,14 @@ mod macos {
             return None;
         }
         let mut matched_identities = Vec::new();
+        let mut remaining_fds = 32 * 1024;
         for pid in unique_pids {
-            if pid_owns_tcp_tuple(pid as i32, peer_addr, local_addr) {
+            if pid_owns_tcp_tuple(pid as i32, peer_addr, local_addr, &mut remaining_fds)? {
                 if let Some(identity) = inspect_process(pid) {
                     // Re-verify full 4-tuple ownership after capturing kernel audit token
-                    if pid_owns_tcp_tuple(pid as i32, peer_addr, local_addr) {
+                    if pid_owns_tcp_tuple(pid as i32, peer_addr, local_addr, &mut remaining_fds)? {
                         matched_identities.push(identity);
+                        if matched_identities.len() > 1 { return None; }
                     }
                 }
             }
@@ -940,7 +1024,8 @@ mod macos {
         pid: i32,
         expected_local: std::net::SocketAddr,
         expected_foreign: std::net::SocketAddr,
-    ) -> bool {
+        remaining_fds: &mut usize,
+    ) -> Option<bool> {
         let expected_lport_be = i32::from(expected_local.port().to_be());
         let expected_fport_be = i32::from(expected_foreign.port().to_be());
         unsafe {
@@ -952,10 +1037,14 @@ mod macos {
                 0,
             );
             if byte_capacity <= 0 {
-                return false;
+                return Some(false);
             }
             let fd_size = std::mem::size_of::<libc::proc_fdinfo>() as i32;
             let count = (byte_capacity / fd_size).max(16) as usize + 16;
+            // Refuse an incomplete attribution search; truncating the
+            // candidates could accept a tuple with ambiguous ownership.
+            if count > 8192 || count > *remaining_fds { return None; }
+            *remaining_fds -= count;
             let mut fds = vec![
                 libc::proc_fdinfo {
                     proc_fd: 0,
@@ -971,9 +1060,10 @@ mod macos {
                 (count * std::mem::size_of::<libc::proc_fdinfo>()) as i32,
             );
             if actual_bytes <= 0 {
-                return false;
+                return Some(false);
             }
             let actual_len = (actual_bytes / fd_size) as usize;
+            if actual_len >= count { return None; }
             let sock_info_size = std::mem::size_of::<SocketFdInfo>() as i32;
             for item in fds.iter().take(actual_len) {
                 if item.proc_fdtype != libc::PROX_FDTYPE_SOCKET as u32 {
@@ -1002,10 +1092,10 @@ mod macos {
                     && addr_bytes_match(ini.insi_vflag, &ini.insi_laddr, expected_local.ip())
                     && addr_bytes_match(ini.insi_vflag, &ini.insi_faddr, expected_foreign.ip())
                 {
-                    return true;
+                    return Some(true);
                 }
             }
-            false
+            Some(false)
         }
     }
 

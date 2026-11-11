@@ -6,6 +6,7 @@
 //! socket termination (`Blocked` / `已阻断`), while keeping interception active
 //! so traffic never falls back to direct routing.
 use crate::storage::StateStore;
+use crate::gateway_budget::{GatewayBudget, Slot, MAX_HTTP_BODY_BYTES, MAX_CHUNK_METADATA_BYTES};
 use claude_watch_core::{
     channel::{
         BoundProcessToken, ChannelEnforcementCommand, ChannelEnforcementReceipt,
@@ -95,6 +96,27 @@ impl Write for TunnelStream {
 }
 
 pub const DEFAULT_DISCONNECT_TIMEOUT_SECONDS: f64 = 3.0;
+const MAX_HTTP_HEADER_BYTES: usize = 16384;
+const REQUEST_IDLE: Duration = Duration::from_secs(2);
+const HEADER_DEADLINE: Duration = Duration::from_secs(5);
+const BODY_DEADLINE: Duration = Duration::from_secs(15);
+const RELAY_WRITE_IDLE: Duration = Duration::from_secs(30);
+
+struct RequestReader<'a> {
+    stream: &'a mut TunnelStream,
+    deadline: Instant,
+}
+impl Read for RequestReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let timeout = || std::io::Error::new(std::io::ErrorKind::TimedOut, "gateway request deadline");
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { return Err(timeout()); }
+        self.stream.set_read_timeout(Some(remaining.min(REQUEST_IDLE)))?;
+        let n = self.stream.read(buffer)?;
+        if Instant::now() >= self.deadline { return Err(timeout()); }
+        Ok(n)
+    }
+}
 
 pub trait ChannelEnforcer: Send + Sync {
     fn boot_id(&self) -> Result<String>;
@@ -159,6 +181,7 @@ struct ActiveSocketFlow {
     process: BoundProcessToken,
     client_stream: Option<TunnelStream>,
     upstream_stream: Option<TunnelStream>,
+    gateway_ingress: Option<TunnelStream>,
     aborted: Arc<AtomicBool>,
     close_requested_at: Option<f64>,
     close_reason: Option<String>,
@@ -241,10 +264,25 @@ struct EnforcerInner {
     strict_peer_verification: bool,
 }
 
+impl EnforcerInner {
+    // Call under the authority lock. A caller timestamp is only a fallback
+    // for explicit, clockless fixture timelines, never the live executor time.
+    fn execution_now(&self, fallback: impl FnOnce() -> f64) -> f64 {
+        self.clock.as_ref().map_or_else(fallback, |clock| clock())
+    }
+
+    fn seed_wall_clock(&mut self, now: f64) {
+        // Readiness updates may initialize the baseline, but must not erase
+        // the last checked sample before the watchdog can detect rollback.
+        self.last_wall_now.get_or_insert(now);
+    }
+}
+
 pub struct LocalTunnelEnforcer {
     inner: Arc<Mutex<EnforcerInner>>,
     receipt_publication: Arc<Mutex<ReceiptPublication>>,
     next_flow_id: Arc<AtomicU64>,
+    gateway_budget: Arc<GatewayBudget>,
     storage: Option<StateStore>,
 }
 
@@ -295,6 +333,7 @@ impl LocalTunnelEnforcer {
                 strict_peer_verification: false,
             })),
             next_flow_id: Arc::new(AtomicU64::new(1)),
+            gateway_budget: Arc::new(GatewayBudget::default()),
             receipt_publication: Arc::new(Mutex::new(ReceiptPublication::default())),
             storage,
         }
@@ -318,11 +357,12 @@ impl LocalTunnelEnforcer {
     /// that processes outside controlled launches are protected.
     pub fn configure_seatbelt_backend(&self, sandbox_ready: bool, now: f64) -> Result<String> {
         let mut guard = self.lock()?;
+        let now = guard.execution_now(|| now);
         guard.backend = NetworkBackendKind::Seatbelt;
         guard.sandbox_ready = sandbox_ready;
         guard.interception_active = sandbox_ready && guard.local_proxy_ready;
         guard.direct_fallback_blocked = sandbox_ready;
-        guard.last_wall_now = Some(now);
+        guard.seed_wall_clock(now);
         if sandbox_ready && guard.local_proxy_ready {
             guard.activation_error_code = None;
         } else if !sandbox_ready && guard.activation_error_code.is_none() {
@@ -341,11 +381,12 @@ impl LocalTunnelEnforcer {
     ) -> Result<bool> {
         let can_enable = report.can_enable_production_backend();
         let mut guard = self.lock()?;
+        let now = guard.execution_now(|| now);
         guard.backend = NetworkBackendKind::Seatbelt;
         guard.sandbox_ready = can_enable;
         guard.interception_active = can_enable && guard.local_proxy_ready;
         guard.direct_fallback_blocked = can_enable;
-        guard.last_wall_now = Some(now);
+        guard.seed_wall_clock(now);
         if can_enable && guard.local_proxy_ready {
             guard.activation_error_code = None;
         } else if !can_enable {
@@ -366,12 +407,13 @@ impl LocalTunnelEnforcer {
         if guard.strict_peer_verification {
             return Err(CoreError::new("fixture_activation_forbidden", "生产执行器必须使用受控启动与网关身份核验"));
         }
+        let now = guard.execution_now(|| now);
         guard.sandbox_ready = true;
         guard.local_proxy_ready = true;
         guard.interception_active = true;
         guard.direct_fallback_blocked = true;
         guard.activation_error_code = None;
-        guard.last_wall_now = Some(now);
+        guard.seed_wall_clock(now);
         Ok(guard.boot_id.clone())
     }
 
@@ -379,8 +421,9 @@ impl LocalTunnelEnforcer {
     /// Seatbelt controlled-instance readiness.
     pub fn set_local_proxy_ready(&self, ready: bool, now: f64) -> Result<()> {
         let mut guard = self.lock()?;
+        let now = guard.execution_now(|| now);
         guard.local_proxy_ready = ready;
-        guard.last_wall_now = Some(now);
+        guard.seed_wall_clock(now);
         if !ready {
             guard.gateway_endpoint_protection = None;
             guard.sandbox_ready = false;
@@ -411,10 +454,11 @@ impl LocalTunnelEnforcer {
         let mut emitted = Vec::new();
         {
             let mut guard = self.lock()?;
+            let now = guard.execution_now(|| now);
             guard.interception_active = false;
             guard.direct_fallback_blocked = false;
             guard.activation_error_code = Some(error_code.into());
-            guard.last_wall_now = Some(now);
+            guard.seed_wall_clock(now);
             if let Some(logger) = &guard.diagnostics {
                 logger.record(crate::channel_diagnostics::ChannelDiagnostic {
                     component: "channel_enforcer".into(), stage: "activation_failed".into(),
@@ -474,6 +518,8 @@ impl LocalTunnelEnforcer {
         Ok(())
     }
 
+    /// Supplies live wall time for executor operations. Sample it only while
+    /// holding the authority lock so watchdog and command samples are ordered.
     pub fn set_clock<F>(&self, clock: F) -> Result<()>
     where
         F: Fn() -> f64 + Send + Sync + 'static,
@@ -597,6 +643,7 @@ impl LocalTunnelEnforcer {
     /// shutdown of any active flows so no traffic bypasses verification.
     pub fn restart_executor(&self, new_boot_id: impl Into<String>, now: f64) -> Result<()> {
         let mut guard = self.lock()?;
+        let now = guard.execution_now(|| now);
         guard.boot_id = new_boot_id.into();
         guard.interception_active = true;
         guard.direct_fallback_blocked = true;
@@ -626,6 +673,7 @@ impl LocalTunnelEnforcer {
     pub fn mark_upstream_unhealthy(&self, now: f64) -> Result<Vec<String>> {
         let (closing_flows, receipts) = {
             let mut guard = self.lock()?;
+            let now = guard.execution_now(|| now);
             guard.upstream_healthy = false;
             let families: Vec<String> = guard.families.keys().cloned().collect();
             let mut closing_flows = Vec::new();
@@ -658,6 +706,7 @@ impl LocalTunnelEnforcer {
     pub fn revoke_family(&self, family: &str, reason: &str, now: f64) -> Result<Option<ChannelEnforcementReceipt>> {
         let receipt = {
             let mut guard = self.lock()?;
+            let now = guard.execution_now(|| now);
             if !guard.families.contains_key(family) {
                 return Ok(None);
             }
@@ -767,8 +816,15 @@ impl LocalTunnelEnforcer {
     /// disconnect timeout without confirmation, transitioning the family to
     /// `Failed` (`flow_termination_timeout`).
     pub fn check_disconnect_timeouts(&self, now: f64) -> Result<Vec<ChannelEnforcementReceipt>> {
+        self.check_disconnect_timeouts_with_clock(|| now)
+    }
+
+    fn check_disconnect_timeouts_with_clock(
+        &self, fallback: impl FnOnce() -> f64,
+    ) -> Result<Vec<ChannelEnforcementReceipt>> {
         let timed_out_receipts = {
             let mut guard = self.lock()?;
+            let now = guard.execution_now(fallback);
             let timeout = guard.disconnect_timeout_seconds;
             let families: Vec<String> = guard.families.keys().cloned().collect();
             let mut timed_out_receipts = Vec::new();
@@ -830,10 +886,16 @@ impl LocalTunnelEnforcer {
                 .as_deref()
                 .and_then(|s| s.parse::<SocketAddr>().ok());
             let mut allowed_snapshot = Vec::new();
-            for (fam, st) in &guard.families {
-                if let Some(cmd) = &st.command {
-                    for tok in &cmd.allowed_processes {
-                        allowed_snapshot.push((fam.clone(), tok.clone()));
+            if ctx_attributor.is_none() {
+                for (fam, st) in &guard.families {
+                    if let Some(cmd) = &st.command {
+                        if allowed_snapshot.len().saturating_add(cmd.allowed_processes.len())
+                            > claude_watch_system::MAX_TCP_PEER_CANDIDATES {
+                            return Err(CoreError::new("gateway_lookup_capacity", "网关核验候选已达上限"));
+                        }
+                        for tok in &cmd.allowed_processes {
+                            allowed_snapshot.push((fam.clone(), tok.clone()));
+                        }
                     }
                 }
             }
@@ -1077,6 +1139,7 @@ impl LocalTunnelEnforcer {
         let addr = protection.as_ref().map(|proof| proof.endpoint()).unwrap_or(bound_addr);
         {
             let mut guard = self.lock()?;
+            let now = guard.execution_now(|| now);
             guard.local_proxy_ready = true;
             guard.gateway_endpoint_protection = protection;
             // A listener alone cannot prove that clients entered the controlled sandbox.
@@ -1089,7 +1152,7 @@ impl LocalTunnelEnforcer {
             };
             guard.require_upstream_connect_handshake = true;
             guard.local_listener_addr = Some(addr.to_string());
-            guard.last_wall_now = Some(now);
+            guard.seed_wall_clock(now);
         }
         let enforcer = Arc::clone(self);
         let handle = thread::Builder::new()
@@ -1102,11 +1165,23 @@ impl LocalTunnelEnforcer {
                                 let _ = incoming.shutdown(Shutdown::Both);
                                 continue;
                             }
-                            let _ = incoming.set_nonblocking(false);
+                            let Some(slot) = enforcer.gateway_budget.connection() else {
+                                let _ = incoming.shutdown(Shutdown::Both);
+                                enforcer.ingress_diagnostic("gateway_admission_capacity");
+                                continue;
+                            };
+                            if incoming.set_nonblocking(false).is_err() {
+                                let _ = incoming.shutdown(Shutdown::Both);
+                                enforcer.ingress_diagnostic("gateway_socket_mode_failed");
+                                continue;
+                            }
                             let enf = Arc::clone(&enforcer);
-                            thread::spawn(move || {
-                                Self::serve_gateway_connection(enf, TunnelStream::Tcp(incoming), Some(peer_addr));
-                            });
+                            if thread::Builder::new().name("channel-gateway-client".into()).spawn(move || {
+                                Self::serve_gateway_connection(enf, TunnelStream::Tcp(incoming), Some(peer_addr), slot);
+                            }).is_err() {
+                                // Dropping the unscheduled closure closes the socket and returns the slot.
+                                enforcer.ingress_diagnostic("gateway_client_worker_failed");
+                            }
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(25));
@@ -1132,13 +1207,30 @@ impl LocalTunnelEnforcer {
     fn read_chunked_http_body<R: Read>(
         reader: &mut R,
         max_bytes: usize,
+        mut reservation: Option<&mut Slot>,
     ) -> std::result::Result<Vec<u8>, &'static str> {
         // Bound payload and framing separately: many tiny chunks with long extensions must
         // not turn the payload limit into an unbounded allocation of raw wire bytes.
-        const MAX_CHUNK_METADATA_BYTES: usize = 64 * 1024;
         let mut total_bytes = 0usize;
         let mut metadata_bytes = 0usize;
+        let limit = max_bytes.checked_add(MAX_CHUNK_METADATA_BYTES).ok_or("too_large")?;
         let mut raw_chunked_payload = Vec::new();
+        let mut reserve = |buf: &mut Vec<u8>, extra: usize| {
+            let needed = buf.len().checked_add(extra).ok_or("too_large")?;
+            if needed > limit { return Err("too_large"); }
+            if needed <= buf.capacity() { return Ok(()); }
+            let suggested = needed.max(buf.capacity().max(128).saturating_mul(2)).min(limit);
+            let capacity = if let Some(slot) = reservation.as_deref_mut() {
+                if slot.grow_body_to(suggested) { suggested }
+                else if slot.grow_body_to(needed) { needed }
+                else { return Err("gateway_body_capacity"); }
+            } else { suggested };
+            buf.try_reserve_exact(capacity - buf.len()).map_err(|_| "gateway_body_capacity")?;
+            if let Some(slot) = reservation.as_deref_mut() {
+                if !slot.grow_body_to(buf.capacity()) { return Err("gateway_body_capacity"); }
+            }
+            Ok(())
+        };
         loop {
             let mut line = Vec::new();
             let mut b = [0u8; 1];
@@ -1160,6 +1252,7 @@ impl LocalTunnelEnforcer {
             if metadata_bytes > MAX_CHUNK_METADATA_BYTES {
                 return Err("too_large");
             }
+            reserve(&mut raw_chunked_payload, line.len())?;
             raw_chunked_payload.extend_from_slice(&line);
             let line_str = std::str::from_utf8(&line[..line.len() - 2])
                 .map_err(|_| "invalid_chunk_header_encoding")?;
@@ -1219,6 +1312,7 @@ impl LocalTunnelEnforcer {
                 if metadata_bytes > MAX_CHUNK_METADATA_BYTES {
                     return Err("too_large");
                 }
+                reserve(&mut raw_chunked_payload, trailer.len())?;
                 raw_chunked_payload.extend_from_slice(&trailer);
                 break;
             }
@@ -1230,11 +1324,12 @@ impl LocalTunnelEnforcer {
             if metadata_bytes > MAX_CHUNK_METADATA_BYTES {
                 return Err("too_large");
             }
-            let mut chunk_data = vec![0u8; chunk_size];
+            let offset = raw_chunked_payload.len();
+            reserve(&mut raw_chunked_payload, chunk_size.checked_add(2).ok_or("too_large")?)?;
+            raw_chunked_payload.resize(offset + chunk_size, 0);
             reader
-                .read_exact(&mut chunk_data)
+                .read_exact(&mut raw_chunked_payload[offset..])
                 .map_err(|_| "incomplete_chunk_data")?;
-            raw_chunked_payload.extend_from_slice(&chunk_data);
             let mut crlf = [0u8; 2];
             reader
                 .read_exact(&mut crlf)
@@ -1247,21 +1342,84 @@ impl LocalTunnelEnforcer {
         Ok(raw_chunked_payload)
     }
 
-    fn serve_gateway_connection(enf: Arc<Self>, mut incoming: TunnelStream, peer_addr: Option<SocketAddr>) {
-        const MAX_HTTP_HEADER_BYTES: usize = 16384;
-        const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
+    fn ingress_diagnostic(&self, reason: &str) {
+        if !self.gateway_budget.diagnostic_allowed() { return; }
+        if let Ok(g) = self.lock() {
+            if let Some(logger) = &g.diagnostics {
+                logger.record(crate::channel_diagnostics::ChannelDiagnostic {
+                    component: "channel_enforcer".into(), stage: "gateway_ingress_denied".into(),
+                    executor_boot_id: Some(g.boot_id.clone()), reason_code: Some(reason.into()),
+                    ..Default::default()
+                }, g.execution_now(crate::native::now));
+            }
+        }
+    }
 
+    fn gateway_attribution(&self, peer: Option<SocketAddr>) -> Result<(String, BoundProcessToken)> {
+        let peer = peer.ok_or_else(|| CoreError::new("unverified_peer_socket_identity", "未核验来源进程身份"))?;
+        let _lookup = self.gateway_budget.lookup().ok_or_else(||
+            CoreError::new("gateway_lookup_capacity", "网关来源核验已达并发上限"))?;
+        self.resolve_peer_socket_identity(peer)
+    }
+
+    fn deny_gateway_request(&self, incoming: &mut TunnelStream, reason: &str, capacity: bool) {
+        self.ingress_diagnostic(reason);
+        let _ = incoming.write_all(if capacity {
+            b"HTTP/1.1 503 Service Unavailable (Gateway Capacity)\r\n\r\n"
+        } else {
+            b"HTTP/1.1 403 Forbidden (Unverified Process Identity)\r\n\r\n"
+        });
+        let _ = incoming.shutdown(Shutdown::Both);
+    }
+
+    fn relay_gateway_client(&self, incoming: &mut TunnelStream, tunnel: &mut TunnelStream) {
+        let worker = (|| {
+            let mut client_read = incoming.try_clone()?;
+            let mut tunnel_write = tunnel.try_clone()?;
+            thread::Builder::new().name("channel-gateway-copy".into()).spawn(move || {
+                let _ = std::io::copy(&mut client_read, &mut tunnel_write);
+                let _ = tunnel_write.shutdown(Shutdown::Both);
+            })
+        })();
+        if let Ok(worker) = worker {
+            let _ = std::io::copy(tunnel, incoming);
+            let _ = incoming.shutdown(Shutdown::Both);
+            let _ = worker.join();
+        } else {
+            self.ingress_diagnostic("gateway_copy_worker_failed");
+            let _ = incoming.shutdown(Shutdown::Both);
+            let _ = tunnel.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn serve_gateway_connection(enf: Arc<Self>, mut incoming: TunnelStream, peer_addr: Option<SocketAddr>, mut slot: Slot) {
         // Only the kernel-attributed controlled instance can authorize this loopback flow.
         // Client headers never supply process identity or command authority.
+        // Release the unattributed slot before any client-controlled read. An
+        // incomplete request cannot indefinitely occupy the attribution pool.
+        if peer_addr.is_some() {
+            let _ = incoming.set_write_timeout(Some(REQUEST_IDLE));
+            match enf.gateway_attribution(peer_addr) {
+                Ok((_, token)) if slot.bind(&token) => {}
+                Ok(_) => {
+                    enf.deny_gateway_request(&mut incoming, "gateway_source_capacity_or_changed", true);
+                    return;
+                }
+                Err(error) => {
+                    enf.deny_gateway_request(&mut incoming, &error.code, error.code == "gateway_lookup_capacity");
+                    return;
+                }
+            }
+        }
         let mut bound_keepalive_authority: Option<String> = None;
         loop {
-            let _ = incoming.set_read_timeout(Some(Duration::from_secs(2)));
-            let _ = incoming.set_write_timeout(Some(Duration::from_secs(2)));
+            let _ = incoming.set_write_timeout(Some(REQUEST_IDLE));
             let mut req_buf = Vec::with_capacity(512);
             let mut byte = [0u8; 1];
             let mut header_complete = false;
+            let mut reader = RequestReader { stream: &mut incoming, deadline: Instant::now() + HEADER_DEADLINE };
             while req_buf.len() < MAX_HTTP_HEADER_BYTES {
-                match incoming.read(&mut byte) {
+                match reader.read(&mut byte) {
                     Ok(0) => break,
                     Ok(_) => {
                         req_buf.push(byte[0]);
@@ -1271,6 +1429,7 @@ impl LocalTunnelEnforcer {
                         }
                     }
                     Err(_) => {
+                        enf.ingress_diagnostic("gateway_header_read_failed");
                         let _ = incoming.shutdown(Shutdown::Both);
                         return;
                     }
@@ -1530,9 +1689,31 @@ impl LocalTunnelEnforcer {
                 bound_keepalive_authority = Some(target_dest.clone());
             }
 
+            let (family, proc_token) = match enf.gateway_attribution(peer_addr) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    enf.deny_gateway_request(&mut incoming, &error.code, error.code == "gateway_lookup_capacity");
+                    return;
+                }
+            };
+            if !slot.bind(&proc_token) {
+                enf.deny_gateway_request(&mut incoming, "gateway_source_capacity_or_changed", true);
+                return;
+            }
+            // For chunked requests the size is learned as each chunk arrives.
+            // Charge capacity before allocating it, without reserving 16 MiB per small upload.
+            let Some(mut body_slot) = slot.body(content_length) else {
+                enf.deny_gateway_request(&mut incoming, "gateway_body_capacity", true);
+                return;
+            };
+            let mut reader = RequestReader { stream: &mut incoming, deadline: Instant::now() + BODY_DEADLINE };
             let req_body = if is_chunked {
-                match Self::read_chunked_http_body(&mut incoming, MAX_HTTP_BODY_BYTES) {
+                match Self::read_chunked_http_body(&mut reader, MAX_HTTP_BODY_BYTES, Some(&mut body_slot)) {
                     Ok(b) => b,
+                    Err("gateway_body_capacity") => {
+                        enf.deny_gateway_request(&mut incoming, "gateway_body_capacity", true);
+                        return;
+                    }
                     Err("too_large") => {
                         let _ = incoming.write_all(
                             b"HTTP/1.1 413 Payload Too Large\r\n\r\n",
@@ -1550,7 +1731,7 @@ impl LocalTunnelEnforcer {
                 }
             } else {
                 let mut b = vec![0u8; content_length];
-                if content_length > 0 && incoming.read_exact(&mut b).is_err() {
+                if content_length > 0 && reader.read_exact(&mut b).is_err() {
                     let _ = incoming.write_all(
                         b"HTTP/1.1 400 Bad Request (Incomplete Request Body)\r\n\r\n",
                     );
@@ -1560,35 +1741,46 @@ impl LocalTunnelEnforcer {
                 b
             };
 
-            let resolved_identity = peer_addr.and_then(|peer| enf.resolve_peer_socket_identity(peer).ok());
-            let Ok((family, proc_token)) = resolved_identity.ok_or_else(|| {
-                CoreError::new("unverified_peer_socket_identity", "未核验来源进程身份")
-            }) else {
-                let _ = incoming.write_all(
-                    b"HTTP/1.1 403 Forbidden (Unverified Process Identity)\r\n\r\n",
-                );
-                let _ = incoming.shutdown(Shutdown::Both);
-                return;
-            };
-            let now = enf
-                .lock()
-                .ok()
-                .and_then(|g| g.clock.as_ref().map(|c| c()))
-                .unwrap_or_else(crate::native::now);
-
-            match enf.connect_supervised_tcp_to_with_handshake(
+            // Retain the post-body live tuple check; a long read cannot make
+            // an early attribution authoritative after the peer changes.
+            if is_chunked || content_length != 0 {
+                match enf.gateway_attribution(peer_addr) {
+                    Ok((f, p)) if f == family && p == proc_token => {}
+                    Err(e) if e.code == "gateway_lookup_capacity" => {
+                        enf.deny_gateway_request(&mut incoming, &e.code, true);
+                        return;
+                    }
+                    _ => {
+                        enf.deny_gateway_request(&mut incoming, "gateway_peer_changed_during_request", false);
+                        return;
+                    }
+                }
+            }
+            match enf.connect_supervised_tcp_with_clock(
                 &family,
                 &proc_token,
                 &target_dest,
                 Some(is_connect),
-                now,
+                Some(&incoming),
+                crate::native::now,
             ) {
                 Ok((_flow_id, mut tunnel_stream)) => {
-                    let _ = incoming.set_read_timeout(None);
-                    let _ = incoming.set_write_timeout(None);
+                    // No total request-read deadline applies to an established
+                    // relay. Bound stalled response writes independently of
+                    // revocation, which shuts down the actual ingress socket.
+                    if incoming.set_read_timeout(None).is_err()
+                        || incoming.set_write_timeout(Some(RELAY_WRITE_IDLE)).is_err()
+                    {
+                        enf.ingress_diagnostic("gateway_relay_socket_mode_failed");
+                        let _ = incoming.shutdown(Shutdown::Both);
+                        let _ = tunnel_stream.shutdown(Shutdown::Both);
+                        return;
+                    }
                     let _ = tunnel_stream.set_read_timeout(None);
                     let _ = tunnel_stream.set_write_timeout(None);
                     if is_connect {
+                        drop(req_body);
+                        drop(body_slot);
                         if incoming
                             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                             .and_then(|_| incoming.flush())
@@ -1598,19 +1790,7 @@ impl LocalTunnelEnforcer {
                             let _ = tunnel_stream.shutdown(Shutdown::Both);
                             return;
                         }
-                        let Ok(mut in_clone) = incoming.try_clone() else {
-                            return;
-                        };
-                        let Ok(mut tun_clone) = tunnel_stream.try_clone() else {
-                            return;
-                        };
-                        let t1 = thread::spawn(move || {
-                            let _ = std::io::copy(&mut in_clone, &mut tun_clone);
-                            let _ = tun_clone.shutdown(Shutdown::Both);
-                        });
-                        let _ = std::io::copy(&mut tunnel_stream, &mut incoming);
-                        let _ = incoming.shutdown(Shutdown::Both);
-                        let _ = t1.join();
+                        enf.relay_gateway_client(&mut incoming, &mut tunnel_stream);
                         return;
                     } else if upgrade_websocket && connection_upgrade {
                         // This is an HTTP proxy, not a WebSocket endpoint: validate the HTTP
@@ -1626,6 +1806,8 @@ impl LocalTunnelEnforcer {
                             let _ = tunnel_stream.shutdown(Shutdown::Both);
                             return;
                         }
+                        drop(req_body);
+                        drop(body_slot);
                         let _ = tunnel_stream.set_read_timeout(Some(Duration::from_secs(2)));
                         let mut resp_hdr = Vec::with_capacity(256);
                         let mut b = [0u8; 1];
@@ -1687,19 +1869,7 @@ impl LocalTunnelEnforcer {
                             let _ = tunnel_stream.shutdown(Shutdown::Both);
                             return;
                         }
-                        let Ok(mut in_clone) = incoming.try_clone() else {
-                            return;
-                        };
-                        let Ok(mut tun_clone) = tunnel_stream.try_clone() else {
-                            return;
-                        };
-                        let t1 = thread::spawn(move || {
-                            let _ = std::io::copy(&mut in_clone, &mut tun_clone);
-                            let _ = tun_clone.shutdown(Shutdown::Both);
-                        });
-                        let _ = std::io::copy(&mut tunnel_stream, &mut incoming);
-                        let _ = incoming.shutdown(Shutdown::Both);
-                        let _ = t1.join();
+                        enf.relay_gateway_client(&mut incoming, &mut tunnel_stream);
                         return;
                     } else {
                         // Ordinary HTTP request (`GET`, `POST`, etc.): rewrite Connection: close
@@ -1735,6 +1905,8 @@ impl LocalTunnelEnforcer {
                             let _ = tunnel_stream.shutdown(Shutdown::Both);
                             return;
                         }
+                        drop(req_body);
+                        drop(body_slot);
                         let _ = std::io::copy(&mut tunnel_stream, &mut incoming);
                         let _ = incoming.flush();
                         let _ = tunnel_stream.shutdown(Shutdown::Both);
@@ -1743,6 +1915,10 @@ impl LocalTunnelEnforcer {
                             return;
                         }
                     }
+                }
+                Err(error) if error.code == "gateway_flow_capacity" => {
+                    enf.deny_gateway_request(&mut incoming, &error.code, true);
+                    return;
                 }
                 Err(_) => {
                     let _ = incoming.write_all(
@@ -1983,8 +2159,15 @@ impl LocalTunnelEnforcer {
         handshake_override: Option<bool>,
         now: f64,
     ) -> Result<(String, TunnelStream)> {
+        self.connect_supervised_tcp_with_clock(family, process, target_destination, handshake_override, None, || now)
+    }
+
+    fn connect_supervised_tcp_with_clock(
+        &self, family: &str, process: &BoundProcessToken, target_destination: &str,
+        handshake_override: Option<bool>, gateway_ingress: Option<&TunnelStream>, fallback: impl Fn() -> f64,
+    ) -> Result<(String, TunnelStream)> {
         let flow_id = format!("flow-{}-{}", family, self.next_flow_id.fetch_add(1, Ordering::Relaxed));
-        let result = self.connect_supervised_tcp_to_inner(family, process, target_destination, handshake_override, now, flow_id.clone());
+        let result = self.connect_supervised_tcp_to_inner(family, process, target_destination, handshake_override, gateway_ingress, &fallback, flow_id.clone());
         if let Err(error) = &result {
             if let Ok(guard) = self.lock() {
                 if let Some(logger) = &guard.diagnostics {
@@ -1998,7 +2181,7 @@ impl LocalTunnelEnforcer {
                         permit_generation: trace.map(|t| t.permit_generation), command_seq: trace.map(|t| t.command_seq),
                         pid: Some(process.pid), failure: Some(DiagnosticFailure::from_error(error)),
                         ..Default::default()
-                    }, guard.clock.as_ref().map(|clock| clock()).unwrap_or(now));
+                    }, guard.execution_now(&fallback));
                 }
             }
         }
@@ -2007,7 +2190,7 @@ impl LocalTunnelEnforcer {
 
     fn connect_supervised_tcp_to_inner(
         &self, family: &str, process: &BoundProcessToken, target_destination: &str,
-        handshake_override: Option<bool>, now: f64, flow_id: String,
+        handshake_override: Option<bool>, gateway_ingress: Option<&TunnelStream>, fallback: impl FnOnce() -> f64, flow_id: String,
     ) -> Result<(String, TunnelStream)> {
         if target_destination.ends_with(":53") || target_destination.ends_with(":853") {
             let _ = self.record_blocked_protocol_attempt(
@@ -2015,7 +2198,7 @@ impl LocalTunnelEnforcer {
                 process,
                 "direct_dns_blocked",
                 format!("已拦截并阻断直连 DNS 端口访问（{target_destination}）"),
-                now,
+                fallback(),
             );
             return Err(CoreError::new(
                 "direct_dns_blocked",
@@ -2024,6 +2207,7 @@ impl LocalTunnelEnforcer {
         }
 
         let (
+            dial_checked_at,
             dial_session_id,
             dial_policy_version,
             dial_permit_generation,
@@ -2035,6 +2219,7 @@ impl LocalTunnelEnforcer {
             defer_confirm,
         ) = {
             let mut guard = self.lock()?;
+            let now = guard.execution_now(fallback);
             let defer_confirm = guard.defer_auto_flow_confirm;
             let upstream_connector = guard.upstream_connector.clone();
             let require_connect_handshake =
@@ -2137,6 +2322,7 @@ impl LocalTunnelEnforcer {
                 now,
             );
             (
+                now,
                 cmd.session_id.clone(),
                 cmd.policy_version.clone(),
                 cmd.permit_generation,
@@ -2149,6 +2335,8 @@ impl LocalTunnelEnforcer {
             )
         };
 
+        let flow_slot = Arc::new(self.gateway_budget.flow(process).ok_or_else(||
+            CoreError::new("gateway_flow_capacity", "网关转发已达并发上限"))?);
         let dial_started_at = Instant::now();
         if let Some(hook) = on_dial_hook {
             hook(family);
@@ -2244,20 +2432,14 @@ impl LocalTunnelEnforcer {
         let upstream_for_state = upstream_stream
             .try_clone()
             .map_err(|_| CoreError::new("socket_clone_failed", "上游句柄复制失败"))?;
+        let gateway_ingress = gateway_ingress.map(TunnelStream::try_clone).transpose()
+            .map_err(|_| CoreError::new("socket_clone_failed", "入口套接字句柄复制失败"))?;
 
         {
             let mut guard = self.lock()?;
-            // Requirement 4 (修正实际取时位置): Re-read current time AFTER dialing
-            // completes rather than trusting pre-dial `now` or cached `last_wall_now`!
-            let dial_elapsed = dial_started_at.elapsed().as_secs_f64();
-            let clock_now = guard
-                .clock
-                .as_ref()
-                .map(|c| c())
-                .unwrap_or(now + dial_elapsed);
-            let post_dial_now = clock_now
-                .max(now + dial_elapsed)
-                .max(guard.last_wall_now.unwrap_or(now));
+            // Use the actual post-dial wall time. A backwards sample is
+            // evidence to reject, not something to clamp to a prior time.
+            let post_dial_now = guard.execution_now(|| dial_checked_at + dial_started_at.elapsed().as_secs_f64());
             let interception_ok = guard.interception_active && guard.direct_fallback_blocked
                 && guard.sandbox_ready;
             let upstream_ok = guard.upstream_healthy;
@@ -2282,13 +2464,15 @@ impl LocalTunnelEnforcer {
                 ));
             };
             let active_policy = cmd.policy_version.clone();
-            let (post_eff_state, post_reason) = cmd.permit.effective_state_with_vpn_epoch(
-                post_dial_now,
-                last_wall,
-                false,
-                &active_policy,
-                dial_vpn_epoch.as_ref(),
-            );
+            let (post_eff_state, post_reason) = if post_dial_now
+                + claude_watch_core::channel::CLOCK_ROLLBACK_TOLERANCE_SECONDS < dial_checked_at
+            {
+                (ChannelPermitState::Revoked, "clock_rollback_detected")
+            } else {
+                cmd.permit.effective_state_with_vpn_epoch(
+                    post_dial_now, last_wall, false, &active_policy, dial_vpn_epoch.as_ref(),
+                )
+            };
             let dial_invariant_ok = interception_ok
                 && upstream_ok
                 && state.enforcement_state == ChannelEnforcementState::Forwarding
@@ -2339,6 +2523,7 @@ impl LocalTunnelEnforcer {
                     process: process.clone(),
                     client_stream: Some(client_for_state),
                     upstream_stream: Some(upstream_for_state),
+                    gateway_ingress,
                     aborted: aborted.clone(),
                     close_requested_at: None,
                     close_reason: None,
@@ -2361,15 +2546,28 @@ impl LocalTunnelEnforcer {
             );
         }
 
-        self.spawn_relay_workers(
+        if let Err(error) = self.spawn_relay_workers(
             family.to_string(),
             flow_id.clone(),
             process.clone(),
             enforcer_client_stream,
             upstream_stream,
-            aborted,
+            aborted.clone(),
             defer_confirm,
-        )?;
+            flow_slot,
+        ) {
+            aborted.store(true, Ordering::Release);
+            let _ = client_side.shutdown(Shutdown::Both);
+            if let Ok(mut guard) = self.lock() {
+                if let Some(flow) = guard.families.get_mut(family)
+                    .and_then(|state| state.active_flows.remove(&flow_id))
+                {
+                    if let Some(socket) = flow.client_stream { let _ = socket.shutdown(Shutdown::Both); }
+                    if let Some(socket) = flow.upstream_stream { let _ = socket.shutdown(Shutdown::Both); }
+                }
+            }
+            return Err(error);
+        }
 
         Ok((flow_id, client_side))
     }
@@ -2398,11 +2596,10 @@ impl LocalTunnelEnforcer {
             .name("channel-lease-watchdog".into())
             .spawn(move || {
                 while !stop.load(Ordering::Acquire) {
-                    let now = clock();
                     let mut emitted = enforcer
-                        .enforce_active_deadlines(now, false)
+                        .enforce_active_deadlines_with_clock(&mut clock, false)
                         .unwrap_or_default();
-                    if let Ok(mut timeouts) = enforcer.check_disconnect_timeouts(now) {
+                    if let Ok(mut timeouts) = enforcer.check_disconnect_timeouts_with_clock(&mut clock) {
                         emitted.append(&mut timeouts);
                     }
                     if !emitted.is_empty() {
@@ -2423,6 +2620,7 @@ impl LocalTunnelEnforcer {
         mut upstream_read: TunnelStream,
         aborted: Arc<AtomicBool>,
         defer_confirm: bool,
+        flow_slot: Arc<Slot>,
     ) -> Result<()> {
         let mut upstream_write = upstream_read
             .try_clone()
@@ -2437,7 +2635,9 @@ impl LocalTunnelEnforcer {
         let aborted_c2u = aborted.clone();
         let proc_c2u = process.clone();
 
-        let c2u = thread::spawn(move || {
+        let upload_slot = flow_slot.clone();
+        let c2u = thread::Builder::new().name("channel-relay-upload".into()).spawn(move || {
+            let _slot = upload_slot;
             let mut buf = [0u8; 4096];
             loop {
                 if aborted_c2u.load(Ordering::Acquire) {
@@ -2478,12 +2678,13 @@ impl LocalTunnelEnforcer {
                 }
             }
             let _ = upstream_write.shutdown(Shutdown::Both);
-        });
+        }).map_err(|_| CoreError::new("gateway_relay_worker_failed", "网关发送线程无法启动"))?;
 
         let inner_done = self.inner.clone();
         let storage_done = self.storage.clone();
         let publication_done = self.receipt_publication.clone();
-        thread::spawn(move || {
+        thread::Builder::new().name("channel-relay-download".into()).spawn(move || {
+            let _slot = flow_slot;
             let mut buf = [0u8; 4096];
             loop {
                 if aborted.load(Ordering::Acquire) {
@@ -2507,9 +2708,7 @@ impl LocalTunnelEnforcer {
                 let maybe_receipt = if let Ok(mut guard) = inner_done.lock() {
                     let clock_now = guard.clock.as_ref().map(|c| c());
                     let r = if let Some(state) = guard.families.get_mut(&family) {
-                        let now = clock_now
-                            .unwrap_or(state.last_updated_at)
-                            .max(state.last_updated_at);
+                        let now = clock_now.unwrap_or(state.last_updated_at);
                         state.last_updated_at = now;
                         if let Some(removed) = state.active_flows.remove(&flow_id) {
                             state.terminated_flows_count =
@@ -2553,7 +2752,7 @@ impl LocalTunnelEnforcer {
                     );
                 }
             }
-        });
+        }).map_err(|_| CoreError::new("gateway_relay_worker_failed", "网关接收线程无法启动"))?;
 
         Ok(())
     }
@@ -2592,6 +2791,9 @@ impl LocalTunnelEnforcer {
                 let _ = stream.shutdown(Shutdown::Both);
             }
             if let Some(stream) = flow.upstream_stream.as_ref() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            if let Some(stream) = flow.gateway_ingress.as_ref() {
                 let _ = stream.shutdown(Shutdown::Both);
             }
             trace_items.push((id.clone(), flow.process.pid, flow.process.role));
@@ -2962,12 +3164,16 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
                 }
             }
 
-            if let Some(prev_wall) = guard.last_wall_now {
-                if now + claude_watch_core::channel::CLOCK_ROLLBACK_TOLERANCE_SECONDS < prev_wall {
-                    let families: Vec<String> = guard.families.keys().cloned().collect();
-                    for fam in families {
-                        Self::begin_autonomous_revoke_locked(&mut guard, &fam, "clock_rollback_detected", now);
-                    }
+            // The command's issued_at and valid_until remain immutable. Only
+            // this execution sample can be compared with the watchdog's.
+            let now = guard.execution_now(|| now);
+            let clock_rolled_back = guard.last_wall_now.is_some_and(|prev_wall|
+                now + claude_watch_core::channel::CLOCK_ROLLBACK_TOLERANCE_SECONDS < prev_wall);
+            if clock_rolled_back {
+                let others: Vec<String> = guard.families.keys()
+                    .filter(|family| *family != &command.family).cloned().collect();
+                for family in others {
+                    Self::begin_autonomous_revoke_locked(&mut guard, &family, "clock_rollback_detected", now);
                 }
             }
             guard.last_wall_now = Some(now);
@@ -3009,13 +3215,24 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
             let (effective_state, effective_reason) = command
                 .permit
                 .effective_state_with_clock(now, None, false, &command.policy_version);
+            let revocation_reason = if command.permit.state == ChannelPermitState::Revoked {
+                command.permit.reason_code.as_str()
+            } else {
+                effective_reason
+            };
 
             let activation_error = guard
                 .activation_error_code
                 .clone()
                 .unwrap_or_else(|| "interception_inactive_direct_leak_risk".into());
 
-            if !interception_active {
+            if clock_rolled_back {
+                if command.permit.state == ChannelPermitState::Revoked {
+                    Self::begin_revoke_locked(&mut guard, &command.family, "clock_rollback_detected", now);
+                } else {
+                    Self::begin_autonomous_revoke_locked(&mut guard, &command.family, "clock_rollback_detected", now);
+                }
+            } else if !interception_active {
                 if let Some(state) = guard.families.get_mut(&command.family) {
                     state.enforcement_state = ChannelEnforcementState::Failed;
                     state.last_error_code = Some(activation_error);
@@ -3031,6 +3248,10 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
                     "tag_upstream_unhealthy",
                     now,
                 );
+            } else if command.permit.state == ChannelPermitState::Permitted
+                && effective_state == ChannelPermitState::Revoked
+            {
+                Self::begin_autonomous_revoke_locked(&mut guard, &command.family, effective_reason, now);
             } else if policy_changed || session_changed {
                 // Any active flows from a previous policy or previous session must
                 // be closed before the new state can be considered clean.
@@ -3047,7 +3268,7 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
                         state.last_error_code = None;
                     }
                 } else {
-                    Self::begin_revoke_locked(&mut guard, &command.family, effective_reason, now);
+                    Self::begin_revoke_locked(&mut guard, &command.family, revocation_reason, now);
                 }
             } else {
                 match effective_state {
@@ -3076,7 +3297,7 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
                         Self::begin_revoke_locked(
                             &mut guard,
                             &command.family,
-                            &command.permit.reason_code.clone(),
+                            revocation_reason,
                             now,
                         );
                     }
@@ -3115,8 +3336,26 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
         now: f64,
         woke_from_sleep: bool,
     ) -> Result<Vec<ChannelEnforcementReceipt>> {
+        self.enforce_active_deadlines_with_clock(|| now, woke_from_sleep)
+    }
+
+    fn local_proxy_port(&self) -> Option<u16> {
+        let guard = self.lock().ok()?;
+        guard.local_listener_addr.as_ref().and_then(|addr| {
+            addr.split(':').last()?.parse::<u16>().ok()
+        })
+    }
+}
+
+impl LocalTunnelEnforcer {
+    fn enforce_active_deadlines_with_clock(
+        &self,
+        fallback: impl FnOnce() -> f64,
+        woke_from_sleep: bool,
+    ) -> Result<Vec<ChannelEnforcementReceipt>> {
         let updated = {
             let mut guard = self.lock()?;
+            let now = guard.execution_now(fallback);
             let last_wall = guard.last_wall_now;
             guard.last_wall_now = Some(now);
             let families: Vec<String> = guard.families.keys().cloned().collect();
@@ -3149,13 +3388,6 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
             updated
         };
         updated.iter().map(|r| self.publish_current_receipt(r)).collect()
-    }
-
-    fn local_proxy_port(&self) -> Option<u16> {
-        let guard = self.lock().ok()?;
-        guard.local_listener_addr.as_ref().and_then(|addr| {
-            addr.split(':').last()?.parse::<u16>().ok()
-        })
     }
 }
 
@@ -3236,6 +3468,140 @@ mod control_rpc_contracts {
                 baseline_ip: Some("1.1.1.1".into()), members: vec![],
                 backend: NetworkBackendKind::Seatbelt, vpn_epoch: None, coverage_scope: None,
             },
+        }
+    }
+
+    fn clock_fixture() -> (Arc<LocalTunnelEnforcer>, Arc<AtomicU64>) {
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("publication-boot", None));
+        enforcer.activate_interception(100.).unwrap();
+        let millis = Arc::new(AtomicU64::new(100_000));
+        let read_clock = millis.clone();
+        enforcer
+            .set_clock(move || read_clock.load(Ordering::Acquire) as f64 / 1000.)
+            .unwrap();
+        (enforcer, millis)
+    }
+
+    fn open_clock_fixture_flow(
+        enforcer: &LocalTunnelEnforcer,
+        command: &ChannelEnforcementCommand,
+    ) -> (TunnelStream, UnixStream) {
+        let (upstream, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let upstream = Mutex::new(Some(upstream));
+        enforcer
+            .set_upstream_connector(move |_| Ok(TunnelStream::Unix(upstream.lock().unwrap().take().unwrap())))
+            .unwrap();
+        let (_, client) = enforcer
+            .connect_supervised_tcp(&command.family, &command.allowed_processes[0], 100.)
+            .unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        (client, peer)
+    }
+
+    fn check_same_socket(client: &mut TunnelStream, peer: &mut UnixStream, data: u8) {
+        let mut byte = [0];
+        client.write_all(&[data]).unwrap();
+        peer.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [data]);
+        peer.write_all(&byte).unwrap();
+        client.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [data]);
+    }
+
+    #[test]
+    fn delayed_command_after_watchdog_preserves_other_live_channel() {
+        use std::sync::mpsc;
+
+        let (enforcer, clock) = clock_fixture();
+        let claude = publication_command();
+        let mut openai = publication_command();
+        openai.family = "openai".into();
+        openai.permit.family = openai.family.clone();
+        enforcer.apply_command(&claude, 100.).unwrap();
+        enforcer.apply_command(&openai, 100.).unwrap();
+        let (mut client, mut peer) = open_clock_fixture_flow(&enforcer, &openai);
+        check_same_socket(&mut client, &mut peer, b'a');
+
+        clock.store(101_000, Ordering::Release);
+        let mut delayed = claude;
+        delayed.issued_at = 101.;
+        delayed.command_seq += 1;
+        delayed.permit.issued_at = delayed.issued_at;
+        delayed.permit.command_seq = delayed.command_seq;
+        delayed.permit.state = ChannelPermitState::Revoked;
+        delayed.permit.reason_code = "channel_inventory_incomplete".into();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_enforcer = enforcer.clone();
+        let original_command = delayed.clone();
+        let worker = thread::spawn(move || {
+            ready_tx.send(delayed.issued_at).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            worker_enforcer.apply_command(&delayed, 101.).unwrap()
+        });
+        assert_eq!(ready_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 101.);
+        clock.store(101_125, Ordering::Release);
+        assert!(enforcer.enforce_active_deadlines(101.125, false).unwrap().is_empty());
+        assert_eq!(enforcer.lock().unwrap().last_wall_now, Some(101.125));
+        release_tx.send(()).unwrap();
+        let revoked = worker.join().unwrap();
+        let other = enforcer.receipt_for("openai", 101.125).unwrap().unwrap();
+        println!("{}", json!({
+            "issued_at": original_command.issued_at, "watchdog_at": 101.125,
+            "claude": revoked, "openai": other
+        }));
+        assert_eq!(other.enforcement_state, ChannelEnforcementState::Forwarding);
+        assert_eq!(other.command_seq, openai.command_seq);
+        assert_eq!(other.active_flows_count, 1);
+        assert!(other.error_code.is_none());
+        assert_eq!(revoked.enforcement_state, ChannelEnforcementState::Blocked);
+        assert_eq!(revoked.observed_at, 101.125);
+        assert_eq!(enforcer.lock().unwrap().last_wall_now, Some(101.125));
+        check_same_socket(&mut client, &mut peer, b'b');
+        let guard = enforcer.lock().unwrap();
+        assert_eq!(guard.families["claude"].command.as_ref(), Some(&original_command));
+        assert_eq!(guard.families["openai"].command.as_ref(), Some(&openai));
+        println!("OpenAI original socket exchanged data after Claude revocation; command deadlines unchanged");
+    }
+
+    #[test]
+    fn executor_clock_detects_rollback_and_expiry_at_application() {
+        for (last_sample, actual, reason) in [
+            (101_000, 101_125, "permit_lease_expired"),
+            (101_375, 101_125, "clock_rollback_detected"),
+        ] {
+            let (enforcer, clock) = clock_fixture();
+            let initial = publication_command();
+            enforcer.apply_command(&initial, 100.).unwrap();
+            let (mut client, mut peer) = open_clock_fixture_flow(&enforcer, &initial);
+            check_same_socket(&mut client, &mut peer, b'x');
+            clock.store(last_sample, Ordering::Release);
+            enforcer.enforce_active_deadlines(last_sample as f64 / 1000., false).unwrap();
+
+            // Both queued renewals looked timely when issued. Only the actual
+            // execution sample can distinguish expiry from a wall clock drop.
+            let mut pending = initial.clone();
+            pending.issued_at = 101.;
+            pending.permit.issued_at = 101.;
+            pending.permit.valid_until = if reason == "permit_lease_expired" { 101.125 } else { 200. };
+            pending.command_seq += 1;
+            pending.permit.command_seq = pending.command_seq;
+            clock.store(actual, Ordering::Release);
+            let receipt = enforcer.apply_command(&pending, last_sample as f64 / 1000.).unwrap();
+            println!("{}", json!({
+                "watchdog_millis": last_sample, "execution_millis": actual,
+                "valid_until": pending.permit.valid_until, "expected": reason, "receipt": receipt,
+            }));
+            assert_eq!(receipt.permit_state, ChannelPermitState::Revoked);
+            assert_eq!(receipt.error_code.as_deref(), Some(reason));
+            assert_eq!(receipt.observed_at, actual as f64 / 1000.);
+            assert!(receipt.new_connections_blocked);
+            assert_eq!(client.read(&mut [0]).unwrap(), 0);
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+            assert!(enforcer.connect_supervised_tcp("claude", &initial.allowed_processes[0], 101.).is_err());
+            assert_eq!(enforcer.lock().unwrap().families["claude"].command.as_ref(), Some(&pending));
+            println!("{reason}: actual EOF at both ends, reconnect refused, original deadline retained");
         }
     }
 
@@ -3329,20 +3695,168 @@ mod control_rpc_contracts {
     }
 
     #[test]
+    fn gateway_request_deadline_is_not_renewed_by_partial_reads() {
+        let (writer, reader) = UnixStream::pair().unwrap();
+        let mut stream = TunnelStream::Unix(reader);
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(100);
+        let sending = thread::spawn(move || {
+            let mut writer = writer;
+            for _ in 0..16 {
+                if writer.write_all(b".").is_err() { break; }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let mut reader = RequestReader { stream: &mut stream, deadline };
+        let mut bytes = [0; 16];
+        let error = reader.read_exact(&mut bytes).unwrap_err();
+        assert!(matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock), "{error}");
+        assert!(bytes.iter().filter(|&&byte| byte == b'.').count() < bytes.len());
+        let _ = stream.shutdown(Shutdown::Both);
+        sending.join().unwrap();
+        println!("partial bytes did not extend the 100 ms absolute request deadline");
+    }
+
+    #[test]
+    fn gateway_denies_unattributed_body_and_preserves_owned_flow_at_capacity() {
+        use crate::gateway_budget::Limits;
+        let mut enforcer = LocalTunnelEnforcer::new("publication-boot", None);
+        enforcer.gateway_budget = Arc::new(GatewayBudget::with_limits(Limits {
+            connections: 1, unattributed: 1, bytes: 8, bytes_per_source: 8, ..Limits::default()
+        }));
+        let enforcer = Arc::new(enforcer);
+        enforcer.activate_interception(100.).unwrap();
+        enforcer.set_clock(|| 100.).unwrap();
+        let command = publication_command();
+        enforcer.apply_command(&command, 100.).unwrap();
+        let token = command.allowed_processes[0].clone();
+        let allowed = Arc::new(AtomicBool::new(false));
+        let fixture_peer = allowed.clone();
+        enforcer.set_accepted_connection_attributor(move |_ctx|
+            fixture_peer.load(Ordering::Acquire).then(|| ("claude".into(), token.clone()))).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (addr, listener) = enforcer.start_local_proxy_listener("127.0.0.1:0", stop.clone(), 100.).unwrap();
+        struct Listener(Arc<AtomicBool>, Option<thread::JoinHandle<()>>);
+        impl Drop for Listener {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                let _ = self.1.take().unwrap().join();
+            }
+        }
+        let _listener = Listener(stop, Some(listener));
+        let socket = || {
+            let stream = TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            stream
+        };
+        let wait_for_release = || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while enforcer.gateway_budget.connections_in_use() != 0 {
+                assert!(Instant::now() < deadline, "connection admission slot did not return");
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let response = |stream: &mut TcpStream| {
+            let mut header = Vec::new();
+            while header.len() < 16384 && !header.ends_with(b"\r\n\r\n") {
+                let mut b = [0];
+                stream.read_exact(&mut b).unwrap();
+                header.extend_from_slice(&b);
+            }
+            header
+        };
+        let mut unverified = socket();
+        assert!(response(&mut unverified).starts_with(b"HTTP/1.1 403"), "reject before waiting for any request bytes");
+        wait_for_release();
+        allowed.store(true, Ordering::Release);
+        let mut oversized = socket();
+        write!(oversized, "POST http://127.0.0.1:17890/ HTTP/1.1\r\nHost: 127.0.0.1:17890\r\nContent-Length: {MAX_HTTP_BODY_BYTES}\r\n\r\n").unwrap();
+        assert!(response(&mut oversized).starts_with(b"HTTP/1.1 503"), "reject over-budget body before waiting for bytes");
+        wait_for_release();
+        let mut chunked = socket();
+        chunked.write_all(b"POST http://127.0.0.1:17890/ HTTP/1.1\r\nHost: 127.0.0.1:17890\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n").unwrap();
+        assert!(response(&mut chunked).starts_with(b"HTTP/1.1 503"), "reject over-budget chunk before waiting for data");
+        wait_for_release();
+
+        let (upstream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let upstream = Mutex::new(Some(upstream));
+        enforcer.set_upstream_connector(move |_| Ok(TunnelStream::Unix(upstream.lock().unwrap().take().unwrap()))).unwrap();
+        let connect = b"CONNECT 127.0.0.1:17890 HTTP/1.1\r\nHost: 127.0.0.1:17890\r\n\r\n";
+        let mut owned = socket();
+        owned.write_all(connect).unwrap();
+        assert!(response(&mut owned).starts_with(b"HTTP/1.1 200"));
+        let mut excess = socket();
+        assert_eq!(excess.read(&mut [0]).unwrap(), 0, "admission closes excess sockets without a worker");
+        assert_eq!(enforcer.gateway_budget.connections_in_use(), 1);
+        let mut byte = [0];
+        owned.write_all(b"a").unwrap();
+        peer.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"a");
+        peer.write_all(b"b").unwrap();
+        owned.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"b");
+
+        enforcer.revoke_family("claude", "fixture_cutoff", 100.).unwrap();
+        assert_eq!(owned.read(&mut byte).unwrap(), 0);
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
+        wait_for_release();
+        let mut reconnect = socket();
+        reconnect.write_all(connect).unwrap();
+        assert!(response(&mut reconnect).starts_with(b"HTTP/1.1 502"));
+        wait_for_release();
+        println!("403 before headers, 503 before over-budget fixed or chunked body, live socket worked until true EOF, reconnect 502");
+    }
+
+    #[test]
+    fn revoke_closes_the_actual_ingress_without_waiting_for_the_gateway_writer() {
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("publication-boot", None));
+        enforcer.activate_interception(100.).unwrap();
+        enforcer.set_clock(|| 100.).unwrap();
+        let command = publication_command();
+        enforcer.apply_command(&command, 100.).unwrap();
+        let (upstream, mut peer) = UnixStream::pair().unwrap();
+        let upstream = Mutex::new(Some(upstream));
+        enforcer.set_upstream_connector(move |_| Ok(TunnelStream::Unix(upstream.lock().unwrap().take().unwrap()))).unwrap();
+        let (ingress, mut client) = UnixStream::pair().unwrap();
+        let ingress = TunnelStream::Unix(ingress);
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (_id, _bridge) = enforcer.connect_supervised_tcp_with_clock(
+            "claude", &command.allowed_processes[0], "127.0.0.1:17890", Some(false), Some(&ingress), || 100.
+        ).unwrap();
+        // No gateway copy worker is attached to this ingress, so only explicit
+        // socket shutdown can produce EOF while its original handle is open.
+        enforcer.revoke_family("claude", "fixture_cutoff", 100.).unwrap();
+        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        println!("revocation shut down ingress and upstream without an ingress copy worker");
+    }
+
+    #[test]
     fn chunked_body_bounds_framing_checks_overflow_and_leaves_the_next_request_unread() {
         use std::io::Cursor;
+        use crate::gateway_budget::Limits;
         let body = b"4;note=ok\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Fixture: yes\r\n\r\n";
         let mut wire = body.to_vec();
         wire.extend_from_slice(b"GET /next HTTP/1.1\r\n\r\n");
         let mut source = Cursor::new(wire);
-        assert_eq!(
-            LocalTunnelEnforcer::read_chunked_http_body(&mut source, 9).unwrap(),
-            body
-        );
+        let budget = Arc::new(GatewayBudget::with_limits(Limits {
+            bytes: 512, bytes_per_source: 512, ..Limits::default()
+        }));
+        let peer = &publication_command().allowed_processes[0];
+        let mut a = budget.connection().unwrap();
+        let mut b = budget.connection().unwrap();
+        assert!(a.bind(peer) && b.bind(peer));
+        let mut first_upload = a.body(0).unwrap();
+        let mut second_upload = b.body(0).unwrap();
+        assert_eq!(LocalTunnelEnforcer::read_chunked_http_body(&mut source, 9, Some(&mut first_upload)).unwrap(), body);
+        assert_eq!(LocalTunnelEnforcer::read_chunked_http_body(&mut Cursor::new(body), 9, Some(&mut second_upload)).unwrap(), body);
+        assert!(a.body(1).is_none(), "both concurrent small requests retain their charged capacity");
         assert_eq!(source.position() as usize, body.len());
         let overflow = format!("1\r\nx\r\n{:x}\r\n", usize::MAX);
         assert_eq!(
-            LocalTunnelEnforcer::read_chunked_http_body(&mut Cursor::new(overflow), 16 * 1024 * 1024),
+            LocalTunnelEnforcer::read_chunked_http_body(&mut Cursor::new(overflow), 16 * 1024 * 1024, None),
             Err("too_large")
         );
         let mut metadata = Vec::new();
@@ -3351,12 +3865,12 @@ mod control_rpc_contracts {
         }
         metadata.extend_from_slice(b"0\r\n\r\n");
         assert_eq!(
-            LocalTunnelEnforcer::read_chunked_http_body(&mut Cursor::new(metadata), 16 * 1024 * 1024),
+            LocalTunnelEnforcer::read_chunked_http_body(&mut Cursor::new(metadata), 16 * 1024 * 1024, None),
             Err("too_large")
         );
         let unterminated = format!("0\r\n{}", "a".repeat(4096));
         assert_eq!(
-            LocalTunnelEnforcer::read_chunked_http_body(&mut Cursor::new(unterminated), 100),
+            LocalTunnelEnforcer::read_chunked_http_body(&mut Cursor::new(unterminated), 100, None),
             Err("trailer_too_long_or_unterminated")
         );
         for invalid in [
@@ -3365,7 +3879,7 @@ mod control_rpc_contracts {
             b"0\r\nnot-a-field\r\n\r\n",
         ] {
             assert!(
-                LocalTunnelEnforcer::read_chunked_http_body(&mut Cursor::new(invalid), 100).is_err()
+                LocalTunnelEnforcer::read_chunked_http_body(&mut Cursor::new(invalid), 100, None).is_err()
             );
         }
     }
@@ -3376,8 +3890,9 @@ mod control_rpc_contracts {
         enforcer.set_strict_peer_verification(true);
         let (mut client, server) = UnixStream::pair().unwrap();
         client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let slot = enforcer.gateway_budget.connection().unwrap();
         let worker = thread::spawn(move || LocalTunnelEnforcer::serve_gateway_connection(
-            enforcer, TunnelStream::Unix(server), None));
+            enforcer, TunnelStream::Unix(server), None, slot));
         client.write_all(b"WATCH-CONTROL 00000000-0000-0000-0000-000000000000 HTTP/1.1\r\n\r\n").unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).unwrap();

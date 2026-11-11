@@ -1177,27 +1177,26 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
             record.bundle = bundle;
             record.bundle_id = id;
         }
-        record.launcher_supported = !script;
         if script {
-            record.interpreter = self
-                .inputs
-                .observed_interpreters
-                .get(&canonical)
-                .cloned()
-                .or_else(|| {
-                    script_interpreter(
-                        &canonical,
-                        self.inputs
-                            .caller_paths
-                            .get(target.as_str())
-                            .unwrap_or(&self.inputs.caller_path),
-                        &self.inputs.daemon_path,
-                    )
-                });
-            if let Some(interpreter) = &record.interpreter {
-                self.watch(interpreter);
-            }
+            let package_root = package.as_ref().filter(|(_, script)| *script).map(|(root, _)| root.as_path());
+            let candidate = package_root.filter(|root| node_esm_package(&canonical, root, target).is_some())
+                .and_then(|_| node_interpreter_candidate(
+                    self.inputs.caller_paths.get(target.as_str()).unwrap_or(&self.inputs.caller_path),
+                    &self.inputs.daemon_path,
+                ));
+            let interpreter = candidate.and_then(|path| {
+                self.watch(&path);
+                let canonical = fs::canonicalize(path).ok()?;
+                self.watch(&canonical);
+                supported_node_26(&canonical).then_some(canonical)
+            });
+            record.launcher_supported = record.valid() && interpreter.is_some();
+            // An observation can help classify a running CLI; it cannot choose
+            // the interpreter approved for a new launch.
+            record.interpreter = interpreter.or_else(|| self.inputs.observed_interpreters.get(&canonical).cloned());
             record.script_entry = Some(canonical);
+        } else {
+            record.launcher_supported = true;
         }
         self.targets.push(record);
     }
@@ -1418,39 +1417,53 @@ fn is_script(path: &Path) -> bool {
             .extension()
             .is_some_and(|v| v == "js" || v == "mjs" || v == "cjs")
 }
-fn script_interpreter(path: &Path, caller: &[PathBuf], daemon: &[PathBuf]) -> Option<PathBuf> {
-    let mut bytes = Vec::new();
-    fs::File::open(path)
-        .ok()?
-        .take(512)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    let line = std::str::from_utf8(&bytes)
-        .ok()?
-        .lines()
-        .next()?
-        .strip_prefix("#!")?
-        .trim();
-    let mut words = line.split_whitespace();
-    let first = words.next()?;
-    let name = if first == "/usr/bin/env" {
-        words.next()?
-    } else {
-        first
-    };
-    if !["node", "nodejs", "bun"].contains(&Path::new(name).file_name()?.to_str()?) {
-        return None;
+fn node_interpreter_candidate(caller: &[PathBuf], daemon: &[PathBuf]) -> Option<PathBuf> {
+    let paths = if caller.is_empty() { daemon } else { caller };
+    paths.iter().take(128).map(|dir| dir.join("node")).find(|p| executable_file(p))
+}
+
+// The file-URL loader is validated for Node 26. The exact resolved executable
+// must be from one of the existing versioned Node layouts, not any file named node.
+fn supported_node_26(path: &Path) -> bool {
+    let Some(dir) = path.parent().filter(|p| p.file_name().is_some_and(|n| n == "bin")) else { return false; };
+    if path.file_name().is_none_or(|n| n != "node") || !executable_file(path) { return false; }
+    let Some(mut version) = dir.parent() else { return false; };
+    if version.file_name().is_some_and(|n| n == "installation") {
+        let Some(p) = version.parent() else { return false; };
+        version = p;
     }
-    let candidate = if Path::new(name).is_absolute() {
-        PathBuf::from(name)
-    } else {
-        caller
-            .iter()
-            .chain(daemon)
-            .map(|p| p.join(name))
-            .find(|p| executable_file(p))?
-    };
-    fs::canonicalize(candidate).ok()
+    let Some(version_text) = version.file_name().and_then(|s| s.to_str()) else { return false; };
+    let mut parts = version_text.trim_start_matches('v').split('.');
+    if parts.next() != Some("26") || parts.next().and_then(|v| v.parse::<u32>().ok()).is_none()
+        || parts.next().and_then(|v| v.parse::<u32>().ok()).is_none() || parts.next().is_some() {
+        return false;
+    }
+    let Some(prefix) = version.parent() else { return false; };
+    let known = prefix.ends_with("Cellar/node") || prefix.ends_with("Cellar/node@26")
+        || prefix.ends_with(".nvm/versions/node") || prefix.ends_with("fnm/node-versions")
+        || prefix.ends_with(".volta/tools/image/node");
+    let mut header = [0;16];
+    known && fs::File::open(path).and_then(|mut f| f.read_exact(&mut header)).is_ok()
+        && header[..8] == [0xcf,0xfa,0xed,0xfe,0x0c,0,0,1] && header[12..16] == [2,0,0,0]
+}
+
+fn node_esm_package(path: &Path, root: &Path, target: LaunchTarget) -> Option<String> {
+    // The Codex npm wrapper execs a separate vendor CLI. Its process boundary
+    // is not the inherited Claude Node entry proved by this contract.
+    if target != LaunchTarget::ClaudeCli { return None; }
+    let mut first = Vec::new();
+    fs::File::open(path).ok()?.take(256).read_to_end(&mut first).ok()?;
+    let line = first.split(|b| *b == b'\n').next()?;
+    if line.strip_suffix(b"\r").unwrap_or(line) != b"#!/usr/bin/env node" { return None; }
+    let mut bytes = Vec::new();
+    fs::File::open(root.join("package.json")).ok()?.take(128 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 128 * 1024 { return None; }
+    let value = crate::storage::strict_json(&bytes).ok()?;
+    let (name, command, expected) = ("@anthropic-ai/claude-code", "claude", "cli.js");
+    let entry = value["bin"].as_str().or_else(|| value["bin"][command].as_str())?;
+    (value["name"] == name && value["type"] == "module"
+        && entry.strip_prefix("./").unwrap_or(entry) == expected && path == root.join(expected))
+        .then(|| crate::storage::sha256(&bytes))
 }
 fn package_evidence(
     path: &Path,
@@ -1505,6 +1518,7 @@ fn is_watch_shim(path: &Path, home: &Path, shim: Option<&Path>) -> bool {
     let root = Paths { home: home.into() }.watch();
     canonical.starts_with(root.join("bin"))
         || canonical.starts_with(root.join("entries/bin"))
+        || canonical.starts_with(root.join("shims"))
         || shim
             .and_then(|p| fs::canonicalize(p).ok())
             .is_some_and(|p| p == canonical)
@@ -1520,6 +1534,7 @@ pub struct ApprovedDiscoveryManifest {
     pub targets: BTreeMap<String, String>,
     pub children: BTreeMap<String, String>,
     pub cli_sources: Vec<crate::sandbox_launch::ApprovedCliSource>,
+    pub script_combos: Vec<claude_watch_core::controlled_launch::ApprovedScriptCombo>,
     pub selection_issues: Vec<String>,
     pub needs_verification_retry: bool,
 }
@@ -1763,6 +1778,18 @@ impl DiscoveryHandle {
         }
         Ok((snapshot, record))
     }
+    /// The caller and daemon build exactly the same proof from the selected
+    /// source, using a per-source content revision rather than scan order.
+    pub fn selected_cli_proof(&self, snapshot: &DiscoverySnapshot, record: &DiscoveredTarget)
+        -> Result<(String, Option<claude_watch_core::controlled_launch::ApprovedScriptCombo>)> {
+        let mut cache = self.0.lock().unwrap();
+        ensure_current(&cache, snapshot, record)?;
+        let path = record.executable.as_ref().ok_or_else(|| CoreError::new("cli_unavailable", "CLI 来源未核验"))?;
+        let sha = cache.fingerprint(path)?;
+        let combo = make_script_combo(&mut cache, snapshot, record, &sha)?;
+        Ok((sha, combo))
+    }
+
     /// Materialize only selected current installs. Discovered historical
     /// versions never become general approvals merely by appearing in a scan.
     pub fn approved_manifest(
@@ -1779,6 +1806,7 @@ impl DiscoveryHandle {
             targets: BTreeMap::new(),
             children: BTreeMap::new(),
             cli_sources: vec![],
+            script_combos: vec![],
             selection_issues: vec![],
             needs_verification_retry: false,
         };
@@ -1813,14 +1841,15 @@ impl DiscoveryHandle {
                 let spec = if target.cli() { None } else {
                     Some(make_spec(&mut cache, record, target)?)
                 };
+                let script_combo = make_script_combo(&mut cache, snapshot, record, &sha)?;
                 let mut children = BTreeMap::new();
                 for child in &record.child_executables {
                     children.insert(child.to_string_lossy().into_owned(), cache.fingerprint(child)?);
                 }
                 ensure_current(&cache, snapshot, record)?;
-                Ok::<_, CoreError>((path.to_string_lossy().into_owned(), sha, spec, children))
+                Ok::<_, CoreError>((path.to_string_lossy().into_owned(), sha, spec, children, script_combo))
             })();
-            let (text, sha, spec, children) = match prepared {
+            let (text, sha, spec, children, script_combo) = match prepared {
                 Ok(values) => values,
                 Err(error) => {
                     manifest.selection_issues.push(format!("{}:{}", target.as_str(), error.code));
@@ -1829,7 +1858,11 @@ impl DiscoveryHandle {
                 }
             };
             manifest.targets.insert(text.clone(), sha.clone());
-            manifest.children.insert(text.clone(), sha.clone());
+            if let Some(combo) = script_combo {
+                manifest.script_combos.push(combo);
+            } else {
+                manifest.children.insert(text.clone(), sha.clone());
+            }
             if target.cli() {
                 manifest
                     .cli_sources
@@ -1854,6 +1887,7 @@ impl DiscoveryHandle {
                 || manifest
                     .children
                     .contains_key(path.to_string_lossy().as_ref())
+                || manifest.script_combos.iter().any(|c| Path::new(&c.interpreter_path) == path)
         });
         Ok(manifest)
     }
@@ -2112,6 +2146,34 @@ fn hint_object<'a>(hints: &'a mut serde_json::Value, key: &str) -> Result<&'a mu
     hints.as_object_mut().and_then(|object| {
         object.entry(key).or_insert_with(|| json!({})).as_object_mut()
     }).ok_or_else(|| CoreError::new("discovery_hint_invalid", "来源提示结构损坏，未覆盖其他目标的记录"))
+}
+
+fn make_script_combo(cache: &mut DiscoveryCache, snapshot: &DiscoverySnapshot,
+    record: &DiscoveredTarget, sha: &str)
+    -> Result<Option<claude_watch_core::controlled_launch::ApprovedScriptCombo>> {
+    use claude_watch_core::controlled_launch::{ApprovedScriptCombo, NODE_ESM_ENTRY_FORMAT};
+    let Some(script) = record.script_entry.as_ref() else { return Ok(None); };
+    let invalid = || CoreError::new("unsupported_launcher", "脚本入口形式或解释器尚未获得批准");
+    let interpreter = record.interpreter.as_ref().filter(|p| record.launcher_supported && supported_node_26(p)).ok_or_else(invalid)?;
+    let (root, _) = package_evidence(script, record.target, |_| {}).filter(|(_, script)| *script).ok_or_else(invalid)?;
+    let package_sha = node_esm_package(script, &root, record.target).ok_or_else(invalid)?;
+    let package_path = root.join("package.json");
+    let interpreter_entry = node_interpreter_candidate(
+        cache.inputs.caller_paths.get(record.target.as_str()).unwrap_or(&cache.inputs.caller_path),
+        &cache.inputs.daemon_path,
+    ).filter(|path| fs::canonicalize(path).ok().as_ref() == Some(interpreter)).ok_or_else(invalid)?;
+    let interpreter_sha = cache.fingerprint(interpreter)?;
+    ensure_current(cache, snapshot, record)?;
+    let source_id = format!("{}:{}", record.target.as_str(), record.entry_path.display());
+    let revision = crate::storage::sha256(&serde_json::to_vec(&json!({
+        "source":source_id,"entry":script,"entry_sha":sha,"package_sha":package_sha,
+        "interpreter_entry":interpreter_entry,"interpreter":interpreter,"interpreter_sha":interpreter_sha,"format":NODE_ESM_ENTRY_FORMAT,
+    })).map_err(|_| invalid())?);
+    Ok(Some(ApprovedScriptCombo { target: record.target, entry_path: record.entry_path.to_string_lossy().into_owned(),
+        script_path: script.to_string_lossy().into_owned(), script_fingerprint: sha.into(),
+        package_path: package_path.to_string_lossy().into_owned(), package_fingerprint: package_sha,
+        interpreter_entry_path: interpreter_entry.to_string_lossy().into_owned(), interpreter_path: interpreter.to_string_lossy().into_owned(),
+        interpreter_fingerprint: interpreter_sha, source_id, source_revision: revision, launcher_format: NODE_ESM_ENTRY_FORMAT.into() }))
 }
 
 fn ensure_snapshot_current(cache: &DiscoveryCache, snapshot: &DiscoverySnapshot) -> Result<()> {

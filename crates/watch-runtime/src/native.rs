@@ -72,6 +72,7 @@ pub struct ProcessRecord {
 }
 pub struct Inventory {
     pub uid: u32,
+    pub(crate) requested_count: u64,
     pub processes: BTreeMap<u32, ProcessRecord>,
     pub unavailable: Vec<Value>,
     pub exited: Vec<u32>,
@@ -80,6 +81,17 @@ pub struct Inventory {
     pub confirmed_exited_count: u32,
     pub started_at: f64,
     pub finished_at: f64,
+}
+impl Inventory {
+    pub(crate) fn incomplete_summary(&self) -> String {
+        let reasons = self.diagnostic_reasons.iter()
+            .map(|(reason, count)| format!("{reason}:{count}"))
+            .collect::<Vec<_>>().join(",");
+        let accounted = self.processes.len() as u64 + self.exited.len() as u64 + self.unavailable.len() as u64;
+        format!("requested_count={}, parsed_count={}, confirmed_exited_count={}, unavailable_count={}, unaccounted_count={}, reasons={reasons}",
+            self.requested_count, self.processes.len(), self.confirmed_exited_count, self.unavailable.len(),
+            self.requested_count.saturating_sub(accounted))
+    }
 }
 pub struct Arguments {
     pub identity: Identity,
@@ -185,6 +197,7 @@ pub fn decode_inventory(value: &Value, sent: f64, received: f64) -> Result<Inven
     }
     Ok(Inventory {
         uid,
+        requested_count: requested,
         processes,
         unavailable,
         confirmed_exited_count: u32::try_from(exited.len()).unwrap_or(u32::MAX),

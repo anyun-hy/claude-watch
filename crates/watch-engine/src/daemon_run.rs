@@ -47,6 +47,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+#[path = "../../watch-runtime/tests/support/hardened_helper.rs"]
+mod hardened_helper;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../tests/support/queued_channel_fixture.rs"]
+mod queued_channel_contracts;
+
 pub struct ProductionChannelStack {
     stop: Arc<AtomicBool>,
     pub packaged_backend: Option<NetworkBackendKind>,
@@ -59,12 +67,15 @@ pub struct ProductionChannelStack {
     pub vpn_wake_handle: Option<Arc<AtomicBool>>,
     pub lease_watchdog: thread::JoinHandle<()>,
     pub async_audit_worker: thread::JoinHandle<()>,
+    process_disposition_worker: Option<thread::JoinHandle<()>>,
     pub sandbox_registration_worker: Option<thread::JoinHandle<()>>,
     pub vpn_observer_worker: Option<thread::JoinHandle<()>>,
     pub last_policy_version: Option<PolicyVersion>,
     activate_local_interception: bool,
     local_proxy_worker: Option<thread::JoinHandle<()>>,
     target_refresh_worker: Option<thread::JoinHandle<()>>,
+    #[cfg(all(test, target_os = "macos"))]
+    private_loopback_backend: bool,
 }
 
 fn refresh_and_stage_production_targets(
@@ -87,7 +98,7 @@ fn stage_discovery_snapshot(
 ) -> Result<()> {
     use claude_watch_runtime::managed_entry::stage_deliverable_entries;
     let manifest = discovery.approved_manifest(snapshot)?;
-    for family in registry.replace_approved_targets_with_cli_sources(manifest.targets, manifest.children, manifest.cli_sources) {
+    for family in registry.replace_discovery_approvals(manifest.targets, manifest.children, manifest.cli_sources, manifest.script_combos) {
         // Only Supervisor emits network commands. Identity loss precedes disk staging.
         let _ = event_tx.send(SupervisionEvent::ProcessInventoryUnavailable { family, observed_at: native::now() });
     }
@@ -105,8 +116,10 @@ fn stage_discovery_snapshot(
     let controlled_entry_macho = resources_dir
         .map(|d| d.join("ControlledEntry"))
         .filter(|p| p.is_file());
+    let (approval_boot, script_approvals) = registry.script_launch_approval_view();
     storage.atomic_json(&storage.paths.watch().join("state/target-discovery.json"), &json!({"snapshot":snapshot,
-        "selection_issues":manifest.selection_issues,"verification_pending":manifest.needs_verification_retry}))?;
+        "selection_issues":manifest.selection_issues,"verification_pending":manifest.needs_verification_retry,
+        "approval_executor_boot_id":approval_boot, "script_launch_approvals":script_approvals}))?;
     stage_deliverable_entries(
         &entries_root,
         &discovered_specs,
@@ -254,7 +267,7 @@ mod m5_tests {
         let policy=PolicyVersion {policy_digest:"m5-policy".into(),guard_policy_digest:"m5-guard".into()};
         let registry=SandboxLaunchRegistry::new("m5-boot",policy.clone(),claude_watch_system::SandboxPeerVerifier {
             expected_uid:claude_watch_system::effective_uid(),expected_helper_executable:"/fixture/helper".into(),
-            expected_helper_sha256:"fixture".into(),require_code_signature_identifier:None },None);
+            expected_helper_sha256:"fixture".into(),expected_helper_cdhash:"0".repeat(40) },None);
         let (tx,rx)=std::sync::mpsc::channel();
         stage_discovery_snapshot(&store,None,&registry,&tx,&discovery,&snapshot).unwrap();
         assert!(rx.try_recv().is_err());registry.refresh_executable_verifications();assert_eq!(registry.executable_verification_counts().1,1);
@@ -569,7 +582,7 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
         ChannelSupervisor::spawn_async_audit_worker(stop.clone(), event_tx.clone(), run_audit)?;
 
     let mut supervisor = ChannelSupervisor::new_with_config(
-        storage,
+        storage.clone(),
         config,
         config_blocking_reason,
         Some(enforcer.clone()),
@@ -577,6 +590,13 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
     )?;
 
     supervisor.set_diagnostics(diagnostics);
+    supervisor.set_inline_receipt_clock(native::now);
+    let process_disposition_worker = if activate_local_interception {
+        let (dispatcher, worker) = claude_watch_runtime::process_disposition::ProcessDispositionDispatcher::start(
+            storage, stop.clone(), event_tx.clone())?;
+        supervisor.install_process_disposition_dispatcher(dispatcher);
+        Some(worker)
+    } else { None };
 
     let mut stack = ProductionChannelStack {
         stop,
@@ -589,35 +609,56 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
         vpn_wake_handle,
         lease_watchdog,
         async_audit_worker,
+        process_disposition_worker,
         sandbox_registration_worker,
         vpn_observer_worker,
         last_policy_version: Some(initial_policy_version),
         activate_local_interception,
         local_proxy_worker: None,
         target_refresh_worker: None,
+        #[cfg(all(test, target_os = "macos"))]
+        private_loopback_backend: false,
     };
     stack.reconcile_controlled_backend(now_ts)?;
     Ok(stack)
 }
 
 impl ProductionChannelStack {
+    fn deliver_background_event(&mut self, event: SupervisionEvent) -> Result<()> {
+        let delivered_at = native::now();
+        self.supervisor.handle_queued_event(event, delivered_at)?;
+        Ok(())
+    }
+
     pub fn drain_background_events(&mut self) -> Result<()> {
         while let Ok(ev) = self.event_rx.try_recv() {
-            let event = match ev {
-                SupervisionEvent::EnforcementReceiptArrived { receipt, .. } =>
-                    SupervisionEvent::EnforcementReceiptArrived { receipt, received_at: native::now() },
-                other => other,
-            };
-            self.supervisor.handle_event(event)?;
+            self.deliver_background_event(ev)?;
         }
         Ok(())
     }
 
     /// Initial assembly and later recovery share one registry and independent component state.
     pub fn reconcile_controlled_backend(&mut self, now: f64) -> Result<()> {
+        #[cfg(all(test, target_os = "macos"))]
+        if self.private_loopback_backend {
+            return self.reconcile_controlled_backend_with_listeners(now,
+                |reg, path, stop| reg.start_registration_listener(path, stop),
+                |enforcer, stop, now| enforcer.start_local_proxy_listener("127.0.0.1:0", stop, now));
+        }
         self.reconcile_controlled_backend_with_listeners(now,
             |reg, path, stop| reg.start_registration_listener(path, stop),
             |enforcer, stop, now| enforcer.start_launchd_proxy_listener(stop, now))
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn start_private_loopback_backend(&mut self) -> Result<()> {
+        if !super::entry_ready_fixture::is_private_fixture_home(&self.supervisor.storage.paths.home) {
+            return Err(CoreError::new("fixture_home_required", "只允许为本轮自有临时目录绑定回环端口"));
+        }
+        self.private_loopback_backend = true;
+        self.activate_local_interception = true;
+        self.enforcer.set_strict_peer_verification(true);
+        self.reconcile_controlled_backend(native::now())
     }
 
     fn synchronize_runtime_policy(&mut self, config: claude_watch_core::config::Config, now: f64) -> Result<()> {
@@ -662,6 +703,7 @@ impl ProductionChannelStack {
             self.sandbox_registry = Some(reg);
         }
         let reg = self.sandbox_registry.as_ref().unwrap().clone();
+        self.supervisor.set_process_disposition_registry(reg.clone());
         if self.target_refresh_worker.as_ref().is_some_and(|h| h.is_finished()) {
             let _ = self.target_refresh_worker.take().unwrap().join();
         }
@@ -695,7 +737,7 @@ impl ProductionChannelStack {
         // The kernel attribution callback was installed on this same registry
         // above. Individual connections still require their own live evidence.
         let report = reg.identity_report(true, components_ready, true);
-        self.enforcer.configure_seatbelt_backend_with_identity_gate(&report, now)?;
+        let sandbox_ready = self.apply_backend_identity_gate(&report, components_ready, now)?;
         if let Some(code) = component_error { self.enforcer.record_activation_failure(&code, now)?; }
         // Configuration/registration metadata is not an execution receipt or an applied policy.
         self.supervisor.storage.atomic_json(&self.supervisor.storage.paths.watch().join("state/seatbelt-runtime.json"), &json!({
@@ -704,10 +746,24 @@ impl ProductionChannelStack {
             "gateway_endpoint": self.enforcer.local_proxy_port().map(|p| format!("127.0.0.1:{p}")).unwrap_or_default(),
             "registration_socket": default_registration_socket_path(&self.supervisor.storage.paths.watch()),
             "components_ready": components_ready,
-            "sandbox_ready": components_ready && report.can_enable_production_backend() && self.enforcer.sandbox_ready()?,
+            "sandbox_ready": components_ready && sandbox_ready && self.enforcer.sandbox_ready()?,
             "identity_report": report, "updated_at": now
         }))?;
         Ok(())
+    }
+
+    fn apply_backend_identity_gate(
+        &self, report: &claude_watch_runtime::sandbox_launch::SandboxGatewayIdentityReport,
+        _components_ready: bool, now: f64,
+    ) -> Result<bool> {
+        #[cfg(all(test, target_os = "macos"))]
+        if self.private_loopback_backend {
+            // The loopback fixture substitutes only for the broker boundary.
+            // Keep the actual identity report; it still lacks I03 proof.
+            self.enforcer.configure_seatbelt_backend(_components_ready, now)?;
+            return self.enforcer.sandbox_ready();
+        }
+        self.enforcer.configure_seatbelt_backend_with_identity_gate(report, now)
     }
 
     pub fn step_with_system<S: DesktopSystem>(
@@ -817,12 +873,7 @@ impl ProductionChannelStack {
                 .min(Duration::from_millis(100));
             match self.event_rx.recv_timeout(wait_for) {
                 Ok(ev) => {
-                    let event = match ev {
-                        SupervisionEvent::EnforcementReceiptArrived { receipt, .. } =>
-                            SupervisionEvent::EnforcementReceiptArrived { receipt, received_at: native::now() },
-                        other => other,
-                    };
-                    let _ = self.supervisor.handle_event(event);
+                    let _ = self.deliver_background_event(ev);
                     let _ = self.drain_background_events();
                     break;
                 }
@@ -845,6 +896,7 @@ impl ProductionChannelStack {
         unregister_production_enforcer(&self.supervisor.storage.paths.watch());
         let _ = self.lease_watchdog.join();
         let _ = self.async_audit_worker.join();
+        if let Some(worker) = self.process_disposition_worker { let _ = worker.join(); }
         if let Some(worker) = self.sandbox_registration_worker { let _ = worker.join(); }
         if let Some(worker) = self.local_proxy_worker { let _ = worker.join(); }
         if let Some(worker) = self.target_refresh_worker { let _ = worker.join(); }
@@ -1508,17 +1560,10 @@ mod tests {
             .and_then(std::fs::canonicalize)
             .unwrap();
         let helper_path = runtime_dir.join("watch-sandbox-launcher");
-        std::fs::copy(&current_exe, &helper_path).unwrap();
-        let helper_sha = claude_watch_system::sha256_file_hex(&helper_path).unwrap();
+        hardened_helper::copy_signed(&current_exe, &helper_path);
         std::fs::write(
             runtime_dir.join("components.json"),
-            json!({
-                "network_backend": "seatbelt",
-                "hashes": {
-                    "watch-sandbox-launcher": helper_sha
-                }
-            })
-            .to_string(),
+            hardened_helper::components(&helper_path).to_string(),
         )
         .unwrap();
 
@@ -1651,7 +1696,7 @@ mod r1_tests {
         let store = StateStore::new(Paths::new(&root).unwrap());
         let registry = SandboxLaunchRegistry::new("metadata", PolicyVersion { policy_digest:"p".into(), guard_policy_digest:"g".into() },
             claude_watch_system::SandboxPeerVerifier { expected_uid:claude_watch_system::effective_uid(), expected_helper_executable:"/fixture/helper".into(),
-                expected_helper_sha256:"fixture".into(), require_code_signature_identifier:None }, None);
+                expected_helper_sha256:"fixture".into(), expected_helper_cdhash:"0".repeat(40) }, None);
         let (tx, _rx) = std::sync::mpsc::channel();
         let a = root.join("image-a"); let b = root.join("image-b");
         for (path, bytes) in [(&a, b"a"), (&b, b"b")] { fs::write(path, bytes).unwrap(); fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap(); }
@@ -1705,10 +1750,8 @@ mod r1_tests {
         fs::create_dir_all(&runtime).unwrap();
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
         let helper = runtime.join("watch-sandbox-launcher");
-        fs::copy("/usr/bin/true", &helper).unwrap();
-        fs::write(runtime.join("components.json"), json!({"network_backend":"seatbelt", "hashes":{
-            "watch-sandbox-launcher": claude_watch_system::sha256_file_hex(&helper).unwrap()
-        }}).to_string()).unwrap();
+        hardened_helper::copy_signed(std::path::Path::new("/usr/bin/true"), &helper);
+        fs::write(runtime.join("components.json"), hardened_helper::components(&helper).to_string()).unwrap();
         if invalid_config { fs::write(store.paths.config(), b"{").unwrap(); }
         let stack = assemble_production_channel_stack(store.clone(), Arc::new(AtomicBool::new(false)), false,
             |_| Err(CoreError::new("unused_fixture_audit", "unused"))).unwrap();

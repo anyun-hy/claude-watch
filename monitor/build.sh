@@ -159,7 +159,6 @@ if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
   BACKEND_SHA256=$(/usr/bin/shasum -a 256 "$APP/Contents/Resources/watch-engine" | /usr/bin/awk '{print $1}')
 else
   /usr/bin/codesign --force --sign - "$APP/Contents/Resources/watch-process-control"
-  /usr/bin/codesign --force --sign - "$APP/Contents/Resources/watch-sandbox-launcher"
   /usr/bin/codesign --force --sign - "$APP/Contents/Resources/ControlledEntry"
   /usr/bin/codesign --force --sign - "$APP/Contents/Resources/watch-leak-worker"
 fi
@@ -168,7 +167,7 @@ fi
 # not a Developer ID or NetworkExtension entitlement. Pinning happens later,
 # when --prepare reads these FINAL component signatures for admin review.
 if [[ "$CW_NETWORK_BACKEND" == seatbelt ]]; then
-  for CW_COMPONENT in watch-engine watch-gateway-broker; do
+  for CW_COMPONENT in watch-engine watch-gateway-broker watch-sandbox-launcher; do
     /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" --options runtime,library "$APP/Contents/Resources/$CW_COMPONENT"
   done
   BACKEND_SHA256=$(/usr/bin/shasum -a 256 "$APP/Contents/Resources/watch-engine" | /usr/bin/awk '{print $1}')
@@ -213,7 +212,7 @@ PLIST
 python3 "$REPOSITORY_ROOT/tools/write-build-identity.py" verify --root "$REPOSITORY_ROOT" --snapshot "$CW_SOURCE_RECEIPT" --version "$APP_VERSION" --build "$BUILD_NUMBER" --resources "$APP/Contents/Resources"
 python3 - "$APP/Contents/Resources" <<'PY'
 from pathlib import Path
-import hashlib, plistlib, sys
+import hashlib, plistlib, subprocess, sys
 root = Path(sys.argv[1])
 manifest = root / "BuildInfo.plist"
 value = plistlib.loads(manifest.read_bytes())
@@ -221,6 +220,12 @@ forbidden = [p for p in root.rglob("*") if p.suffix == ".py" or p.name in ("clau
 if forbidden: raise SystemExit("The bundle still contains retired Python backend resources")
 files = [root / n for n in ("watch-engine", "watch-native-observer", "watch-admin.sh", "watch-process-control", "watch-sandbox-launcher", "watch-gateway-broker", "ControlledEntry", "watch-native-collector.zsh", "watch-leak-worker", "netcoffee_probe.html", "netcoffee_probe.js", "netcoffee_probe.css", "ipleak_probe.html", "ipleak_probe.js", "BuildIdentity.json")]
 value["RuntimeHashes"] = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
+helper = root / "watch-sandbox-launcher"
+signature = subprocess.run(["/usr/bin/codesign", "--display", "--verbose=4", helper], capture_output=True, text=True, check=True).stderr
+cdhash = next((line[7:] for line in signature.splitlines() if line.startswith("CDHash=")), "")
+if len(cdhash) != 40 or any(c not in "0123456789abcdef" for c in cdhash):
+    raise SystemExit("Missing final signed sandbox helper CDHash")
+value["RuntimeCDHashes"] = {"watch-sandbox-launcher": cdhash}
 manifest.write_bytes(plistlib.dumps(value))
 PY
 if [[ "$CW_SIGNING_IDENTITY" != - ]]; then

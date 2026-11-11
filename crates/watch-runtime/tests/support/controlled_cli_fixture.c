@@ -36,6 +36,11 @@ int main(int argc, char **argv) {
     char line[256];
     while (fgets(line, sizeof(line), stdin)) {
         if (!strncmp(line, "PING ", 5)) { printf("PONG %d %s", getpid(), line + 5); continue; }
+        if (!strncmp(line, "FORK", 4)) {
+            pid_t pid = fork(); need(pid >= 0, "fixture fork");
+            if (pid == 0) { for (;;) pause(); }
+            printf("FORKED %d\n", pid); continue;
+        }
         if (!strncmp(line, "QUIT", 4)) { for (int i = 0; i < count; ++i) close(streams[i]); return 0; }
         if (!strncmp(line, "EXEC ", 5)) {
             char descriptors[512] = {0};
@@ -44,6 +49,12 @@ int main(int argc, char **argv) {
             char *args[] = {line + 5, argv[1], argv[2], NULL}; execv(args[0], args); need(0, "fixture exec");
         }
         if (!strncmp(line, "DIRECT", 6)) { int fd = dial(upstream); need(fd < 0, "direct network must be denied"); puts("DIRECT_DENIED"); continue; }
+        if (!strcmp(line, "USE\n")) {
+            need(count == 1, "USE requires one previously opened stream");
+            need(write(streams[0], "live", 4) == 4, "existing stream write");
+            char echo[4]; exact(streams[0], echo, 4); need(!memcmp(echo, "live", 4), "existing stream echo");
+            puts("STILL_OPEN"); continue;
+        }
         if (!strncmp(line, "EOF", 3)) {
             for (int i = 0; i < count; ++i) { char b; int n = (int)read(streams[i], &b, 1); need(n == 0, "real EOF required, errors/timeouts fail"); close(streams[i]); }
             printf("EOF %d\n", count); count = 0; continue;

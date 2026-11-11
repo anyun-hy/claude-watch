@@ -83,6 +83,24 @@ pub fn run(
     enforcer: &LocalTunnelEnforcer,
     req: &AsyncAuditRequest,
 ) -> Result<(Value, Value, f64)> {
+    let executable = std::env::current_exe()
+        .map_err(|_| CoreError::new("audit_worker_missing", "无法定位审计运行组件"))?;
+    run_with_worker(paths, enforcer, req, |kind, input, deadline, cancel| {
+        claude_watch_runtime::audit_process::run_json(
+            Command::new(&executable).args(["--channel-audit-worker", kind]),
+            input,
+            deadline,
+            cancel,
+        )
+    })
+}
+
+pub(crate) fn run_with_worker(
+    paths: &Paths,
+    enforcer: &LocalTunnelEnforcer,
+    req: &AsyncAuditRequest,
+    worker: impl Fn(&str, &Value, Instant, &AtomicBool) -> Result<Value>,
+) -> Result<(Value, Value, f64)> {
     let start_now = native::now();
     let remaining = req.requested_at + req.timeout_seconds - start_now;
     if !remaining.is_finite() || remaining <= 0.0 {
@@ -93,19 +111,12 @@ pub fn run(
     let deadline = Instant::now() + Duration::from_secs_f64(remaining);
     let fallback = AtomicBool::new(false);
     let cancel = req.cancellation.as_deref().unwrap_or(&fallback);
-    let executable = std::env::current_exe()
-        .map_err(|_| CoreError::new("audit_worker_missing", "无法定位审计运行组件"))?;
     let invoke = |kind: &str, mut input: Value| {
         input["home"] = json!(paths.home);
         input["family"] = json!(req.family);
         input["launch_target"] = json!(req.target);
         input["policy_version"] = json!(req.policy_version);
-        claude_watch_runtime::audit_process::run_json(
-            Command::new(&executable).args(["--channel-audit-worker", kind]),
-            &input,
-            deadline,
-            cancel,
-        )
+        worker(kind, &input, deadline, cancel)
     };
     let audit = invoke("audit", json!({}))?;
     let mid_now = native::now();

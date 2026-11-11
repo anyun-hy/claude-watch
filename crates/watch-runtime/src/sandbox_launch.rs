@@ -20,7 +20,7 @@ use crate::executable_verification::VerificationKey;
 use claude_watch_core::{
     channel::{BoundProcessToken, NetworkBackendKind, PolicyVersion},
     controlled_launch::{
-        AcceptedConnectionContext, ControlledLaunchRequest, ManagedInstanceState,
+        AcceptedConnectionContext, ApprovedScriptCombo, ControlledLaunchRequest, ManagedInstanceState,
         ManagedLaunchInstance, SandboxLaunchEvidence,
     },
     error::{CoreError, Result},
@@ -192,6 +192,22 @@ struct RetainedCliApproval {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ImageStatus { Verified, Pending, Invalid }
 
+#[derive(Clone)]
+struct ScriptInstanceApproval {
+    combo: ApprovedScriptCombo,
+    cdhash: [u8; 20],
+    package: VerificationKey,
+}
+
+fn combo_key(combo: &ApprovedScriptCombo) -> (String, String) {
+    (combo.script_path.clone(), combo.interpreter_path.clone())
+}
+
+fn combo_aliases_match(combo: &ApprovedScriptCombo) -> bool {
+    std::fs::canonicalize(&combo.entry_path).ok().as_deref() == Some(Path::new(&combo.script_path))
+        && std::fs::canonicalize(&combo.interpreter_entry_path).ok().as_deref() == Some(Path::new(&combo.interpreter_path))
+}
+
 struct RegistryInner {
     executor_boot_id: String,
     policy_version: PolicyVersion,
@@ -213,6 +229,8 @@ struct RegistryInner {
     instances: BTreeMap<String, ManagedLaunchInstance>,
     pid_to_instance: BTreeMap<u32, String>,
     child_identities: BTreeMap<u32, (String, BoundProcessToken)>,
+    approved_script_combos: BTreeMap<(String, String), ApprovedScriptCombo>,
+    script_instances: BTreeMap<String, ScriptInstanceApproval>,
     used_nonces: BTreeMap<String, f64>,
     endpoint_protection: Option<claude_watch_system::launchd_gateway::GatewayEndpointProtection>,
 }
@@ -251,6 +269,8 @@ impl SandboxLaunchRegistry {
                 instances: BTreeMap::new(),
                 pid_to_instance: BTreeMap::new(),
                 child_identities: BTreeMap::new(),
+                approved_script_combos: BTreeMap::new(),
+                script_instances: BTreeMap::new(),
                 used_nonces: BTreeMap::new(),
                 endpoint_protection: None,
             })),
@@ -272,6 +292,13 @@ impl SandboxLaunchRegistry {
         self.refresh_executable_verifications();
     }
 
+    pub fn is_target_approved(&self, executable_path: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|g| g.approved_targets.contains_key(executable_path))
+            .unwrap_or(false)
+    }
+
     pub fn approve_child_executable(
         &self,
         executable_path: impl Into<String>,
@@ -284,6 +311,13 @@ impl SandboxLaunchRegistry {
             Self::rebuild_image_approvals(&mut guard);
         }
         self.refresh_executable_verifications();
+    }
+
+    pub fn script_launch_approval_view(&self) -> (String, Vec<ApprovedScriptCombo>) {
+        self.inner
+            .lock()
+            .map(|g| (g.executor_boot_id.clone(), g.approved_script_combos.values().cloned().collect()))
+            .unwrap_or_default()
     }
 
     /// Atomically replaces the approved target executables and child executables maps.
@@ -304,6 +338,19 @@ impl SandboxLaunchRegistry {
         children: BTreeMap<String, String>,
         sources: Vec<ApprovedCliSource>,
     ) -> Vec<String> {
+        self.replace_discovery_approvals(targets, children, sources, Vec::new())
+    }
+
+    pub fn replace_discovery_approvals(
+        &self, targets: BTreeMap<String, String>, children: BTreeMap<String, String>,
+        sources: Vec<ApprovedCliSource>, combos: Vec<ApprovedScriptCombo>,
+    ) -> Vec<String> {
+        let current_combos: BTreeMap<_, _> = combos.into_iter().filter(|combo|
+            targets.get(&combo.script_path) == Some(&combo.script_fingerprint)
+                && !targets.contains_key(&combo.interpreter_path)
+                && !children.contains_key(&combo.interpreter_path)
+                && combo_aliases_match(combo)
+        ).map(|combo| (combo_key(&combo), combo)).collect();
         let mut current_sources = BTreeMap::new();
         let mut conflicts = BTreeSet::new();
         for source in sources {
@@ -318,7 +365,7 @@ impl SandboxLaunchRegistry {
         {
             let Ok(guard) = self.inner.lock() else { return Vec::new(); };
             if guard.approved_targets == targets && guard.approved_child_executables == children
-                && guard.cli_sources == current_sources { return Vec::new(); }
+                && guard.cli_sources == current_sources && guard.approved_script_combos == current_combos { return Vec::new(); }
         }
         // A normal, content-verified B is required before retaining any A.
         // Inventory refresh is the only production caller; the rare transition
@@ -336,15 +383,22 @@ impl SandboxLaunchRegistry {
         current_sources.retain(|_, source| source.valid(&targets) && source_proofs.get(&source.executable).is_some_and(|(key, valid)|
             *valid && key.is_some() && *key == VerificationKey::new(&source.executable, &source.fingerprint, 0)));
         if guard.approved_targets == targets && guard.approved_child_executables == children
-            && guard.cli_sources == current_sources { return Vec::new(); }
+            && guard.cli_sources == current_sources && guard.approved_script_combos == current_combos { return Vec::new(); }
         let old_targets = std::mem::replace(&mut guard.approved_targets, targets);
         let old_children = std::mem::replace(&mut guard.approved_child_executables, children);
         let old_sources = std::mem::replace(&mut guard.cli_sources, current_sources);
+        guard.approved_script_combos = current_combos;
         let ids: Vec<_> = guard.instances.keys().cloned().collect();
         for id in ids {
             let inst = guard.instances[&id].clone();
             if matches!(inst.state, ManagedInstanceState::Failed | ManagedInstanceState::Exited) { continue; }
-            let current_approval = guard.approved_targets.get(&inst.expected_executable) == Some(&inst.expected_fingerprint);
+            let script_current = inst.script_entry.is_some() && Self::script_approval_current(&mut guard, &inst);
+            if inst.script_entry.is_some() && !script_current {
+                Self::invalidate_instance(&mut guard, &id, "script_approval_changed");
+                continue;
+            }
+            let current_approval = script_current
+                || guard.approved_targets.get(&inst.expected_executable) == Some(&inst.expected_fingerprint);
             if !current_approval {
                 let existing = guard.retained_cli_instances.get(&id).cloned();
                 let source_key = existing.as_ref().map(|r| &r.source_key).or_else(|| guard.instance_sources.get(&id)).cloned();
@@ -373,7 +427,8 @@ impl SandboxLaunchRegistry {
                 let valid = guard.child_identities.get(&pid).is_some_and(|(exe, token)| {
                     let old_sha = old_children.get(exe).or_else(|| old_targets.get(exe));
                     let new_sha = guard.approved_child_executables.get(exe).or_else(|| guard.approved_targets.get(exe));
-                    (old_sha.is_some() && old_sha == new_sha)
+                    (script_current && exe == &inst.expected_executable)
+                        || (old_sha.is_some() && old_sha == new_sha)
                         || retained.as_ref().is_some_and(|r| r.children.get(&pid) == Some(&(exe.clone(), token.clone()))
                             && exe == &inst.expected_executable)
                 });
@@ -438,7 +493,26 @@ impl SandboxLaunchRegistry {
             }
         }
         guard.retained_cli_instances.remove(id);
+        guard.script_instances.remove(id);
         guard.instance_sources.remove(id);
+    }
+
+    fn script_approval_current(guard: &mut RegistryInner, inst: &ManagedLaunchInstance) -> bool {
+        if inst.script_entry.is_none() { return true; }
+        let Some(binding) = guard.script_instances.get(&inst.instance_id).cloned() else { return false; };
+        let c = &binding.combo;
+        guard.approved_script_combos.get(&combo_key(c)) == Some(c)
+            && combo_aliases_match(c)
+            && Self::image_status(guard, &c.script_path, &c.script_fingerprint) == ImageStatus::Verified
+            && Self::image_status(guard, &c.interpreter_path, &c.interpreter_fingerprint) == ImageStatus::Verified
+            && binding.package.matches_current()
+    }
+
+    fn initial_script_exec_matches(guard: &RegistryInner, inst: &ManagedLaunchInstance,
+        live: &claude_watch_system::ProcessKernelIdentity) -> bool {
+        inst.script_entry.is_none() || guard.script_instances.get(&inst.instance_id).is_some_and(|binding|
+            claude_watch_system::bound_process_cdhash(live) == Some(binding.cdhash)
+                && inst.helper_identity.as_ref().is_some_and(|tok| tok.audit_token != Some(live.audit_token)))
     }
 
     fn rebuild_image_approvals(guard: &mut RegistryInner) {
@@ -448,6 +522,13 @@ impl SandboxLaunchRegistry {
             if let Some(inst) = guard.instances.get(id) {
                 if inst.state == ManagedInstanceState::ExecVerified {
                     desired.insert(inst.expected_executable.clone(), inst.expected_fingerprint.clone());
+                }
+            }
+        }
+        for inst in guard.instances.values() {
+            if !matches!(inst.state, ManagedInstanceState::Failed | ManagedInstanceState::Exited) {
+                if let Some(binding) = guard.script_instances.get(&inst.instance_id) {
+                    desired.insert(binding.combo.interpreter_path.clone(), binding.combo.interpreter_fingerprint.clone());
                 }
             }
         }
@@ -593,7 +674,7 @@ impl SandboxLaunchRegistry {
                 instance_id: None,
                 executor_boot_id: self.executor_boot_id(),
                 error_code: Some("untrusted_sandbox_helper_peer".into()),
-                message: "Helper 进程未通过内核 LOCAL_PEERTOKEN 或可执行文件哈希核验".into(),
+                message: "Helper 进程未通过内核身份、实时签名或加载防护核验".into(),
             };
             let _ = Self::write_wire_response(&mut stream, &resp);
             return Ok(resp);
@@ -628,6 +709,15 @@ impl SandboxLaunchRegistry {
             }
         };
 
+        if verify_sandbox_helper_peer(&stream, &verifier).as_ref() != Some(&peer_id) {
+            let resp = SandboxHelperWireResponse {
+                accepted: false, instance_id: None, executor_boot_id: self.executor_boot_id(),
+                error_code: Some("untrusted_sandbox_helper_peer".into()),
+                message: "读取登记请求期间 Helper 的实时身份无法核验".into(),
+            };
+            let _ = Self::write_wire_response(&mut stream, &resp);
+            return Ok(resp);
+        }
         let resp = self.process_verified_registration(peer_id, wire_req, now);
         let _ = Self::write_wire_response(&mut stream, &resp);
         Ok(resp)
@@ -764,18 +854,49 @@ impl SandboxLaunchRegistry {
                 message: "目标程序不在受控 AI 白名单内，拒绝冒充启动".into(),
             };
         };
+        let binding = if let (Some(script), Some(interpreter)) = (&wire.request.script_entry, &wire.request.interpreter) {
+            let combo = guard.approved_script_combos.get(&(script.clone(), interpreter.clone()))
+                .filter(|c| c.matches_request(&wire.request) && c.script_path == canon_target && combo_aliases_match(c)).cloned();
+            let Some(combo) = combo else {
+                return SandboxHelperWireResponse { accepted: false, instance_id: None, executor_boot_id: guard.executor_boot_id.clone(),
+                    error_code: Some("unapproved_script_combination".into()), message: "脚本、解释器或来源修订不匹配".into() };
+            };
+            Some(combo)
+        } else {
+            if guard.approved_script_combos.values().any(|c| c.script_path == canon_target) {
+                return SandboxHelperWireResponse { accepted: false, instance_id: None, executor_boot_id: guard.executor_boot_id.clone(),
+                    error_code: Some("script_launch_contract_required".into()), message: "脚本不能按原生程序注册".into() };
+            }
+            None
+        };
         let revision = guard.image_approvals.get(&canon_target).map(|(_, revision)| *revision).unwrap_or(0);
         let key = VerificationKey::new(&canon_target, &expected_target_sha, revision);
         drop(guard);
         // Registration always performs a real first-use content read, outside
         // the authority lock, even if an inventory proof is already cached.
         let verified = key.as_ref().and_then(VerificationKey::verify) == Some(true);
+        let script_checks = binding.as_ref().and_then(|c| {
+            let interpreter = VerificationKey::new(&c.interpreter_path, &c.interpreter_fingerprint, 0)?;
+            let package = VerificationKey::new_regular(&c.package_path, &c.package_fingerprint)?;
+            let cdhash = claude_watch_system::executable_cdhash(Path::new(&c.interpreter_path))?;
+            (interpreter.verify() == Some(true) && package.verify() == Some(true)).then_some((interpreter, package, cdhash))
+        });
+
         let mut guard = match self.inner.lock() {
             Ok(guard) => guard,
             Err(_) => return SandboxHelperWireResponse { accepted: false, instance_id: None, executor_boot_id: String::new(),
                 error_code: Some("registry_lock_poisoned".into()), message: "沙箱注册表锁异常".into() },
         };
-        guard.content_reads += 1;
+        guard.content_reads += if binding.is_some() { 3 } else { 1 };
+        if binding.as_ref().is_some_and(|c| {
+            guard.approved_script_combos.get(&combo_key(c)) != Some(c) || !combo_aliases_match(c)
+                || script_checks.as_ref().is_none_or(|(interpreter, package, _)|
+                    VerificationKey::new(&c.interpreter_path, &c.interpreter_fingerprint, 0).as_ref() != Some(interpreter)
+                    || !package.matches_current())
+        }) {
+            return SandboxHelperWireResponse { accepted: false, instance_id: None, executor_boot_id: guard.executor_boot_id.clone(),
+                error_code: Some("script_source_changed_during_verification".into()), message: "启动前脚本、解释器或来源文件变化".into() };
+        }
         let current_key = VerificationKey::new(&canon_target, &expected_target_sha, revision);
         if guard.executor_boot_id != wire.request.executor_boot_id || guard.policy_version != wire.request.policy_version
             || guard.used_nonces.contains_key(&wire.request.launch_nonce)
@@ -830,7 +951,7 @@ impl SandboxLaunchRegistry {
             direct_network_blocked: true,
             unix_relay_blocked: true,
             verified_helper_origin: true,
-            helper_cdhash: peer.helper_sha256,
+            helper_cdhash: peer.helper_cdhash,
             helper_identity: helper_token.clone(),
             executor_boot_id: guard.executor_boot_id.clone(),
             applied_at: now,
@@ -848,6 +969,12 @@ impl SandboxLaunchRegistry {
             "claude".to_string()
         };
 
+        let (expected_exe, expected_sha, script_entry, script_fingerprint) = if let Some(c) = &binding {
+            (c.interpreter_path.clone(), c.interpreter_fingerprint.clone(), Some(c.script_path.clone()), Some(c.script_fingerprint.clone()))
+        } else {
+            (canon_target, expected_target_sha, None, None)
+        };
+
         let instance = ManagedLaunchInstance {
             instance_id: instance_id.clone(),
             entry_id: wire.request.entry_id.clone(),
@@ -856,8 +983,8 @@ impl SandboxLaunchRegistry {
             launch_nonce: wire.request.launch_nonce,
             executor_boot_id: guard.executor_boot_id.clone(),
             helper_identity: Some(helper_token),
-            expected_executable: canon_target,
-            expected_fingerprint: expected_target_sha,
+            expected_executable: expected_exe,
+            expected_fingerprint: expected_sha,
             exec_identity: None,
             verified_executable: None,
             pid: peer.process.pid,
@@ -869,14 +996,28 @@ impl SandboxLaunchRegistry {
             sandbox_evidence: Some(evidence),
             updated_at: now,
             error_code: None,
+            script_entry,
+            script_fingerprint,
         };
 
         let sources: Vec<_> = guard.cli_sources.iter().filter(|(_, source)|
-            source.target == instance.target && source.executable == instance.expected_executable
-                && source.fingerprint == instance.expected_fingerprint).map(|(key, _)| key.clone()).collect();
+            source.target == instance.target && (
+                (source.executable == instance.expected_executable && source.fingerprint == instance.expected_fingerprint)
+                || (instance.script_entry.as_ref().is_some_and(|s| &source.executable == s)
+                    && instance.script_fingerprint.as_ref().is_some_and(|f| &source.fingerprint == f))
+            )
+        ).map(|(key, _)| key.clone()).collect();
         if sources.len() == 1 { guard.instance_sources.insert(instance_id.clone(), sources[0].clone()); }
         guard.pid_to_instance.insert(peer.process.pid, instance_id.clone());
         guard.instances.insert(instance_id.clone(), instance);
+        if let (Some(combo), Some((mut interpreter, package, cdhash))) = (binding, script_checks) {
+            guard.script_instances.insert(instance_id.clone(), ScriptInstanceApproval { combo, cdhash, package });
+            Self::rebuild_image_approvals(&mut guard);
+            if let Some((_, revision)) = guard.image_approvals.get(&interpreter.path) {
+                interpreter.approval_revision = *revision;
+                guard.image_verifications.insert(interpreter, ImageStatus::Verified);
+            }
+        }
         drop(guard);
         self.persist_instances();
 
@@ -898,16 +1039,54 @@ impl SandboxLaunchRegistry {
         canon_child: &str,
         child_token: &BoundProcessToken,
         inst: &ManagedLaunchInstance,
+        child: &claude_watch_system::ProcessKernelIdentity,
     ) -> bool {
+        if inst.script_entry.is_some() {
+            return canon_child == inst.expected_executable && Self::script_approval_current(guard, inst)
+                && Self::verified_script_fork(guard, inst, child, child_token);
+        }
         let current_sha = guard.approved_targets.get(canon_child)
             .or_else(|| guard.approved_child_executables.get(canon_child)).cloned();
         let sha = current_sha.or_else(|| {
-            (canon_child == inst.expected_executable
-                && guard.retained_cli_instances.get(&inst.instance_id).is_some_and(|retained|
-                    retained.children.get(&child_token.pid) == Some(&(canon_child.into(), child_token.clone()))))
-                .then(|| inst.expected_fingerprint.clone())
+            if canon_child == inst.expected_executable {
+                Some(inst.expected_fingerprint.clone())
+            } else {
+                guard.retained_cli_instances.get(&inst.instance_id).and_then(|retained| {
+                    (retained.children.get(&child_token.pid) == Some(&(canon_child.into(), child_token.clone())))
+                        .then(|| inst.expected_fingerprint.clone())
+                })
+            }
         });
         sha.is_some_and(|sha| Self::image_status(guard, canon_child, &sha) == ImageStatus::Verified)
+    }
+
+    fn verified_script_fork(guard: &RegistryInner, inst: &ManagedLaunchInstance,
+        child: &claude_watch_system::ProcessKernelIdentity, token: &BoundProcessToken) -> bool {
+        if !claude_watch_system::bound_fork_only(child) || child.uid != inst.uid { return false; }
+        if let Some((exe, previous)) = guard.child_identities.get(&child.pid) {
+            return exe == &inst.expected_executable && previous == token
+                && guard.pid_to_instance.get(&child.pid) == Some(&inst.instance_id);
+        }
+        let Some(current) = guard.instances.get(&inst.instance_id) else { return false; };
+        let mut cursor = child.clone();
+        for _ in 0..32 {
+            let Some(parent) = inspect_process_identity(cursor.ppid).filter(|parent| {
+                parent.uid == inst.uid && parent.executable_path == inst.expected_executable
+                    && (parent.start_seconds, parent.start_microseconds) <= (cursor.start_seconds, cursor.start_microseconds)
+            }) else { return false; };
+            let matches = |token: &BoundProcessToken| token.matches_process(parent.pid, parent.uid,
+                parent.start_seconds, parent.start_microseconds, Some(&parent.audit_token));
+            if parent.pid == inst.pid {
+                return current.has_verified_main_protection(&guard.executor_boot_id, &guard.policy_version)
+                    && current.exec_identity.as_ref().is_some_and(matches);
+            }
+            if !claude_watch_system::bound_fork_only(&parent) { return false; }
+            if guard.pid_to_instance.get(&parent.pid) == Some(&inst.instance_id)
+                && guard.child_identities.get(&parent.pid).is_some_and(|(_, token)| matches(token))
+            { return true; }
+            cursor = parent;
+        }
+        false
     }
 
     /// Reconciles all managed launch instances and their inherited child process trees (`D03`/`I02`):
@@ -940,6 +1119,10 @@ impl SandboxLaunchRegistry {
                 continue;
             }
 
+            if !Self::script_approval_current(&mut guard, &inst) {
+                Self::invalidate_instance(&mut guard, &inst_id, "script_source_evidence_changed");
+                continue;
+            }
             if inst.state == ManagedInstanceState::ExecVerified
                 && Self::image_status(&mut guard, &inst.expected_executable, &inst.expected_fingerprint) != ImageStatus::Verified {
                 Self::invalidate_instance(&mut guard, &inst_id, "executable_evidence_changed");
@@ -991,6 +1174,10 @@ impl SandboxLaunchRegistry {
                         role,
                     )
                     .with_audit_token(main_kernel.audit_token);
+                    if inst.state == ManagedInstanceState::SandboxApplied && !Self::initial_script_exec_matches(&guard, &inst, &main_kernel) {
+                        Self::invalidate_instance(&mut guard, &inst_id, "script_interpreter_loaded_identity_mismatch");
+                        continue;
+                    }
                     if let Some(m) = guard.instances.get_mut(&inst_id) {
                         if m.state == ManagedInstanceState::SandboxApplied {
                             m.exec_identity = Some(tok);
@@ -1085,7 +1272,7 @@ impl SandboxLaunchRegistry {
                 )
                 .with_audit_token(child_kernel.audit_token);
                 let is_allowed_child = Self::verify_approved_child_executable_fingerprint(
-                    &mut guard, &canon_child, &child_tok, &inst,
+                    &mut guard, &canon_child, &child_tok, &inst, &child_kernel,
                 );
                 if !is_allowed_child {
                     if guard.child_identities.contains_key(&child_pid) { guard.invalidated_families.insert(inst.family.clone()); }
@@ -1162,6 +1349,45 @@ impl SandboxLaunchRegistry {
         tokens
     }
 
+    /// Check the already issued member without rediscovering another subtree.
+    /// The process worker separately revalidates the live kernel token at signal.
+    pub(crate) fn disposition_instance_id(&self, family: &str, token: &BoundProcessToken) -> Option<String> {
+        let guard = self.inner.lock().ok()?;
+        let id = guard.pid_to_instance.get(&token.pid)?;
+        let inst = guard.instances.get(id)?;
+        if inst.family != family || inst.state != ManagedInstanceState::ExecVerified { return None; }
+        let matches = if inst.pid == token.pid { inst.exec_identity.as_ref() == Some(token) } else {
+            inst.controlled_subtree_pids.contains(&token.pid)
+                && guard.child_identities.get(&token.pid).is_some_and(|(_, current)| current == token)
+        };
+        matches.then(|| id.clone())
+    }
+
+    pub(crate) fn current_disposition_member(
+        &self, intent: &claude_watch_core::channel::ProcessDispositionIntent,
+        token: &BoundProcessToken, process: &claude_watch_system::ProcessKernelIdentity, now: f64,
+    ) -> bool {
+        let Ok(mut guard) = self.inner.lock() else { return false; };
+        if guard.executor_boot_id != intent.executor_boot_id || guard.policy_version != intent.policy_version {
+            return false;
+        }
+        let Some(inst) = guard.pid_to_instance.get(&token.pid).and_then(|id| guard.instances.get(id)).cloned()
+        else { return false; };
+        if inst.family != intent.family || intent.target_instances.get(&token.pid) != Some(&inst.instance_id)
+            || !(0.0..10.0).contains(&(now - inst.updated_at))
+            || !Self::script_approval_current(&mut guard, &inst)
+            || Self::image_status(&mut guard, &inst.expected_executable, &inst.expected_fingerprint) != ImageStatus::Verified
+        { return false; }
+        if inst.pid == token.pid {
+            return inst.has_verified_main_protection(&guard.executor_boot_id, &guard.policy_version)
+                && inst.exec_identity.as_ref() == Some(token) && inst.expected_executable == process.executable_path;
+        }
+        inst.has_verified_subtree_protection(&guard.executor_boot_id, &guard.policy_version)
+            && inst.controlled_subtree_pids.contains(&token.pid)
+            && guard.child_identities.get(&token.pid).is_some_and(|(exe, stored)| stored == token && exe == &process.executable_path)
+            && Self::verify_approved_child_executable_fingerprint(&mut guard, &process.executable_path, token, &inst, process)
+    }
+
     /// Live TCP socket attribution (`I02`) using `AcceptedConnectionContext`.
     ///
     /// - Reconciles the managed process tree (including inherited `fork`/`exec` children).
@@ -1180,6 +1406,9 @@ impl SandboxLaunchRegistry {
         let (boot_id, policy_version, candidate_pids) = {
             let guard = self.inner.lock().ok()?;
             if !ctx.is_valid_for_listener(&guard.executor_boot_id) {
+                return None;
+            }
+            if guard.pid_to_instance.len() > claude_watch_system::MAX_TCP_PEER_CANDIDATES {
                 return None;
             }
             let pids: Vec<u32> = guard.pid_to_instance.keys().copied().collect();
@@ -1208,6 +1437,10 @@ impl SandboxLaunchRegistry {
         let inst_id = guard.pid_to_instance.get(&kernel_id.pid)?.clone();
         let prev_child = guard.child_identities.get(&kernel_id.pid).cloned();
         let original = guard.instances.get(&inst_id)?.clone();
+        if !Self::script_approval_current(&mut guard, &original) {
+            Self::invalidate_instance(&mut guard, &inst_id, "script_source_evidence_changed");
+            return None;
+        }
         if Self::image_status(&mut guard, &original.expected_executable, &original.expected_fingerprint) != ImageStatus::Verified {
             if original.state == ManagedInstanceState::ExecVerified { Self::invalidate_instance(&mut guard, &inst_id, "executable_evidence_changed"); }
             return None;
@@ -1256,6 +1489,10 @@ impl SandboxLaunchRegistry {
             .with_audit_token(kernel_id.audit_token);
 
             if inst.state == ManagedInstanceState::SandboxApplied {
+                if !Self::initial_script_exec_matches(&guard, &inst, &kernel_id) {
+                    Self::invalidate_instance(&mut guard, &inst_id, "script_interpreter_loaded_identity_mismatch");
+                    return None;
+                }
                 inst.exec_identity = Some(verified_token.clone());
                 inst.verified_executable = Some(canon_exec);
                 inst.state = ManagedInstanceState::ExecVerified;
@@ -1291,7 +1528,7 @@ impl SandboxLaunchRegistry {
                 kernel_id.pid, kernel_id.uid, kernel_id.start_seconds,
                 kernel_id.start_microseconds, ProcessRole::Child,
             ).with_audit_token(kernel_id.audit_token);
-            if !Self::verify_approved_child_executable_fingerprint(&mut guard, &canon_exec, &child_token, &instance) {
+            if !Self::verify_approved_child_executable_fingerprint(&mut guard, &canon_exec, &child_token, &instance, &kernel_id) {
                 guard.invalidated_families.insert(instance.family.clone());
                 guard.pid_to_instance.remove(&kernel_id.pid);
                 guard.child_identities.remove(&kernel_id.pid);
@@ -1375,6 +1612,7 @@ impl SandboxLaunchRegistry {
                     current.push(((id.clone(), token.pid), token.clone()));
                 }
                 for pid in &instance.controlled_subtree_pids {
+                    if guard.pid_to_instance.get(pid) != Some(id) { continue; }
                     if let Some((_, token)) = guard.child_identities.get(pid).filter(|(_, token)| token.has_verified_audit_token()) {
                         current.push(((id.clone(), *pid), token.clone()));
                     }
@@ -1388,11 +1626,18 @@ impl SandboxLaunchRegistry {
                 let mut row = json!(instance);
                 let members: Vec<_> = guard.visibility_tokens.range((id.clone(), 0)..=(id.clone(), u32::MAX)).map(|((_, pid), token)| {
                     let bytes = token.audit_token.unwrap().iter().map(u32::to_string).collect::<Vec<_>>().join(":");
-                    let currently_verified = instance.state == ManagedInstanceState::ExecVerified &&
-                        (instance.exec_identity.as_ref() == Some(token) || (instance.controlled_subtree_pids.contains(pid)
-                            && guard.child_identities.get(pid).is_some_and(|(_, current)| current == token)));
+                    let verified_executable = (instance.state == ManagedInstanceState::ExecVerified).then(|| {
+                        if instance.exec_identity.as_ref() == Some(token) {
+                            instance.verified_executable.as_deref()
+                        } else if instance.controlled_subtree_pids.contains(pid) && guard.pid_to_instance.get(pid) == Some(id) {
+                            guard.child_identities.get(pid).filter(|(_, current)| current == token).map(|(exe, _)| exe.as_str())
+                        } else {
+                            None
+                        }
+                    }).flatten();
                     json!({"pid":token.pid,"uid":token.uid,"start_seconds":token.start_seconds,"start_microseconds":token.start_microseconds,
-                        "audit_identity_digest":sha256_bytes_hex(bytes.as_bytes()),"currently_verified":currently_verified})
+                        "audit_identity_digest":sha256_bytes_hex(bytes.as_bytes()),"currently_verified":verified_executable.is_some(),
+                        "verified_executable":verified_executable})
                 }).collect();
                 if !members.is_empty() { row["process_visibility"] = json!({"observed_at":observed_at,"members":members}); }
                 row
@@ -1457,65 +1702,36 @@ pub fn register_helper_with_daemon(
     register_helper_over_connected_stream(stream, request, sandbox_applied, profile_sbpl)
 }
 
-/// Reads the expected SHA-256 hash for `component_rel_path` (e.g. `"watch-sandbox-launcher"`)
-/// from a trusted `BuildInfo.plist` (`RuntimeHashes`) or `components.json` manifest.
-/// Never computes a hash from the unverified binary itself as the root of trust (`I01`).
-pub fn lookup_trusted_component_sha256(
-    manifest_dir: &Path,
-    component_rel_path: &str,
-) -> Option<String> {
-    let build_info = manifest_dir.join("BuildInfo.plist");
-    if build_info.is_file() {
-        if let Ok(output) = std::process::Command::new("/usr/bin/plutil")
-            .args(["-convert", "json", "-o", "-"])
-            .arg(&build_info)
-            .output()
-        {
-            if output.status.success() {
-                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                    if let Some(sha) = val
-                        .get("RuntimeHashes")
-                        .and_then(|h| h.get(component_rel_path))
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        let trimmed = sha.trim().to_ascii_lowercase();
-                        if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
-                            return Some(trimmed);
-                        }
-                    }
-                }
-            }
+/// SHA-256 and CDHash must come from the same trusted manifest. A present
+/// but incomplete primary manifest cannot borrow identity from a fallback.
+fn lookup_trusted_helper_pins(dir: &Path) -> (Option<String>, Option<String>) {
+    let name = "watch-sandbox-launcher";
+    let build_info = dir.join("BuildInfo.plist");
+    let pair = if std::fs::symlink_metadata(&build_info).is_ok() {
+        let Some(value) = std::process::Command::new("/usr/bin/plutil")
+            .args(["-convert", "json", "-o", "-"]).arg(&build_info).output().ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+        else { return (None, None); };
+        (value["RuntimeHashes"][name].as_str().map(str::to_owned),
+         value["RuntimeCDHashes"][name].as_str().map(str::to_owned))
+    } else {
+        let Some(value) = std::fs::read(dir.join("components.json")).ok()
+            .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+        else { return (None, None); };
+        let component = value["components"].get("sandbox_launcher")
+            .or_else(|| value["components"].get(name));
+        if let Some(component) = component.filter(|c| c.is_object()) {
+            (component["sha256"].as_str().map(str::to_owned), component["cdhash"].as_str().map(str::to_owned))
+        } else {
+            let key = if value["hashes"].get(name).is_some() { name } else { "sandbox_launcher" };
+            (component.and_then(serde_json::Value::as_str).or_else(|| value["hashes"][key].as_str()).map(str::to_owned),
+             value["cdhashes"][key].as_str().map(str::to_owned))
         }
-    }
-    let components_json = manifest_dir.join("components.json");
-    if components_json.is_file() {
-        if let Ok(bytes) = std::fs::read(&components_json) {
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                let key = if component_rel_path == "watch-sandbox-launcher" {
-                    "sandbox_launcher"
-                } else {
-                    component_rel_path
-                };
-                if let Some(sha) = val
-                    .get("components")
-                    .and_then(|c| c.get(key).or_else(|| c.get(component_rel_path)))
-                    .and_then(|c| c.get("sha256").or(Some(c)))
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| {
-                        val.get("hashes")
-                            .and_then(|h| h.get(key).or_else(|| h.get(component_rel_path)))
-                            .and_then(serde_json::Value::as_str)
-                    })
-                {
-                    let trimmed = sha.trim().to_ascii_lowercase();
-                    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
-                        return Some(trimmed);
-                    }
-                }
-            }
-        }
-    }
-    None
+    };
+    let normalized = |value: Option<String>, len| value.map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| v.len() == len && v.bytes().all(|b| b.is_ascii_hexdigit()));
+    (normalized(pair.0, 64), normalized(pair.1, 40))
 }
 
 /// Reads packaged backend metadata. Seatbelt is the only executable backend;
@@ -1563,8 +1779,8 @@ pub fn build_helper_verifier_from_manifest(
     manifest_dir: &Path,
     helper_path: &Path,
 ) -> Result<SandboxPeerVerifier> {
-    let expected_sha = lookup_trusted_component_sha256(manifest_dir, "watch-sandbox-launcher")
-        .ok_or_else(|| {
+    let (sha, cdhash) = lookup_trusted_helper_pins(manifest_dir);
+    let expected_sha = sha.ok_or_else(|| {
             CoreError::new(
                 "helper_manifest_hash_missing",
                 "可信构建清单 (BuildInfo.plist / components.json) 缺少 watch-sandbox-launcher 预期哈希",
@@ -1582,11 +1798,17 @@ pub fn build_helper_verifier_from_manifest(
             "watch-sandbox-launcher 实际文件哈希与可信构建清单不符",
         ));
     }
+    let expected_helper_cdhash = cdhash.ok_or_else(|| CoreError::new(
+        "helper_manifest_cdhash_missing", "可信构建清单缺少最终签名的沙箱 helper CDHash"))?;
+    let actual_cdhash = component_cdhash(&canon)?;
+    if actual_cdhash != expected_helper_cdhash {
+        return Err(CoreError::new("helper_manifest_cdhash_mismatch", "沙箱 helper 最终签名与清单不符"));
+    }
     Ok(SandboxPeerVerifier {
         expected_uid: effective_uid(),
         expected_helper_executable: canon.to_string_lossy().into_owned(),
         expected_helper_sha256: expected_sha,
-        require_code_signature_identifier: None,
+        expected_helper_cdhash,
     })
 }
 
@@ -1608,8 +1830,14 @@ pub fn build_helper_verifier_for_path(helper_path: &Path) -> Result<SandboxPeerV
         expected_uid: effective_uid(),
         expected_helper_executable: canon.to_string_lossy().into_owned(),
         expected_helper_sha256: sha,
-        require_code_signature_identifier: None,
+        expected_helper_cdhash: component_cdhash(&canon)?,
     })
+}
+
+fn component_cdhash(path: &Path) -> Result<String> {
+    claude_watch_system::executable_cdhash(path)
+        .map(|hash| hash.iter().map(|b| format!("{b:02x}")).collect())
+        .ok_or_else(|| CoreError::new("helper_signature_unavailable", "沙箱 helper 文件签名不可核验"))
 }
 
 pub fn default_registration_socket_path(watch_dir: &Path) -> PathBuf {
@@ -1630,7 +1858,7 @@ mod approval_refresh_tests {
         let path = std::fs::canonicalize(&file).unwrap().to_string_lossy().into_owned();
         let sha = sha256_file_hex(&file).unwrap();
         let reg = Arc::new(SandboxLaunchRegistry::new("boot", PolicyVersion { policy_digest:"p".into(), guard_policy_digest:"g".into() },
-            SandboxPeerVerifier { expected_uid:effective_uid(), expected_helper_executable:"/fixture/helper".into(), expected_helper_sha256:"h".into(), require_code_signature_identifier:None }, None));
+            SandboxPeerVerifier { expected_uid:effective_uid(), expected_helper_executable:"/fixture/helper".into(), expected_helper_sha256:"h".into(), expected_helper_cdhash:"0".repeat(40) }, None));
         reg.replace_approved_targets(BTreeMap::from([(path.clone(), sha.clone())]), BTreeMap::new());
         let (entered_tx, entered_rx) = mpsc::channel(); let (release_tx, release_rx) = mpsc::channel();
         let worker_registry = reg.clone();
@@ -1700,6 +1928,7 @@ mod approval_refresh_tests {
             verified_executable: Some(exe.into()), pid, uid: 501, start_seconds: 10, start_microseconds: 0,
             controlled_subtree_pids: Vec::new(), state: ManagedInstanceState::ExecVerified,
             sandbox_evidence: None, updated_at: 1.0, error_code: None,
+            script_entry: None, script_fingerprint: None,
         }
     }
 
@@ -1707,7 +1936,7 @@ mod approval_refresh_tests {
     fn replacement_invalidates_removed_targets_and_changed_children_without_touching_other_families() {
         let reg = SandboxLaunchRegistry::new("boot", PolicyVersion { policy_digest: "p".into(), guard_policy_digest: "g".into() },
             SandboxPeerVerifier { expected_uid: 501, expected_helper_executable: "/fixture/helper".into(),
-                expected_helper_sha256: "h".into(), require_code_signature_identifier: None }, None);
+                expected_helper_sha256: "h".into(), expected_helper_cdhash: "0".repeat(40) }, None);
         let a = "/fixture/a".to_string(); let b = "/fixture/b".to_string(); let child = "/fixture/child".to_string();
         let targets = BTreeMap::from([(a.clone(), "a1".into()), (b.clone(), "b1".into())]);
         reg.replace_approved_targets(targets.clone(), BTreeMap::from([(child.clone(), "c1".into())]));

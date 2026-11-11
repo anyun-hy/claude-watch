@@ -5,9 +5,10 @@ import Darwin
 import Foundation
 
 struct ControlledEntryLaunchBinding {
-    static func arguments(target: String, bundlePath: String) -> [String] {
+    static func arguments(target: String, bundlePath: String, home: String? = nil) -> [String] {
         var arguments = ["launch", "--target", target, "--apply"]
         if !bundlePath.isEmpty { arguments += ["--target-bundle", bundlePath] }
+        if let home, !home.isEmpty { arguments += ["--home", home] }
         return arguments
     }
 }
@@ -64,39 +65,44 @@ enum InstanceAuditResult {
 final class ControlledEntryDelegate: NSObject, NSApplicationDelegate {
     let env = ProcessInfo.processInfo.environment
     let info = Bundle.main.infoDictionary ?? [:]
+    var managedHome: String? { info["CWWatchHomePath"] as? String }
+
+    private func legacyOverride(_ key: String) -> String? {
+        managedHome == nil ? env[key] : nil
+    }
 
     lazy var target: String = {
-        env["CW_ENTRY_TARGET"]
+        legacyOverride("CW_ENTRY_TARGET")
             ?? (info["CWTarget"] as? String)
             ?? (info["CWManagedEntryTarget"] as? String)
             ?? "claude-desktop"
     }()
 
     lazy var targetBundleId: String = {
-        env["CW_TARGET_BUNDLE_ID"]
+        legacyOverride("CW_TARGET_BUNDLE_ID")
             ?? (info["CWTargetBundleId"] as? String)
             ?? defaultBundleId(for: target)
     }()
 
     lazy var targetExecutable: String = {
-        env["CW_TARGET_EXECUTABLE"]
+        legacyOverride("CW_TARGET_EXECUTABLE")
             ?? (info["CWTargetExecutable"] as? String)
             ?? ""
     }()
 
     lazy var targetBundlePath: String = {
-        env["CW_TARGET_BUNDLE_PATH"] ?? (info["CWTargetBundlePath"] as? String) ?? ""
+        legacyOverride("CW_TARGET_BUNDLE_PATH") ?? (info["CWTargetBundlePath"] as? String) ?? ""
     }()
 
     lazy var watchBin: String = {
-        env["CW_WATCH_BINARY"]
+        legacyOverride("CW_WATCH_BINARY")
             ?? (info["CWWatchBin"] as? String)
             ?? (info["CWWatchBinaryPath"] as? String)
             ?? "\(NSHomeDirectory())/.local/bin/claude-watch"
     }()
 
     lazy var watchStateDir: String = {
-        if let dir = env["CW_WATCH_STATE_DIR"], !dir.isEmpty {
+        if let dir = legacyOverride("CW_WATCH_STATE_DIR"), !dir.isEmpty {
             return dir
         }
         return (info["CWWatchStateDirPath"] as? String)
@@ -104,7 +110,7 @@ final class ControlledEntryDelegate: NSObject, NSApplicationDelegate {
     }()
 
     lazy var eventLog: BoundedDiagnosticLog = {
-        ControlledEntryDiagnosticFields.logger(stateDirectory: watchStateDir, overridePath: env["CW_ENTRY_EVENT_LOG"])
+        ControlledEntryDiagnosticFields.logger(stateDirectory: watchStateDir, overridePath: legacyOverride("CW_ENTRY_EVENT_LOG"))
     }()
 
     private var pendingURLs: [URL] = []
@@ -342,10 +348,13 @@ final class ControlledEntryDelegate: NSObject, NSApplicationDelegate {
     func discoverRunningTargetPids() -> [pid_t] {
         var pids = Set<pid_t>()
         let myPid = getpid()
+        let selectedBundle = managedHome != nil && !targetBundlePath.isEmpty
+            ? URL(fileURLWithPath: targetBundlePath).resolvingSymlinksInPath().path : nil
         for app in NSWorkspace.shared.runningApplications {
             let pid = app.processIdentifier
             if pid <= 1 || pid == myPid { continue }
-            if app.bundleIdentifier == targetBundleId {
+            if app.bundleIdentifier == targetBundleId,
+               selectedBundle == nil || app.bundleURL?.resolvingSymlinksInPath().path == selectedBundle {
                 pids.insert(pid)
             } else if !targetExecutable.isEmpty,
                       let exeURL = app.executableURL,
@@ -614,7 +623,7 @@ final class ControlledEntryDelegate: NSObject, NSApplicationDelegate {
     func performControlledLaunch() async -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: watchBin)
-        process.arguments = ControlledEntryLaunchBinding.arguments(target: target, bundlePath: targetBundlePath)
+        process.arguments = ControlledEntryLaunchBinding.arguments(target: target, bundlePath: targetBundlePath, home: managedHome)
         // Inherit the wrapper's streams. Do not wait before draining a bounded
         // pipe or block the AppKit event loop while the engine starts its child.
         process.standardOutput = FileHandle.standardOutput

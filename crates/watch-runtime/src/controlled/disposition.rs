@@ -1,6 +1,9 @@
 //! Decision/execution boundary for the guard. A skipped action is not a stop.
 use super::*;
-use claude_watch_core::session::{Egress, Phase, Session};
+use claude_watch_core::{
+    channel::ChannelPermit,
+    session::{Egress, Phase, Session},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StopOutcome {
@@ -138,6 +141,13 @@ impl Controller {
                     self.forget_risk(family.id, receipt["session_id"].as_str())?;
                 }
             }
+            Ok(StopOutcome::SkippedWarn)
+        } else if action == "force" && system.channel_mode() && system.delegates_process_disposition() {
+            receipt["process_requested_action"] = json!("force_quit");
+            receipt["channel_requested_action"] = json!("disconnect");
+            receipt["process_execution_state"] = json!("awaiting_supervisor");
+            receipt["process_preserved"] = Value::Null;
+            receipt["stop_state"] = json!("awaiting_supervisor");
             Ok(StopOutcome::SkippedWarn)
         } else if action == "force" && family.is_some_and(|f| f.performable("force")) {
             // When user policy requested force (SIGKILL), respect it regardless of channel mode.
@@ -399,5 +409,23 @@ impl Controller {
             }
         }
         Ok(true)
+    }
+
+    // Presentation only: the active Supervisor is the sole signer and its
+    // worker is the sole automatic signal executor in channel mode.
+    pub(super) fn describe_cli_channel_disposition(&self, family: &str, permit: &ChannelPermit, receipt: &mut Value) {
+        let action = PolicyCatalog::family(family).and_then(|f| f.providers.first().copied())
+            .map(|provider| self.close_action(&permit.reason_code, provider)).unwrap_or_else(|| "warn".into());
+        receipt["stop_action"] = json!(action);
+        receipt["stop_reason_code"] = json!(permit.reason_code);
+        receipt["process_execution_state"] = json!(match action.as_str() {
+            "force" => "awaiting_supervisor",
+            "close" => "preserved",
+            _ => "skipped_warn_only",
+        });
+        if action == "force" {
+            receipt["process_requested_action"] = json!("force_quit");
+            receipt["process_preserved"] = Value::Null;
+        }
     }
 }

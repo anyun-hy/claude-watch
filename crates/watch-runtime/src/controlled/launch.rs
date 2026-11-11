@@ -227,18 +227,21 @@ impl Controller {
         }
         result
     }
-    fn observation_audit<S: DesktopSystem>(
-        &self,
-        system: &mut S,
-        owner: &ProcessIdentity,
-    ) -> Result<Value> {
-        let target = system.launch_target();
+    fn require_launch_backend<S: DesktopSystem>(system: &mut S) -> Result<()> {
         if !system.backend_healthy()? {
             return Err(CoreError::new(
                 "backend_unhealthy",
                 "采集后台未有效运行，未启动",
             ));
         }
+        Ok(())
+    }
+    fn observation_audit<S: DesktopSystem>(
+        &self,
+        system: &mut S,
+        owner: &ProcessIdentity,
+    ) -> Result<Value> {
+        let target = system.launch_target();
         let audit = system.full_audit()?;
         let current = system.egress();
         let now = system.now();
@@ -260,6 +263,10 @@ impl Controller {
         Ok(audit)
     }
     fn launch_observation<S: DesktopSystem>(&self, system: &mut S) -> Result<Value> {
+        // Collection is an independent launch requirement. A missing
+        // heartbeat can rule out launch before scanning the full inventory.
+        // Keep both target scans and the post-audit backend/owner recheck.
+        Self::require_launch_backend(system)?;
         let target = system.launch_target();
         let owner = system.observation_owner()?;
         if !owner.valid() {
@@ -353,6 +360,7 @@ impl Controller {
                 "CLI启动器身份未确认",
             ));
         }
+        Self::require_launch_backend(system)?;
         self.observation_audit(system, &owner)?;
         system.prepare_cli()?;
         if let Some(code) = system.cli_interrupted() {

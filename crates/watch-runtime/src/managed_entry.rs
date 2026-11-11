@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    io::Read,
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -234,6 +235,11 @@ pub fn prepare_desktop_managed_launch(
         vpn_epoch,
         launch_nonce: format!("nonce-{}", Uuid::new_v4()),
         executor_boot_id: executor_boot_id.to_string(),
+        script_entry: None,
+        script_fingerprint: None,
+        interpreter: None,
+        interpreter_fingerprint: None,
+        script_source: None,
     };
     req.validate()?;
     Ok(DesktopEntryPreparation::ReadyToLaunch { request: req })
@@ -338,6 +344,143 @@ pub fn resolve_real_cli_with_source(
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedScriptContext {
+    pub target_executable: String,
+    pub target_fingerprint: String,
+    pub script_entry: Option<String>,
+    pub script_fingerprint: Option<String>,
+    pub interpreter: Option<String>,
+    pub interpreter_fingerprint: Option<String>,
+}
+
+pub fn is_script_file(path: &Path) -> bool {
+    let mut bytes = [0; 2];
+    fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .is_ok()
+        && bytes == *b"#!"
+        || path
+            .extension()
+            .is_some_and(|v| v == "js" || v == "mjs" || v == "cjs")
+}
+
+pub fn resolve_script_launcher_context(
+    real_exe: &Path,
+    real_sha: &str,
+    search_paths: &[PathBuf],
+) -> Result<ResolvedScriptContext> {
+    if !is_script_file(real_exe) {
+        return Ok(ResolvedScriptContext {
+            target_executable: real_exe.to_string_lossy().into_owned(),
+            target_fingerprint: real_sha.to_string(),
+            script_entry: None,
+            script_fingerprint: None,
+            interpreter: None,
+            interpreter_fingerprint: None,
+        });
+    }
+
+    let mut bytes = Vec::new();
+    let mut f = fs::File::open(real_exe)
+        .map_err(|e| CoreError::new("script_read_failed", &format!("无法打开脚本文件: {e}")))?;
+    let _ = f.read_to_end(&mut bytes);
+
+    let first_line = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|s| s.lines().next())
+        .and_then(|l| l.strip_prefix("#!"))
+        .map(str::trim);
+
+    let interp_name = if let Some(line) = first_line {
+        let mut words = line.split_whitespace();
+        let first = words.next().ok_or_else(|| {
+            CoreError::new("unsupported_launcher", "脚本 shebang 格式无效")
+        })?;
+        if first == "/usr/bin/env" {
+            let mut next = words.next().ok_or_else(|| {
+                CoreError::new("unsupported_launcher", "脚本 shebang /usr/bin/env 缺少解释器参数")
+            })?;
+            if next == "-S" {
+                next = words.next().ok_or_else(|| {
+                    CoreError::new("unsupported_launcher", "脚本 shebang -S 缺少解释器参数")
+                })?;
+            }
+            next
+        } else {
+            first
+        }
+    } else if real_exe.extension().is_some_and(|v| v == "js" || v == "mjs" || v == "cjs") {
+        "node"
+    } else {
+        return Err(CoreError::new(
+            "unsupported_launcher",
+            "脚本缺少有效 shebang 或受支持的文件扩展名",
+        ));
+    };
+
+    let base_name = Path::new(interp_name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(interp_name);
+    if !["node", "nodejs", "bun", "sh", "bash"].contains(&base_name) {
+        return Err(CoreError::new(
+            "unsupported_launcher",
+            &format!("不支持此形式的脚本型 CLI 解释器: {base_name}"),
+        ));
+    }
+
+    let default_paths = [
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+    ];
+
+    let interp_path = if Path::new(interp_name).is_absolute() {
+        let p = PathBuf::from(interp_name);
+        if !p.is_file() {
+            return Err(CoreError::new(
+                "unsupported_launcher",
+                &format!("未找到绝对路径解释器: {interp_name}"),
+            ));
+        }
+        fs::canonicalize(p).map_err(|e| CoreError::new("unsupported_launcher", &format!("无法解析解释器路径: {e}")))?
+    } else {
+        search_paths
+            .iter()
+            .chain(default_paths.iter())
+            .map(|dir| dir.join(interp_name))
+            .find(|cand| {
+                if let Ok(meta) = fs::metadata(cand) {
+                    meta.is_file() && (meta.permissions().mode() & 0o111 != 0)
+                } else {
+                    false
+                }
+            })
+            .and_then(|p| fs::canonicalize(p).ok())
+            .ok_or_else(|| {
+                CoreError::new(
+                    "unsupported_launcher",
+                    &format!("在搜索路径中未找到受支持的解释器: {interp_name}"),
+                )
+            })?
+    };
+
+    let interp_sha = sha256_file_hex(&interp_path).ok_or_else(|| {
+        CoreError::new("unsupported_launcher", "无法计算解释器 SHA-256 指纹")
+    })?;
+
+    Ok(ResolvedScriptContext {
+        target_executable: real_exe.to_string_lossy().into_owned(),
+        target_fingerprint: real_sha.to_string(),
+        script_entry: Some(real_exe.to_string_lossy().into_owned()),
+        script_fingerprint: Some(real_sha.to_string()),
+        interpreter: Some(interp_path.to_string_lossy().into_owned()),
+        interpreter_fingerprint: Some(interp_sha),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliShimExecutionResult {
     pub exit_code: i32,
@@ -348,6 +491,14 @@ pub struct CliShimExecutionResult {
 
 /// Executes a CLI target through `watch-sandbox-launcher`, preserving
 /// `args`, `cwd`, `env`, `stdin`/`stdout`/`stderr`, and exit status (`C01`).
+fn clear_helper_loader_environment(cmd: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(claude_watch_core::controlled_launch::loader_startup_input) {
+            cmd.env_remove(key);
+        }
+    }
+}
+
 pub fn execute_cli_via_sandbox_launcher(
     launcher_binary: &Path,
     registration_socket: Option<&Path>,
@@ -415,6 +566,9 @@ pub fn execute_cli_via_sandbox_launcher_with_stdin(
     };
     let (real_exe, real_sha) =
         resolve_real_cli_skipping_shim(cli_name, shim_executable, search_paths)?;
+    if is_script_file(&real_exe) {
+        return Err(CoreError::new("script_source_proof_required", "脚本启动必须走已核验的产品发现入口"));
+    }
     let req = ControlledLaunchRequest {
         entry_id: DesktopManagedEntrySpec::entry_bundle_id_for(target).to_string(),
         target,
@@ -428,6 +582,11 @@ pub fn execute_cli_via_sandbox_launcher_with_stdin(
         vpn_epoch,
         launch_nonce: format!("cli-nonce-{}", Uuid::new_v4()),
         executor_boot_id: executor_boot_id.to_string(),
+        script_entry: None,
+        script_fingerprint: None,
+        interpreter: None,
+        interpreter_fingerprint: None,
+        script_source: None,
     };
     req.validate()?;
     let req_json = serde_json::to_string(&req)
@@ -445,8 +604,11 @@ pub fn execute_cli_via_sandbox_launcher_with_stdin(
         cmd.current_dir(dir);
     }
     for (k, v) in extra_env {
-        cmd.env(k, v);
+        if !claude_watch_core::controlled_launch::loader_startup_input(k) {
+            cmd.env(k, v);
+        }
     }
+    clear_helper_loader_environment(&mut cmd);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -551,6 +713,9 @@ pub fn run_cli_interactive_via_sandbox_launcher(
     };
     let (real_exe, real_sha) =
         resolve_real_cli_skipping_shim(cli_name, shim_executable, search_paths)?;
+    if is_script_file(&real_exe) {
+        return Err(CoreError::new("script_source_proof_required", "脚本启动必须走已核验的产品发现入口"));
+    }
     let req = ControlledLaunchRequest {
         entry_id: DesktopManagedEntrySpec::entry_bundle_id_for(target).to_string(),
         target,
@@ -564,6 +729,11 @@ pub fn run_cli_interactive_via_sandbox_launcher(
         vpn_epoch,
         launch_nonce: format!("cli-nonce-{}", Uuid::new_v4()),
         executor_boot_id: executor_boot_id.to_string(),
+        script_entry: None,
+        script_fingerprint: None,
+        interpreter: None,
+        interpreter_fingerprint: None,
+        script_source: None,
     };
     req.validate()?;
     let req_json = serde_json::to_string(&req)
@@ -581,8 +751,11 @@ pub fn run_cli_interactive_via_sandbox_launcher(
         cmd.current_dir(dir);
     }
     for (k, v) in extra_env {
-        cmd.env(k, v);
+        if !claude_watch_core::controlled_launch::loader_startup_input(k) {
+            cmd.env(k, v);
+        }
     }
+    clear_helper_loader_environment(&mut cmd);
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -646,7 +819,39 @@ pub fn stage_desktop_entry_bundle(
                 .join("Library/Application Support/ClaudeWatch/state")
         }
     };
-    let info_plist = format!(
+    let info_plist = desktop_entry_plist(spec, app_display_name, watch_engine_bin, launcher_bin, &state_dir, None);
+    fs::write(bundle_dir.join("Contents/Info.plist"), info_plist)
+        .map_err(|_| CoreError::new("stage_entry_plist_failed", "无法写入受控入口 Info.plist"))?;
+    let exe_dst = macos_dir.join("ControlledEntry");
+    if let Some(macho) = controlled_entry_macho.filter(|p| p.is_file()) {
+        fs::copy(macho, &exe_dst)
+            .map_err(|_| CoreError::new("stage_entry_copy_failed", "无法复制 ControlledEntry 二进制"))?;
+    } else {
+        let script = format!(
+            "#!/bin/sh\nexport CW_TARGET={}\nexport CW_WATCH_BIN={}\nexec {} launch --target {} --target-bundle {} --apply \"$@\"\n",
+            shell_word(spec.target.as_str()),
+            shell_word(&watch_engine_bin.to_string_lossy()),
+            shell_word(&watch_engine_bin.to_string_lossy()),
+            shell_word(spec.target.as_str()),
+            shell_word(&spec.target_bundle_path.to_string_lossy()),
+        );
+        fs::write(&exe_dst, script)
+            .map_err(|_| CoreError::new("stage_entry_script_failed", "无法写入受控入口启动器"))?;
+    }
+    let mut perms = fs::metadata(&exe_dst)
+        .map_err(|_| CoreError::new("stage_entry_stat_failed", "无法读取受控入口权限"))?
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&exe_dst, perms)
+        .map_err(|_| CoreError::new("stage_entry_chmod_failed", "无法设置受控入口执行权限"))?;
+    Ok(bundle_dir)
+}
+
+pub(crate) fn desktop_entry_plist(spec: &DesktopManagedEntrySpec, app_display_name: &str,
+    watch_engine_bin: &Path, launcher_bin: &Path, state_dir: &Path, home: Option<&Path>) -> String {
+    let home_key = home.map_or_else(String::new, |home|
+        format!("<key>CWWatchHomePath</key><string>{}</string>", xml_text(&home.to_string_lossy())));
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -675,45 +880,21 @@ pub fn stage_desktop_entry_bundle(
     <string>{}</string>
     <key>CWWatchStateDirPath</key>
     <string>{}</string>
+    {home_key}
 </dict>
 </plist>
 "#,
-        spec.entry_bundle_id,
+        xml_text(&spec.entry_bundle_id),
         app_display_name.trim_end_matches(".app"),
         spec.target.as_str(),
         xml_text(&spec.target_bundle_path.to_string_lossy()),
-        spec.target_bundle_id,
+        xml_text(&spec.target_bundle_id),
         xml_text(&spec.target_executable.to_string_lossy()),
-        spec.target_fingerprint,
+        xml_text(&spec.target_fingerprint),
         xml_text(&watch_engine_bin.to_string_lossy()),
         xml_text(&launcher_bin.to_string_lossy()),
         xml_text(&state_dir.to_string_lossy()),
-    );
-    fs::write(bundle_dir.join("Contents/Info.plist"), info_plist)
-        .map_err(|_| CoreError::new("stage_entry_plist_failed", "无法写入受控入口 Info.plist"))?;
-    let exe_dst = macos_dir.join("ControlledEntry");
-    if let Some(macho) = controlled_entry_macho.filter(|p| p.is_file()) {
-        fs::copy(macho, &exe_dst)
-            .map_err(|_| CoreError::new("stage_entry_copy_failed", "无法复制 ControlledEntry 二进制"))?;
-    } else {
-        let script = format!(
-            "#!/bin/sh\nexport CW_TARGET={}\nexport CW_WATCH_BIN={}\nexec {} launch --target {} --target-bundle {} --apply \"$@\"\n",
-            shell_word(spec.target.as_str()),
-            shell_word(&watch_engine_bin.to_string_lossy()),
-            shell_word(&watch_engine_bin.to_string_lossy()),
-            shell_word(spec.target.as_str()),
-            shell_word(&spec.target_bundle_path.to_string_lossy()),
-        );
-        fs::write(&exe_dst, script)
-            .map_err(|_| CoreError::new("stage_entry_script_failed", "无法写入受控入口启动器"))?;
-    }
-    let mut perms = fs::metadata(&exe_dst)
-        .map_err(|_| CoreError::new("stage_entry_stat_failed", "无法读取受控入口权限"))?
-        .permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&exe_dst, perms)
-        .map_err(|_| CoreError::new("stage_entry_chmod_failed", "无法设置受控入口执行权限"))?;
-    Ok(bundle_dir)
+    )
 }
 
 fn xml_text(value:&str)->String { value.replace('&',"&amp;").replace('<',"&lt;").replace('>',"&gt;").replace('"',"&quot;").replace('\'',"&apos;") }
@@ -739,8 +920,9 @@ pub fn stage_cli_entry_shim(
     fs::create_dir_all(bin_dir)
         .map_err(|_| CoreError::new("stage_shim_mkdir_failed", "无法创建受控 CLI shim 目录"))?;
     let shim_path = bin_dir.join(cli_name);
+    let entry_id = DesktopManagedEntrySpec::entry_bundle_id_for(target);
     let script = format!(
-        "#!/bin/sh\nexport CW_SHIM_EXECUTABLE=\"$0\"\nexec \"{}\" launch --target \"{}\" --apply -- \"$@\"\n",
+        "#!/bin/sh\n# CLAUDE WATCH MANAGED CLI ENTRY SHIM v1\n# ENTRY_ID: {entry_id}\n# TARGET: {target_flag}\nexport CW_SHIM_EXECUTABLE=\"$0\"\nexec \"{}\" launch --target \"{}\" --apply -- \"$@\"\n",
         watch_engine_bin.display(),
         target_flag,
     );

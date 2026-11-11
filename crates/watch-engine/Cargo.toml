@@ -16,3 +16,8 @@ claude-watch-system = { path = "../watch-system" }
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
+
+[[test]]
+name = "ready_entry_fixture"
+path = "tests/support/ready_entry_fixture_main.rs"
+harness = false

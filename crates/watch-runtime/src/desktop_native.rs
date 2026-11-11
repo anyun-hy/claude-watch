@@ -141,7 +141,11 @@ struct SelectedApplication {
 }
 struct SelectedCli {
     path: PathBuf,
+    home: PathBuf,
     fingerprint: (u64, u64, u64, i64, i64),
+    sha: String,
+    source_id: String,
+    script: Option<claude_watch_core::controlled_launch::ApprovedScriptCombo>,
 }
 fn cli_fingerprint(path: &Path) -> Result<(u64, u64, u64, i64, i64)> {
     let m = fs::symlink_metadata(path)
@@ -342,7 +346,7 @@ impl<R: ReadRunner> NativeDesktop<R> {
         let discovery = self.discovery_for(Some(home));
         let snapshot = discovery.refresh(&self.runner, native::now());
         let Ok(manifest) = discovery.approved_manifest(&snapshot) else { return Vec::new(); };
-        let invalidated=registry.replace_approved_targets_with_cli_sources(manifest.targets, manifest.children, manifest.cli_sources);
+        let invalidated=registry.replace_discovery_approvals(manifest.targets, manifest.children, manifest.cli_sources, manifest.script_combos);
         registry.queue_inventory_invalidations(invalidated);
         manifest.desktop_specs
     }
@@ -458,11 +462,12 @@ impl<R: ReadRunner> NativeDesktop<R> {
             return Err(CoreError::new("invalid_target", "目标不是CLI"));
         }
         let discovery = self.discovery_for(Some(home));
-        let (_, record) = discovery.select_cli(&self.runner, target, env, native::now())?;
+        let (snapshot, record) = discovery.select_cli(&self.runner, target, env, native::now())?;
+        let (sha, script) = discovery.selected_cli_proof(&snapshot, &record)?;
         if self.authority == Authority::ExplicitPermit { discovery.publish_caller_hint(target)?; }
         let path = record.executable.unwrap();
         let fingerprint = cli_fingerprint(&path)?;
-        self.cli = Some(SelectedCli { path, fingerprint });
+        self.cli = Some(SelectedCli { path, home: home.to_owned(), fingerprint, sha, source_id: record.source_id, script });
         self.selected = None; self.target = target; Ok(())
     }
     #[allow(clippy::too_many_arguments)]
@@ -499,11 +504,36 @@ impl<R: ReadRunner> NativeDesktop<R> {
                 "CLI中断处理尚未就绪",
             ));
         }
-        let target_sha = claude_watch_system::sha256_file_hex(&selected.path)
-            .ok_or_else(|| CoreError::new("cli_unavailable", "无法计算CLI可执行文件哈希"))?;
         let cwd = std::env::current_dir()
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
+        let discovery = self.discovery_for(None);
+        let snapshot = discovery.refresh(&self.runner, native::now());
+        let record = snapshot.select(self.target, Some(&selected.source_id))?;
+        let (sha, script) = discovery.selected_cli_proof(&snapshot, record)?;
+        if record.executable.as_ref() != Some(&selected.path) || sha != selected.sha || script != selected.script {
+            return Err(CoreError::new("cli_source_changed", "已选 CLI 或解释器版本已变化，未启动"));
+        }
+        if let Some(combo) = &script {
+            // The caller hint and daemon discovery run in different processes.
+            // Wait briefly for the exact daemon revision instead of selecting
+            // a different interpreter or attempting an unapproved launch.
+            // Registration still performs the authoritative recheck.
+            let store = StateStore::new(crate::storage::Paths { home: selected.home.clone() });
+            let path = store.paths.watch().join("state/target-discovery.json");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let exact = serde_json::json!(combo);
+            loop {
+                let state = store.read_json(&path, Value::Null)?;
+                if state["approval_executor_boot_id"] == executor_boot_id
+                    && state["script_launch_approvals"].as_array().is_some_and(|rows| rows.contains(&exact))
+                { break; }
+                if Instant::now() >= deadline {
+                    return Err(CoreError::new("script_approval_pending", "后台尚未确认本次脚本和解释器的同一来源修订"));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
         let req = claude_watch_core::controlled_launch::ControlledLaunchRequest {
             entry_id: crate::managed_entry::DesktopManagedEntrySpec::entry_bundle_id_for(
                 self.target,
@@ -511,7 +541,7 @@ impl<R: ReadRunner> NativeDesktop<R> {
             .to_string(),
             target: self.target,
             target_executable: selected.path.to_string_lossy().into_owned(),
-            target_fingerprint: target_sha,
+            target_fingerprint: sha,
             args: args.to_vec(),
             cwd,
             proxy_adaptation: claude_watch_core::controlled_launch::ProxyAdaptationKind::EnvOnly,
@@ -520,16 +550,27 @@ impl<R: ReadRunner> NativeDesktop<R> {
             vpn_epoch,
             launch_nonce: format!("cli-nonce-{}", uuid::Uuid::new_v4()),
             executor_boot_id: executor_boot_id.to_string(),
+            script_entry: script.as_ref().map(|s| s.script_path.clone()),
+            script_fingerprint: script.as_ref().map(|s| s.script_fingerprint.clone()),
+            interpreter: script.as_ref().map(|s| s.interpreter_path.clone()),
+            interpreter_fingerprint: script.as_ref().map(|s| s.interpreter_fingerprint.clone()),
+            script_source: script.as_ref().map(|s| s.source_proof()),
         };
         req.validate()?;
         let req_json = serde_json::to_string(&req).map_err(|_| {
             CoreError::new("serialize_launch_request_failed", "序列化CLI受控启动请求失败")
         })?;
-        let command = Exec::cmd(launcher_bin)
+        let mut command = Exec::cmd(launcher_bin)
             .arg("--launch-json")
             .arg(&req_json)
             .arg("--registration-socket")
             .arg(registration_socket);
+        for (key, _) in std::env::vars_os() {
+            use claude_watch_core::controlled_launch::{loader_startup_input, script_startup_input};
+            if key.to_str().is_some_and(|k| loader_startup_input(k) || (script.is_some() && script_startup_input(k))) {
+                command = command.env_remove(key);
+            }
+        }
         start_cli_process(command, state)
     }
     fn resolve_target(&self, target: LaunchTarget) -> Result<SelectedApplication> {
@@ -571,7 +612,7 @@ impl<R: ReadRunner> NativeDesktop<R> {
         if !inventory.complete {
             return Err(CoreError::new(
                 "target_inventory_incomplete",
-                "进程清单不完整，未假定目标已关闭",
+                &format!("进程清单不完整，未假定目标已关闭（{}）", inventory.incomplete_summary()),
             ));
         }
         let catalog = self.catalog_for_inventory(&inventory);
@@ -733,13 +774,23 @@ impl<R: ReadRunner> NativeDesktop<R> {
             vpn_epoch,
             launch_nonce: format!("desktop-nonce-{}", uuid::Uuid::new_v4()),
             executor_boot_id: executor_boot_id.to_string(),
+            script_entry: None,
+            script_fingerprint: None,
+            interpreter: None,
+            interpreter_fingerprint: None,
+            script_source: None,
         };
         req.validate()?;
         let req_json = serde_json::to_string(&req).map_err(|_| {
             CoreError::new("serialize_launch_request_failed", "序列化桌面受控启动请求失败")
         })?;
-        let mut child = std::process::Command::new(launcher_bin)
-            .arg("--launch-json")
+        let mut command = std::process::Command::new(launcher_bin);
+        for (key, _) in std::env::vars_os() {
+            if key.to_str().is_some_and(claude_watch_core::controlled_launch::loader_startup_input) {
+                command.env_remove(key);
+            }
+        }
+        let mut child = command.arg("--launch-json")
             .arg(&req_json)
             .arg("--registration-socket")
             .arg(registration_socket)
@@ -1165,6 +1216,7 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
     fn quit_for_confirmed_ip_risk(&mut self, forced: &mut Option<u32>) -> Result<()> {
         self.desktop.quit_for_confirmed_ip_risk(forced)
     }
+    fn delegates_process_disposition(&self) -> bool { true }
     fn channel_mode(&self) -> bool {
         true
     }
@@ -1215,6 +1267,7 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
         }
         Ok(serde_json::from_value(raw).ok())
     }
+
 }
 
 #[cfg(test)]

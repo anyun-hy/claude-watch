@@ -484,6 +484,40 @@ pub enum OperationOutcome {
     Receipt(Value),
     CliExit(claude_watch_runtime::controlled::CliOutcome),
 }
+pub(crate) fn dispatch_launch(
+    request: &Request,
+    storage: &StateStore,
+    desktop: &mut impl claude_watch_runtime::controlled::DesktopSystem,
+) -> Result<OperationOutcome> {
+    let controller = claude_watch_runtime::controlled::Controller::new(storage.clone());
+    if request.launch_target().cli() {
+        Ok(OperationOutcome::CliExit(controller.launch_cli(desktop, &request.child_args)?))
+    } else {
+        let _operation = storage.lock("operation", None)?;
+        Ok(OperationOutcome::Receipt(controller.launch(desktop)?))
+    }
+}
+pub(crate) fn native_desktop_for_request<R: claude_watch_runtime::commands::ReadRunner>(
+    request: &Request,
+    storage: &StateStore,
+    runner: R,
+    process_helper: PathBuf,
+    authority: Authority,
+) -> Result<NativeDesktop<R>> {
+    let mut desktop = NativeDesktop::new(runner, process_helper, authority)?;
+    desktop.set_discovery(claude_watch_runtime::target_discovery::DiscoveryHandle::for_home(&storage.paths.home));
+    if request.command == "launch" {
+        let target = request.launch_target();
+        if target.cli() {
+            desktop.select_cli(target, &storage.paths.home)?;
+        } else if let Some(path) = request.value("target-bundle") {
+            desktop.select_target_source(target, std::path::Path::new(path))?;
+        } else {
+            desktop.select_target(target)?;
+        }
+    }
+    Ok(desktop)
+}
 #[allow(dead_code)]
 pub fn managed_entry_bundle_id(target: claude_watch_core::processes::LaunchTarget) -> &'static str {
     claude_watch_runtime::managed_entry::DesktopManagedEntrySpec::entry_bundle_id_for(target)
@@ -545,17 +579,14 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
     } else {
         Authority::ReadOnly
     };
-    let mut desktop = NativeDesktop::new(host.runner.clone(), process_component()?, authority)?;
-    desktop.set_discovery(claude_watch_runtime::target_discovery::DiscoveryHandle::for_home(&storage.paths.home));
-    if request.command == "launch" {
-        if request.launch_target().cli() {
-            desktop.select_cli(request.launch_target(), &storage.paths.home)?;
-        } else {
-            if let Some(path)=request.value("target-bundle") {
-                desktop.select_target_source(request.launch_target(),std::path::Path::new(path))?;
-            } else { desktop.select_target(request.launch_target())?; }
-        }
+    let process_helper = process_component()?;
+    #[cfg(all(test, target_os = "macos"))]
+    if request.command == "launch" && super::entry_ready_fixture::is_fixture_child() {
+        return super::entry_ready_fixture::fixture_launch(
+            request, &storage, host.runner.clone(), process_helper, authority,
+        ).map(Some);
     }
+    let mut desktop = native_desktop_for_request(request, &storage, host.runner.clone(), process_helper, authority)?;
     if account_action {
         let config = ConfigStore {
             storage: storage.clone(),
@@ -601,20 +632,11 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
         started: Instant::now(),
         cli: None,
     };
-    let controller = Controller::new(storage.clone());
     if request.command == "launch" {
-        if request.launch_target().cli() {
-            return Ok(Some(OperationOutcome::CliExit(
-                controller.launch_cli(&mut desktop_runtime, &request.child_args)?,
-            )));
-        }
-        let _operation = storage.lock("operation", None)?;
-        Ok(Some(OperationOutcome::Receipt(
-            controller.launch(&mut desktop_runtime)?,
-        )))
+        Ok(Some(dispatch_launch(request, &storage, &mut desktop_runtime)?))
     } else {
         Ok(Some(OperationOutcome::Receipt(
-            controller.guard_tick(&mut desktop_runtime)?,
+            Controller::new(storage).guard_tick(&mut desktop_runtime)?,
         )))
     }
 }

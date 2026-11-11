@@ -73,6 +73,9 @@ struct WatchedProcess: Decodable, Identifiable, Sendable {
             // Rust bounds this proof by the fresh cutoff receipt and registry,
             // not by the old revoke command's lease. Keep that evidence expiry.
             guard proof.reason_code == "blocked_verified", state.isConfirmedFlowBlocked else { return pending }
+            if state.process_disposition_action == "force" {
+                return "已确认断流；此进程仍运行，退出处置单独核实"
+            }
         default:
             return pending
         }
@@ -409,6 +412,62 @@ struct BackendCoverageScopeModel: Codable, Equatable, Sendable {
     }
 }
 
+struct ProcessDispositionTargetModel: Codable, Equatable, Sendable {
+    let pid: UInt32
+    let requested_action: String
+    let terminated: Bool
+    let process_state: String
+    let timestamp: Double
+    let signal_sent_at: Double?
+
+    var statusLabel: String {
+        switch process_state {
+        case "terminated": return "已确认退出"
+        case "already_exited": return "发信号前已退出"
+        case "timeout": return "等待超时，进程仍运行"
+        case "exit_unconfirmed": return "已发信号，退出未确认"
+        case "cancelled": return "未发信号，处置已取消"
+        case "identity_mismatch": return "身份未核验"
+        case "signal_failed": return "发信号失败"
+        default: return "结果待验证"
+        }
+    }
+}
+
+struct ProcessDispositionReceiptModel: Codable, Equatable, Sendable {
+    let intent_id: String
+    let family: String
+    let session_id: String
+    let action: String
+    let process_execution_state: String
+    let target_results: [ProcessDispositionTargetModel]
+    let observed_at: Double
+    let authority: Authority?
+
+    var resultLabel: String {
+        let summary: String
+        switch process_execution_state {
+        case "confirmed": summary = "已核验目标退出"
+        case "already_exited": summary = "目标此前已退出"
+        case "partially_terminated": summary = "仅部分目标退出"
+        case "cancelled": summary = "未执行的处置已取消"
+        case "failed": summary = "退出处置失败"
+        default: summary = "部分或全部退出结果待验证"
+        }
+        let visible = target_results.prefix(4).map { "PID \($0.pid) \($0.statusLabel)" }
+        let more = target_results.count > visible.count ? "，另有 \(target_results.count - visible.count) 个目标" : ""
+        return visible.isEmpty ? summary : summary + "：" + visible.joined(separator: "，") + more
+    }
+
+    struct Authority: Codable, Equatable, Sendable {
+        let intent_id: String
+        let producer_boot_id: String
+        let policy_version: ChannelPolicyVersionModel
+        let permit_generation: UInt64
+        let command_seq: UInt64
+    }
+}
+
 struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
     var producer_boot_id: String = ""
     let family: String
@@ -424,6 +483,10 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
     let display_label_zh: String
     let reason_code: String
     let process_preserved: Bool
+    var process_execution_state: String? = nil
+    var process_disposition_action: String? = nil
+    var process_disposition_receipt: ProcessDispositionReceiptModel? = nil
+    var previous_process_disposition_receipts: [ProcessDispositionReceiptModel]? = nil
     let active_member_pids: [UInt32]
     var active_members: [BoundProcessTokenModel] = []
     var local_proxy_ready: Bool = false
@@ -439,6 +502,35 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
     var coverage_scope: BackendCoverageScopeModel? = nil
     var unmanaged_member_pids: [UInt32]? = nil
     var sandbox_ready: Bool? = nil
+
+    func processDispositionLabel(now: Double) -> String {
+        guard process_disposition_action == "force" else {
+            return isConfirmedFlowBlocked && process_preserved ? "进程保留" : "进程处置未确认"
+        }
+        guard let receipt = process_disposition_receipt, let authority = receipt.authority,
+              receipt.family == family, receipt.session_id == session_id,
+              receipt.action == process_disposition_action,
+              authority.intent_id == receipt.intent_id,
+              authority.producer_boot_id == producer_boot_id,
+              authority.policy_version == saved_policy_version,
+              authority.command_seq == command_seq, authority.permit_generation == permit_generation,
+              now.isFinite, receipt.observed_at.isFinite,
+              now >= receipt.observed_at - 1, now - receipt.observed_at <= 15 else {
+            return process_execution_state == "executing" ? "退出处置进行中" : "退出处置结果待验证"
+        }
+        return receipt.resultLabel
+    }
+
+    func previousProcessDispositionLabel(now: Double) -> String? {
+        guard let receipt = previous_process_disposition_receipts?.last(where: { receipt in
+            guard let authority = receipt.authority else { return false }
+            return !producer_boot_id.isEmpty && receipt.family == family && receipt.action == "force"
+                && authority.intent_id == receipt.intent_id && authority.producer_boot_id == producer_boot_id
+                && now.isFinite && receipt.observed_at.isFinite
+                && now >= receipt.observed_at - 1 && now - receipt.observed_at <= 15
+        }) else { return nil }
+        return "先前批次（授权已结束）：\(receipt.resultLabel)"
+    }
 
     var isPermitted: Bool {
         permit_state == "permitted"
@@ -599,7 +691,7 @@ struct ChannelMonitorSubscriptionStore: Sendable {
                 display_state: .pendingVerification,
                 display_label_zh: "待验证（订阅失联或状态已过期）",
                 reason_code: "subscription_stale_or_disconnected",
-                process_preserved: state.process_preserved,
+                process_preserved: false,
                 active_member_pids: state.active_member_pids,
                 active_flows_count: state.active_flows_count,
                 terminated_flows_count: state.terminated_flows_count,

@@ -190,8 +190,10 @@ struct ConnectionGraphView: View {
         let symbol: String
         let tint: Color
         if let channelState = store.channelState(for: selectedProduct) {
-            let disposition = channelState.process_preserved ? "断流保进程" : "传统退出"
-            text = "通道状态：\(channelState.display_label_zh)（\(disposition)） · \(channelState.policy_sync_label_zh) · 活动连接 \(channelState.active_flows_count) / 已断开 \(channelState.terminated_flows_count) / 拒新连接 \(channelState.blocked_new_connections)"
+            let now = store.now.timeIntervalSince1970
+            let disposition = channelState.processDispositionLabel(now: now)
+            let previous = channelState.previousProcessDispositionLabel(now: now).map { "\n\($0)" } ?? ""
+            text = "通道状态：\(channelState.display_label_zh)（\(disposition)） · \(channelState.policy_sync_label_zh) · 活动连接 \(channelState.active_flows_count) / 已断开 \(channelState.terminated_flows_count) / 拒新连接 \(channelState.blocked_new_connections)\(previous)"
             switch channelState.display_state {
             case .forwarding:
                 symbol = "checkmark.shield.fill"; tint = p.mint

@@ -54,8 +54,7 @@ fn prepare(args: &[String]) -> io::Result<()> {
     fs::write(out.join("config.json"), serde_json::to_vec_pretty(&config)?)?;
     let plist = plist(&config);
     fs::write(out.join(format!("{SERVICE_LABEL}.plist")), plist)?;
-    fs::write(out.join("install.sh"), include_str!("../../../monitor/GatewayBroker/install.sh"))?;
-    fs::write(out.join("README.txt"), format!("Prepared only; not installed.\nBroker destination: {INSTALL_DIR}\nEngine must remain at: {}\nPort: {}\nReview config/plist/install.sh, then obtain explicit administrator installation authorization.\nChanging or re-signing the engine requires a new approved configuration.\n", config.engine_executable, config.gateway_port))?;
+    fs::write(out.join("README.txt"), format!("Prepared for review only; not an administrator executable.\nBroker destination: {INSTALL_DIR}\nEngine must remain at: {}\nPort: {}\nUse the native release transaction for any separately approved installation.\nChanging or re-signing the engine requires a new approved configuration.\n", config.engine_executable, config.gateway_port))?;
     println!("prepared {} (no system changes)", out.display());
     Ok(())
 }

@@ -56,6 +56,12 @@ pub fn dispatch(request: &Request, paths: Paths) -> Result<Option<Value>> {
             ));
         }
         request.require_apply()?;
+        if request.flag("remove-managed-rules") {
+            return Err(CoreError::new(
+                "vpn_managed_externally",
+                "VPN 与代理规则由外部客户端管理，Watch 不再修改外部规则文件；请在代理客户端中管理规则",
+            ));
+        }
         let options = claude_watch_runtime::uninstall::Options {
             purge_accounts: request.flag("purge-accounts"),
             confirm_data_removal: request.flag("confirm-data-removal"),

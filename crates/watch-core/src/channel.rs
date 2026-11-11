@@ -1028,6 +1028,15 @@ pub struct FamilyChannelMonitorState {
     pub display_label_zh: String,
     pub reason_code: String,
     pub process_preserved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_execution_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_disposition_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_disposition_receipt: Option<ProcessDispositionReceipt>,
+    /// Observed results of issued batches whose authority no longer applies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_process_disposition_receipts: Vec<ProcessDispositionReceipt>,
     pub active_member_pids: Vec<u32>,
     #[serde(default)]
     pub active_members: Vec<BoundProcessToken>,
@@ -1207,6 +1216,56 @@ impl ChannelMonitorSubscriber {
         }
         Some(state)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessDispositionIntent {
+    pub intent_id: String,
+    pub family: String,
+    pub risk_code: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    pub session_id: String,
+    pub policy_version: PolicyVersion,
+    pub producer_boot_id: String,
+    pub executor_boot_id: String,
+    pub permit_generation: u64,
+    pub command_seq: u64,
+    pub target_identities: Vec<BoundProcessToken>,
+    #[serde(default)]
+    pub target_executables: BTreeMap<u32, String>,
+    #[serde(default)]
+    pub target_instances: BTreeMap<u32, String>,
+    pub valid_until: f64,
+    pub created_at: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TargetProcessDispositionResult {
+    pub pid: u32,
+    pub requested_action: String,
+    pub terminated: bool,
+    pub process_state: String,
+    pub timestamp: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_sent_at: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessDispositionReceipt {
+    pub intent_id: String,
+    pub family: String,
+    pub session_id: String,
+    pub action: String,
+    pub process_execution_state: String,
+    pub process_preserved: bool,
+    pub target_results: Vec<TargetProcessDispositionResult>,
+    pub observed_at: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<ProcessDispositionIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 #[cfg(test)]
@@ -1493,6 +1552,10 @@ mod tests {
             display_label_zh: ChannelMonitorDisplayState::Forwarding.label_zh().into(),
             reason_code: "active".into(),
             process_preserved: true,
+            process_execution_state: None,
+            process_disposition_action: None,
+            process_disposition_receipt: None,
+            previous_process_disposition_receipts: Vec::new(),
             active_member_pids: vec![42],
             active_members: vec![BoundProcessToken::with_system_identity(
                 42,

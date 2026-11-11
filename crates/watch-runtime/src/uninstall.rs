@@ -1,6 +1,6 @@
 //! The switcher-level uninstall contract. Removing the GUI/collector uses the
 //! separate app lifecycle; the active Claude profile is never a removal target.
-use crate::{config_store::ConfigStore, rules, storage::StateStore};
+use crate::{config_store::ConfigStore, storage::StateStore};
 use claude_watch_core::error::{CoreError, Result};
 use serde_json::{json, Value};
 use std::fs;
@@ -15,6 +15,12 @@ pub fn apply(
     options: Options,
     mut stop_services: impl FnMut() -> Result<()>,
 ) -> Result<Value> {
+    if options.remove_managed_rules {
+        return Err(CoreError::new(
+            "vpn_managed_externally",
+            "VPN 与代理规则由外部客户端管理，Watch 不再修改外部规则文件；请在代理客户端中管理规则",
+        ));
+    }
     if options.purge_accounts && !options.confirm_data_removal {
         return Err(CoreError::new(
             "data_confirmation_required",
@@ -43,23 +49,6 @@ pub fn apply(
             json!({"status":"partial","accounts_removed":false,"automatic_actions_disabled":true,
             "code":error.code,"message":error.message}),
         );
-    }
-    if options.remove_managed_rules {
-        let path=store.paths.home.join("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles/Merge.yaml");
-        if let Some(before) = store.read_bytes(&path, 8_000_000)? {
-            let text = std::str::from_utf8(&before)
-                .map_err(|_| CoreError::new("invalid_rules", "规则文件编码无效"))?;
-            let after = rules::remove_block(text)?;
-            if store.read_bytes(&path, 8_000_000)?.as_ref() != Some(&before) {
-                return Err(CoreError::new(
-                    "external_change",
-                    "规则已被其他程序更改，未覆盖",
-                ));
-            }
-            if after.as_bytes() != before {
-                store.atomic_bytes(&path, after.as_bytes(), 0o600)?;
-            }
-        }
     }
     if options.purge_accounts {
         for path in [
@@ -146,6 +135,17 @@ mod tests {
         assert_eq!(result["accounts_removed"], true);
         assert!(!slot.exists());
         assert_eq!(fs::read(active).unwrap(), b"current-login");
+
+        let refused = apply(
+            &store,
+            Options {
+                remove_managed_rules: true,
+                ..Default::default()
+            },
+            || panic!("stop_services must not be called when remove_managed_rules is rejected"),
+        );
+        assert_eq!(refused.unwrap_err().code, "vpn_managed_externally");
+
         fs::remove_dir_all(root).unwrap();
     }
 }

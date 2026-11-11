@@ -1,6 +1,6 @@
 use claude_watch_core::{channel::{BoundProcessToken, ChannelPermitState}, config::Config, session::Desktop,
     vpn::{ObservationConsistency, ObservedField, UpstreamProtocol, VpnEpoch, VpnExpectation, VpnObservation}};
-use claude_watch_runtime::{channel_enforcer::LocalTunnelEnforcer, channel_supervisor::{ChannelSupervisor, SupervisionEvent},
+use claude_watch_runtime::{channel_enforcer::ChannelEnforcer, channel_supervisor::{ChannelSupervisor, SupervisionEvent},
     config_store::{policy_digest, ConfigStore}, receipt_store::ReceiptStore, session_store::SessionStore, storage::StateStore};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -28,7 +28,7 @@ pub fn sample_vpn_observation(now: f64, change_generation: u64) -> VpnObservatio
     }
 }
 
-fn controlled_egress(
+pub fn controlled_egress(
     cfg: &Config,
     now: f64,
     ip: &str,
@@ -54,7 +54,7 @@ fn controlled_egress(
     val
 }
 
-fn fixture_audit_val(store: &StateStore, now: f64, ip: &str, country: &str) -> Value {
+pub fn fixture_audit_val(store: &StateStore, now: f64, ip: &str, country: &str) -> Value {
     let config = (ConfigStore {
         storage: store.clone(),
     })
@@ -78,7 +78,7 @@ fn fixture_audit_val(store: &StateStore, now: f64, ip: &str, country: &str) -> V
     })
 }
 
-fn seed_probe_receipts(store: &StateStore, now: f64, country: &str) {
+pub fn seed_probe_receipts(store: &StateStore, now: f64, country: &str) {
     let receipts = ReceiptStore {
         storage: store.clone(),
     };
@@ -143,16 +143,20 @@ pub fn inventory(supervisor: &mut ChannelSupervisor, tokens: Vec<BoundProcessTok
     let snapshot = supervisor.handle_event(SupervisionEvent::ProcessInventoryUpdated { family:"claude".into(), desktops, processes:tokens, observed_at:now }).unwrap();
     assert_eq!(snapshot.families["claude"].permit_state, ChannelPermitState::Permitted, "{}", snapshot.families["claude"].reason_code);
 }
-pub fn activate(store: &StateStore, cfg: &Config, enforcer: Arc<LocalTunnelEnforcer>, tokens: Vec<BoundProcessToken>, now: f64) -> ChannelSupervisor {
+pub fn activate(store: &StateStore, cfg: &Config, enforcer: Arc<dyn ChannelEnforcer>, tokens: Vec<BoundProcessToken>, now: f64) -> ChannelSupervisor {
     seed_probe_receipts(store, now, "US");
     let mut supervisor = ChannelSupervisor::new(store.clone(), Some(enforcer), None).unwrap();
     let mut observation = sample_vpn_observation(now, 1); observation.upstream_endpoint = Some(cfg.proxy_url.clone());
     let egress = controlled_egress(cfg, now, "1.1.1.1", "US", Some(observation.epoch.clone()));
+    // Collect both current observations before binding a live session. An
+    // active session with an as-yet missing guard observation must hard close.
+    supervisor.handle_event(SupervisionEvent::VpnObservationUpdated { observation, observed_at:now }).unwrap();
+    supervisor.handle_event(SupervisionEvent::EnvironmentUpdated { egress:egress.clone(), local_guard:json!({"proxy":"ok","tun":"disabled","context_id":"ctx-vpn"}), observed_at:now }).unwrap();
     let sessions = SessionStore::for_family(store.clone(), "claude");
     let pending = sessions.begin_verified(&ReceiptStore { storage:store.clone() }, &fixture_audit_val(store, now, "1.1.1.1", "US"), &egress, now).unwrap();
-    for token in &tokens { sessions.bind_desktop(&pending.session_id, Desktop { pid:token.pid, start_seconds:token.start_seconds, start_microseconds:token.start_microseconds }, now).unwrap(); }
-    supervisor.handle_event(SupervisionEvent::VpnObservationUpdated { observation, observed_at:now }).unwrap();
-    supervisor.handle_event(SupervisionEvent::EnvironmentUpdated { egress, local_guard:json!({"proxy":"ok","tun":"disabled","context_id":"ctx-vpn"}), observed_at:now }).unwrap();
+    if let Some(token) = tokens.iter().find(|token| token.role != claude_watch_core::processes::ProcessRole::Child).or(tokens.first()) {
+        sessions.bind_desktop(&pending.session_id, Desktop { pid:token.pid, start_seconds:token.start_seconds, start_microseconds:token.start_microseconds }, now).unwrap();
+    }
     inventory(&mut supervisor, tokens, now);
     supervisor
 }

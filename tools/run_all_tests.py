@@ -128,6 +128,13 @@ def build_plan(run_dir: Path) -> tuple[list[Step], dict]:
         Step("rust.process_protection_fixture", "prerequisite", dependencies=["rust.workspace"], prepare=[
             {"kind": "require_file", "path": "{run_dir}/artifacts/process-protection-deadlines.json"}],
              notes=["Exported by the workspace process projection test; no duplicate test run."]),
+        Step("rust.mechanism_review_fixtures", "prerequisite", dependencies=["rust.workspace"], prepare=[
+            {"kind": "require_file", "path": "{run_dir}/artifacts/" + name}
+            for name in ("process-disposition-wire.json", "process-disposition-partial.json",
+                         "process-disposition-network-failure.json", "script-gateway-wire.json",
+                         "entry-product-wire.json", "process-disposition-delivery.json",
+                         "process-disposition-deadline.json")],
+             notes=["Production payloads from targeted owned fixtures in the Rust workspace tests."]),
         Step("rust.target_discovery_fixture", "prerequisite", dependencies=["rust.workspace"], prepare=[
             {"kind": "require_file", "path": "{run_dir}/artifacts/target-discovery-wire.json"},
             {"kind": "require_file", "path": "{run_dir}/artifacts/target-discovery-pending.json"},

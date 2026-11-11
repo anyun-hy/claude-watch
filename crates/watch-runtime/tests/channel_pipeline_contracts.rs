@@ -308,6 +308,74 @@ fn standalone_cli_is_discovered_audited_and_rebound_after_exec_without_a_launche
 }
 
 #[test]
+fn audit_completed_in_time_but_delivered_after_deadline_stays_revoked() {
+    use claude_watch_core::channel::ChannelPermitState;
+    use claude_watch_runtime::channel_supervisor::AsyncAuditOutcome;
+
+    let (_dir, store) = setup_store();
+    let now = 1_710_000_000.;
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("audit-delivery", Some(store.clone())));
+    enforcer.activate_interception(now).unwrap();
+    seed_receipts(&store, now, "JP");
+    let (tx, rx) = mpsc::channel();
+    let mut supervisor =
+        fixture_supervisor(store.clone(), Some(enforcer.clone()), Some(tx)).unwrap();
+    supervisor.handle_event(environment(now)).unwrap();
+    supervisor
+        .handle_event(inventory_event(
+            "claude",
+            vec![bound(4100, ProcessRole::Cli)],
+            now + 0.1,
+        ))
+        .unwrap();
+    let initial = rx.try_recv().unwrap();
+    let allowed = supervisor
+        .handle_event(audit_completion(&store, initial, now + 0.2))
+        .unwrap();
+    assert_eq!(allowed.families["claude"].permit_state, ChannelPermitState::Permitted);
+
+    let changed_at = now + 1.;
+    let mut changed = fixture_egress(changed_at, "1.1.1.1", "JP");
+    changed["context_id"] = json!("new-network");
+    let mut local = fixture_local();
+    local["context_id"] = json!("new-network");
+    local["context"] = json!("new-network");
+    let blocked = supervisor
+        .handle_event(SupervisionEvent::EnvironmentUpdated {
+            egress: changed,
+            local_guard: local,
+            observed_at: changed_at,
+        })
+        .unwrap();
+    assert_eq!(blocked.families["claude"].permit_state, ChannelPermitState::Revoked);
+
+    let recovery = rx.try_recv().unwrap();
+    let deadline = recovery.requested_at + recovery.timeout_seconds;
+    let completed = deadline - 0.2;
+    let delivered = deadline + 0.1;
+    assert!(recovery.requested_at < completed && completed < deadline && deadline < delivered);
+    let mut event = audit_completion(&store, recovery, completed);
+    let SupervisionEvent::AsyncAuditCompleted {
+        outcome: AsyncAuditOutcome::Succeeded { audit, egress }, ..
+    } = &mut event
+    else {
+        panic!("fixture must return successful audit evidence");
+    };
+    audit["context_id"] = json!("new-network");
+    egress["context_id"] = json!("new-network");
+    let rejected = supervisor.handle_queued_event(event, delivered).unwrap();
+    let family = &rejected.families["claude"];
+    let receipt = enforcer.receipt_for("claude", delivered).unwrap().unwrap();
+    println!("{}", json!({
+        "completed_at": completed, "deadline": deadline, "delivered_at": delivered,
+        "permit_state": family.permit_state, "reason": family.reason_code, "execution": receipt
+    }));
+    assert_eq!(family.permit_state, ChannelPermitState::Revoked);
+    assert_eq!(family.reason_code, "async_audit_timeout");
+    assert_eq!(receipt.enforcement_state, ChannelEnforcementState::Blocked);
+}
+
+#[test]
 fn fresh_audit_context_recovers_after_network_change_and_next_event_stays_permitted() {
     let (_dir, store) = setup_store();
     let now = 1_710_000_000.;
@@ -2000,6 +2068,10 @@ fn daemon_restart_resync_with_producer_boot_id() {
         policy_sync_label_zh: "执行器已应用".into(),
         reason_code: "active".into(),
         process_preserved: true,
+        process_execution_state: None,
+        process_disposition_action: None,
+        process_disposition_receipt: None,
+        previous_process_disposition_receipts: Vec::new(),
         active_member_pids: vec![4100],
         active_members: vec![],
         local_proxy_ready: true,

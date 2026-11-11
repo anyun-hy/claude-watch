@@ -1,3 +1,6 @@
+#[path = "support/hardened_helper.rs"]
+mod hardened_helper;
+
 use claude_watch_core::{
     channel::PolicyVersion,
     controlled_launch::{
@@ -10,9 +13,10 @@ use claude_watch_core::{
 use claude_watch_runtime::{
     managed_entry::{
         build_claude_code_process_wrapper_plan, classify_process_protection_state,
-        execute_cli_via_sandbox_launcher_with_stdin, prepare_desktop_managed_launch,
-        resolve_real_cli_skipping_shim, snapshot_running_processes, stage_cli_entry_shim,
-        stage_desktop_entry_bundle, DesktopEntryPreparation, DesktopManagedEntrySpec,
+        execute_cli_via_sandbox_launcher_with_stdin, is_script_file, prepare_desktop_managed_launch,
+        resolve_real_cli_skipping_shim, resolve_script_launcher_context, snapshot_running_processes,
+        stage_cli_entry_shim, stage_desktop_entry_bundle, DesktopEntryPreparation,
+        DesktopManagedEntrySpec,
     },
     sandbox_launch::{
         build_helper_verifier_for_path, generate_nono_seatbelt_profile,
@@ -92,7 +96,7 @@ fn d02_already_running_unmanaged_desktop_is_reported_unprotected_and_never_claim
         expected_uid: effective_uid(),
         expected_helper_executable: exe.to_string_lossy().into_owned(),
         expected_helper_sha256: sha256_file_hex(&exe).unwrap(),
-        require_code_signature_identifier: None,
+        expected_helper_cdhash: "0".repeat(40),
     };
     let pv = test_policy_version();
     let registry = SandboxLaunchRegistry::new("boot-d02", pv.clone(), verifier, Some(store));
@@ -182,7 +186,7 @@ fn d03_and_d04_direct_child_inherits_protection_while_out_of_tree_launchd_proces
         expected_uid: effective_uid(),
         expected_helper_executable: exe_str.clone(),
         expected_helper_sha256: exe_sha.clone(),
-        require_code_signature_identifier: None,
+        expected_helper_cdhash: "0".repeat(40),
     };
     let pv = test_policy_version();
     let boot_id = "boot-d03";
@@ -223,6 +227,11 @@ fn d03_and_d04_direct_child_inherits_protection_while_out_of_tree_launchd_proces
         vpn_epoch: Some(VpnEpoch::new("vpn-d03", 1)),
         launch_nonce: "nonce-d03-001".into(),
         executor_boot_id: boot_id.into(),
+        script_entry: None,
+        script_fingerprint: None,
+        interpreter: None,
+        interpreter_fingerprint: None,
+        script_source: None,
     };
     let resp = register_helper_with_daemon(&sock_path, req, true, &sbpl).unwrap();
     assert!(resp.accepted);
@@ -367,7 +376,7 @@ fn c01_cli_shim_skips_self_in_path_streams_stdin_stdout_stderr_and_executes_via_
     // Locate the built `watch-sandbox-launcher` binary next to current test binary's deps parent
     let current_exe = std::env::current_exe().unwrap();
     let debug_dir = current_exe.parent().unwrap().parent().unwrap();
-    let launcher_bin = debug_dir.join("watch-sandbox-launcher");
+    let launcher_bin = hardened_helper::copy_signed(&debug_dir.join("watch-sandbox-launcher"), &tmp.0.join("watch-sandbox-launcher"));
     assert!(
         launcher_bin.is_file(),
         "expected watch-sandbox-launcher binary at {}",
@@ -520,9 +529,8 @@ fn controlled_entry_appkit_component_reopens_real_window_and_checks_standard_eve
 
 #[test]
 fn controlled_entry_async_transport_preserves_file_completion_uncertainty_without_retry() {
-    // A separate negative case deliberately reads without presenting a document.
-    // On this host AppKit waits for window ordering before completing odoc;
-    // receipt of the file alone must never be promoted to completed opening.
+    // A separate negative case reads the file but deliberately suspends the
+    // standard reply. Delivery alone must never be promoted to completion.
     run_controlled_entry_appkit_fixture(false);
 }
 
@@ -530,7 +538,7 @@ fn run_controlled_entry_appkit_fixture(require_file_completion: bool) {
     let (tmp, store) = make_temp_store("cw-entry-d01");
     let current_exe = std::env::current_exe().unwrap();
     let debug_dir = current_exe.parent().unwrap().parent().unwrap();
-    let launcher_bin = debug_dir.join("watch-sandbox-launcher");
+    let launcher_bin = hardened_helper::copy_signed(&debug_dir.join("watch-sandbox-launcher"), &tmp.0.join("watch-sandbox-launcher"));
     assert!(
         launcher_bin.is_file(),
         "expected watch-sandbox-launcher at {}",
@@ -614,27 +622,49 @@ final class MockAppDelegate: NSObject, NSApplicationDelegate {
         record("RECEIVED_REOPEN_PID=\(myPid) VISIBLE=\(window.isVisible ? 1 : 0)")
         return window.isVisible
     }
-    // Exercise AppKit's standard odoc decoding, not a private string protocol.
-    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+    @objc func handleOpenDocuments(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
+        let err = AEKeyword(keyErrorNumber)
+        record("ODOC_HANDLER_PID=\(myPid) REPLY_TYPE=\(reply.descriptorType)")
+        guard let list = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject)),
+              list.descriptorType == DescType(typeAEList), list.numberOfItems > 0 else {
+            reply.setParam(NSAppleEventDescriptor(int32: -1700), forKeyword: err)
+            return
+        }
+        let filenames = (1...list.numberOfItems).compactMap { index -> String? in
+            guard let item = list.atIndex(index) else { return nil }
+            record("ODOC_ITEM_TYPE=\(item.descriptorType)")
+            return (item.fileURLValue ?? item.coerce(toDescriptorType: DescType(typeFileURL))?.fileURLValue)?.path
+        }
+        guard filenames.count == list.numberOfItems else {
+            reply.setParam(NSAppleEventDescriptor(int32: -1700), forKeyword: err)
+            return
+        }
         let contents = filenames.map { try? String(contentsOfFile: $0, encoding: .utf8) }
         let readable = !contents.isEmpty && contents.allSatisfy { $0 == "controlled-entry-document" }
         record("RECEIVED_FILES_PID=\(myPid) FILES=\(filenames.joined(separator: ",")) READABLE=\(readable ? 1 : 0)")
-        if readable && env["CW_MOCK_PRESENT_DOCUMENT"] == "1" {
-            // Exercise an actual document open. Current AppKit defers the
-            // standard odoc reply until its window-ordering completion runs.
-            // No private acknowledgment or sender-side success substitute.
-            let document = NSWindow(contentRect: NSRect(x: 160, y: 160, width: 360, height: 180),
-                                    styleMask: [.titled, .closable], backing: .buffered, defer: false)
-            document.isReleasedWhenClosed = false
-            document.title = "Watch document fixture"
-            let text = NSTextView(frame: document.contentView!.bounds)
-            text.string = contents[0] ?? ""
-            document.contentView = text
-            documentWindows.append(document)
-            document.makeKeyAndOrderFront(nil)
-            record("DOCUMENT_OPENED_PID=\(myPid) VISIBLE=\(document.isVisible ? 1 : 0)")
+        guard readable else {
+            reply.setParam(NSAppleEventDescriptor(int32: -10000), forKeyword: err)
+            return
         }
-        sender.reply(toOpenOrPrint: readable ? .success : .failure)
+        guard env["CW_MOCK_PRESENT_DOCUMENT"] == "1" else {
+            guard NSAppleEventManager.shared().suspendCurrentAppleEvent() != nil else { exit(91) }
+            record("DOCUMENT_REPLY_SUSPENDED_PID=\(myPid)")
+            return
+        }
+        // The former delegate opened the window but its open/print reply
+        // never reached the sender. Complete the real odoc reply descriptor
+        // directly, after the fixture actually presents the document.
+        let document = NSWindow(contentRect: NSRect(x: 160, y: 160, width: 360, height: 180),
+                                styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        document.isReleasedWhenClosed = false
+        document.title = "Watch document fixture"
+        let text = NSTextView(frame: document.contentView!.bounds)
+        text.string = contents[0] ?? ""
+        document.contentView = text
+        documentWindows.append(document)
+        document.makeKeyAndOrderFront(nil)
+        record("DOCUMENT_OPENED_PID=\(myPid) VISIBLE=\(document.isVisible ? 1 : 0)")
+        reply.setParam(NSAppleEventDescriptor(int32: document.isVisible ? 0 : -10000), forKeyword: err)
     }
     @objc func handleGetURL(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
         guard let url = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue else {
@@ -658,9 +688,14 @@ NSAppleEventManager.shared().setEventHandler(delegate,
     andSelector: #selector(MockAppDelegate.handleGetURL(_:reply:)),
     forEventClass: AEEventClass(kInternetEventClass), andEventID: AEEventID(kAEGetURL))
 app.finishLaunching()
-delegate.window.makeKeyAndOrderFront(nil)
-record("WINDOW_READY=\(delegate.window.isVisible ? 1 : 0) PID=\(myPid)")
-record("PROXY=\(env["HTTP_PROXY"] ?? "") SANDBOX=\(env["CW_CONTROLLED_SANDBOX"] ?? "")")
+DispatchQueue.main.async {
+    NSAppleEventManager.shared().setEventHandler(delegate,
+        andSelector: #selector(MockAppDelegate.handleOpenDocuments(_:reply:)),
+        forEventClass: AEEventClass(kCoreEventClass), andEventID: AEEventID(kAEOpenDocuments))
+    delegate.window.makeKeyAndOrderFront(nil)
+    record("WINDOW_READY=\(delegate.window.isVisible ? 1 : 0) PID=\(myPid)")
+    record("PROXY=\(env["HTTP_PROXY"] ?? "") SANDBOX=\(env["CW_CONTROLLED_SANDBOX"] ?? "")")
+}
 let lifecycleTimer = Timer.scheduledTimer(withTimeInterval: 0.025, repeats: true) { _ in
     guard FileManager.default.fileExists(atPath: keepAliveFile) else { exit(0) }
     if FileManager.default.fileExists(atPath: closeFile) {
@@ -739,6 +774,11 @@ app.run()
         vpn_epoch: Some(VpnEpoch::new("vpn-d01", 1)),
         launch_nonce: "nonce-d01-real-001".into(),
         executor_boot_id: boot_id.into(),
+        script_entry: None,
+        script_fingerprint: None,
+        interpreter: None,
+        interpreter_fingerprint: None,
+        script_source: None,
     };
     let req_json = serde_json::to_string(&req_template).unwrap();
     let real_helper_dispatch = tmp.0.join("watch-helper-dispatch");
@@ -866,14 +906,15 @@ app.run()
         .args(["--open-file", document_file.to_str().unwrap()])
         .output().expect("deliver one standard file event");
     let target_received = fs::read_to_string(&window_state_file).unwrap();
+    let file_events = fs::read_to_string(&events_log_file).unwrap_or_default();
     let received_file = target_received.lines().find_map(|line| {
         line.strip_prefix(&format!("RECEIVED_FILES_PID={managed_pid} FILES="))
             .and_then(|value| value.strip_suffix(" READABLE=1"))
-    }).expect("AppKit must receive and read the standard file event");
+    }).unwrap_or_else(|| panic!("AppKit must receive and read the standard file event: status={:?}, target_state={target_received}, wrapper_log={file_events}, target_stderr={}",
+        file_out.status.code(), fs::read_to_string(&target_stderr).unwrap_or_default()));
     assert_eq!(fs::canonicalize(received_file).unwrap(), fs::canonicalize(&document_file).unwrap(), "AppKit must decode the requested file URL");
     assert_eq!(target_received.matches("RECEIVED_FILES_PID=").count(), 1, "one input file event must be delivered once");
     eprintln!("AppKit fixture: standard file URL decoded/read exactly once by the managed PID");
-    let file_events = fs::read_to_string(&events_log_file).unwrap_or_default();
     if require_file_completion {
         assert!(target_received.contains(&format!("DOCUMENT_OPENED_PID={managed_pid} VISIBLE=1")),
             "successful document open must present its window: {target_received}");
@@ -886,6 +927,7 @@ app.run()
         eprintln!("AppKit fixture: actual document window opened and standard completion reply confirmed");
     } else {
         assert!(!target_received.contains("DOCUMENT_OPENED_PID="));
+        assert!(target_received.contains(&format!("DOCUMENT_REPLY_SUSPENDED_PID={managed_pid}")));
         assert_eq!(file_out.status.code(), Some(74), "missing completion must not become success: {file_events}");
         let events: Vec<serde_json::Value> = file_events.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
         assert_eq!(events.iter().filter(|event| event["error"] == "apple_event_reply_timeout" && event["outcome"] == "unconfirmed").count(), 1,
@@ -927,4 +969,237 @@ app.run()
 
     stop.store(true, Ordering::Release);
     let _ = reg_handle.join();
+}
+
+#[test]
+fn n2_managed_entry_activation_lifecycle_preview_activate_status_deactivate() {
+    use claude_watch_runtime::managed_entry_activation::{EntryActivity, EntryShell, EntrySource, ManagedEntryActivationManager};
+    let (tmp, store) = make_temp_store("cw-n2-activation");
+    let root = fs::canonicalize(&tmp.0).unwrap();
+    let shims = root.join("bin");
+    let original = root.join("native-original");
+    fs::copy("/bin/sleep", &original).unwrap();
+    let original_bytes = fs::read(&original).unwrap();
+    let rc = root.join(".zshrc");
+    fs::write(&rc, b"# user bytes without newline").unwrap();
+    let source = EntrySource::Cli { entry_path: original.clone(), executable: original.clone(),
+        sha256: sha256_file_hex(&original).unwrap(), kind: claude_watch_core::processes::Kind::ClaudeCode, script: false };
+    let mut manager = ManagedEntryActivationManager::new(store, root.join("watch-engine"), root.join("watch-sandbox-launcher"), None);
+    manager.set_shims_dir(shims.clone());
+    manager.set_shell(EntryShell::Zsh);
+    let preview = manager.preview(LaunchTarget::ClaudeCli, &source).unwrap();
+    assert_eq!(preview.destination_path, shims.join("claude"));
+    assert_eq!(preview.shell_config_path.as_deref(), Some(rc.as_path()));
+    assert!(!preview.conflict_detected && !shims.exists());
+    assert_eq!(fs::read(&rc).unwrap(), b"# user bytes without newline");
+    assert!(!manager.status(LaunchTarget::ClaudeCli, EntryActivity::default()).unwrap().entry_generated);
+    for _ in 0..2 {
+        let result = manager.activate(LaunchTarget::ClaudeCli, &source, &EntryActivity::default()).unwrap();
+        assert_eq!(result.status, "activated");
+        assert!(result.activation_configured);
+    }
+    let status = manager.status(LaunchTarget::ClaudeCli, EntryActivity::default()).unwrap();
+    assert!(status.entry_generated && status.activation_configured);
+    assert!(!status.current_invocation_verified);
+    assert_ne!(status.shell_resolution, "verified");
+    let mut bytes = fs::read(&rc).unwrap();
+    bytes.extend(b"# user edit outside managed block\n");
+    fs::write(&rc, &bytes).unwrap();
+    assert!(manager.deactivate(LaunchTarget::ClaudeCli).unwrap().was_present);
+    assert!(!manager.deactivate(LaunchTarget::ClaudeCli).unwrap().was_present);
+    assert_eq!(fs::read(&rc).unwrap(), b"# user bytes without newline# user edit outside managed block\n");
+    assert_eq!(fs::read(&original).unwrap(), original_bytes);
+}
+
+#[test]
+fn n3a_script_cli_dual_fingerprint_binding_and_tamper_detection() {
+    let (tmp, _store) = make_temp_store("n3a");
+    let script_dir = tmp.0.join("bin");
+    fs::create_dir_all(&script_dir).unwrap();
+
+    // 1. Create a valid script CLI with a standard /bin/sh shebang
+    let script_path = script_dir.join("test_script.sh");
+    fs::write(&script_path, b"#!/bin/sh\necho \"script_arg=$1\"\nexit 0\n").unwrap();
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(is_script_file(&script_path));
+    let script_sha = sha256_file_hex(&script_path).unwrap();
+
+    // Resolve script launcher context
+    let search_paths = vec![script_dir.clone(), PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+    let ctx = resolve_script_launcher_context(&script_path, &script_sha, &search_paths).unwrap();
+
+    // Verify dual binding: script entry + interpreter
+    assert_eq!(ctx.target_executable, script_path.to_string_lossy());
+    assert_eq!(ctx.target_fingerprint, script_sha);
+    assert_eq!(ctx.script_entry, Some(script_path.to_string_lossy().into_owned()));
+    assert_eq!(ctx.script_fingerprint, Some(script_sha.clone()));
+    assert!(ctx.interpreter.is_some());
+    let interp = ctx.interpreter.unwrap();
+    assert!(interp.ends_with("/sh") || interp.ends_with("/bash"));
+    assert!(ctx.interpreter_fingerprint.is_some());
+
+    // 2. Non-script binary returns single target binding without script/interpreter fields
+    let echo_path = PathBuf::from("/bin/echo");
+    if echo_path.is_file() {
+        let echo_sha = sha256_file_hex(&echo_path).unwrap();
+        let non_script_ctx = resolve_script_launcher_context(&echo_path, &echo_sha, &search_paths).unwrap();
+        assert_eq!(non_script_ctx.script_entry, None);
+        assert_eq!(non_script_ctx.script_fingerprint, None);
+        assert_eq!(non_script_ctx.interpreter, None);
+        assert_eq!(non_script_ctx.interpreter_fingerprint, None);
+    }
+
+    // 3. Unsupported interpreter (e.g. python, perl, ruby) fails closed with unsupported_launcher
+    let py_script = script_dir.join("test_py.py");
+    fs::write(&py_script, b"#!/usr/bin/env python3\nprint('hello')\n").unwrap();
+    fs::set_permissions(&py_script, fs::Permissions::from_mode(0o755)).unwrap();
+    let py_sha = sha256_file_hex(&py_script).unwrap();
+    let py_err = resolve_script_launcher_context(&py_script, &py_sha, &search_paths).unwrap_err();
+    assert_eq!(py_err.code, "unsupported_launcher");
+
+    // 4. Missing / invalid shebang without supported extension fails closed
+    let broken_script = script_dir.join("broken");
+    fs::write(&broken_script, b"#!\n").unwrap();
+    fs::set_permissions(&broken_script, fs::Permissions::from_mode(0o755)).unwrap();
+    let broken_sha = sha256_file_hex(&broken_script).unwrap();
+    let broken_err = resolve_script_launcher_context(&broken_script, &broken_sha, &search_paths).unwrap_err();
+    assert_eq!(broken_err.code, "unsupported_launcher");
+}
+
+#[test]
+fn n3b_legacy_script_fields_cannot_replace_current_approval() {
+    let (tmp, store) = make_temp_store("n3b");
+    let bin_dir = tmp.0.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    // 1. Create a mock Claude script CLI
+    let script_claude = bin_dir.join("claude");
+    fs::write(&script_claude, b"#!/bin/sh\necho \"script_ok\"\nexit 0\n").unwrap();
+    fs::set_permissions(&script_claude, fs::Permissions::from_mode(0o755)).unwrap();
+    let script_canon = fs::canonicalize(&script_claude).unwrap();
+    let script_sha = sha256_file_hex(&script_canon).unwrap();
+
+    let search_paths = vec![bin_dir.clone(), PathBuf::from("/bin")];
+    let script_ctx = resolve_script_launcher_context(&script_canon, &script_sha, &search_paths).unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let debug_dir = current_exe.parent().unwrap().parent().unwrap();
+    let launcher_bin = hardened_helper::copy_signed(&debug_dir.join("watch-sandbox-launcher"), &tmp.0.join("watch-sandbox-launcher"));
+
+    let verifier = build_helper_verifier_for_path(&launcher_bin).expect("helper verifier");
+    let pv = test_policy_version();
+    let boot_id = "boot-n3b";
+    let registry = SandboxLaunchRegistry::new(boot_id, pv.clone(), verifier, Some(store));
+
+    // Register script CLI in approved_targets
+    registry.approve_target_executable(script_canon.to_string_lossy(), &script_sha);
+
+    // 2. Verify that attempting to register interpreter directly in approved_targets is prohibited
+    let interp_path = script_ctx.interpreter.clone().unwrap();
+
+    // Registry correctly maps script target to approved targets without approving interpreter globally
+    assert!(registry.is_target_approved(&script_canon.to_string_lossy()));
+    assert!(!registry.is_target_approved(&interp_path));
+
+    // 3. Construct ControlledLaunchRequest with dual script + interpreter binding
+    let req = ControlledLaunchRequest {
+        entry_id: "io.local.watchpanel.entry.claude-cli".into(),
+        target: LaunchTarget::ClaudeCli,
+        target_executable: script_ctx.target_executable,
+        target_fingerprint: script_ctx.target_fingerprint,
+        args: vec!["test-arg".into()],
+        cwd: None,
+        proxy_adaptation: ProxyAdaptationKind::EnvOnly,
+        gateway_endpoint: "127.0.0.1:18955".into(),
+        policy_version: pv.clone(),
+        vpn_epoch: Some(VpnEpoch::new("vpn-n3b", 1)),
+        launch_nonce: "nonce-n3b-001".into(),
+        executor_boot_id: boot_id.into(),
+        script_entry: script_ctx.script_entry.clone(),
+        script_fingerprint: script_ctx.script_fingerprint.clone(),
+        interpreter: script_ctx.interpreter.clone(),
+        interpreter_fingerprint: script_ctx.interpreter_fingerprint.clone(),
+        script_source: None,
+    };
+    assert_eq!(req.validate().unwrap_err().code, "invalid_script_launch_contract");
+
+    // 4. Invalidation when script changes on disk
+    fs::write(&script_canon, b"#!/bin/sh\necho \"tampered\"\nexit 1\n").unwrap();
+    let tampered_sha = sha256_file_hex(&script_canon).unwrap();
+    assert_ne!(script_sha, tampered_sha);
+}
+
+#[test]
+fn n2b_managed_entry_safety_conflicts_symlinks_tamper_rejection() {
+    use claude_watch_runtime::managed_entry_activation::{EntryActivity, EntrySource, ManagedEntryActivationManager};
+    use claude_watch_core::processes::Kind;
+    use std::os::unix::fs::symlink;
+    let (tmp, store) = make_temp_store("cw-n2b-conflicts");
+    let root = fs::canonicalize(&tmp.0).unwrap();
+    let shims = root.join("shims");
+    fs::create_dir(&shims).unwrap();
+    let dest = shims.join("claude");
+    let original = root.join("original");
+    fs::copy("/bin/sleep", &original).unwrap();
+    let original_bytes = fs::read(&original).unwrap();
+    let source = EntrySource::Cli { entry_path: original.clone(), executable: original.clone(),
+        sha256: sha256_file_hex(&original).unwrap(), kind: Kind::ClaudeCode, script: false };
+    let mut manager = ManagedEntryActivationManager::new(store, root.join("watch-engine"), root.join("watch-sandbox-launcher"), None);
+    manager.set_shims_dir(shims.clone());
+    let target = LaunchTarget::ClaudeCli;
+    let blocked = || {
+        assert!(manager.preview(target, &source).unwrap().conflict_detected);
+        assert!(manager.activate(target, &source, &EntryActivity::default()).is_err());
+        assert!(manager.deactivate(target).is_err());
+    };
+    let forged = b"#!/bin/sh\n# CLAUDE WATCH MANAGED CLI ENTRY SHIM v2\nuser bytes\n";
+    fs::write(&dest, forged).unwrap();
+    blocked();
+    assert_eq!(fs::read(&dest).unwrap(), forged);
+    fs::remove_file(&dest).unwrap();
+    for link in [&original, &root.join("missing")] {
+        symlink(link, &dest).unwrap();
+        blocked();
+        assert_eq!(fs::read_link(&dest).unwrap(), *link);
+        assert_eq!(fs::read(&original).unwrap(), original_bytes);
+        fs::remove_file(&dest).unwrap();
+    }
+    fs::remove_dir(&shims).unwrap();
+    let outside = root.join("unrelated-dir");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("claude"), b"unrelated command").unwrap();
+    symlink(&outside, &shims).unwrap();
+    blocked();
+    assert_eq!(fs::read(outside.join("claude")).unwrap(), b"unrelated command");
+    fs::remove_file(&shims).unwrap();
+
+    manager.activate(target, &source, &EntryActivity::default()).unwrap();
+    let mut tampered = fs::read(&dest).unwrap();
+    tampered.extend(b"\n# user edit kept managed marker\n");
+    fs::write(&dest, &tampered).unwrap();
+    blocked();
+    assert_eq!(fs::read(&dest).unwrap(), tampered);
+    assert_eq!(fs::read(&original).unwrap(), original_bytes);
+}
+
+#[test]
+fn n3c_unsupported_shell_script_never_enters_discovery_approvals() {
+    use claude_watch_runtime::{commands::SystemRunner, native, target_discovery::{DiscoveryHandle, DiscoveryInputs}};
+    let (tmp, _) = make_temp_store("cw-n3c-combos");
+    let root = fs::canonicalize(&tmp.0).unwrap();
+    let versions = root.join(".local/share/claude/versions");
+    fs::create_dir_all(&versions).unwrap();
+    let script = versions.join("fixture-shell");
+    fs::write(&script, b"#!/bin/sh\necho fixture\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir_all(root.join(".local/bin")).unwrap();
+    std::os::unix::fs::symlink(&script, root.join(".local/bin/claude")).unwrap();
+    let discovery = DiscoveryHandle::new(DiscoveryInputs::for_home(&root));
+    let runner = SystemRunner::new(native::built_observer_path().unwrap()).unwrap();
+    let snap = discovery.refresh(&runner, native::now());
+    assert!(snap.targets.iter().any(|r| r.script_entry.as_ref() == Some(&script) && !r.launcher_supported));
+    let manifest = discovery.approved_manifest(&snap).unwrap();
+    assert!(manifest.script_combos.is_empty());
+    assert!(!manifest.targets.contains_key(script.to_str().unwrap()));
 }
