@@ -516,7 +516,8 @@ impl SessionStore {
             .watch()
             .join(format!("state/sessions/rust-{}.session", desktop.pid));
         let old_lease = self.storage.read_bytes(&lease_path, 16 * 1024)?;
-        crate::controlled::Controller::new(self.storage.clone()).lease(desktop, stamp, now, provider)?;
+        crate::lease_store::LeaseStore { storage: self.storage.clone() }
+            .save_desktop(desktop, stamp, now, provider)?;
         if let Err(error) = self.save(&verified) {
             let rollback = match old_lease {
                 Some(bytes) => self.storage.atomic_bytes(&lease_path, &bytes, 0o600),

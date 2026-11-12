@@ -394,6 +394,18 @@ struct InitializationTests {
                 hasBaseline: false, stderrBytes: 0, processes: [], events: [], proxy: proxy, proxyError: nil,
                 logPath: "/fixture/log", backendVersion: "fixture", monitoredApps: ["claude"])
         }
+        do {
+            let isolated = MonitorStore(leakChecks: LeakCheckStore(isFixture: true), aiChecks: AIProbeStore(isFixture: true),
+                                        switcher: SwitcherStore(isFixture: true))
+            isolated.beginInitialization(startSnapshotPolling: false)
+            let isolatedSnapshotTime = Date().timeIntervalSince1970
+            isolated.acceptSnapshot(snapshot(node: "isolated", at: isolatedSnapshotTime),
+                                    receivedAt: Date(timeIntervalSince1970: isolatedSnapshotTime))
+            isolated.handleChannelUpdate()
+            isolated.refresh(full: true, manual: true)
+            expect(!isolated.refreshing && isolated.error == nil && isolated.snapshot?.capturedAt == isolatedSnapshotTime,
+                   "fixture channel callbacks and manual refreshes cannot schedule live snapshot reads or replace supplied evidence")
+        }
         // A clean installation has no UI snapshot to seed the first check.
         // Replay publication latency (4s) and the observed 14s proxy cadence:
         // first sample at t=5, next at t=19. Timer rereads keep returning the
@@ -575,9 +587,28 @@ struct InitializationTests {
         expect(full.approval?.action == .protection && fullLeaks.initializationReceiptIsCurrent(.dns) &&
                fullLeaks.initializationReceiptIsCurrent(.webrtc),
                "retry obtains new-context receipts before presenting a new guard confirmation")
+        let beforeProtectionObservation = fullSwitcher.currentEnvironment!.observed_at
         if let request = full.approval { await full.authorize(request) }
-        expect(full.allPassed && !full.entered && fullStore.switcher.settings["guard_enabled"] as? Bool == true,
+        let finalVerificationPassed = full.allPassed && !full.entered && fullStore.switcher.settings["guard_enabled"] as? Bool == true
+        if !finalVerificationPassed {
+            let diagnosticNow = Date().timeIntervalSince1970
+            let policy = fullSwitcher.currentPolicyEvaluation
+            let guardState = policy?.rows.first { $0.id == "guard" }?.state ?? "missing"
+            let states = full.rows.map { "\($0.step.rawValue):\($0.status.rawValue):\($0.code):\($0.detail)" }
+            let services = fullSwitcher.background?.services.filter { ["guard", "watchdog"].contains($0.id) }
+                .map { "\($0.id):\($0.state):desired=\(String(describing: $0.desired)):healthy=\($0.healthy)" } ?? []
+            print("Final verification rows: \(states)")
+            print("Final verification coordinator: running=\(full.running), entered=\(full.entered), approval=\(String(describing: full.approval?.action))")
+            print("Final verification settings: policy=\(String(describing: fullSwitcher.settings[Setting.enabled.key])), guard=\(String(describing: fullSwitcher.settings[Setting.guardEnabled.key])), watchdog=\(String(describing: fullSwitcher.settings[Setting.timezoneWatchdog.key]))")
+            print("Final verification snapshot: error=\(String(describing: fullStore.error)), age=\(fullStore.snapshot.map { diagnosticNow - $0.capturedAt } ?? -1)")
+            print("Final verification environment: historical=\(fullSwitcher.currentEnvironmentIsHistorical), age=\(fullSwitcher.currentEnvironment.map { diagnosticNow - $0.observed_at } ?? -1), policyReady=\(String(describing: policy?.ready)), blocked=\(policy?.blocked ?? []), guardState=\(guardState)")
+            print("Final verification background: error=\(fullSwitcher.backgroundError), age=\(fullSwitcher.background.map { diagnosticNow - $0.observed_at } ?? -1), services=\(services)")
+        }
+        expect(finalVerificationPassed,
                "confirmed fixture guard still runs the real final verification before entry")
+        expect((fullSwitcher.currentEnvironment?.observed_at ?? 0) > beforeProtectionObservation &&
+               fullSwitcher.currentPolicyEvaluation?.rows.first(where: { $0.id == "guard" })?.state == "ok",
+               "successful guard setup replaces the pre-enable audit with a fresh verified guard row")
         // Scheduled cycles must not re-collect receipts that are still
         // current: re-running both probes every cycle turned each waiting
         // refresh into a full multi-minute restart of the network checks.
@@ -614,19 +645,40 @@ struct InitializationTests {
         for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
         expect(full.rows[4].status == .failed && !full.canEnter(at: Date().timeIntervalSince1970),
                "an automatic DNS failure is visible and cannot reuse the previous green")
+        fullSwitcher.receiptCommandFixture = { _, _ in
+            try JSONSerialization.data(withJSONObject: ["status": "error", "code": "invalid_dns_receipt",
+                                                        "message": "回执契约测试拒绝"])
+        }
+        full.refreshReadiness(at: Date().addingTimeInterval(31))
+        for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
+        expect(full.rows[4].status == .failed && full.rows[4].detail.contains("回执契约测试拒绝"),
+               "a backend receipt rejection stays visible when the probe also timed out")
+        fullSwitcher.receiptCommandFixture = nil
         fullLeaks.fixtureScenario = .matched
         full.refreshReadiness(at: Date().addingTimeInterval(31))
         for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
         expect(full.allPassed && full.canEnter(at: Date().timeIntervalSince1970),
                "automatic retry restores readiness only after new checks and joint verification")
         let gapAt = Date().timeIntervalSince1970
+        let beforeGapProxyTime = fullStore.snapshot?.proxy?.observedAt
         let gap = MonitorSnapshot(capturedAt: gapAt, health: firstSnapshot.health,
             installed: true, autoStart: true, keepAlive: true, hasBaseline: false,
             stderrBytes: 0, processes: [], events: [], proxy: nil, proxyError: nil,
             logPath: "/fixture/log", backendVersion: "fixture", monitoredApps: ["claude"])
         fullStore.acceptSnapshot(gap, receivedAt: Date())
         full.refreshReadiness()
-        expect(full.rows[1].code == "context_unavailable" && full.rows[2].status == .pending && !full.allPassed,
+        let gapRevokedExpectedRows = full.rows[1].code == "context_unavailable" && full.rows[2].status == .pending && !full.allPassed
+        if !gapRevokedExpectedRows {
+            let diagnosticNow = Date().timeIntervalSince1970
+            let states = full.rows.map { "\($0.step.rawValue):\($0.status.rawValue):\($0.code)" }
+            print("Sampling gap rows: \(states)")
+            print("Sampling gap context: retained=\(fullStore.initializationContext != nil), proxyPresent=\(fullStore.snapshot?.proxy != nil), previousProxyAge=\(beforeGapProxyTime.map { diagnosticNow - $0 } ?? -1)")
+            print("Sampling gap snapshot: error=\(String(describing: fullStore.error)), age=\(fullStore.snapshot.map { diagnosticNow - $0.capturedAt } ?? -1)")
+            let dnsProblem = fullLeaks.initializationReceiptProblem(.dns)?.code ?? "none"
+            let rtcProblem = fullLeaks.initializationReceiptProblem(.webrtc)?.code ?? "none"
+            print("Sampling gap receipts: dns=\(dnsProblem), webrtc=\(rtcProblem), allPassed=\(full.allPassed), canEnter=\(full.canEnter(at: diagnosticNow)), running=\(full.running)")
+        }
+        expect(gapRevokedExpectedRows,
                "a temporary proxy sampling gap revokes dependent green states")
         fullStore.acceptSnapshot(snapshot(node: fullNode, at: Date().timeIntervalSince1970), receivedAt: Date())
         full.refreshReadiness(at: Date().addingTimeInterval(31))

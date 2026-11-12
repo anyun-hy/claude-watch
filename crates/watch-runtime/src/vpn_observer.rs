@@ -613,6 +613,11 @@ pub fn kernel_listener_owner(kernel: &CommandEvidence, port: u16) -> Option<u32>
         source: "lsof".into(),
     };
     let evidence = listener_fallback_for_port(empty, Some(kernel), port);
+    listener_owner_at(&evidence, port, None)
+}
+
+/// The same owner parser for a fresh, port-targeted lsof observation.
+pub(crate) fn listener_owner_at(evidence: &CommandEvidence, port: u16, address: Option<std::net::IpAddr>) -> Option<u32> {
     if evidence.status != 0 || !evidence.stderr.trim().is_empty() {
         return None;
     }
@@ -628,12 +633,22 @@ pub fn kernel_listener_owner(kernel: &CommandEvidence, port: u16) -> Option<u32>
         if let Some(raw) = line.strip_prefix('p') {
             pid = raw.parse::<u32>().ok().filter(|v| *v > 1);
         } else if let Some(endpoint) = line.strip_prefix('n') {
-            if accepted.iter().any(|v| v == endpoint) {
+            let matches = address.map_or_else(|| accepted.iter().any(|value| value == endpoint), |expected|
+                endpoint == format!("*:{port}") || claude_watch_core::tag_flow::parse_endpoint(endpoint).ok()
+                    .is_some_and(|(host, actual_port)| actual_port == port && host.parse::<std::net::IpAddr>().is_ok_and(|actual|
+                        actual == expected || (actual.is_unspecified() && actual.is_ipv4() == expected.is_ipv4()))));
+            if matches {
                 owners.insert(pid?);
             }
         }
     }
     (owners.len() == 1).then(|| owners.into_iter().next()).flatten()
+}
+
+pub(crate) fn kernel_listener_owner_at(kernel: &CommandEvidence, port: u16, address: std::net::IpAddr) -> Option<u32> {
+    let empty = CommandEvidence { status:1, stdout:String::new(), stderr:String::new(), source:"lsof".into() };
+    let evidence = claude_watch_core::tag_flow::listener_fallback_for_address(empty, Some(kernel), port, address);
+    listener_owner_at(&evidence, port, Some(address))
 }
 
 /// Reads the kernel listener table once through `runner`.

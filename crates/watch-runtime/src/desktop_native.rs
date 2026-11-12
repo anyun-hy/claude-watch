@@ -884,7 +884,11 @@ impl<R: ReadRunner> NativeDesktop<R> {
             return Err(CoreError::new("protected_scope_mismatch", "该服务未声明强制退出能力"));
         }
         let command = if allow_force { "guard-close-desktop" } else { "close-desktop" };
-        let request = execute_output(&self.helper, &[command, family.id], Duration::from_secs(20));
+        let engine = std::env::current_exe()
+            .map_err(|_| CoreError::new("executable_unavailable", "无法定位运行组件"))?;
+        let engine = engine.to_str()
+            .ok_or_else(|| CoreError::new("invalid_executable", "运行组件路径无效"))?;
+        let request = execute_output(&self.helper, &[command, family.id, "--engine-path", engine], Duration::from_secs(20));
         close_receipt::finish(request, family.id, allow_force, forced, || self.desktop_tree_running())
     }
 
@@ -902,11 +906,14 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopRuntime
     /// second observation is the required post-I/O identity/policy check.
     pub fn sample_guard_environment(
         &mut self, enforcer: &crate::channel_enforcer::LocalTunnelEnforcer, families: &[&str],
+        round: &crate::sampler::ProcessRound,
     ) -> (std::collections::BTreeMap<String, Value>, Value) {
         let configs = ConfigStore { storage: self.storage.clone() };
         let result = (|| -> Result<_> {
+            let fresh = || (0.0..=crate::process_disposition::INTENT_TTL).contains(&(native::now() - round.observed_at));
+            if !fresh() { return Err(CoreError::new("process_observation_stale", "本轮进程观察已过期")); }
             let config = configs.load()?;
-            let before = self.system.local_for_target(&config, self.desktop.target())?;
+            let before = self.system.local_from_process_round(&config, self.desktop.target(), round)?;
             let context = before["context_id"].as_str().filter(|s| !s.is_empty())
                 .ok_or_else(|| CoreError::new("missing_context_id", "当前环境上下文无法确认"))?;
             let mut egress = std::collections::BTreeMap::new();
@@ -919,15 +926,22 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopRuntime
                 egress.insert(family.to_owned(), probe);
             }
             let latest = configs.load()?;
-            let after = self.system.local_for_target(&latest, self.desktop.target())?;
-            if config.value()? != latest.value()? || after["context_id"].as_str() != Some(context) {
+            let mut after = self.system.local_from_process_round(&latest, self.desktop.target(), round)?;
+            if !fresh() { return Err(CoreError::new("process_observation_stale", "出口采样结束时进程观察已经过期")); }
+            if config.value()? != latest.value()? || after["context_id"].as_str() != Some(context)
+                || before["network"] != after["network"]
+                || before["guard_listener"] != after["guard_listener"]
+                || before["guard_identity_evidence"] != after["guard_identity_evidence"] {
                 return Err(CoreError::new("audit_context_changed", "出口采样期间环境变化"));
             }
+            after["environment_observed_at"] = serde_json::json!(round.observed_at
+                .min(before["environment_observed_at"].as_f64().unwrap_or(round.observed_at))
+                .min(after["environment_observed_at"].as_f64().unwrap_or(round.observed_at)));
             Ok((egress, after))
         })();
         result.unwrap_or_else(|error| (
             families.iter().map(|&family| (family.to_owned(), unknown_guard_egress(family, &error.code))).collect(),
-            serde_json::json!({"proxy":"unknown","tun":"unknown","code":error.code}),
+            serde_json::json!({"proxy":"unknown","tun":"unknown","code":error.code,"process_observed_at":round.observed_at}),
         ))
     }
 
@@ -1094,17 +1108,7 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
     fn launch_target(&self) -> LaunchTarget {
         self.desktop.target()
     }
-    fn set_family(&mut self, family_id: &str) -> Result<()> {
-        let target = claude_watch_core::policy::PolicyCatalog::family(family_id)
-            .and_then(claude_watch_core::policy::PolicyCatalog::guard_target)
-            .ok_or_else(|| CoreError::new("unknown_family", "策略表未声明该监督对象"))?;
-        // Supervision scope is derived from the target's provider, not from a
-        // resolved app bundle, so pointing the guard at a family never fails
-        // when its app is not yet installed. Launch-time binding still goes
-        // through `select_target`.
-        self.desktop.set_guard_target(target);
-        Ok(())
-    }
+
     fn observation_roots(&mut self) -> Result<Vec<Target>> {
         self.desktop.observation_roots()
     }
@@ -1120,18 +1124,8 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
     fn wait(&mut self, d: Duration) {
         std::thread::sleep(d)
     }
-    fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
-        self.desktop.desktops()
-    }
-    fn desktop_alive(&mut self, desktop: &Desktop) -> Result<bool> {
-        self.desktop.desktop_alive(desktop)
-    }
-    fn desktop_tree_running(&mut self) -> Result<bool> {
-        self.desktop.desktop_tree_running()
-    }
-    fn launcher(&mut self) -> Result<Launcher> {
-        self.desktop.launcher()
-    }
+
+
     fn full_audit(&mut self) -> Result<Value> {
         let audit = AuditStore::new(self.storage.clone()).collect_target(
             self.system,
@@ -1161,7 +1155,11 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
             .unwrap_or("claude");
 
         if let Some(ref enforcer) = enforcer {
-            let (mut egress, _) = self.sample_guard_environment(enforcer, &[family_id]);
+            let round = crate::sampler::Sampler::new(&self.desktop.runner, self.storage.paths.clone())
+                .processes_with_system_metadata();
+            let round = match round { Ok(round) => round,
+                Err(error) => return unknown_guard_egress(family_id, &error.code) };
+            let (mut egress, _) = self.sample_guard_environment(enforcer, &[family_id], &round);
             return egress.remove(family_id).unwrap_or(Value::Null);
         }
 
@@ -1201,19 +1199,12 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
         data["via_controlled_path"] = serde_json::json!(false);
         data
     }
-    fn local_guard(&mut self) -> Result<Value> {
-        let config = ConfigStore {
-            storage: self.storage.clone(),
-        }
-        .load()?;
-        AuditSystem::local(self.system, &config)
-    }
+
     fn backend_healthy(&mut self) -> Result<bool> {
         Ok(ServiceSystem::backend_healthy(self.system))
     }
-    fn launcher_matches(&mut self, l: &Launcher) -> Result<bool> {
-        self.desktop.launcher_matches(l)
-    }
+
+
     fn open_desktop(&mut self) -> Result<()> {
         let config = ConfigStore {
             storage: self.storage.clone(),
@@ -1225,9 +1216,10 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
             &launcher_bin, &reg_sock, &gw_endpoint, &boot_id, policy_version, vpn_epoch,
         )
     }
-    fn quit_desktop(&mut self) -> Result<()> {
-        self.desktop.quit()
-    }
+
+
+
+
 }
 
 #[cfg(test)]

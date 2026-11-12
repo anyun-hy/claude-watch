@@ -48,8 +48,8 @@ fn main() {
         executable.display()
     );
     let control = output.join("watch-process-control");
-    let status = Command::new("/usr/bin/xcrun")
-        .args([
+    let mut compiler = Command::new("/usr/bin/xcrun");
+    compiler.args([
             "swiftc",
             "-parse-as-library",
             "-swift-version",
@@ -64,8 +64,18 @@ fn main() {
         .args([
             "../../monitor/Sources/AIProcessControl.swift",
             "../../monitor/tools/ProcessHelper.swift",
-        ])
-        .arg("-o")
+        ]);
+    // The development helper accepts only this Cargo build's explicitly passed
+    // engine, whose live parent identity it also checks. Release has no override.
+    if env::var("PROFILE").as_deref() == Ok("debug") {
+        let engine = output.ancestors().nth(3).expect("Cargo profile directory")
+            .join("claude-watch-engine");
+        let paths = output.join("ProcessHelperDevelopment.swift");
+        fs::write(&paths, format!("enum ProcessHelperDevelopment {{ static let enginePath = {:?} }}\n",
+            engine.to_str().expect("UTF-8 engine path"))).expect("development helper path");
+        compiler.args(["-D", "PROCESS_HELPER_DEVELOPMENT"]).arg(&paths);
+    }
+    let status = compiler.arg("-o")
         .arg(&control)
         .status()
         .expect("Swift process adapter compiler");

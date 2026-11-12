@@ -1,16 +1,19 @@
 """Behavioral tests of the coordinator; never invokes the actual project suite."""
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import plistlib
 import socket
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("cw_unified_runner", ROOT / "tools/run_all_tests.py")
@@ -36,6 +39,135 @@ class UnifiedRunnerTests(unittest.TestCase):
     def run_quiet(self, runner):
         with contextlib.redirect_stdout(io.StringIO()):
             return runner.run()
+
+    def isolated_repo(self):
+        repo = self.root / "source"
+        (repo / "crates").mkdir(parents=True)
+        (repo / "crates/input.rs").write_text("original source")
+        (repo / "target").mkdir()
+        return repo
+
+    def isolated_runner(self, repo, steps):
+        return Runner(repo, self.output, steps, runner_module.clean_environment(dict(os.environ), repo, self.output))
+
+    def test_source_receipt_reuses_build_algorithm_and_marks_mid_run_change(self):
+        repo = self.isolated_repo()
+        expected = runner_module._IDENTITY.snapshot(repo, None, None)
+        runner = self.isolated_runner(repo, [Step("mutate", "test", [[sys.executable, "-c",
+            "from pathlib import Path;Path('crates/input.rs').write_text('changed source')"]])])
+        self.assertEqual(self.run_quiet(runner), 0)
+        report = json.loads((self.output / "results.json").read_text())
+        for key in runner_module.SOURCE_KEYS:
+            self.assertEqual(report["source_identity"]["before"][key], expected[key])
+        self.assertIsNone(report["source_identity"]["before"]["app_build"])
+        self.assertIsNone(report["source_identity"]["before"]["source_revision"])
+        self.assertTrue(report["source_identity"]["changed_during_run"])
+        self.assertEqual(report["evidence_binding"], "unstable")
+        self.assertEqual(report["outcome"], "passed", "source changes must not rewrite actual test results")
+
+    def test_declared_component_changes_are_unstable_for_tests_but_expected_for_builds(self):
+        for category, binding in (("test", "unstable"), ("build", "before_after_match")):
+            with self.subTest(category=category), tempfile.TemporaryDirectory(dir=self.root) as temp:
+                repo = Path(temp)
+                (repo / "crates").mkdir()
+                component = repo / "component"
+                component.write_text("before")
+                output = repo / "results"
+                runner = Runner(repo, output, [Step("change", category, [[sys.executable, "-c",
+                    "from pathlib import Path;Path('component').write_text('after')"]], artifacts=[str(component)])], dict(os.environ))
+                self.assertEqual(self.run_quiet(runner), 0)
+                report = json.loads((output / "results.json").read_text())
+                self.assertFalse(report["source_identity"]["changed_during_run"])
+                self.assertEqual(report["evidence_binding"], binding)
+
+    def test_executed_file_replacement_is_detected_even_when_source_is_unchanged(self):
+        repo = self.isolated_repo()
+        executable = repo / "target/self-replacing"
+        executable.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath(__file__).write_text('replaced')\n")
+        executable.chmod(0o700)
+        runner = self.isolated_runner(repo, [Step("execute", "test", [[str(executable)]])])
+        self.assertEqual(self.run_quiet(runner), 0)
+        report = json.loads((self.output / "results.json").read_text())
+        evidence = report["steps"][0]["command_results"][0]
+        self.assertTrue(evidence["program_changed_during_command"])
+        self.assertNotEqual(evidence["program_before"]["sha256"], evidence["program_after"]["sha256"])
+        self.assertFalse(report["source_identity"]["changed_during_run"])
+        self.assertEqual(report["evidence_binding"], "unstable")
+
+    def test_old_product_receipt_and_runtime_hashes_are_not_rebound_to_run_source(self):
+        repo = self.isolated_repo()
+        runtime = repo / "target/runtime"
+        runtime.mkdir()
+        engine = runtime / "watch-engine"
+        engine.write_bytes(b"old candidate bytes")
+        (runtime / "BuildIdentity.json").write_text(json.dumps({"schema": 1, "app_build": "404",
+            "app_version": "4.0.0", "source_revision": "old", "source_dirty": True, "source_tree_digest": "0" * 64}))
+        (runtime / "BuildInfo.plist").write_bytes(plistlib.dumps({"RuntimeHashes": {
+            "watch-engine": hashlib.sha256(engine.read_bytes()).hexdigest(), "../outside": "0" * 64}}))
+        runner = self.isolated_runner(repo, [Step("fixture", "test", [[sys.executable, "-c", "pass"]], artifacts=[str(engine)])])
+        self.assertEqual(self.run_quiet(runner), 0)
+        artifact = runner.results[0]["declared_artifacts_after"][0]
+        self.assertEqual(artifact["product_build_identity"]["identity"]["app_build"], "404")
+        self.assertFalse(artifact["product_build_identity"]["matches_run_source"])
+        checks = {Path(item["path"]).name: item for item in artifact["runtime_hashes"]["files"]}
+        self.assertTrue(checks["watch-engine"]["matches_manifest"])
+        self.assertEqual(checks["outside"]["state"], "outside_manifest_directory")
+
+    def test_typecheck_has_no_product_or_compiler_output_and_source_errors_are_explicit(self):
+        repo = self.isolated_repo()
+        runner = self.isolated_runner(repo, [Step("typecheck", "build", [[sys.executable, "-c", "pass", "swiftc", "-typecheck"]])])
+        with mock.patch.object(runner_module, "source_identity", return_value={"error": "source unavailable"}):
+            self.assertEqual(self.run_quiet(runner), 0)
+        report = json.loads((self.output / "results.json").read_text())
+        self.assertEqual(report["evidence_binding"], "unavailable")
+        self.assertIsNone(report["source_identity"]["changed_during_run"])
+        self.assertEqual(report["steps"][0]["command_results"][0]["artifacts"], [])
+        self.assertEqual(report["steps"][0]["declared_artifacts_after"], [])
+
+    def test_cargo_reports_known_test_executable_and_native_component_paths(self):
+        repo = self.isolated_repo()
+        test_binary, helper = repo / "target/test executable", repo / "target/watch-process-control"
+        test_binary.write_bytes(b"fixture test program")
+        helper.write_bytes(b"fixture native component")
+        records = [json.dumps({"reason": "compiler-artifact", "executable": str(test_binary),
+                              "target": {"name": "fixture"}, "profile": {"test": True}, "fresh": False}),
+                   json.dumps({"reason": "build-script-executed", "env": [["CW_PROCESS_CONTROL_BUILD_PATH", str(helper)]]}),
+                   f"     Running tests/fixture.rs ({test_binary})"]
+        cargo = repo / "target/cargo"
+        cargo.write_text(f"#!{sys.executable}\nprint({chr(10).join(records)!r})\n")
+        cargo.chmod(0o700)
+        runner = self.isolated_runner(repo, [Step("cargo-fixture", "test", [[str(cargo), "test", "--message-format=json"]])])
+        self.assertEqual(self.run_quiet(runner), 0)
+        artifacts = runner.results[0]["command_results"][0]["artifacts"]
+        self.assertEqual(len(artifacts), 2)
+        self.assertTrue(artifacts[0]["invocation_observed"])
+        self.assertEqual(artifacts[0]["sha256"], hashlib.sha256(test_binary.read_bytes()).hexdigest())
+        self.assertEqual(artifacts[1]["component_key"], "CW_PROCESS_CONTROL_BUILD_PATH")
+        self.assertEqual(artifacts[1]["sha256"], hashlib.sha256(helper.read_bytes()).hexdigest())
+        self.assertTrue(all(item["product_build_identity"] is None for item in artifacts))
+
+    def test_fixture_log_cannot_claim_cargo_binary_provenance(self):
+        repo = self.isolated_repo()
+        target = repo / "target/pretend-test"
+        target.write_bytes(b"not executed")
+        record = json.dumps({"reason": "compiler-artifact", "executable": str(target),
+                             "target": {"name": "fake"}, "profile": {"test": True}})
+        runner = self.isolated_runner(repo, [Step("fixture-log", "test", [[sys.executable, "-c", f"print({record!r})"]])])
+        self.assertEqual(self.run_quiet(runner), 0)
+        self.assertEqual(runner.results[0]["command_results"][0]["artifacts"], [])
+
+    def test_explicit_candidate_component_query_records_only_returned_component_paths(self):
+        repo = self.isolated_repo()
+        helper = repo / "target/watch-process-control"
+        helper.write_bytes(b"actual candidate helper")
+        engine = repo / "target/claude-watch-engine"
+        engine.write_text(f"#!{sys.executable}\nprint({json.dumps({'process_control': str(helper)})!r})\n")
+        engine.chmod(0o700)
+        runner = self.isolated_runner(repo, [Step("components", "prerequisite", [[str(engine), "--component-paths"]])])
+        self.assertEqual(self.run_quiet(runner), 0)
+        artifacts = runner.results[0]["command_results"][0]["artifacts"]
+        self.assertEqual([(item["component_key"], item["path"]) for item in artifacts], [("process_control", str(helper))])
+        self.assertEqual(artifacts[0]["sha256"], hashlib.sha256(helper.read_bytes()).hexdigest())
 
     def test_failure_is_preserved_independent_steps_continue_and_dependencies_block(self):
         runner = self.runner([

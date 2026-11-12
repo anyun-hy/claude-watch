@@ -10,10 +10,12 @@ import argparse
 import datetime as dt
 import glob
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import platform
+import plistlib
 import re
 import selectors
 import shlex
@@ -28,6 +30,10 @@ from dataclasses import asdict, dataclass, field
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "tools/unified_swift_tests.json"
+_IDENTITY_SPEC = importlib.util.spec_from_file_location("cw_test_build_identity", ROOT / "tools/write-build-identity.py")
+_IDENTITY = importlib.util.module_from_spec(_IDENTITY_SPEC)
+_IDENTITY_SPEC.loader.exec_module(_IDENTITY)
+SOURCE_KEYS = ("source_revision", "source_dirty", "source_tree_digest")
 
 
 @dataclass
@@ -44,6 +50,8 @@ class Step:
     timeout_seconds: int = 600
     excluded_reason: str | None = None
     notes: list[str] = field(default_factory=list)
+    # Reviewed, known files only. Presence is not proof that a nested test executed them.
+    artifacts: list[str] = field(default_factory=list)
 
 
 class PrerequisiteError(Exception):
@@ -94,6 +102,45 @@ def source_paths(patterns: list[str]) -> list[str]:
     return result
 
 
+def source_identity(repo: Path) -> dict:
+    try:
+        # This is the packaging algorithm, without claiming an app version/build.
+        result = _IDENTITY.snapshot(repo, None, None)
+    except (OSError, ValueError) as exc:
+        result = {"error": f"{type(exc).__name__}: {exc}"}
+    return {**result, "captured_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+
+
+def file_identity(path: Path) -> dict:
+    result = {"path": str(path.absolute()), "captured_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+    try:
+        result["resolved_path"] = str(path.resolve(strict=True))
+        with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+            after = os.fstat(stream.fileno())
+        current = path.stat()
+        stamp = lambda stat: (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        result.update(state="present", sha256=digest.hexdigest(), size=after.st_size,
+                      device=after.st_dev, inode=after.st_ino, mtime_ns=after.st_mtime_ns,
+                      stable_during_capture=stamp(before) == stamp(after) == stamp(current))
+    except FileNotFoundError:
+        result["state"] = "missing"
+    except (OSError, ValueError) as exc:
+        result.update(state="unavailable", error=f"{type(exc).__name__}: {exc}")
+    return result
+
+
+def changed_file(before: dict, after: dict) -> bool | None:
+    if before.get("state") != "present":
+        return None
+    keys = ("resolved_path", "sha256", "size", "device", "inode", "mtime_ns")
+    return (after.get("state") != "present" or not before.get("stable_during_capture")
+            or not after.get("stable_during_capture") or any(before.get(key) != after.get(key) for key in keys))
+
+
 def build_plan(run_dir: Path) -> tuple[list[Step], dict]:
     manifest = json.loads(MANIFEST.read_text())
     entries = manifest["entries"]
@@ -112,14 +159,14 @@ def build_plan(run_dir: Path) -> tuple[list[Step], dict]:
              notes=["Require the pinned toolchain to exist; do not invoke rustup installation."]),
         Step("macos.gui_session", "prerequisite", prepare=[{"kind": "console_session"}],
              notes=["Checks console ownership only; actual GUI/sandbox errors still fail the affected fixture."]),
-        Step("rust.build", "build", [["cargo", "build", "--workspace", "--locked"]],
+        Step("rust.build", "build", [["cargo", "build", "--workspace", "--locked", "--message-format=json"]],
              dependencies=["rust.toolchain"], timeout_seconds=3600),
-        Step("rust.workspace", "test", [["cargo", "test", "--workspace", "--locked", "--no-fail-fast",
+        Step("rust.workspace", "test", [["cargo", "test", "--workspace", "--locked", "--no-fail-fast", "--message-format=json",
               "--", "--test-threads=1", "--nocapture"]], dependencies=["rust.build", "macos.gui_session"],
              environment=cargo_env, timeout_seconds=7200,
              notes=["Default Cargo tests; automatic opt-in cases have separate entries; the root launchd diagnostic requires separate authorization and is excluded.",
                     "May open owned fixture windows and terminate owned child processes."]),
-        Step("rust.engine", "prerequisite", dependencies=["rust.build"], prepare=[
+        Step("rust.engine", "prerequisite", [[variables["engine"], "--component-paths"]], dependencies=["rust.build"], prepare=[
             {"kind": "require_file", "path": "{engine}"}]),
         Step("rust.monitor_coverage_fixture", "prerequisite", dependencies=["rust.workspace"], prepare=[
             {"kind": "require_file", "path": "{run_dir}/artifacts/monitor-coverage-wire.json"},
@@ -166,7 +213,8 @@ def build_plan(run_dir: Path) -> tuple[list[Step], dict]:
                     test_files=entry.get("test_files", []), prepare=entry.get("prepare", []).copy(),
                     environment=entry.get("environment", {}), success_markers=entry.get("success_markers", []),
                     failure_patterns=entry.get("failure_patterns", [r"(?m)^FAIL:"]),
-                    timeout_seconds=entry.get("timeout_seconds", 600), notes=entry.get("safety_notes", []))
+                    timeout_seconds=entry.get("timeout_seconds", 600), notes=entry.get("safety_notes", []),
+                    artifacts=entry.get("artifacts", []).copy())
         if isinstance(step.notes, str):
             step.notes = [step.notes]
         if entry.get("unselected_modes"):
@@ -191,6 +239,7 @@ def build_plan(run_dir: Path) -> tuple[list[Step], dict]:
                 compiler += ["-framework", framework]
             compiler += entry.get("compiler_args", [])
             compiler += inputs + ["-o", str(work / "test")]
+            step.artifacts.append(str(work / "test"))
             step.commands = [compiler]
             if kind == "compile_only":
                 step.category = "build"
@@ -203,9 +252,10 @@ def build_plan(run_dir: Path) -> tuple[list[Step], dict]:
         step.commands = [[expand(arg, local) for arg in argv] for argv in step.commands]
         step.environment = {k: expand(v, local) for k, v in step.environment.items()}
         step.prepare = expand_tree(step.prepare, local)
+        step.artifacts = [expand(path, local) for path in step.artifacts]
         steps.append(step)
     steps += [
-        Step("rust.listener_readonly", "host_readonly", [["cargo", "test", "--locked", "-p", "claude-watch-runtime",
+        Step("rust.listener_readonly", "host_readonly", [["cargo", "test", "--locked", "--message-format=json", "-p", "claude-watch-runtime",
               "--test", "live_listener_diagnostics", "system_runner_reports_listener_evidence_without_mutation",
               "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"]], dependencies=["rust.build"],
              notes=["Uses two owned ephemeral loopback listeners and real kernel collection; checks the exact selected endpoint, PID and birth identity. Does not require or modify the VPN listener."]),
@@ -219,6 +269,7 @@ def build_plan(run_dir: Path) -> tuple[list[Step], dict]:
                "--ignored", "--exact", "--nocapture", "--test-threads=1"]], dependencies=["rust.signed_peer_build"],
              prepare=[{"kind": "copy_cargo_test", "log_step": "rust.signed_peer_build", "target_name": "claude_watch_system",
                        "destination": str(run_dir / "artifacts/signed-system-tests")}],
+             artifacts=[str(run_dir / "artifacts/signed-system-tests")],
              notes=["Signs only a copy of the test executable with free local ad-hoc signing; no installation."]),
         Step("acceptance.real_ai_and_service", "excluded", excluded_reason=
              "Real AI/Finder interaction, root service installation, live VPN changes and long-run physical-machine acceptance are outside this command."),
@@ -253,6 +304,8 @@ class Runner:
         self.current: subprocess.Popen | None = None
         self.started = dt.datetime.now(dt.timezone.utc).isoformat()
         self.output.mkdir(parents=True, exist_ok=False)
+        self.source_before = source_identity(self.repo)
+        self.source_after: dict | None = None
         for name in ("logs", "artifacts", "swift-cache"):
             (self.output / name).mkdir()
         if fixture_tmp is not None:
@@ -272,6 +325,22 @@ class Runner:
                   "completed": completed, "counts": counts, "coverage": self.coverage, "steps": self.results,
                   "scope": self.coverage.get("scope", "Automatic fixture suite only") +
                            "; exclusions and Cargo ignored/subcase gaps are not passes."}
+        source_known = self.source_after is not None and all(
+            "error" not in value and all(key in value for key in SOURCE_KEYS)
+            for value in (self.source_before, self.source_after))
+        source_changed = any(self.source_before[key] != self.source_after[key] for key in SOURCE_KEYS) if source_known else None
+        artifact_changed = any(step.get("declared_artifacts_changed_during_step") is True
+                               or any(command.get("program_changed_during_command") is True
+                                      for command in step.get("command_results", [])) for step in self.results)
+        report["source_identity"] = {"before": self.source_before, "after": self.source_after,
+                                     "changed_during_run": source_changed}
+        report["evidence_binding"] = ("running" if self.source_after is None else "unavailable" if not source_known
+                                       else "unstable" if source_changed or artifact_changed else "before_after_match")
+        report["evidence_limits"] = (
+            "Before/after snapshots detect observed changes; they are not an immutable checkout. "
+            "Artifact hashes identify observed files. Declared components/compiler outputs do not prove execution. "
+            "Only an artifact's own BuildIdentity receipt describes its claimed product source; "
+            "typechecks and fixture binaries are not packaged or installed product acceptance.")
         destination = self.output / "results.json"
         temporary = destination.with_suffix(".tmp")
         temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
@@ -279,6 +348,9 @@ class Runner:
         lines = ["# Claude Watch test run", "", f"Outcome: **{outcome}**", "",
                  "Step counts (not individual assertions): " + json.dumps(counts), "",
                  "Scope: " + report["scope"], "",
+                 "Source/artifact binding: **" + report["evidence_binding"] + "**; source changed during run: " + str(source_changed), "",
+                 "Source revision: `" + str(self.source_before.get("source_revision")) + "`; dirty: `" + str(self.source_before.get("source_dirty")) + "`", "",
+                 "Source tree digest: `" + str(self.source_before.get("source_tree_digest")) + "`", "",
                  "Automatic fixture suite; not installed-service or real-AI acceptance.", "",
                  "| Step | Kind | Result | Seconds | Exit | Log / reason |", "|---|---|---|---:|---:|---|"]
         for result in self.results:
@@ -394,6 +466,93 @@ class Runner:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
+    def observed_artifact(self, value: str, origin: str) -> dict:
+        path = Path(value)
+        if not path.is_absolute():
+            path = self.repo / path
+        result = {**file_identity(path), "origin": origin, "product_build_identity": None}
+        # Only look beside this explicit artifact. Never discover installed apps
+        # or follow a manifest to arbitrary user data.
+        if not any(path.resolve().is_relative_to(root.resolve()) for root in (self.repo, self.output)):
+            return result
+        directories = [path.parent]
+        if path.parent.name == "MacOS" and path.parent.parent.name == "Contents":
+            directories.append(path.parent.parent / "Resources")
+        for directory in directories:
+            receipt = directory / "BuildIdentity.json"
+            if receipt.is_file():
+                try:
+                    value = json.loads(receipt.read_text())
+                    result["product_build_identity"] = {
+                        "receipt": file_identity(receipt),
+                        "identity": {key: value.get(key) for key in ("schema", "app_version", "app_build", *SOURCE_KEYS)},
+                        "matches_run_source": all(value.get(key) == self.source_before.get(key) for key in SOURCE_KEYS)
+                                              and bool(value.get("source_tree_digest")),
+                    }
+                except (OSError, ValueError, AttributeError) as exc:
+                    result["product_build_identity"] = {"error": f"{type(exc).__name__}: {exc}"}
+            manifest = directory / "BuildInfo.plist"
+            if manifest.is_file():
+                try:
+                    hashes = plistlib.loads(manifest.read_bytes()).get("RuntimeHashes", {})
+                    checks = []
+                    for name, expected in hashes.items():
+                        relative = Path(name)
+                        if relative.is_absolute() or ".." in relative.parts or not (directory / relative).resolve().is_relative_to(directory.resolve()):
+                            checks.append({"path": name, "state": "outside_manifest_directory"})
+                            continue
+                        actual = file_identity(directory / relative)
+                        checks.append({**actual, "expected_sha256": expected,
+                                       "matches_manifest": actual.get("sha256") == expected})
+                    result["runtime_hashes"] = {"manifest": file_identity(manifest), "files": checks}
+                except (OSError, ValueError, AttributeError, TypeError) as exc:
+                    result["runtime_hashes"] = {"error": f"{type(exc).__name__}: {exc}"}
+        return result
+
+    def command_evidence(self, argv: list[str], text: str) -> list[dict]:
+        artifacts: dict[tuple[str, str], dict] = {}
+        def capture(path: str, origin: str, **extra):
+            candidate = Path(path)
+            if not candidate.is_absolute():
+                candidate = self.repo / candidate
+            if not any(candidate.resolve().is_relative_to(root.resolve()) for root in (self.repo, self.output)):
+                return
+            artifacts[(str(candidate), origin)] = {**self.observed_artifact(str(candidate), origin), **extra}
+
+        if any(Path(arg).name == "swiftc" for arg in argv) and "-o" in argv and "-typecheck" not in argv:
+            capture(argv[argv.index("-o") + 1], "swift_compiler_output")
+        if argv[1:] == ["--component-paths"] and Path(argv[0]).name in ("claude-watch-engine", "watch-engine"):
+            try:
+                paths = json.loads(text)
+                for key in ("native_observer", "process_control", "sandbox_launcher", "gateway_broker"):
+                    if isinstance(paths.get(key), str) and paths[key]:
+                        capture(paths[key], "engine_component_path", component_key=key)
+            except (ValueError, AttributeError):
+                pass
+        # A fixture may print arbitrary JSON. Only a Cargo invocation can
+        # supply Cargo compiler/build-script provenance.
+        if Path(argv[0]).name != "cargo":
+            return list(artifacts.values())
+        invoked = {str((self.repo / path).resolve()) for path in
+                   re.findall(r"(?m)^\s*Running .+ \((.+)\)\s*$", text)}
+        for line in text.splitlines():
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(item, dict):
+                continue
+            if item.get("reason") == "compiler-artifact" and item.get("executable"):
+                executable = item["executable"]
+                capture(executable, "cargo_compiler_artifact", cargo_target=item.get("target", {}).get("name"),
+                        cargo_test=item.get("profile", {}).get("test"), cargo_fresh=item.get("fresh"),
+                        invocation_observed=str(Path(executable).resolve()) in invoked)
+            elif item.get("reason") == "build-script-executed":
+                for key, value in item.get("env", []):
+                    if key in ("CW_NATIVE_OBSERVER_BUILD_PATH", "CW_PROCESS_CONTROL_BUILD_PATH", "CW_SANDBOX_LAUNCHER_BUILD_PATH") and value:
+                        capture(value, "cargo_build_script_component", component_key=key)
+        return list(artifacts.values())
+
     def prepare(self, action: dict):
         kind = action["kind"]
         if kind == "installed_rust_toolchain":
@@ -448,6 +607,13 @@ class Runner:
             raise ValueError(f"Unsupported prepare action: {kind}")
 
     def run(self, preflight_error: str | None = None) -> int:
+        try:
+            return self._run_steps(preflight_error)
+        finally:
+            self.source_after = source_identity(self.repo)
+            self.write_results()
+
+    def _run_steps(self, preflight_error: str | None = None) -> int:
         for step in self.steps:
             started = time.monotonic()
             result = {"id": step.id, "category": step.category, "commands": step.commands,
@@ -475,17 +641,33 @@ class Runner:
                 (self.output / "artifacts" / step.id).mkdir(parents=True, exist_ok=True)
                 try:
                     with log_path.open("wb") as log, payload_path.open("wb") as payload:
+                        result["declared_artifacts_before"] = [self.observed_artifact(path, "recipe_declared") for path in step.artifacts]
                         for action in step.prepare:
                             log.write(("PREPARE " + json.dumps(action, ensure_ascii=False) + "\n").encode())
                             self.prepare(action)
                         status, reason = 0, None
                         command_results = []
+                        result["command_results"] = command_results
                         for argv in step.commands:
                             if self.cancelled:
                                 raise Interrupted()
                             env = {**self.environment, **step.environment}
-                            status, reason = self.command(argv, env, log, payload, step.timeout_seconds)
-                            command_results.append({"argv": argv, "exit_code": status, "reason": reason})
+                            program = (str(self.repo / argv[0]) if "/" in argv[0] and not Path(argv[0]).is_absolute()
+                                       else shutil.which(argv[0], path=env.get("PATH")) or str(self.repo / argv[0]))
+                            before = file_identity(Path(program))
+                            offset = payload.tell()
+                            evidence = {"argv": argv, "program_before": before}
+                            command_results.append(evidence)
+                            try:
+                                status, reason = self.command(argv, env, log, payload, step.timeout_seconds)
+                                evidence.update(exit_code=status, reason=reason)
+                            finally:
+                                after = file_identity(Path(program))
+                                with payload_path.open("rb") as captured:
+                                    captured.seek(offset)
+                                    text = captured.read().decode(errors="replace")
+                                evidence.update(program_after=after, program_changed_during_command=changed_file(before, after),
+                                                artifacts=self.command_evidence(argv, text))
                             if status != 0 or reason:
                                 break
                         result.update(command_results=command_results, exit_code=status)
@@ -509,6 +691,13 @@ class Runner:
                     result.update(status="blocked", reason=str(exc))
                 except Exception as exc:
                     result.update(status="failed", reason=f"{type(exc).__name__}: {exc}")
+                result["declared_artifacts_after"] = [self.observed_artifact(path, "recipe_declared") for path in step.artifacts]
+                prior_artifacts = {item["path"]: item for item in result.get("declared_artifacts_before", [])}
+                result["declared_artifacts_changed_during_step"] = (
+                    any(changed_file(prior_artifacts.get(item["path"], {}), item) is True
+                        for item in result["declared_artifacts_after"])
+                    if step.category in ("test", "host_readonly") else False)
+                result["product_binding"] = "Only embedded artifact receipts; no product version inferred from this run's source"
                 if result.get("reason"):
                     with log_path.open("a") as log:
                         log.write("\nRUNNER RESULT: " + result["reason"] + "\n")

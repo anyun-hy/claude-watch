@@ -1,16 +1,9 @@
-//! Isolated multi-main contracts: temporary files and mock native observations.
-//! No child process, network, native helper, app launch or signal is used.
-use claude_watch_core::{
-    config::Config, error::{CoreError, Result}, processes::Provider,
-    session::{self, Desktop, Phase, Session, GROUP_CONTINUITY_KEY, GROUP_KEY, GROUP_RECHECK_KEY},
-};
+//! Compatibility contracts for persisted desktop groups. Live membership,
+//! policy and recovery are exercised through ChannelSupervisor in channel_pipeline_contracts.
+use claude_watch_core::{config::Config, processes::Provider, session::{Desktop, Phase, Session}};
 use claude_watch_runtime::{
-    background_evidence::{self, EvidenceSystem, ProbeKind},
-    config_store::{ConfigStore, policy_digest},
-    receipt_store::ReceiptStore,
-    session_store::{SessionStore, desktop_groups::{
-        canonical_desktops, desktop_members, group_rechecking, group_stamps,
-    }},
+    background_evidence::ProbeKind, config_store::{ConfigStore, policy_digest},
+    receipt_store::ReceiptStore, session_store::{SessionStore, desktop_groups::{canonical_desktops, desktop_members, group_stamps}},
     storage::{Paths, StateStore},
 };
 use serde_json::{json, Value};
@@ -56,151 +49,103 @@ impl Fixture {
         let root = std::env::temp_dir().join(format!("cw-multi-main-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
         let store = StateStore::new(Paths::new(&root).unwrap());
-        store.atomic_json(&store.paths.config(), &Config { guard_enabled: true, ..Default::default() }.value().unwrap()).unwrap();
-        let f = Self { root, store };
-        f.seed(1000., "JP");
-        f
+        store.atomic_json(&store.paths.config(), &Config { guard_enabled:true, ..Default::default() }.value().unwrap()).unwrap();
+        Self { root, store }
     }
-    fn seed(&self, now: f64, country: &str) {
-        let receipts = ReceiptStore { storage: self.store.clone() };
-        receipts.record_dns(&probe(ProbeKind::Dns, now, country), &local(), None, now).unwrap();
-        receipts.record_webrtc(&probe(ProbeKind::WebRtc, now, country), &local(), None, now).unwrap();
+    fn seed(&self, now: f64) {
+        let r = ReceiptStore { storage:self.store.clone() };
+        r.record_dns(&probe(ProbeKind::Dns,now,"JP"),&local(),None,now).unwrap();
+        r.record_webrtc(&probe(ProbeKind::WebRtc,now,"JP"),&local(),None,now).unwrap();
     }
-    fn sessions(&self) -> SessionStore { SessionStore::for_family(self.store.clone(), "openai") }
-    fn session(&self, now: f64) -> Session { self.sessions().load(now).unwrap().unwrap() }
-
-    // Seed an existing group record. The evidence worker still performs the
-    // real identity, policy, context, receipt and commit checks.
-    fn pending_join(&self) -> (Mock, Session) {
-        let system = Mock {
-            store: self.store.clone(), family: "openai", now: 1002.,
-            mains: vec![desktop(77, 900), desktop(78, 900)], ip: "1.1.1.1", country: "JP",
-            support_group: true, change_on_revalidate: false, lock_on_revalidate: false,
-        };
-        let initial = 1000.0;
-        let egress = egress(initial, system.ip, system.country);
-        let audit = audit(&self.store, initial, true, system.ip, system.country);
-        let risk = (ReceiptStore { storage: self.store.clone() }).session_risk("ctx", Some(system.ip), initial);
-        let mut value = session::begin(&audit, &egress, &risk, "fixture-pending-group", initial).unwrap();
+    fn sessions(&self) -> SessionStore { SessionStore::for_family(self.store.clone(),"openai") }
+    fn pending(&self) -> Session {
+        self.seed(1000.);
+        let pending = self.sessions().begin_verified(&ReceiptStore { storage:self.store.clone() },
+            &audit(&self.store,1000.,true,"1.1.1.1","JP"),&egress(1000.,"1.1.1.1","JP"),1000.).unwrap();
+        let mut value = self.sessions().bind_desktop(&pending.session_id,desktop(77,900),1000.).unwrap();
+        // A persisted legacy group is fixture input, not a second guard loop.
         value.state = Phase::Rechecking;
-        value.created_at = system.now;
-        value.pending_deadline = system.now + session::RISK_EVIDENCE_TTL;
-        value.desktop = system.mains.first().cloned();
-        value.bound_at = Some(system.now);
-        value.extra.insert(GROUP_KEY.into(), json!(system.mains));
-        value.extra.insert(GROUP_RECHECK_KEY.into(), json!(true));
-        value.extra.insert(GROUP_CONTINUITY_KEY.into(), json!(true));
-        value.extra.insert("baseline_dns_countries".into(), json!(["JP"]));
-        self.store.atomic_json(&self.store.paths.session_for("openai"), &json!(value)).unwrap();
-        (system, value)
+        value.created_at = 1001.; value.pending_deadline = 1031.;
+        value.extra.insert("desktop_group_v1".into(),json!([desktop(77,900),desktop(78,900)]));
+        value.extra.insert("desktop_group_recheck_v1".into(),json!(true));
+        value.extra.insert("desktop_group_continuity_v1".into(),json!(true));
+        self.store.atomic_json(&self.store.paths.session_for("openai"),&json!(value)).unwrap();
+        self.seed(1003.);
+        value
+    }
+    fn bindings(&self) -> Vec<(Desktop,String)> {
+        vec![(desktop(77,900),"fixture-77".into()),(desktop(78,900),"fixture-78".into())]
+    }
+    fn complete(&self, expected: &Session, bindings: &[(Desktop,String)], check: &Value)
+        -> claude_watch_core::error::Result<Option<Session>> {
+        self.sessions().complete_group_recheck(expected, bindings, check,
+            &egress(1003.,"1.1.1.1","JP"),1003.,Provider::Codex)
     }
 }
 impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.root); } }
 
-struct Mock {
-    store: StateStore, family: &'static str, now: f64,
-    mains: Vec<Desktop>, ip: &'static str, country: &'static str,
-    support_group: bool, change_on_revalidate: bool, lock_on_revalidate: bool,
+#[test]
+fn legacy_group_completion_preserves_baseline_and_writes_all_identity_leases() {
+    let f=Fixture::new(); let before=f.pending();
+    let after=f.complete(&before,&f.bindings(),&audit(&f.store,1003.,true,"1.1.1.1","JP")).unwrap().unwrap();
+    assert_eq!(after.state,Phase::Active); assert_eq!(after.baseline,before.baseline);
+    assert_eq!(desktop_members(&after).unwrap(),vec![desktop(77,900),desktop(78,900)]);
+    for pid in [77,78] { assert!(f.store.paths.watch().join(format!("state/sessions/rust-{pid}.session")).exists()); }
 }
-impl Mock {
-    fn rows(&self) -> Vec<(Desktop, bool, String)> {
-        self.mains.iter().map(|d| (d.clone(), true, format!("fixture-{}-{}", d.pid, d.start_seconds))).collect()
+
+#[test]
+fn completion_refuses_missing_duplicate_or_wrong_members_without_writing() {
+    let f=Fixture::new(); let before=f.pending(); let check=audit(&f.store,1003.,true,"1.1.1.1","JP");
+    for members in [vec![desktop(77,900)],vec![desktop(77,900),desktop(77,900)],vec![desktop(77,900),desktop(78,901)]] {
+        let bindings=members.into_iter().map(|d|(d,"fixture".to_owned())).collect::<Vec<_>>();
+        assert!(f.complete(&before,&bindings,&check).is_err());
+        assert_eq!(f.sessions().load(1003.).unwrap(),Some(before.clone()));
+        assert!(!f.store.paths.watch().join("state/sessions/rust-77.session").exists());
     }
 }
-impl EvidenceSystem for Mock {
-    fn now(&self) -> f64 { self.now }
-    fn local(&mut self, _: &Config) -> Result<Value> { Ok(local()) }
-    fn desktop_matches(&mut self, expected: &Desktop) -> Result<bool> { Ok(self.mains.contains(expected)) }
-    fn desktop_unique_stamp(&mut self, expected: &Desktop) -> Result<Option<String>> {
-        Ok(group_stamps(&[expected.clone()], &self.rows())?.and_then(|v| v.into_iter().next().map(|(_, s)| s)))
-    }
-    fn desktop_group_stamps(&mut self, expected: &[Desktop]) -> Result<Option<Vec<(Desktop, String)>>> {
-        if !self.support_group { return Err(CoreError::new("evidence_identity_unknown", "fixture")); }
-        group_stamps(expected, &self.rows())
-    }
-    fn supervised_provider(&self) -> Provider { if self.family == "openai" { Provider::Codex } else { Provider::Claude } }
-    fn set_family(&mut self, family: &str) -> Result<()> {
-        self.family = match family { "openai" => "openai", "claude" => "claude", _ => return Err(CoreError::new("unknown_family", "fixture")) };
-        Ok(())
-    }
-    fn collect(&mut self, kind: ProbeKind) -> Result<Value> { Ok(probe(kind, self.now, "JP")) }
-    fn revalidate(&mut self) -> Result<(Value, Value)> {
-        let sessions = SessionStore::for_family(self.store.clone(), "openai");
-        if self.change_on_revalidate {
-            self.change_on_revalidate = false;
-            self.mains.push(desktop(99, 902));
-            self.now += 1.;
-            let mut newer = sessions.load(self.now)?.unwrap();
-            newer.session_id = "fixture-newer-group".into();
-            newer.extra.insert(GROUP_KEY.into(), json!(self.mains));
-            self.store.atomic_json(&self.store.paths.session_for("openai"), &json!(newer))?;
-        }
-        if self.lock_on_revalidate {
-            self.lock_on_revalidate = false;
-            self.now += 1.;
-            let current = sessions.load(self.now)?.unwrap();
-            sessions.mark_failure(Some(&current.session_id), self.now, "egress_country_cn", "newer risk", true)?;
-        }
-        Ok((audit(&self.store, self.now, self.family == "openai", self.ip, self.country),
-            egress(self.now, self.ip, self.country)))
+
+#[test]
+fn a_late_group_audit_cannot_replace_a_newer_session_or_mandatory_risk() {
+    for replacement in [true,false] {
+        let f=Fixture::new(); let before=f.pending(); let mut current=before.clone();
+        if replacement { current.session_id=uuid::Uuid::new_v4().to_string(); }
+        else { current.state=Phase::Locked; current.reason=Some(claude_watch_core::session::Reason::new("egress_country_cn","newer risk",1002.)); }
+        f.store.atomic_json(&f.store.paths.session_for("openai"),&json!(current)).unwrap();
+        assert!(f.complete(&before,&f.bindings(),&audit(&f.store,1003.,true,"1.1.1.1","JP")).unwrap().is_none());
+        assert_eq!(f.sessions().load(1003.).unwrap(),Some(current));
     }
 }
+
 #[test]
-fn background_recheck_verifies_every_member_without_rebasing_continuous_work() {
-    let f = Fixture::new(); let (mut system, before) = f.pending_join(); system.now += 2.;
-    let out = background_evidence::refresh_active_session(&f.store, &mut system).unwrap();
-    assert_eq!(out["status"], "ok"); let after = f.session(system.now);
-    assert_eq!(after.state, Phase::Active); assert!(!group_rechecking(&after));
-    assert_eq!(after.session_id, before.session_id); assert_eq!(after.baseline, before.baseline);
-    assert_eq!(after.extra["baseline_dns_countries"], before.extra["baseline_dns_countries"]);
-    assert_eq!(desktop_members(&after).unwrap(), system.mains);
-    assert_eq!(after.extra["guard_checked_at"], json!(system.now));
+fn legacy_single_desktop_recheck_cannot_drop_group_members() {
+    let f=Fixture::new(); let before=f.pending();
+    assert!(f.sessions().complete_recheck(&before.session_id,before.desktop.as_ref().unwrap(),"fixture",
+        &audit(&f.store,1003.,true,"1.1.1.1","JP"),&egress(1003.,"1.1.1.1","JP"),1003.,Provider::Codex).unwrap().is_none());
+    assert_eq!(f.sessions().load(1003.).unwrap(),Some(before));
 }
+
 #[test]
-fn completion_refuses_missing_duplicate_or_wrong_members() {
-    let f = Fixture::new(); let (mut system, pending) = f.pending_join(); system.now += 2.; f.seed(system.now, "JP");
-    let audit = audit(&f.store, system.now, true, system.ip, system.country);
-    for members in [vec![desktop(77,900)], vec![desktop(77,900),desktop(77,900)], vec![desktop(77,900),desktop(78,901)]] {
-        let bindings: Vec<_> = members.into_iter().map(|d| (d, "fixture".to_string())).collect();
-        assert!(f.sessions().complete_group_recheck(&pending, &bindings, &audit,
-            &egress(system.now,system.ip,system.country), system.now,Provider::Codex).is_err());
-        assert_eq!(f.session(system.now).state, Phase::Rechecking);
+fn group_recheck_rejects_changed_context_policy_and_wrong_family_without_leases() {
+    for case in ["context","policy","family"] {
+        let f=Fixture::new(); let before=f.pending(); let mut check=audit(&f.store,1003.,case!="family","1.1.1.1","JP");
+        if case=="context" { check["context_id"]=json!("different"); check["egress_reference"]["context"]=json!("different"); }
+        if case=="policy" { check["policy"]=json!("obsolete"); }
+        assert!(f.complete(&before,&f.bindings(),&check).is_err());
+        assert_eq!(f.sessions().load(1003.).unwrap(),Some(before));
+        assert!(!f.store.paths.watch().join("state/sessions/rust-77.session").exists());
     }
 }
+
 #[test]
-fn the_legacy_single_desktop_recheck_cannot_drop_group_members() {
-    let f = Fixture::new(); let (mut system, pending) = f.pending_join(); system.now += 2.; f.seed(system.now, "JP");
-    assert!(f.sessions().complete_recheck(&pending.session_id,pending.desktop.as_ref().unwrap(),"fixture",
-        &audit(&f.store,system.now,true,system.ip,system.country),&egress(system.now,system.ip,system.country),
-        system.now,Provider::Codex).unwrap().is_none());
-    assert_eq!(f.session(system.now), pending);
+fn malformed_group_is_not_silently_read_as_a_single_main() {
+    let f=Fixture::new(); let mut raw=json!(f.pending());
+    raw["desktop_group_v1"]=json!([desktop(77,900),desktop(77,900)]);
+    f.store.atomic_json(&f.store.paths.session_for("openai"),&raw).unwrap();
+    let bytes=fs::read(f.store.paths.session_for("openai")).unwrap();
+    assert!(f.sessions().load(1003.).is_err());
+    assert_eq!(fs::read(f.store.paths.session_for("openai")).unwrap(),bytes);
 }
-#[test]
-fn malformed_group_data_is_not_silently_read_as_a_single_main() {
-    let f = Fixture::new();
-    let (system, pending) = f.pending_join();
-    let mut raw = json!(pending);
-    raw[GROUP_KEY] = json!([desktop(77,900),desktop(77,900)]);
-    let path = f.store.paths.session_for("openai");
-    f.store.atomic_json(&path, &raw).unwrap();
-    let bytes = fs::read(&path).unwrap();
-    assert!(f.sessions().load(system.now).is_err());
-    assert_eq!(fs::read(&path).unwrap(), bytes);
-}
-#[test]
-fn a_late_audit_cannot_overwrite_a_newer_membership_revision() {
-    let f = Fixture::new(); let (mut system, before) = f.pending_join(); system.now += 2.; system.change_on_revalidate = true;
-    assert_eq!(background_evidence::refresh_active_session(&f.store,&mut system).unwrap_err().code,"evidence_session_changed");
-    let after = f.session(system.now); assert_ne!(after.session_id,before.session_id);
-    assert_eq!(desktop_members(&after).unwrap().len(),3); assert_eq!(after.state,Phase::Rechecking);
-}
-#[test]
-fn a_late_audit_cannot_unlock_a_new_mandatory_risk() {
-    let f = Fixture::new(); let (mut system, _) = f.pending_join(); system.now += 2.; system.lock_on_revalidate = true;
-    assert_eq!(background_evidence::refresh_active_session(&f.store,&mut system).unwrap_err().code,"evidence_session_changed");
-    let after = f.session(system.now); assert_eq!(after.state,Phase::Locked);
-    assert_eq!(after.reason.unwrap().code,"egress_country_cn");
-}
+
 #[test]
 fn invalid_or_duplicate_native_members_are_rejected() {
     for rows in [vec![desktop(1,900)],vec![desktop(77,0)],vec![desktop(77,900),desktop(77,901)],
@@ -214,35 +159,4 @@ fn native_group_binding_requires_the_exact_main_set_and_valid_stamps() {
     rows.push((desktop(99,900),false,"helper".into())); assert_eq!(group_stamps(&roots,&rows).unwrap().unwrap().len(),2);
     rows[1].2="bad|stamp".into(); assert!(group_stamps(&roots,&rows).is_err());
     rows[1].2="b".into(); rows[1].1=false; assert!(group_stamps(&roots,&rows).unwrap().is_none());
-}
-#[test]
-fn an_adapter_without_group_identity_support_cannot_promote_it() {
-    let f=Fixture::new(); let (mut system,before)=f.pending_join(); system.now+=2.; system.support_group=false;
-    assert_eq!(background_evidence::refresh_active_session(&f.store,&mut system).unwrap_err().code,"evidence_identity_unknown");
-    assert_eq!(f.session(system.now),before);
-}
-#[test]
-fn recheck_cannot_commit_a_different_network_context() {
-    let f = Fixture::new(); let (mut system, pending) = f.pending_join();
-    system.now += 2.; f.seed(system.now, "JP");
-    let bindings = group_stamps(&desktop_members(&pending).unwrap(), &system.rows()).unwrap().unwrap();
-    let mut wrong = audit(&f.store, system.now, true, system.ip, system.country);
-    wrong["context_id"] = json!("other-context");
-    wrong["egress_reference"]["context"] = json!("other-context");
-    assert_eq!(f.sessions().complete_group_recheck(&pending, &bindings, &wrong,
-        &egress(system.now, system.ip, system.country), system.now, Provider::Codex)
-        .unwrap_err().code, "revalidation_context_changed");
-    assert_eq!(f.session(system.now), pending);
-}
-#[test]
-fn group_recheck_rejects_another_familys_audit_without_writing_leases() {
-    let f = Fixture::new(); let (mut system, pending) = f.pending_join();
-    system.now += 2.; f.seed(system.now, "JP");
-    let bindings = group_stamps(&desktop_members(&pending).unwrap(), &system.rows()).unwrap().unwrap();
-    assert_eq!(f.sessions().complete_group_recheck(&pending, &bindings,
-        &audit(&f.store, system.now, false, system.ip, system.country),
-        &egress(system.now, system.ip, system.country), system.now, Provider::Codex)
-        .unwrap_err().code, "launch_target_mismatch");
-    assert_eq!(f.session(system.now), pending);
-    assert!(!f.store.paths.watch().join("state/sessions/rust-78.session").exists());
 }

@@ -314,7 +314,10 @@ impl Runner for Fake {
                 }
             }
             "/usr/bin/codesign" => Ok(result(
-                if fail == "codesign" { 1 } else { 0 },
+                if fail == "codesign"
+                    || (fail == "new_signature"
+                        && args.last().is_some_and(|path| path.contains("/monitor/build/")))
+                { 1 } else { 0 },
                 "",
                 "",
             )),
@@ -353,7 +356,7 @@ impl Runner for Fake {
                 make_app(
                     &app_out,
                     env.get("APP_VERSION").expect("version"),
-                    env.get("BUILD_NUMBER").expect("build"),
+                    if fail == "new_version" { "999" } else { env.get("BUILD_NUMBER").expect("build") },
                 );
                 let dmg = self
                     .layout
@@ -373,6 +376,9 @@ impl Runner for Fake {
                 .expect("sha");
                 if fail == "reappeared" {
                     make_app(&self.layout.app, "9.9.9", "999");
+                }
+                if fail == "pending_during_build" {
+                    std::fs::write(self.layout.base().join("switcher/transaction.json"), "{}").unwrap();
                 }
                 Ok(result(0, "", ""))
             }
@@ -602,6 +608,13 @@ fn full_workflow_removes_only_watch_data_and_installs_requested_build() {
         })
         .collect();
     assert_eq!(packages.len(), 1, "exactly one package");
+    let calls = h.fake.calls();
+    let package = calls.iter().position(|call| call[0] == "/bin/bash").unwrap();
+    let verify = calls.iter().position(|call| call[0] == "/usr/bin/codesign"
+        && call.last().is_some_and(|path| path.contains("/monitor/build/"))).unwrap();
+    let uninstall = calls.iter().position(|call| call.iter().any(|arg| arg == "app-uninstall")
+        && call.iter().any(|arg| arg == "--apply")).unwrap();
+    assert!(package < verify && verify < uninstall, "verify prepared bundle before resetting");
     h.assert_preserved();
 }
 
@@ -700,7 +713,8 @@ fn admin_failure_stops_with_watch_data_intact() {
         .home
         .join("Library/Preferences/io.local.watchpanel.plist")
         .exists());
-    assert!(!h.fake.calls().iter().any(|call| call[0] == "/bin/bash"));
+    assert!(h.fake.layout.project.join("monitor/dist").is_dir());
+    assert!(!h.fake.calls().iter().any(|call| call.iter().any(|value| value == "app-install")));
     h.assert_preserved();
 }
 
@@ -761,7 +775,7 @@ fn running_claude_and_unknown_system_files_block_before_uninstall() {
 }
 
 #[test]
-fn uninstall_failure_does_not_clean_or_package() {
+fn uninstall_failure_preserves_data_and_prepared_package() {
     let h = Harness::new();
     h.fake.set_fail("uninstall");
     h.blocked(h.perform("3.0.0", "314", false, "y"), "执行失败");
@@ -771,7 +785,8 @@ fn uninstall_failure_does_not_clean_or_package() {
         .fake
         .calls()
         .iter()
-        .any(|call| matches!(call[0].as_str(), "/usr/bin/sudo" | "/bin/bash")));
+        .any(|call| call[0] == "/usr/bin/sudo"));
+    assert!(h.fake.layout.project.join("monitor/dist").is_dir());
     h.assert_preserved();
 }
 
@@ -791,7 +806,7 @@ fn watch_process_that_does_not_exit_is_not_killed_or_cleaned() {
         .home
         .join("Library/Preferences/io.local.watchpanel.plist")
         .exists());
-    assert!(!h.fake.calls().iter().any(|call| call[0] == "/bin/bash"));
+    assert!(h.fake.calls().iter().any(|call| call[0] == "/bin/bash"));
     assert!(!h.fake.calls().iter().any(|call| call[0].contains("kill")));
     h.assert_preserved();
 }
@@ -868,29 +883,29 @@ fn invalid_version_is_rejected_without_calling_system_tools() {
 }
 
 #[test]
-fn build_and_checksum_failure_never_install() {
-    let h = Harness::new();
-    h.fake.set_fail("package");
-    h.blocked(h.perform("3.0.0", "314", false, "y"), "未执行安装");
-    assert!(!h
-        .fake
-        .calls()
-        .iter()
-        .any(|call| call.iter().any(|value| value == "app-install")));
-    h.assert_preserved();
-}
-
-#[test]
-fn checksum_mismatch_never_installs() {
-    let h = Harness::new();
-    h.fake.set_fail("checksum");
-    h.blocked(h.perform("3.0.0", "314", false, "y"), "校验不匹配");
-    assert!(!h
-        .fake
-        .calls()
-        .iter()
-        .any(|call| call.iter().any(|value| value == "app-install")));
-    h.assert_preserved();
+fn preparation_failure_preserves_old_app_data_and_running_jobs() {
+    for (failure, message) in [
+        ("package", "打包失败"),
+        ("checksum", "校验不匹配"),
+        ("new_signature", "新应用签名"),
+        ("new_version", "版本不匹配"),
+    ] {
+        let h = Harness::new();
+        h.fake.set_fail(failure);
+        h.blocked(h.perform("3.0.0", "314", false, "y"), message);
+        assert_eq!(h.fake.identity(&h.fake.layout.app), ("3.0.0".into(), "313".into()), "{failure}");
+        assert_eq!(std::fs::read_to_string(h.fake.layout.base().join("switcher/config.json")).unwrap(), "watch settings");
+        assert!(h.fake.layout.helper().is_file());
+        assert!(h.fake.prefs.get());
+        assert!(h.fake.jobs.borrow()[&h.fake.layout.agent_label(h.fake.uid)]);
+        assert!(h.fake.jobs.borrow()[&h.fake.layout.helper_label()]);
+        assert!(!h.fake.calls().iter().any(|call| {
+            call.iter().any(|arg| arg == "--apply" || arg == "app-install" || arg == "bootout")
+                || call[0] == "/usr/bin/sudo"
+                || (call[0] == "/usr/bin/defaults" && call.get(1).is_some_and(|arg| arg == "delete"))
+        }), "{failure} performed a reset action");
+        h.assert_preserved();
+    }
 }
 
 #[test]
@@ -899,11 +914,24 @@ fn app_created_during_build_is_not_replaced() {
     h.fake.set_fail("reappeared");
     h.blocked(h.perform("3.0.0", "314", false, "y"), "发生变化");
     assert_eq!(h.fake.identity(&h.fake.layout.app), ("9.9.9".into(), "999".into()));
+    assert!(h.fake.layout.base().join("switcher/config.json").is_file());
     assert!(!h
         .fake
         .calls()
         .iter()
-        .any(|call| call.iter().any(|value| value == "app-install")));
+        .any(|call| call.iter().any(|value| value == "app-install" || value == "--apply")));
+    h.assert_preserved();
+}
+
+#[test]
+fn transaction_started_during_build_blocks_before_reset() {
+    let h = Harness::new();
+    h.fake.set_fail("pending_during_build");
+    h.blocked(h.perform("3.0.0", "314", false, "y"), "未完成");
+    assert_eq!(h.fake.identity(&h.fake.layout.app), ("3.0.0".into(), "313".into()));
+    assert!(h.fake.layout.base().join("switcher/config.json").is_file());
+    assert!(h.fake.layout.base().join("switcher/transaction.json").is_file());
+    assert!(!h.fake.calls().iter().any(|call| call.iter().any(|value| value == "--apply")));
     h.assert_preserved();
 }
 
@@ -950,7 +978,8 @@ fn residual_observer_is_not_ignored_after_old_bundle_and_data_move() {
         h.fake.uid, h.fake.layout.base().display()
     );
     h.blocked(h.perform("3.0.0", "314", false, "y"), "watch-native-observer");
-    assert!(!h.fake.calls().iter().any(|call| call[0] == "/bin/bash"));
+    assert!(h.fake.layout.project.join("monitor/dist").is_dir());
+    assert!(!h.fake.calls().iter().any(|call| call.iter().any(|value| value == "app-install")));
     h.assert_preserved();
 }
 

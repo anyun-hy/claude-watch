@@ -1,13 +1,12 @@
 //! Explanations for a failed guard check, never an alternative readiness gate.
 //! Only fixed reason codes leave this module; raw executor/VPN errors may contain
 //! paths, credentials or other data that do not belong in the first-run screen.
-use crate::channel_policy_status::FrameEvidence;
-use claude_watch_core::channel::{ChannelEnforcementState, NetworkBackendKind, PolicySyncState};
+use crate::channel_policy_status::{producer_is_current, StatusFrame};
+use claude_watch_core::channel::{NetworkBackendKind, PolicySyncState};
 use serde_json::{json, Value};
 
-pub(crate) fn read(frame: &FrameEvidence<'_>, backend: bool, healthy: bool, heartbeat: &Value) -> Value {
-    let (config, now, channel) = (frame.config, frame.now, frame.value);
-    let installation_issue = if config.effective_network_backend() == NetworkBackendKind::Seatbelt {
+pub(crate) fn read(frame: &StatusFrame<'_>, backend: bool, healthy: bool, heartbeat: &Value) -> Value {
+    let installation_issue = if frame.config.effective_network_backend() == NetworkBackendKind::Seatbelt {
         let paths = [claude_watch_system::launchd_gateway::CONFIG_PATH,
             claude_watch_system::launchd_gateway::BROKER_PATH,
             "/Library/LaunchDaemons/io.local.claudewatch.gateway.plist"];
@@ -18,20 +17,24 @@ pub(crate) fn read(frame: &FrameEvidence<'_>, backend: bool, healthy: bool, hear
             Some("gateway_installation_unverified")
         } else { None }
     } else { None };
-    let code = project(frame, backend, healthy, installation_issue, heartbeat);
+    let code = project(frame, backend, healthy, installation_issue, &frame.value["vpn_supervision"], heartbeat,
+        producer_is_current(frame.value));
+    report(code, frame, heartbeat)
+}
+
+fn report(code: &str, frame: &StatusFrame<'_>, heartbeat: &Value) -> Value {
     let evidence_at = match code {
         "guard_ready" | "guard_heartbeat_stale" | "guard_policy_unverified" => heartbeat["time"].clone(),
         "guard_disabled" | "gateway_not_installed" | "gateway_installation_unverified"
-        | "legacy_config_migration_required" | "vpn_expectation_unconfigured" | "guard_backend_unverified" => json!(now),
-        _ => channel["captured_at"].clone(),
+        | "legacy_config_migration_required" | "vpn_expectation_unconfigured" | "guard_backend_unverified" => json!(frame.now),
+        _ => frame.value["captured_at"].clone(),
     };
-    json!({"reason_code":code,"evidence_observed_at":evidence_at,"checked_at":now})
+    json!({"reason_code":code,"evidence_observed_at":evidence_at,"checked_at":frame.now})
 }
 
-fn project(frame: &FrameEvidence<'_>, backend: bool, healthy: bool, installation_issue: Option<&'static str>,
-    heartbeat: &Value) -> &'static str {
+fn project(frame: &StatusFrame<'_>, backend: bool, healthy: bool, installation_issue: Option<&'static str>,
+    vpn: &Value, heartbeat: &Value, producer_current: bool) -> &'static str {
     let (config, now, channel) = (frame.config, frame.now, frame.value);
-    let vpn = &channel["vpn_supervision"];
     if !config.enabled || !config.guard_enabled { return "guard_disabled"; }
     // A previous failure must never override an independently verified recovery.
     if healthy { return "guard_ready"; }
@@ -39,29 +42,34 @@ fn project(frame: &FrameEvidence<'_>, backend: bool, healthy: bool, installation
     if config.schema < 2 || config.network_backend.is_none() { return "legacy_config_migration_required"; }
     if config.vpn_expectation.as_ref().is_none_or(|v| !v.configured) { return "vpn_expectation_unconfigured"; }
     if !backend { return "guard_backend_unverified"; }
-    if frame.policy.is_err() { return "guard_policy_unverified"; }
-    // Readiness keeps its stricter no-future-frame rule.
-    if frame.boot.is_none() || channel["captured_at"].as_f64().is_none_or(|at| at > now) {
+    let Some(policy) = frame.policy_wire() else { return "guard_policy_unverified"; };
+    if !frame.readiness_frame_current(producer_current) {
         return "execution_evidence_stale_or_mismatched";
     }
-    for evidence in &frame.families {
-        if evidence.sync != PolicySyncState::ApplyFailed { continue; }
-        let Some(receipt) = &evidence.receipt else { return "channel_execution_failed"; };
-        if evidence.permit.as_ref().is_none_or(|permit| receipt.vpn_epoch != permit.vpn_epoch) {
-            return "execution_evidence_stale_or_mismatched";
+    // A failure authenticates diagnostic details only for its own family.
+    for (family, state) in frame.family_policy_states() {
+        if state == PolicySyncState::ApplyFailed {
+            let receipt = &channel["enforcement_receipts"][family];
+            if !receipt.is_null() && receipt["vpn_epoch"] != channel["authoritative_permits"][family]["vpn_epoch"] {
+                return "execution_evidence_stale_or_mismatched";
+            }
+            if receipt["enforcement_state"] != "failed" { return "channel_execution_failed"; }
+            return match channel["enforcement_receipts"][family]["error_code"].as_str() {
+                Some("gateway_endpoint_unverified_i03" | "gateway_server_identity_unverified_i03") => "gateway_identity_unverified",
+                Some("active_flow_close_failed" | "flow_close_failed" | "close_timeout") => "flow_close_failed",
+                _ => "channel_execution_failed",
+            };
         }
-        if receipt.enforcement_state != ChannelEnforcementState::Failed { return "channel_execution_failed"; }
-        return match receipt.error_code.as_deref() {
-            Some("gateway_endpoint_unverified_i03" | "gateway_server_identity_unverified_i03") => "gateway_identity_unverified",
-            Some("active_flow_close_failed" | "flow_close_failed" | "close_timeout") => "flow_close_failed",
-            _ => "channel_execution_failed",
-        };
     }
     if vpn["captured_at"] == channel["captured_at"] {
         if let (Some(expected), Ok(observation)) = (config.vpn_expectation.as_ref(), serde_json::from_value::<claude_watch_core::vpn::VpnObservation>(vpn["observation"].clone())) {
-            let epoch_current = frame.families.iter().any(|evidence|
-                evidence.permit.as_ref().is_some_and(|permit| permit.vpn_epoch.as_ref() == Some(&observation.epoch))
-                    && evidence.state["vpn_epoch"] == json!(observation.epoch));
+            let epoch_current = channel["families"].as_object().is_some_and(|families| families.iter().any(|(family, state)| {
+                let permit = &channel["authoritative_permits"][family];
+                state["producer_boot_id"] == channel["producer_boot_id"] && state["saved_policy_version"] == *policy
+                    && permit["policy_version"] == *policy && permit["family"] == *family
+                    && state["command_seq"] == permit["command_seq"] && state["permit_generation"] == permit["permit_generation"]
+                    && permit["vpn_epoch"] == json!(observation.epoch) && state["vpn_epoch"] == json!(observation.epoch)
+            }));
             if epoch_current {
                 use claude_watch_core::vpn::VpnMatch;
                 match claude_watch_core::vpn::compare_vpn(expected, &observation, now) {
@@ -110,7 +118,9 @@ mod tests {
     #[test]
     fn current_configuration_and_recovery_take_precedence_over_historical_errors() {
         let (config, channel, heartbeat) = fixture();
-        let p = |c: &Config, installed, healthy| project(&FrameEvidence::with_producer(&channel, c, 103.0, |_| true), true, healthy, installed, &heartbeat);
+        let p = |c: &Config, installed, healthy| {
+            project(&StatusFrame::new(&channel, c, 103.0), true, healthy, installed, &Value::Null, &heartbeat, true)
+        };
         assert_eq!(p(&config,Some("gateway_not_installed"),false),"gateway_not_installed");
         assert_eq!(p(&config,None,true),"guard_ready");
         let mut old = config.clone(); old.network_backend = None; old.schema = 1;
@@ -124,7 +134,9 @@ mod tests {
     #[test]
     fn failure_reason_requires_current_authority_boot_policy_command_and_receipt() {
         let (config, channel, heartbeat) = fixture();
-        let p = |v: &Value, at, live| project(&FrameEvidence::with_producer(v, &config, at, |_| live), true, false, None, &heartbeat);
+        let p = |v: &Value, at, live| {
+            project(&StatusFrame::new(v, &config, at), true, false, None, &Value::Null, &heartbeat, live)
+        };
         assert_eq!(p(&channel,103.0,true),"gateway_identity_unverified");
         assert_ne!(p(&channel,103.0,false),"gateway_identity_unverified");
         assert_ne!(p(&channel,112.0,true),"gateway_identity_unverified");
@@ -167,9 +179,7 @@ mod tests {
             source_error:None,sample_seq:1,epoch:VpnEpoch::new("vpn-1",1) };
         let vpn = json!({"captured_at":102.0,"observation":observation});
         let p = |v: &Value, at| {
-            let mut frame = channel.clone();
-            frame["vpn_supervision"] = v.clone();
-            project(&FrameEvidence::with_producer(&frame, &config, at, |_| true), true, false, None, &heartbeat)
+            project(&StatusFrame::new(&channel, &config, at), true, false, None, v, &heartbeat, true)
         };
         assert_eq!(p(&vpn,103.0),"vpn_expectation_mismatched");
         assert_eq!(p(&vpn,105.0),"vpn_observation_stale");
@@ -177,6 +187,35 @@ mod tests {
         assert_ne!(p(&old,103.0),"vpn_expectation_mismatched");
         old = vpn.clone(); old["observation"]["epoch"]["observer_boot_id"] = json!("old");
         assert_ne!(p(&old,103.0),"vpn_expectation_mismatched");
+    }
+
+    #[test]
+    fn readiness_preserves_raw_failure_details_observation_times_and_late_liveness() {
+        let (config, mut channel, mut heartbeat) = fixture();
+        channel["enforcement_receipts"]["claude"]["observed_at"] = json!("malformed");
+        channel["enforcement_receipts"]["claude"]["error_code"] = json!("active_flow_close_failed");
+        heartbeat["time"] = json!(101.5);
+        let frame = StatusFrame::new(&channel, &config, 103.0);
+        let diagnostic = |live, healthy| {
+            let code = project(&frame, true, healthy, None, &Value::Null, &heartbeat, live);
+            report(code, &frame, &heartbeat)
+        };
+        assert_eq!(diagnostic(true, false), json!({
+            "reason_code":"flow_close_failed", "evidence_observed_at":102.0, "checked_at":103.0
+        }));
+        assert_eq!(diagnostic(false, false), json!({
+            "reason_code":"execution_evidence_stale_or_mismatched", "evidence_observed_at":102.0, "checked_at":103.0
+        }));
+        assert_eq!(diagnostic(false, true), json!({
+            "reason_code":"guard_ready", "evidence_observed_at":101.5, "checked_at":103.0
+        }));
+
+        let mut future = channel.clone();
+        future["captured_at"] = json!(103.02);
+        assert_eq!(
+            project(&StatusFrame::new(&future, &config, 103.0), true, false, None, &Value::Null, &heartbeat, true),
+            "execution_evidence_stale_or_mismatched"
+        );
     }
 }
 

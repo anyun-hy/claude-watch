@@ -142,8 +142,8 @@ impl SessionStore {
             previous.push((path.clone(), self.storage.read_bytes(&path, 16 * 1024)?));
         }
         let result = (|| {
-            let controller = crate::controlled::Controller::new(self.storage.clone());
-            for (desktop, stamp) in bindings { controller.lease(desktop, stamp, now, provider)?; }
+            let leases = crate::lease_store::LeaseStore { storage: self.storage.clone() };
+            for (desktop, stamp) in bindings { leases.save_desktop(desktop, stamp, now, provider)?; }
             self.save(&verified)
         })();
         if let Err(error) = result {

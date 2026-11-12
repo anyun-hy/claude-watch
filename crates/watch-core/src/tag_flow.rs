@@ -105,6 +105,16 @@ fn owner_from_field(value: &str) -> Option<u32> {
     pid.parse::<u32>().ok().filter(|v| *v > 0)
 }
 fn kernel_listener_owners(kernel: &CommandEvidence, port: u16) -> (BTreeSet<u32>, bool) {
+    kernel_listener_owners_at(kernel, port, None)
+}
+fn listener_host_matches(host: &str, address: Option<IpAddr>) -> bool {
+    match address {
+        None => ["127.0.0.1", "*", "0.0.0.0", "::"].contains(&host),
+        Some(expected) => host == "*" || host.parse::<IpAddr>().is_ok_and(|actual|
+            actual == expected || (actual.is_unspecified() && actual.is_ipv4() == expected.is_ipv4())),
+    }
+}
+fn kernel_listener_owners_at(kernel: &CommandEvidence, port: u16, address: Option<IpAddr>) -> (BTreeSet<u32>, bool) {
     let mut owners = BTreeSet::new();
     let mut incomplete = kernel.status != 0 || !kernel.stderr.trim().is_empty();
     for line in kernel.stdout.lines() {
@@ -118,7 +128,7 @@ fn kernel_listener_owners(kernel: &CommandEvidence, port: u16) -> (BTreeSet<u32>
         let Some((host, raw_port)) = fields[3].rsplit_once('.') else {
             continue;
         };
-        if raw_port != port.to_string() || !["127.0.0.1", "*", "0.0.0.0", "::"].contains(&host) {
+        if raw_port != port.to_string() || !listener_host_matches(host, address) {
             continue;
         }
         let ids: Vec<_> = fields[6..]
@@ -144,6 +154,16 @@ pub fn listener_fallback_for_port(
     kernel: Option<&CommandEvidence>,
     port: u16,
 ) -> CommandEvidence {
+    listener_fallback_at(lsof, kernel, port, None)
+}
+pub fn listener_fallback_for_address(
+    lsof: CommandEvidence, kernel: Option<&CommandEvidence>, port: u16, address: IpAddr,
+) -> CommandEvidence {
+    listener_fallback_at(lsof, kernel, port, Some(address))
+}
+fn listener_fallback_at(
+    lsof: CommandEvidence, kernel: Option<&CommandEvidence>, port: u16, address: Option<IpAddr>,
+) -> CommandEvidence {
     if port == 0 {
         return CommandEvidence { status:1, stdout:String::new(), stderr:"invalid listener port".into(), source:lsof.source };
     }
@@ -151,7 +171,7 @@ pub fn listener_fallback_for_port(
         return lsof;
     }
     let Some(kernel) = kernel else { return lsof };
-    let (_, mut failed) = kernel_listener_owners(kernel, port);
+    let (_, mut failed) = kernel_listener_owners_at(kernel, port, address);
     let port_text = port.to_string();
     let mut output = Vec::new();
     if kernel.status == 0 && kernel.stderr.trim().is_empty() {
@@ -166,7 +186,7 @@ pub fn listener_fallback_for_port(
             let Some((host, raw_port)) = fields[3].rsplit_once('.') else {
                 continue;
             };
-            if raw_port != port_text || !["127.0.0.1", "*", "0.0.0.0", "::"].contains(&host) {
+            if raw_port != port_text || !listener_host_matches(host, address) {
                 continue;
             }
             let owners: Vec<_> = fields[6..]
@@ -180,7 +200,7 @@ pub fn listener_fallback_for_port(
             output.push(format!("p{}", owners[0]));
             output.push(format!(
                 "n{}:{port}",
-                if host == "::" { "[::]" } else { host }
+                if host.contains(':') { format!("[{host}]") } else { host.to_owned() }
             ));
         }
     }

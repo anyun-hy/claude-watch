@@ -10,6 +10,7 @@ mod dns_dispatch;
 mod gateway_endpoint_check;
 mod install_dispatch;
 mod maintenance_dispatch;
+mod process_inventory;
 mod reference_dispatch;
 mod reinstall_dispatch;
 mod runtime;
@@ -346,6 +347,12 @@ fn run() -> Result<EngineOutput> {
         home.ok_or_else(|| CoreError::new("home_unavailable", "当前用户目录不可读取"))?,
     )?;
     paths.require_owner(uid)?;
+    // Process control shares the read-only sampler, without listener workers,
+    // socket/TAG probes or mutation-oriented dispatch.
+    if request.command == "observe" && request.flag("processes-only") {
+        let mut sampler = Sampler::new(runtime::runner()?, paths);
+        return Ok(EngineOutput::json(process_inventory::value(&sampler.processes()?), 0));
+    }
     #[cfg(all(test, target_os = "macos"))]
     entry_ready_fixture::validate_child(&request, &paths)?;
     runtime::initialize_native_listener(&request)?;

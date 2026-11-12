@@ -175,13 +175,14 @@ pub fn process_rows(round: &ProcessRound, active: &[u32]) -> Vec<Value> {
 }).collect()
 }
 
-fn append_live_failed_instances(store: &StateStore, boot: Option<&str>, round: &ProcessRound, rows: &mut Vec<Value>, now: f64) {
+fn append_live_failed_instances(store: &StateStore, authority: &Value, round: &ProcessRound, rows: &mut Vec<Value>, now: f64) {
     use claude_watch_core::{controlled_launch::{ManagedInstanceState, ManagedLaunchInstance}, processes::{Kind, LaunchTarget}};
-    let Some(boot) = boot else { return; };
+    if !crate::channel_policy_status::producer_is_current(authority)
+        || !authority["captured_at"].as_f64().is_some_and(|at| now.is_finite() && now >= at - 1.0 && now - at < 10.0) { return; }
     let raw = store.read_json(&store.paths.watch().join("state/managed-launch-instances.json"), json!([])).unwrap_or(json!([]));
     for value in raw.as_array().into_iter().flatten() {
         let Ok(instance) = serde_json::from_value::<ManagedLaunchInstance>(value.clone()) else { continue; };
-        if instance.uid != round.uid || boot != instance.executor_boot_id { continue; }
+        if instance.uid != round.uid || authority["executor_boot_id"].as_str() != Some(instance.executor_boot_id.as_str()) { continue; }
         let visibility = &value["process_visibility"];
         let Some(at) = visibility["observed_at"].as_f64().filter(|at| at.is_finite() && now >= *at - 1.0 && now - *at < 10.0) else { continue; };
         let root_kind = match instance.target {
@@ -641,20 +642,11 @@ pub(crate) fn assemble_with_active(
     let installed = store.paths.watch().join("runtime/watch-engine").is_file() && agent.is_file();
     let (events, event_error) = match events(store) { Ok(events) => (events, None), Err(_) => (Vec::new(), Some("事件日志不可读取")) };
     let mut channel_supervision = crate::channel_policy_status::read_frame(store);
-    // Lifetime visibility needs a live producer, even while policy application is pending.
-    let observed_boot = channel_supervision["executor_boot_id"].as_str().filter(|_| {
-        channel_supervision["captured_at"].as_f64().is_some_and(|captured|
-            at.is_finite() && at >= captured - 1.0 && at - captured < 10.0)
-            && crate::channel_policy_status::producer_is_current(&channel_supervision)
-    });
-    let config = (crate::config_store::ConfigStore { storage: store.clone() }).load().ok();
-    let frame = config.as_ref().map(|config|
-        crate::channel_policy_status::FrameEvidence::with_producer(&channel_supervision, config, at, |_| observed_boot.is_some()));
     let mut rows = process_rows(round, active);
     for (row, target) in rows.iter_mut().zip(&round.targets) {
-        row["protection"] = crate::channel_policy_status::process_protection(store, frame.as_ref(), &target.identity, target.kind, at);
+        row["protection"] = crate::channel_policy_status::process_protection(store, &channel_supervision, &target.identity, target.kind, at);
     }
-    append_live_failed_instances(store, observed_boot, round, &mut rows, at);
+    append_live_failed_instances(store, &channel_supervision, round, &mut rows, at);
     let (channel_events, vpn_supervision) = channel_supervision.as_object_mut().map(|frame| (
         frame.remove("events").unwrap_or_else(|| json!([])),
         frame.remove("vpn_supervision").unwrap_or(Value::Null),
@@ -736,57 +728,6 @@ pub fn read<R: ReadRunner>(store: &StateStore, runner: &R) -> Result<Value> {
     let age = at - snapshot["capturedAt"].as_f64().unwrap();
     result["health"]["heartbeatAge"] = json!(age);
     Ok(result)
-}
-
-#[cfg(all(test, target_os = "macos"))]
-#[test]
-fn retained_process_visibility_does_not_require_current_policy() {
-    use claude_watch_core::{config::Config, controlled_launch::ManagedInstanceState, processes::LaunchTarget};
-    use std::fs;
-
-    let root = std::env::temp_dir().join(format!("cw-visibility-{}", uuid::Uuid::new_v4()));
-    fs::create_dir(&root).unwrap();
-    let store = StateStore::new(crate::storage::Paths::new(&root).unwrap());
-    let live = claude_watch_system::inspect_process_identity(std::process::id()).unwrap();
-    let producer = Identity { pid: live.pid, uid: live.uid, parent: live.ppid, executable: live.executable_path,
-        start_seconds: live.start_seconds, start_microseconds: live.start_microseconds, start_stamp: "fixture".into() };
-    let at = native::now();
-    let round = ProcessRound { id: "fixture".into(), uid: live.uid, targets: vec![], identities: Default::default(),
-        roles: Value::Null, match_evidence: Default::default(), unavailable: vec![], diagnostic_reasons: Default::default(),
-        confirmed_exited_count: 0, complete: true, observed_at: at, discovery: None };
-    let config = store.paths.config();
-    store.atomic_json(&config, &Config::default_for_new_install().value().unwrap()).unwrap();
-    store.atomic_json(&store.paths.watch().join(crate::channel_policy_status::FRAME_PATH), &json!({
-        "captured_at": at, "producer_boot_id": "producer", "executor_boot_id": "executor",
-        "producer_identity": crate::channel_policy_status::current_producer_identity(),
-        "saved_policy_version": {"policy_digest": "previous", "guard_policy_digest": "previous"},
-    })).unwrap();
-    let token = live.audit_token.iter().map(u32::to_string).collect::<Vec<_>>().join(":");
-    let mut registry = json!([{"instance_id": "fixture", "entry_id": "fixture", "family": "claude",
-        "target": LaunchTarget::ClaudeCli, "launch_nonce": "fixture", "executor_boot_id": "executor",
-        "expected_executable": producer.executable, "expected_fingerprint": "fixture", "pid": live.pid,
-        "uid": live.uid, "start_seconds": live.start_seconds, "start_microseconds": live.start_microseconds,
-        "state": ManagedInstanceState::Failed, "updated_at": at,
-        "process_visibility": {"observed_at": at, "members": [{"pid": live.pid, "uid": live.uid,
-            "start_seconds": live.start_seconds, "start_microseconds": live.start_microseconds,
-            "audit_identity_digest": sha256(token.as_bytes())}]}}]);
-    let registry_path = store.paths.watch().join("state/managed-launch-instances.json");
-    store.atomic_json(&registry_path, &registry).unwrap();
-    let rows = || assemble(&store, &round, &Value::Null, &producer, "fixture", true, at)["processes"].clone();
-    let assert_visible_unprotected = || {
-        let list = rows();
-        assert_eq!(list[0]["pid"], live.pid);
-        assert_eq!(list[0]["matchReason"], "retained_lifetime");
-        assert_eq!(list[0]["protection"]["state"], "unprotected");
-        assert_eq!(list[0]["authorized"], false);
-    };
-    assert_visible_unprotected();
-    fs::write(config, b"{invalid").unwrap();
-    assert_visible_unprotected();
-    registry[0]["process_visibility"]["members"][0]["audit_identity_digest"] = json!("wrong-lifetime");
-    store.atomic_json(&registry_path, &registry).unwrap();
-    assert_eq!(rows(), json!([]));
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(test)]

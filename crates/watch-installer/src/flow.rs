@@ -940,7 +940,7 @@ fn perform_with_environment(
     // the flow must never look like "nothing happened, no idea what this
     // command does". Target and phases are known before any check runs.
     println!("Watch 重装：目标 {version} / build {build}（arm64 Rust 候选版）");
-    println!("流程：卸载已安装应用 → 清理 Watch 专属数据 → 打包 DMG → 校验 → 安装");
+    println!("流程：打包 DMG → 校验 → 复核安装状态 → 卸载已安装应用 → 清理 Watch 专属数据 → 安装");
     let _ = std::io::stdout().flush();
     let plan = preflight(layout, runner, uid).map_err(|error| {
         println!(
@@ -959,7 +959,7 @@ fn perform_with_environment(
     println!("系统网关：{}；保留端口 {}；新组件最终落位后将请求管理员授权安装/更新 io.local.claudewatch.gateway。", if plan.gateway_preview["action"] == "upgrade" { "更新已确认属于本用户的 Watch 网关" } else { "首次安装" }, plan.gateway_preview["gateway_port"]);
     println!("使用免费本机 ad-hoc 签名，不需要付费开发者签名；仅修改 Watch 网关及其 launchd 定义，不修改 VPN。旧网关在打包阶段保留端点，安装失败撤回本次网关变更。实际监听句柄验证成功后才启动后台。");
     println!("将永久删除 Claude Watch 的设置、日志、A/B 快照及其自有后台；保留 Claude 登录、TAG 配置和独立原版工具。");
-    println!("流程先卸载再打包；如果打包失败，旧应用已卸载，请保留输出并检查当前状态。");
+    println!("新包通过版本、DMG 校验和签名验证后才会卸载和清理；准备失败时保留旧应用与 Watch 数据。");
     // The confirmation prompt writes to stderr; without flushing stdout the
     // preview can stay in the pipe buffer and the prompt looks like it came
     // out of nowhere (or, when the output is captured, from nowhere at all).
@@ -983,9 +983,45 @@ fn perform_with_environment(
     if current != plan {
         return Err(blocked("确认后安装状态发生变化；未执行卸载。"));
     }
+    // Finish the expensive, fallible preparation while the installed app and
+    // Watch data are still intact. The existing install transaction consumes
+    // this verified bundle after the explicitly requested reset.
+    if [&app_out, &dmg, &sha].iter().any(|path| exists(path)) {
+        return Err(blocked("本次输出路径已存在，未覆盖。"));
+    }
+    let env = package_environment(&build_environment, version, build, &app_out, &dmg_name);
+    println!("[1/4] 打包并校验 {version} / build {build}；旧应用和数据暂时保留。");
+    let packaged = runner.run(
+        &[
+            "/bin/bash".to_string(),
+            layout.project.join("monitor/package-dmg.sh").display().to_string(),
+        ],
+        Some(&env),
+        RunMode::Inherit,
+    )?;
+    require(packaged.success(), "打包失败，未执行卸载、数据清理或安装。")?;
+    let produced = app_identity_with(runner, &app_out)?;
+    let artifacts_ok = !path_is_symlink(&dmg) && !path_is_symlink(&sha) && dmg.is_file() && sha.is_file();
+    require(
+        produced == (version.to_string(), build.to_string()) && artifacts_ok,
+        "打包产物或版本不匹配，未执行卸载、数据清理或安装。",
+    )?;
+    require(
+        checksum_matches(&sha, &dmg)?,
+        "DMG 校验不匹配，未执行卸载、数据清理或安装。",
+    )?;
+    require(
+        verify_signature(runner, &app_out)?,
+        "新应用签名校验失败，未执行卸载、数据清理或安装。",
+    )?;
+    // Packaging may take minutes. Revalidate the exact approved installation
+    // and transaction boundaries immediately before the destructive phase.
+    if preflight(layout, runner, uid)? != plan {
+        return Err(blocked("打包期间 Watch 安装状态发生变化；未执行卸载或数据清理。"));
+    }
     let mut trashed: Option<PathBuf> = None;
     if plan.old_identity.is_some() {
-        println!("[1/4] 卸载已安装应用（移入废纸篓，可恢复）。");
+        println!("[2/4] 卸载已安装应用（移入废纸篓，可恢复）。");
         let _ = std::io::stdout().flush();
         let engine = built_engine(layout);
         let result = json_command(
@@ -1032,37 +1068,8 @@ fn perform_with_environment(
         )?;
     }
     clean_data(layout, runner, uid, trashed.as_deref(), sleep)?;
-    println!("Watch 卸载与数据清理完成。");
-    if [&app_out, &dmg, &sha].iter().any(|path| exists(path)) {
-        return Err(blocked("本次输出路径已存在，未覆盖。"));
-    }
-    let env = package_environment(&build_environment, version, build, &app_out, &dmg_name);
-    println!("正在打包 {version} / build {build}。");
-    let packaged = runner.run(
-        &[
-            "/bin/bash".to_string(),
-            layout.project.join("monitor/package-dmg.sh").display().to_string(),
-        ],
-        Some(&env),
-        RunMode::Inherit,
-    )?;
-    require(packaged.success(), "打包失败，未执行安装。")?;
-    let produced = app_identity_with(runner, &app_out)?;
-    let artifacts_ok = !path_is_symlink(&dmg) && !path_is_symlink(&sha) && dmg.is_file() && sha.is_file();
-    require(
-        produced == (version.to_string(), build.to_string()) && artifacts_ok,
-        "打包产物或版本不匹配，未执行安装。",
-    )?;
-    require(
-        checksum_matches(&sha, &dmg)?,
-        "DMG 校验不匹配，未执行安装。",
-    )?;
-    require(
-        verify_signature(runner, &app_out)?,
-        "新应用签名校验失败，未执行安装。",
-    )?;
-    // A user or another process may have installed or restarted Watch while
-    // the build ran. Never replace that new state silently.
+    println!("[3/4] Watch 卸载与数据清理完成；复核后安装已校验的新包。");
+    // Never replace a concurrently recreated installation or restart silently.
     check_no_conflicting_work(runner, uid)?;
     check_transactions(layout)?;
     let mut changed = layout.data_paths();
@@ -1072,7 +1079,7 @@ fn perform_with_environment(
     changed.push(layout.system_root.clone());
     changed.push(layout.system_plist.clone());
     if changed.iter().any(|path| exists(path)) {
-        return Err(blocked("打包期间 Watch 安装或数据状态发生变化，未执行安装。"));
+        return Err(blocked("清理后 Watch 安装或数据状态发生变化，未执行安装。"));
     }
     for label in [
         layout.agent_label(uid),
@@ -1081,7 +1088,7 @@ fn perform_with_environment(
     ] {
         if loaded(runner, &label)? {
             return Err(blocked(format!(
-                "打包期间后台任务重新出现，未执行安装：{label}"
+                "清理后后台任务重新出现，未执行安装：{label}"
             )));
         }
     }
@@ -1102,6 +1109,7 @@ fn perform_with_environment(
         && preview.get("installed").and_then(Value::as_str)
             == Some(layout.app.display().to_string().as_str());
     require(preview_ok, "安装预览不匹配，未执行安装。")?;
+    println!("[4/4] 安装并核验新应用。");
     let installed = json_command(
         runner,
         &[

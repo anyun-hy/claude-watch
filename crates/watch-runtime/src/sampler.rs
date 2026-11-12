@@ -18,7 +18,6 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    net::{SocketAddr, TcpStream},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -141,6 +140,14 @@ fn load_mcp_specs(paths: &Paths) -> Vec<McpSpec> {
     }
     result
 }
+#[derive(Clone)]
+pub struct ProcessTableObservation {
+    pub observed_at: f64,
+    pub processes: Result<BTreeMap<u32, Value>>,
+    pub root_starts: BTreeMap<u32, (u64, u32)>,
+}
+
+#[derive(Clone)]
 pub struct ProcessRound {
     pub id: String,
     pub uid: u32,
@@ -154,6 +161,9 @@ pub struct ProcessRound {
     pub complete: bool,
     pub observed_at: f64,
     pub discovery: Option<Value>,
+    /// Optional system-wide supplement, including root-owned proxy processes.
+    /// A handoff keeps this collection time; consumers must recheck known PIDs.
+    pub system_processes: Option<ProcessTableObservation>,
 }
 impl ProcessRound {
     pub fn public_value(&self) -> Value {
@@ -240,6 +250,16 @@ impl<R: ReadRunner> Sampler<R> {
     pub fn discovery(&self)->crate::target_discovery::DiscoveryHandle { self.discovery.clone() }
     pub fn processes(&mut self) -> Result<ProcessRound> {
         self.processes_with_alias_reader(cli_alias_signature)
+    }
+    pub fn processes_with_system_metadata(&mut self) -> Result<ProcessRound> {
+        let mut round = self.processes()?;
+        let observed_at = native::now();
+        let processes = self.process_table();
+        let root_starts = processes.as_ref().ok().into_iter().flat_map(|table| table.iter())
+            .filter(|(_, row)| row["uid"] == 0 && crate::macos::proxy_mode(row["executable"].as_str().unwrap_or("")).is_some())
+            .filter_map(|(pid, _)| self.runner.process_start_time_any_user(*pid).map(|start| (*pid, start))).collect();
+        round.system_processes = Some(ProcessTableObservation { observed_at, processes, root_starts });
+        Ok(round)
     }
     fn processes_with_alias_reader(&mut self, read: impl FnMut(&Paths) -> CliAliasSignature) -> Result<ProcessRound> {
         let snapshot = cli_alias_snapshot(&self.paths, read);
@@ -465,6 +485,7 @@ impl<R: ReadRunner> Sampler<R> {
             complete,
             observed_at: inventory.finished_at,
             discovery: Some(json!({"revision":discovery_snapshot.revision,"complete":discovery_snapshot.complete,"issues":discovery_snapshot.issues})),
+            system_processes: None,
         })
     }
     pub fn sockets(&self, round: &ProcessRound) -> Result<SocketRound> {
@@ -520,18 +541,28 @@ impl<R: ReadRunner> Sampler<R> {
         }
         let captured = native::now();
         let mut report = json!({"schema":1,"observed_epoch":captured.floor(),"round_id":processes.id,"expected_group":group,"expected_node":pin,"pinned":!pin.is_empty(),"flows":[],"cli":{"state":"unconfirmed","detail":"连接证据来自原生套接字，不读取或修改shell代理变量"}});
-        let before = self.process_table();
-        let kernel =
-            self.command_evidence(ReadCommand::Listeners, Duration::from_secs(3), "netstat");
+        let before = match &processes.system_processes {
+            Some(observation) if (0.0..=crate::process_disposition::INTENT_TTL).contains(&(captured - observation.observed_at)) => observation.processes.clone(),
+            Some(_) => Err(CoreError::new("process_observation_stale", "本轮系统进程观察已过期")),
+            None => self.process_table(),
+        };
+        let kernel_snapshot = crate::vpn_observer::read_vpn_kernel_snapshot(&self.runner, Duration::from_secs(3));
+        let kernel_at = kernel_snapshot.as_ref().map(|snapshot| snapshot.captured_at);
+        let kernel = kernel_snapshot.map(|snapshot| snapshot.evidence)
+            .ok_or_else(|| CoreError::new("listener_snapshot_unavailable", "系统监听快照不可读取"));
+        let listener_at = native::now();
         let listener =
             self.command_evidence(ReadCommand::LsofListener, Duration::from_secs(3), "lsof");
         let listener = listener.map(|v| tag_flow::listener_fallback(v, kernel.as_ref().ok()));
-        let reachable = TcpStream::connect_timeout(
-            &SocketAddr::from(([127, 0, 0, 1], 7890)),
-            Duration::from_millis(500),
-        )
-        .is_ok();
-        let after = self.process_table();
+        report["listener_observed_at"] = listener.as_ref().ok().and_then(|listener|
+            if listener.source == "netstat" { kernel_at } else { Some(listener_at) }).map_or(Value::Null, |at| json!(at));
+        let reachable = self.runner.loopback_tcp_reachable(7890, Duration::from_millis(500));
+        let after = before.as_ref().map_err(Clone::clone).and_then(|table| {
+            let pids = table.iter().filter_map(|(pid, row)|
+                (tag_flow::is_tag_process(row, processes.uid) || processes.targets.iter().any(|p| p.identity.pid == *pid))
+                    .then_some(*pid)).collect::<Vec<_>>();
+            self.process_table_pids(&pids)
+        });
         let mut entry = match (&before, &after, &listener) {
             (Ok(before), Ok(after), Ok(listener)) => {
                 tag_flow::inspect_entry(before, after, listener, reachable, processes.uid)
@@ -695,8 +726,15 @@ impl<R: ReadRunner> Sampler<R> {
         })
     }
     pub fn process_table(&self) -> Result<BTreeMap<u32, Value>> {
+        self.read_process_table(ReadCommand::ProcessTable)
+    }
+    pub fn process_table_pids(&self, pids: &[u32]) -> Result<BTreeMap<u32, Value>> {
+        if pids.is_empty() { return Ok(BTreeMap::new()); }
+        self.read_process_table(ReadCommand::ProcessTablePids { pids: pids.to_vec() })
+    }
+    fn read_process_table(&self, command: ReadCommand) -> Result<BTreeMap<u32, Value>> {
         let out = self.runner.run(
-            ReadCommand::ProcessTable,
+            command,
             &[],
             Duration::from_secs(3),
             4 * 1024 * 1024,

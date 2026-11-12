@@ -23,7 +23,8 @@ Each invocation creates a new, Git-ignored directory under
 `.agent/test-runs/<timestamp>-<unique-id>/`. It prints the absolute path first.
 
 - `SUMMARY.md`: result, duration, exit code and log link for every step.
-- `results.json`: machine-readable results, commands and conditional skips.
+- `results.json`: machine-readable results, commands, conditional skips, source
+  snapshots and observed executable/component hashes.
 - `logs/`: combined stdout/stderr for each step, including build failures.
 - `plan.json`: the exact selected commands and dependencies.
 - `run-info.json`: runner/manifest hashes and host metadata.
@@ -43,6 +44,19 @@ distinct: native bridge scripts must print their actual completion marker and
 must not print a failure marker. A failure or blocked step makes the final exit
 code nonzero. Ctrl-C records interruption and stops only the active process group
 created by the runner. Completed results are written after every step.
+
+The source snapshots use the same digest algorithm as `BuildIdentity.json`,
+captured before and after the selected run. They record the revision, dirty
+state and source-tree digest; a test run does not invent an application version
+or build number. Executed command paths are hashed before and after execution.
+Cargo compiler artifacts, Swift outputs and explicitly declared components are
+recorded separately: compiling or finding a file does not prove it was executed.
+An artifact's existing build receipt is compared with the tested source; an old
+receipt is not relabelled as current.
+
+Observed source or executed-file changes mark the evidence binding unstable
+without hiding individual test results. Matching endpoint snapshots are not an
+immutable checkout, and fixture results are not installed-product acceptance.
 
 Exit codes: `0` selected automatic steps passed (explicit exclusions remain),
 `1` one or more steps failed/blocked, `2` invalid runner configuration, `130`
@@ -85,7 +99,9 @@ environment used by the bootstrap and staging scripts using a private Cargo
 fixture. The native startup regression copies the already-built engine and
 read-only helpers into a private directory, runs an unregistered observe-only
 daemon, verifies its first unready observation and kernel producer identity,
-then confirms the original worker has exited after stopping its owned parent.
+observes fresh publication for 16 seconds, then confirms the original worker
+and its observed descendants have exited within the existing five-second stop
+budget. It records monotonic timings and hashes of the copied runtime files.
 It checks that this private publisher cannot pass the normal launchd verifier.
 It installs no service, launches no AI, and modifies no VPN configuration.
 The graph fixtures now check the existing desktop grouping while retaining

@@ -18,7 +18,11 @@ static int dial(int port) {
 }
 static void need(int ok, const char *reason) { if (!ok) { perror(reason); exit(70); } }
 static void exact(int fd, char *bytes, int count) {
-    while (count) { int n = (int)read(fd, bytes, count); need(n > 0, "complete read"); bytes += n; count -= n; }
+    while (count) {
+        int n = (int)read(fd, bytes, count);
+        if (n == 0) { fputs("complete read: unexpected EOF\n", stderr); exit(70); }
+        need(n > 0, "complete read"); bytes += n; count -= n;
+    }
 }
 #ifndef FIXTURE_VERSION
 #define FIXTURE_VERSION "A"

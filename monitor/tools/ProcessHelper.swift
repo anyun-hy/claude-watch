@@ -14,9 +14,9 @@ struct WatchProcessHelper {
             scope: AIProcessClosePolicy.automaticDesktopScope(for: .claude)
         )
     }
-    static func inventory(for product: MonitoredProduct) throws -> [AIProcessIdentity] {
+    static func inventory(for product: MonitoredProduct, engine: URL?, timeout: TimeInterval) throws -> [AIProcessIdentity] {
         AIProcessClosePolicy.scopedInventory(
-            try AIProcessInventory.read(),
+            try AIProcessInventory.read(engine: engine, timeout: timeout),
             for: product,
             scope: AIProcessClosePolicy.automaticDesktopScope(for: product)
         )
@@ -65,9 +65,12 @@ struct WatchProcessHelper {
     /// `allowForce` mirrors the policy decision made upstream: the engine only
     /// issues `guard-close-desktop` for a family whose policy declares force,
     /// so the helper carries no per-product rule of its own.
-    static func close(_ product: MonitoredProduct, allowForce: Bool) throws -> [String: Any] {
+    static func close(_ product: MonitoredProduct, allowForce: Bool, engine: URL?) throws -> [String: Any] {
         let label = product == .claude ? "Claude" : "ChatGPT / Codex"
-        let selected = plan(product, inventory: try inventory(for: product))
+        // Fit both classification batches inside the caller's 20-second helper bound.
+        let deadline = ProcessInfo.processInfo.systemUptime + 18
+        let selected = plan(product, inventory: try inventory(for: product, engine: engine,
+                                                               timeout: AIProcessInventory.maximumReadSeconds))
         let outcome = AIProcessClosePolicy.execute(selected, lookup: AIProcessInventory.identity,
             quitApplication: { expected in
                 AIProcessClosePolicy.applyToMatchingIdentity(expected, lookup: AIProcessInventory.identity) {
@@ -79,17 +82,17 @@ struct WatchProcessHelper {
                     Darwin.kill($0, SIGTERM) == 0
                 }
             })
-        var forced = (requested: 0, skipped: 0, failed: 0)
-        if allowForce {
-            func originalNotConfirmedGone() -> Bool {
-                selected.targets.contains { target in
-                    switch AIProcessInventory.presence(target.pid) {
-                    case .live(let actual): return target.sameProcess(as: actual)
-                    case .gone: return false
-                    case .unavailable: return true
-                    }
+        func originalNotConfirmedGone() -> Bool {
+            selected.targets.contains { target in
+                switch AIProcessInventory.presence(target.pid) {
+                case .live(let actual): return target.sameProcess(as: actual)
+                case .gone: return false
+                case .unavailable: return true
                 }
             }
+        }
+        var forced = (requested: 0, skipped: 0, failed: 0)
+        if allowForce {
             let graceDeadline = ProcessInfo.processInfo.systemUptime + 2
             while originalNotConfirmedGone() && ProcessInfo.processInfo.systemUptime < graceDeadline {
                 Thread.sleep(forTimeInterval: 0.1)
@@ -106,15 +109,17 @@ struct WatchProcessHelper {
         }
         // A root disappearing must not erase an original, now-orphaned child.
         // New roots are reported, not force-signalled by this invocation.
-        let until = ProcessInfo.processInfo.systemUptime + (allowForce ? 5 : 15)
-        var evidence: AIProcessExitEvidence
-        repeat {
-            evidence = AIProcessClosePolicy.exitEvidence(selected, inventory: try inventory(for: product),
-                                                         lookup: AIProcessInventory.presence)
-            if evidence.complete { break }
-            if ProcessInfo.processInfo.systemUptime >= until { break }
+        let until = min(ProcessInfo.processInfo.systemUptime + (allowForce ? 5 : 15),
+                        deadline - AIProcessInventory.maximumReadSeconds)
+        while originalNotConfirmedGone() && ProcessInfo.processInfo.systemUptime < until {
             Thread.sleep(forTimeInterval: 0.2)
-        } while true
+        }
+        let remainingBudget = deadline - ProcessInfo.processInfo.systemUptime
+        guard remainingBudget > 0 else { throw AIProcessInventoryFailure.timeout }
+        let fresh = try inventory(for: product, engine: engine,
+                                  timeout: min(AIProcessInventory.maximumReadSeconds, remainingBudget))
+        let evidence = AIProcessClosePolicy.exitEvidence(selected, inventory: fresh,
+                                                        lookup: AIProcessInventory.presence)
         let code = evidence.complete ? "" : (evidence.unconfirmed > 0
             ? "process_identity_unavailable" : "target_still_running")
         return ["schema": 1, "product": product == .claude ? "claude" : "openai",
@@ -137,7 +142,13 @@ struct WatchProcessHelper {
     static func main() {
         do {
             guard getuid() != 0 else { throw NSError(domain: "user_required", code: 1) }
-            let args = Array(CommandLine.arguments.dropFirst())
+            var args = Array(CommandLine.arguments.dropFirst())
+            var engine: URL?
+            if args.count >= 2, args[args.count - 2] == "--engine-path" {
+                guard args.last!.hasPrefix("/") else { throw AIProcessInventoryFailure.engineUnavailable }
+                engine = URL(fileURLWithPath: args.removeLast())
+                args.removeLast()
+            }
             guard !args.isEmpty, args.count == 1 || args.count == 2 || args[0] == "regional-status" else {
                 throw NSError(domain: "invalid_arguments", code: 1)
             }
@@ -145,7 +156,7 @@ struct WatchProcessHelper {
             switch args[0] {
             case "regional-status": result = try regionalStatus(Array(args.dropFirst()))
             case "inventory":
-                result = ["status": "ok", "processes": try AIProcessInventory.read().map(encode)]
+                result = ["status": "ok", "processes": try AIProcessInventory.read(engine: engine).map(encode)]
             // One exit routine for every supervised family: the product is a
             // command argument, and `guard-close-desktop` is only issued when
             // the family's policy declares force, so which trees may be forced
@@ -154,7 +165,7 @@ struct WatchProcessHelper {
                 guard args.count == 2, let product = product(args[1]) else {
                     throw NSError(domain: "invalid_arguments", code: 1)
                 }
-                result = try close(product, allowForce: args[0] == "guard-close-desktop")
+                result = try close(product, allowForce: args[0] == "guard-close-desktop", engine: engine)
             default: throw NSError(domain: "invalid_action", code: 1)
             }
             let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])

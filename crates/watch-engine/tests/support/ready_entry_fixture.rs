@@ -7,7 +7,7 @@ mod hardened_helper;
 
 use super::{
     channel_audit,
-    daemon_run::{assemble_production_channel_stack_with_vpn_reader, ProductionChannelStack},
+    daemon_run::{assemble_production_channel_stack_with_vpn_reader, GuardObservation, ProductionChannelStack},
     runtime::{self, OperationOutcome},
 };
 use claude_watch_core::{
@@ -174,6 +174,34 @@ pub fn fixture_launch(request: &Request, storage: &StateStore, system_runner: Ar
         desktop: &mut desktop, network, system: &mut system, storage: storage.clone(), started: Instant::now(), cli: None,
     };
     runtime::dispatch_launch(request, storage, &mut desktop)
+}
+
+fn step_fixture(stack: &mut ProductionChannelStack,
+    system: &mut DesktopRuntime<'_, ScopedReader, FixtureTransport, FixtureSystem>)
+    -> Result<claude_watch_core::channel::ChannelMonitorSnapshot> {
+    use claude_watch_core::policy::PolicyCatalog;
+    let specs:Vec<_>=PolicyCatalog::families().iter().filter(|family|PolicyCatalog::guard_target(family).is_some()).collect();
+    let families:Vec<_>=specs.iter().map(|family|family.id).collect();
+    let store=&system.storage;
+    let reader=ScopedReader { system:Arc::new(SystemRunner::new(&store.paths.watch().join("runtime/watch-native-observer"))?),home:store.paths.home.clone() };
+    let mut sampler=claude_watch_runtime::sampler::Sampler::new(reader,store.paths.clone());
+    sampler.set_discovery(DiscoveryHandle::for_home(&store.paths.home));
+    let round=sampler.processes_with_system_metadata();
+    let now=round.as_ref().map_or_else(|_|native::now(),|round|round.observed_at);
+    let mut observations=Vec::new();
+    if let Ok(round)=&round {
+        let (egress,local_guard)=system.sample_guard_environment(&stack.enforcer,&families,round);
+        observations.push(GuardObservation::Environment { egress:json!({"families":egress}),local_guard,observed_at:now });
+    }
+    for family in specs {
+        let target=PolicyCatalog::guard_target(family).unwrap();
+        observations.push(match round.as_ref().ok().and_then(|round|
+            claude_watch_runtime::desktop_native::supervision_inventory(round,target.provider()).ok()) {
+            Some((desktops,processes))=>GuardObservation::Inventory { family:family.id.into(),desktops,processes,observed_at:now },
+            None=>GuardObservation::InventoryUnavailable { family:family.id.into(),observed_at:now },
+        });
+    }
+    stack.step_with_observations(observations,native::now())
 }
 
 struct Root(PathBuf);
@@ -465,7 +493,7 @@ pub fn run_contract() {
     };
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let startup = stack.step_with_system(&mut system).unwrap();
+        let startup = step_fixture(stack, &mut system).unwrap();
         if startup.families["claude"].vpn_match.as_ref().is_some_and(|m| m.is_matched()) { break; }
         assert!(Instant::now() < deadline, "production VPN observation did not arrive");
         stack.wait_or_drain(deadline, &workers.0);
@@ -495,7 +523,7 @@ pub fn run_contract() {
         });
         let deadline = Instant::now() + Duration::from_secs(3);
         let pending = loop {
-            let snapshot = stack.step_with_system(&mut system).unwrap();
+            let snapshot = step_fixture(stack, &mut system).unwrap();
             let state = &snapshot.families["claude"];
             if state.active_members.iter().any(|member| member.pid == pid)
                 && helper_pid.is_none_or(|pid| state.active_members.iter().any(|t| t.pid == pid)) { break snapshot; }
@@ -527,7 +555,7 @@ pub fn run_contract() {
         let mut events = Vec::new();
         let mut refresh = None;
         let projection = loop {
-            let snapshot = stack.step_with_system(&mut system).unwrap();
+            let snapshot = step_fixture(stack, &mut system).unwrap();
             events.extend(stack.supervisor.drain_emitted_events());
             let state = &snapshot.families["claude"];
             if refresh.is_none() {
@@ -677,7 +705,7 @@ pub fn run_contract() {
         drop(own_target);
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let snapshot = stack.step_with_system(&mut system).unwrap();
+            let snapshot = step_fixture(stack, &mut system).unwrap();
             if snapshot.families["claude"].active_members.is_empty() {
                 assert_eq!(sessions.load(native::now()).unwrap().unwrap().state, Phase::Ended);
                 break;

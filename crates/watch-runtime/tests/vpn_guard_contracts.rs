@@ -758,7 +758,7 @@ impl FamilyStateTestExt for claude_watch_core::channel::FamilyChannelMonitorStat
 #[test]
 fn f01_f02_f03_gateway_revoke_and_upstream_disconnect_close_active_flows_while_preserving_process() {
     use std::net::TcpStream;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     let (_tmp, _store, _cfg, enforcer, mut supervisor, _rx, proc_tok, now) =
         setup_active_session_and_supervisor(|_, _| {}, |_| {});
@@ -797,7 +797,9 @@ fn f01_f02_f03_gateway_revoke_and_upstream_disconnect_close_active_flows_while_p
             Ok(TunnelStream::Tcp(s))
         })
         .unwrap();
-    enforcer.set_clock(move || now + 0.06).unwrap();
+    let executor_time = Arc::new(AtomicU64::new((now + 0.06).to_bits()));
+    let read_time = executor_time.clone();
+    enforcer.set_clock(move || f64::from_bits(read_time.load(Ordering::Acquire))).unwrap();
     let tok_for_attr = proc_tok.clone();
     enforcer
         .set_accepted_connection_attributor(move |_ctx| {
@@ -917,6 +919,9 @@ fn f01_f02_f03_gateway_revoke_and_upstream_disconnect_close_active_flows_while_p
     let mut bad_obs = sample_vpn_observation(now + 0.5, 2);
     bad_obs.selected_node = ObservedField::Known("DE-Unexpected".into());
     bad_obs.proxy_chain = ObservedField::Known(vec!["AI-Group".into(), "DE-Unexpected".into()]);
+    // Both production participants observe the same fixture clock. A receipt
+    // timestamped before this new command is correctly rejected as stale.
+    executor_time.store((now + 0.5).to_bits(), Ordering::Release);
     let snap = supervisor
         .handle_event(SupervisionEvent::VpnObservationUpdated {
             observation: bad_obs,

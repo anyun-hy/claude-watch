@@ -338,7 +338,30 @@ fn real_native_observer_reads_only_bound_self_socket_and_rejects_reused_identity
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn own_sampling_child_has_output_and_time_limits_without_signaling_target_apps() {
+    use std::time::Instant;
+    // Isolate the test's process tree from other parallel Rust tests. The child
+    // runs this same production-path contract, with no alternate runner logic.
+    if std::env::var_os("CW_OWNED_SAMPLING_CHILD").is_none() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "own_sampling_child_has_output_and_time_limits_without_signaling_target_apps", "--nocapture"])
+            .env("CW_OWNED_SAMPLING_CHILD", "1").process_group(0).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() { assert!(status.success()); return; }
+            if Instant::now() >= deadline {
+                claude_watch_system::terminate_owned_group(&child); let _ = child.wait();
+                panic!("owned sampling contract exceeded its 30-second total budget");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let children = || claude_watch_system::list_descendant_pids(
+        &[std::process::id()], claude_watch_system::effective_uid());
+    let before = children();
+    assert!(before.is_empty(), "isolated sampling contract must start without children");
     let runner = SystemRunner::development().unwrap();
+    let started = Instant::now();
     let error = runner
         .run(
             ReadCommand::Observer(ObserverAction::Inventory),
@@ -349,6 +372,9 @@ fn own_sampling_child_has_output_and_time_limits_without_signaling_target_apps()
         .err()
         .expect("native inventory exceeds tiny test limit");
     assert_eq!(error.code, "command_output_oversize");
+    let oversize_seconds = started.elapsed().as_secs_f64();
+    assert_eq!(children(), before, "output-limit return must reap its owned Observer, including zombies");
+    let started = Instant::now();
     let error = runner
         .run(
             ReadCommand::Observer(ObserverAction::Inventory),
@@ -359,6 +385,72 @@ fn own_sampling_child_has_output_and_time_limits_without_signaling_target_apps()
         .err()
         .expect("native inventory cannot finish in 1ms");
     assert_eq!(error.code, "command_timeout");
+    let timeout_seconds = started.elapsed().as_secs_f64();
+    assert_eq!(children(), before, "timeout return must reap its owned Observer, including zombies");
+    // Exercise the same command owner after both failure paths, then normal
+    // plutil completion. These are real helpers, not a second subprocess mock.
+    let started = Instant::now();
+    let inventory = Observer { runner: &runner }.inventory().unwrap();
+    assert!(inventory.processes.contains_key(&std::process::id()));
+    let recovery_seconds = started.elapsed().as_secs_f64();
+    assert_eq!(children(), before, "successful Observer completion must be waited for");
+    struct Plist(PathBuf);
+    impl Drop for Plist { fn drop(&mut self) { let _ = fs::remove_file(&self.0); } }
+    let plist = Plist(std::env::temp_dir().join(format!("cw-owned-sampling-{}.plist", Uuid::new_v4())));
+    fs::write(&plist.0, b"<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>owned</key><true/></dict></plist>").unwrap();
+    let started = Instant::now();
+    for _ in 0..16 {
+        let output = runner.run(ReadCommand::Plist(plist.0.clone()), &[], Duration::from_secs(3), 1024).unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(serde_json::from_slice::<Value>(&output.stdout).unwrap()["owned"], true);
+        assert_eq!(children(), before, "normal plutil return must reap its owned child, including zombies");
+    }
+    let plutil_seconds = started.elapsed().as_secs_f64();
+    // Stop the actual audit worker while its owned process is still running.
+    // This checks cancellation/reaping, not just the idle worker's join path.
+    use claude_watch_runtime::channel_supervisor::{AsyncAuditRequest, ChannelSupervisor};
+    use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc};
+    let stop = Arc::new(AtomicBool::new(false));
+    let (events, _event_rx) = mpsc::channel();
+    let (finished, completed) = mpsc::channel();
+    let (requests, worker) = ChannelSupervisor::spawn_async_audit_worker(stop.clone(), events, move |request| {
+        let result = claude_watch_runtime::audit_process::run_json(
+            std::process::Command::new("/bin/sleep").arg("30"), &json!({}),
+            Instant::now() + Duration::from_secs(10), request.cancellation.as_deref().unwrap());
+        let _ = finished.send(result.as_ref().err().map(|error| error.code.clone()));
+        result.map(|value| (value, Value::Null, native::now()))
+    }).unwrap();
+    requests.send(AsyncAuditRequest {
+        request_id: 1, family: "claude".into(), target: claude_watch_core::processes::LaunchTarget::ClaudeCli,
+        session_id: None, context_id: None,
+        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest:"owned-fixture".into(), guard_policy_digest:"owned-fixture".into() },
+        vpn_epoch: None, upstream_endpoint: "http://127.0.0.1:1".into(), requested_at:native::now(),
+        timeout_seconds:10.0, cancellation:None,
+    }).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut running_child = None;
+    while Instant::now() < deadline && running_child.is_none() {
+        running_child = children().into_iter().find(|pid| claude_watch_system::inspect_process_identity(*pid)
+            .is_some_and(|identity| identity.executable_path == "/bin/sleep"));
+        if running_child.is_none() { std::thread::sleep(Duration::from_millis(5)); }
+    }
+    let started = Instant::now();
+    stop.store(true, Ordering::Release);
+    worker.join().unwrap();
+    let audit_cancel_seconds = started.elapsed().as_secs_f64();
+    assert!(running_child.is_some(), "cancellation must interrupt a real in-flight owned child");
+    assert_eq!(completed.recv_timeout(Duration::from_millis(50)).unwrap().as_deref(), Some("audit_cancelled"));
+    assert!(audit_cancel_seconds < 2.0, "audit stop must honor its existing one-second cleanup allowance");
+    assert_eq!(children(), before, "audit cancellation must finish reaping before shutdown is acknowledged");
+    let evidence = json!({"clock":"monotonic", "observer_output_limit_seconds":oversize_seconds,
+        "observer_timeout_seconds":timeout_seconds, "observer_recovery_seconds":recovery_seconds,
+        "plutil_calls":16, "plutil_total_seconds":plutil_seconds, "inflight_audit_cancel_seconds":audit_cancel_seconds,
+        "remaining_owned_descendants":0});
+    println!("sampling child lifecycle: {evidence}");
+    if let Some(dir) = std::env::var_os("CW_CHANNEL_CONTRACT_DIR") {
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(Path::new(&dir).join("sampling-child-lifecycle.json"), serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+    }
     assert!(runner
         .run(
             ReadCommand::DnsA {

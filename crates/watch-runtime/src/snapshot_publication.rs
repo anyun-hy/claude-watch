@@ -169,10 +169,10 @@ impl<R: ReadRunner> SnapshotPublisher<R> {
         self.poll(group, pin, true)
     }
     pub fn poll(&mut self, group: &str, pin: &str, force_network: bool) -> Result<Value> {
-        self.poll_with_inventory(group, pin, force_network, |_| {})
+        self.poll_with_inventory(group, pin, force_network, false, |_| {})
     }
     pub fn poll_with_inventory(
-        &mut self, group: &str, pin: &str, force_network: bool,
+        &mut self, group: &str, pin: &str, force_network: bool, guard_context: bool,
         observe: impl FnOnce(std::result::Result<&crate::sampler::ProcessRound, &CoreError>),
     ) -> Result<Value> {
         let current = Observer {
@@ -188,7 +188,8 @@ impl<R: ReadRunner> SnapshotPublisher<R> {
                 "快照生产者启动身份未通过核对",
             ));
         }
-        let processes = self.sampler.processes();
+        let processes = if guard_context { self.sampler.processes_with_system_metadata() }
+            else { self.sampler.processes() };
         observe(processes.as_ref());
         let processes = processes?;
         let (due, early_retry) =
@@ -667,6 +668,11 @@ mod tests {
         fs::write(bundle.join("Contents/Info.plist"),r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string><key>CFBundleExecutable</key><string>PrivateMain</string></dict></plist>"#).unwrap();
         let runner = std::sync::Arc::new(PipelineFake { incomplete: AtomicBool::new(true),bundle });
         let mut sampler = Sampler::new(runner.clone(), store.paths.clone()); sampler.use_fixture_tag();
+        let mut inputs = crate::target_discovery::DiscoveryInputs::for_home(&store.paths.home);
+        inputs.application_roots = vec![fs::canonicalize(&path).unwrap().join("Applications")];
+        inputs.prefixes.clear();
+        inputs.query_registry = false;
+        sampler.set_discovery(crate::target_discovery::DiscoveryHandle::new(inputs));
         let mut publisher = SnapshotPublisher::new(store.clone(), sampler, identity()).unwrap();
         let first = publisher.poll("", "", true).unwrap();
         assert_eq!(first["proxy"]["connectionObservation"]["collectorState"], "partial");

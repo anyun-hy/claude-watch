@@ -120,7 +120,7 @@ impl Request {
             "guard-diagnostic" => (&[], &["apply"], &[]),
             "receipt-diagnostic" => (&[], &["apply"], &[]),
             "diagnose-proxy" => (&[], &["stdin-config"], &["proxy", "config"]),
-            "observe" => (&[], &["json"], &["home"]),
+            "observe" => (&[], &["json", "processes-only"], &["home"]),
             "snapshot" => (&[], &["full"], &[]),
             "ai-probe" => (&[], &[], &["service"]),
             "dns-probe" => (&[], &[], &[]),

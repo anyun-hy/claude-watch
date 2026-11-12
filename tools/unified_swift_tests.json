@@ -49,8 +49,9 @@
       ],
       "dependencies": [],
       "fixture_only": true,
-      "safety_notes": "Default invocation mocks all exit requests; live API checks read only this test process's cwd/argv. AIProcessControl(isFixture: true) never signals monitored apps.",
+      "safety_notes": "Default invocation mocks monitored-app exit requests; bounded command tests run echo and terminate/reap only their own sleeping fixture child. AIProcessControl(isFixture: true) never signals monitored apps.",
       "unselected_modes": {
+        "--classification-smoke": "Read-only host inventory bridge check requires an isolated test bundle explicitly wired to the current candidate engine and observer; it never closes targets.",
         "--owned-force-child": "Excluded from automatic execution: this optional mode has cleanup signals by PID without a fresh identity check. Default policy fixtures and owned-child identity-checked TERM remain included.",
         "--inspect": "Read-only host inventory mode is not an assertion suite and is not selected."
       },
@@ -113,12 +114,32 @@
     {
       "id": "swift.TargetDiscoveryTests",
       "kind": "swift",
-      "test_files": ["monitor/tests/TargetDiscoveryTests.swift"],
-      "sources": ["monitor/Sources/*.swift", "monitor/ControlledEntry/ControlledEntryApp.swift"],
-      "defines": ["UI_REVIEW", "CONTROLLED_ENTRY_BINDING_TESTS"],
-      "args": ["{run_dir}/artifacts/target-discovery-wire.json", "{run_dir}/artifacts/target-discovery-pending.json", "{run_dir}/artifacts/target-discovery-staging.json"],
-      "frameworks": ["SwiftUI", "AppKit", "WebKit", "ApplicationServices", "Carbon"],
-      "dependencies": ["rust.target_discovery_fixture"],
+      "test_files": [
+        "monitor/tests/TargetDiscoveryTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift",
+        "monitor/ControlledEntry/ControlledEntryApp.swift"
+      ],
+      "defines": [
+        "UI_REVIEW",
+        "CONTROLLED_ENTRY_BINDING_TESTS"
+      ],
+      "args": [
+        "{run_dir}/artifacts/target-discovery-wire.json",
+        "{run_dir}/artifacts/target-discovery-pending.json",
+        "{run_dir}/artifacts/target-discovery-staging.json"
+      ],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit",
+        "ApplicationServices",
+        "Carbon"
+      ],
+      "dependencies": [
+        "rust.target_discovery_fixture"
+      ],
       "fixture_only": true,
       "safety_notes": "Decodes production Rust discovery/monitor/staging fixtures and calls the real wrapper argument binding only; no NSApplication, registration, real AI or configuration changes."
     },
@@ -170,7 +191,8 @@
         "UI_REVIEW"
       ],
       "args": [
-        "{run_dir}/artifacts/process-protection-deadlines.json"
+        "{run_dir}/artifacts/process-protection-deadlines.json",
+        "{run_dir}/artifacts/graph-block-deadline.json"
       ],
       "frameworks": [
         "SwiftUI",
@@ -530,11 +552,21 @@
     {
       "id": "swift.InitializationFlowLogTests",
       "kind": "swift",
-      "test_files": ["monitor/tests/InitializationFlowLogTests.swift"],
-      "sources": ["monitor/Sources/*.swift"],
-      "defines": ["UI_REVIEW"],
+      "test_files": [
+        "monitor/tests/InitializationFlowLogTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
       "args": [],
-      "frameworks": ["SwiftUI", "AppKit", "WebKit"],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
       "dependencies": [],
       "fixture_only": true,
       "safety_notes": "Owned temporary private log directories, synthetic initialization outcomes and production entry-log factory; no real UI launch, AI, service, VPN or installed log writes."
@@ -714,6 +746,27 @@
       "dependencies": [],
       "fixture_only": true,
       "safety_notes": "Every LeakCheckStore is fixture-backed; no optional historical/live receipt argument selected."
+    },
+    {
+      "id": "swift.LeakReceiptRoundTripTests",
+      "kind": "compile_only",
+      "test_files": [
+        "monitor/tests/LeakReceiptRoundTripTests.swift"
+      ],
+      "sources": [
+        "monitor/Sources/*.swift"
+      ],
+      "defines": [
+        "UI_REVIEW"
+      ],
+      "frameworks": [
+        "SwiftUI",
+        "AppKit",
+        "WebKit"
+      ],
+      "dependencies": [],
+      "fixture_only": false,
+      "safety_notes": "Compiles the real Swift submission bridge; the automatic fixture suite never runs it. Explicit execution accepts only original WebKit probes and current local proxy context. The --production-home flag additionally acknowledges writes of these real diagnostic receipts to Watch state; no synthetic input is supported."
     },
     {
       "id": "swift.LeakDiagnosticTraceTests",

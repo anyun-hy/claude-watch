@@ -19,6 +19,7 @@ use claude_watch_runtime::{
     channel_supervisor::{AsyncAuditRequest, ChannelSupervisor, SupervisionEvent},
     channel_diagnostics::ChannelDiagnostics,
     config_store::ConfigStore,
+    controlled::Controller,
     daemon::{DaemonLease, PROCESS_INTERVAL},
     desktop_native::{DesktopRuntime, NativeDesktop},
     events::{Alert, EventFields, EventStore, Severity},
@@ -48,6 +49,35 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+/// A single ownership-transfer slot: newer producer rounds replace pending
+/// ones. Consumed rounds are never retained here or timestamped again.
+#[derive(Default)]
+struct GuardRoundHandoff {
+    pending: std::sync::Mutex<Option<(f64, Result<claude_watch_runtime::sampler::ProcessRound>)>>,
+    ready: std::sync::Condvar,
+}
+impl GuardRoundHandoff {
+    fn publish(&self, round: Result<claude_watch_runtime::sampler::ProcessRound>) {
+        let observed_at = round.as_ref().map_or_else(|_| native::now(), |round| round.observed_at);
+        *self.pending.lock().unwrap_or_else(|error| error.into_inner()) = Some((observed_at, round));
+        self.ready.notify_one();
+    }
+    fn take(&self) -> Option<(f64, Result<claude_watch_runtime::sampler::ProcessRound>)> {
+        let pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
+        let (mut pending, _) = self.ready.wait_timeout_while(pending, Duration::from_millis(100), |value| value.is_none())
+            .unwrap_or_else(|error| error.into_inner());
+        pending.take()
+    }
+    fn unchanged(&self, current: &claude_watch_runtime::sampler::ProcessRound, backend: &std::path::Path) -> bool {
+        let pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
+        match pending.as_ref() {
+            Some((_, Ok(newer))) => claude_watch_runtime::macos::guard_round_matches(current, newer, backend),
+            Some((_, Err(_))) => false,
+            None => claude_watch_runtime::macos::guard_round_matches(current, current, backend),
+        }
+    }
+}
 
 #[cfg(test)]
 #[path = "../../watch-runtime/tests/support/hardened_helper.rs"]
@@ -82,40 +112,11 @@ pub struct ProductionChannelStack {
 
 /// Slow collectors report facts. Only the authority thread filters identities
 /// and turns these facts into permits. No collector owns a supervisor lock.
-enum GuardObservation {
+pub(crate) enum GuardObservation {
     Environment { egress: Value, local_guard: Value, observed_at: f64 },
     Inventory { family: String, desktops: Vec<(Desktop, bool, String)>,
         processes: Vec<BoundProcessToken>, observed_at: f64 },
     InventoryUnavailable { family: String, observed_at: f64 },
-}
-
-#[cfg(test)]
-use claude_watch_runtime::controlled::DesktopSystem;
-
-#[cfg(test)]
-fn collect_guard_observations<S: DesktopSystem>(
-    system: &mut S, mut publish: impl FnMut(GuardObservation) -> Result<()>,
-) -> Result<()> {
-    let egress = system.egress();
-    let local_guard = system.local_guard()
-        .unwrap_or_else(|_| json!({"proxy":"unknown","tun":"unknown"}));
-    publish(GuardObservation::Environment { egress, local_guard, observed_at: system.now() })?;
-    for family in PolicyCatalog::families() {
-        if PolicyCatalog::guard_target(family).is_none() { continue; }
-        let result = system.set_family(family.id).and_then(|()| {
-            Ok((system.desktops()?, system.supervised_processes()?))
-        });
-        let observation = match result {
-            Ok((desktops, processes)) => GuardObservation::Inventory {
-                family: family.id.into(), desktops, processes, observed_at: system.now(),
-            },
-            Err(_) => GuardObservation::InventoryUnavailable {
-                family: family.id.into(), observed_at: system.now(),
-            },
-        };
-        publish(observation)?;
-    }
-    Ok(())
 }
 
 fn refresh_and_stage_production_targets(
@@ -819,7 +820,7 @@ impl ProductionChannelStack {
                 SupervisionEvent::EnvironmentUpdated { egress, local_guard, observed_at },
             GuardObservation::InventoryUnavailable { family, observed_at } =>
                 SupervisionEvent::ProcessInventoryUnavailable { family, observed_at },
-            GuardObservation::Inventory { family, desktops, mut processes, observed_at } => {
+            GuardObservation::Inventory { family, mut desktops, mut processes, observed_at } => {
                 if let Some(ref reg) = self.sandbox_registry {
                     let verified_tokens = reg.verified_family_tokens(&family, delivered_at);
                     let mut protected_pids: Vec<u32> = verified_tokens.iter().map(|t| t.pid).collect();
@@ -829,6 +830,11 @@ impl ProductionChannelStack {
                         .filter(|t| !protected_pids.contains(&t.pid)).map(|t| t.pid).collect();
                     unprotected_pids.sort_unstable();
                     unprotected_pids.dedup();
+                    // Discovered desktops remain visible in the unmanaged
+                    // scope; only current registry members can request audits.
+                    desktops.retain(|(desktop, _, _)| verified_tokens.iter().any(|token|
+                        token.pid == desktop.pid && token.start_seconds == desktop.start_seconds
+                            && token.start_microseconds == desktop.start_microseconds));
                     processes = verified_tokens;
                     let id_report = reg.identity_report(true, true, true);
                     self.supervisor.set_family_unmanaged_pids(&family, unprotected_pids.clone(), delivered_at);
@@ -925,22 +931,14 @@ impl ProductionChannelStack {
         Ok(())
     }
 
-    // Synchronous harness for existing component contracts. Production uses
-    // the same collection and ingestion functions on independent threads.
+    /// Tests supply observation inputs to the actual authority ingestion path.
     #[cfg(test)]
-    pub fn step_with_system<S: DesktopSystem>(&mut self, system: &mut S) -> Result<ChannelMonitorSnapshot> {
+    pub(crate) fn step_with_observations(&mut self, observations: Vec<GuardObservation>, now: f64) -> Result<ChannelMonitorSnapshot> {
         self.drain_background_events()?;
-        self.reconcile_controlled_backend(system.now())?;
-        collect_guard_observations(system, |observation| {
-            let at = match &observation {
-                GuardObservation::Environment { observed_at, .. }
-                | GuardObservation::Inventory { observed_at, .. }
-                | GuardObservation::InventoryUnavailable { observed_at, .. } => *observed_at,
-            };
-            self.apply_guard_observation(observation, at)
-        })?;
+        self.reconcile_controlled_backend(now)?;
+        for observation in observations { self.apply_guard_observation(observation, now)?; }
         self.drain_background_events()?;
-        Ok(self.supervisor.snapshot(system.now()))
+        Ok(self.supervisor.snapshot(now))
     }
 
     #[cfg(test)]
@@ -1211,6 +1209,9 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
         })?)
     };
     let (observation_tx, observation_rx) = std::sync::mpsc::channel();
+    // One immutable handoff, not a second observation cache. A slow collector
+    // cannot hold up the authority or accumulate unbounded stale rounds.
+    let guard_rounds = Arc::new(GuardRoundHandoff::default());
     let guard = if request.flag("observe-only") {
         None
     } else {
@@ -1228,6 +1229,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
         let audit_paths = paths.clone();
         let guard_producer = owner.producer.clone();
         let environment_tx = observation_tx.clone();
+        let collector_rounds = guard_rounds.clone();
         Some(
             thread::Builder::new()
                 .name("claude-session-guard".into())
@@ -1248,6 +1250,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                     let enforcer = channel_stack.enforcer.clone();
                     let collector = thread::Builder::new().name("watch-guard-collector".into())
                         .spawn(move || -> Result<()> {
+                            let controller = Controller::new(store.clone());
                             let network = host.network.clone();
                             let mut runtime = DesktopRuntime {
                                 desktop: &mut desktop, system: &mut host, network, storage: store,
@@ -1261,12 +1264,22 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                                 .map(|family| family.id).collect();
                             while !collector_stop.load(Ordering::Acquire) {
                                 let started = Instant::now();
-                                let (egress, local_guard) = runtime.sample_guard_environment(&enforcer, &families);
+                                let Some((observed_at, round)) = collector_rounds.take() else { continue; };
+                                let (mut egress, mut local_guard) = match &round {
+                                    Ok(round) => runtime.sample_guard_environment(&enforcer, &families, round),
+                                    Err(error) => (families.iter().map(|family| ((*family).to_owned(), json!({"state":"unknown","code":error.code}))).collect(),
+                                        json!({"proxy":"unknown","tun":"unknown","code":error.code})),
+                                };
+                                if round.as_ref().is_ok_and(|round| !collector_rounds.unchanged(round, &runtime.storage.paths.watch().join("runtime/watch-engine"))) {
+                                    egress = families.iter().map(|family| ((*family).to_owned(), json!({"state":"unknown","code":"process_observation_changed"}))).collect();
+                                    local_guard = json!({"proxy":"unknown","tun":"unknown","code":"process_observation_changed","process_observed_at":observed_at});
+                                }
+                                let observed_at = observed_at.min(local_guard["environment_observed_at"].as_f64().unwrap_or(observed_at));
                                 environment_tx.send(GuardObservation::Environment {
-                                    egress: json!({"families":egress}), local_guard, observed_at: native::now(),
+                                    egress: json!({"families":egress}), local_guard, observed_at,
                                 }).map_err(|_| CoreError::new("guard_authority_closed", "保护监督器已关闭"))?;
                                 if collector_stop.load(Ordering::Acquire) { break; }
-                                let receipt = claude_watch_runtime::channel_policy_status::read_guard_summary(&runtime.storage, native::now());
+                                let receipt = controller.guard_tick(&mut runtime)?;
                                 guard_history.observe(&guard_diagnostics, &receipt, native::now());
                                 if let Some(alerts) = &guard_alerts {
                                     let pending = notices.pending(&receipt);
@@ -1359,8 +1372,9 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
             }
             .load()?;
             let pin = pinned_node(&storage.paths, &config.proxy_group);
-            let sample = publisher.poll_with_inventory(&config.proxy_group, &pin, false, |result| {
+            let sample = publisher.poll_with_inventory(&config.proxy_group, &pin, false, guard.is_some(), |result| {
                 if guard.is_none() { return; }
+                guard_rounds.publish(result.cloned().map_err(Clone::clone));
                 let at = result.as_ref().map_or_else(|_| native::now(), |round| round.observed_at);
                 for family in PolicyCatalog::families() {
                     let Some(target) = PolicyCatalog::guard_target(family) else { continue; };
@@ -1468,6 +1482,46 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guard_round_handoff_keeps_latest_time_and_rejects_inflight_changes() {
+        use claude_watch_runtime::sampler::{ProcessRound, ProcessTableObservation};
+        let handoff = GuardRoundHandoff::default();
+        let at = native::now();
+        let row = json!({"uid":501,"executable":"/Applications/Surge.app/Contents/MacOS/Surge","stamp":"same-start"});
+        let mut round = ProcessRound {
+            id:"initial".into(), uid:501, targets:vec![], identities:Default::default(), roles:json!({}),
+            match_evidence:Default::default(), unavailable:vec![], diagnostic_reasons:Default::default(),
+            confirmed_exited_count:0, complete:true, observed_at:at, discovery:None,
+            system_processes:Some(ProcessTableObservation { observed_at:at, processes:Ok([(42,row.clone())].into()), root_starts:Default::default() }),
+        };
+        for sequence in 0..100 {
+            round.id = sequence.to_string();
+            handoff.publish(Ok(round.clone()));
+        }
+        let (source_at, current) = handoff.take().unwrap();
+        let current = current.unwrap();
+        assert_eq!(current.id, "99");
+        assert_eq!(source_at, at);
+        assert_eq!(current.observed_at, at, "overwriting queued rounds must never renew their source time");
+        let backend = std::path::Path::new("/fixture/runtime/watch-engine");
+        handoff.publish(Ok(current.clone()));
+        assert!(handoff.unchanged(&current, backend));
+        round.system_processes.as_mut().unwrap().processes.as_mut().unwrap().insert(43, row);
+        handoff.publish(Ok(round.clone()));
+        assert!(!handoff.unchanged(&current, backend), "a newly observed candidate invalidates in-flight results");
+        let mut stale = current.clone(); stale.observed_at -= 9.0;
+        handoff.publish(Ok(stale));
+        assert!(!handoff.unchanged(&current, backend));
+        handoff.publish(Err(CoreError::new("sampling_failed", "fixture input")));
+        assert!(!handoff.unchanged(&current, backend));
+        let (failed_at, failed) = handoff.take().unwrap();
+        assert!(failed.is_err());
+        assert!(failed_at >= at && failed_at <= native::now());
+        let started = Instant::now();
+        assert!(handoff.take().is_none());
+        assert!(started.elapsed() < Duration::from_millis(500), "empty handoff must leave stop checks bounded");
+    }
 
     #[test]
     fn slow_collector_does_not_delay_vpn_events_or_expiry() {
@@ -1731,116 +1785,13 @@ mod tests {
         use claude_watch_core::{
             channel::{BoundProcessToken, NetworkBackendKind},
             config::Config,
-            processes::{LaunchTarget, ProcessRole},
-            session::{Desktop, Launcher},
+            processes::ProcessRole,
+            session::Desktop,
             vpn::{
                 ObservationConsistency, ObservedField, UpstreamProtocol, VpnEpoch, VpnExpectation,
                 VpnObservation,
             },
         };
-
-        struct SeatbeltFixtureSystem {
-            family: &'static str,
-            now: f64,
-        }
-        impl DesktopSystem for SeatbeltFixtureSystem {
-            fn launch_target(&self) -> LaunchTarget {
-                if self.family == "openai" {
-                    LaunchTarget::CodexDesktop
-                } else {
-                    LaunchTarget::ClaudeDesktop
-                }
-            }
-            fn set_family(&mut self, family_id: &str) -> Result<()> {
-                self.family = if family_id == "openai" { "openai" } else { "claude" };
-                Ok(())
-            }
-            fn now(&self) -> f64 {
-                self.now
-            }
-            fn monotonic(&self) -> Duration {
-                Duration::from_secs(1)
-            }
-            fn wait(&mut self, _: Duration) {}
-            fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
-                if self.family == "claude" {
-                    Ok(vec![(
-                        Desktop {
-                            pid: 4100,
-                            start_seconds: 900,
-                            start_microseconds: 1,
-                        },
-                        true,
-                        "u501:900:1".into(),
-                    )])
-                } else {
-                    Ok(vec![])
-                }
-            }
-            fn supervised_processes(&mut self) -> Result<Vec<BoundProcessToken>> {
-                if self.family == "claude" {
-                    Ok(vec![BoundProcessToken::with_system_identity(
-                        4100,
-                        501,
-                        900,
-                        1,
-                        ProcessRole::DesktopMain,
-                    )
-                    .with_audit_token([501, 501, 20, 501, 20, 4100, 0, 9])])
-                } else {
-                    Ok(vec![])
-                }
-            }
-            fn desktop_alive(&mut self, _: &Desktop) -> Result<bool> {
-                Ok(true)
-            }
-            fn desktop_tree_running(&mut self) -> Result<bool> {
-                Ok(self.family == "claude")
-            }
-            fn launcher(&mut self) -> Result<Launcher> {
-                Ok(Launcher {
-                    pid: 1,
-                    start: "init".into(),
-                })
-            }
-            fn full_audit(&mut self) -> Result<Value> {
-                panic!("guard loop must not call synchronous full_audit")
-            }
-            fn egress(&mut self) -> Value {
-                json!({
-                    "ip": "1.1.1.1",
-                    "country": "JP",
-                    "observed_at": self.now,
-                    "source": "fixture",
-                    "family": "*",
-                    "upstream_endpoint": "http://127.0.0.1:17890",
-                    "context_id": "ctx",
-                    "via_controlled_path": true
-                })
-            }
-            fn local_guard(&mut self) -> Result<Value> {
-                Ok(json!({
-                    "context": "ctx",
-                    "context_id": "ctx",
-                    "proxy": "ok",
-                    "tun": "disabled",
-                    "guard_backend_healthy": true,
-                    "observation_unavailable": []
-                }))
-            }
-            fn backend_healthy(&mut self) -> Result<bool> {
-                Ok(true)
-            }
-            fn launcher_matches(&mut self, _: &Launcher) -> Result<bool> {
-                Ok(true)
-            }
-            fn open_desktop(&mut self) -> Result<()> {
-                Ok(())
-            }
-            fn quit_desktop(&mut self) -> Result<()> {
-                Ok(())
-            }
-        }
 
         let short_id = &uuid::Uuid::new_v4().simple().to_string()[..8];
         let root = std::path::PathBuf::from("/tmp").join(format!("cwdsb-{short_id}"));
@@ -1972,21 +1923,19 @@ mod tests {
             "gateway_server_identity_unverified_i03"
         );
 
-        // 3. Verify `step_with_system` ingests VPN observations from the background worker and classifies
-        //    unregistered processes as `unmanaged_member_pids` (never falsely claiming protected)
+        // Actual ingestion must consume worker VPN events and leave the
+        // supplied, unregistered identity outside managed membership.
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut sys = SeatbeltFixtureSystem {
-            family: "claude",
-            now: native::now(),
-        };
         let snap = loop {
-            sys.now = native::now();
-            let s = stack.step_with_system(&mut sys).unwrap();
-            if s.families["claude"].vpn_epoch.is_some() {
-                break s;
-            }
-            assert!(Instant::now() < deadline, "VPN observation worker did not deliver sample");
-            stack.wait_or_drain(deadline, &stop);
+            let now = native::now();
+            let observation = GuardObservation::Inventory { family:"claude".into(),
+                desktops:vec![(Desktop { pid:4100,start_seconds:900,start_microseconds:1 },true,"fixture".into())],
+                processes:vec![BoundProcessToken::with_system_identity(4100,501,900,1,ProcessRole::DesktopMain)
+                    .with_audit_token([501,501,20,501,20,4100,0,9])], observed_at:now };
+            let s=stack.step_with_observations(vec![observation],now).unwrap();
+            if s.families["claude"].vpn_epoch.is_some() { break s; }
+            assert!(Instant::now()<deadline,"VPN observation worker did not deliver sample");
+            stack.wait_or_drain(deadline,&stop);
         };
         assert_eq!(snap.families["claude"].backend, NetworkBackendKind::Seatbelt);
         assert!(!snap.families["claude"].sandbox_ready);

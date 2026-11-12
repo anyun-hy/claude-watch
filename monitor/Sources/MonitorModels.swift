@@ -498,6 +498,7 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
     let blocked_new_connections: UInt32
     var local_proxy_port: UInt16? = nil
     var valid_until: Double? = nil
+    var blocked_evidence_valid_until: Double? = nil
     let updated_at: Double
     var backend: String? = nil
     var vpn_epoch: VpnEpochModel? = nil
@@ -594,6 +595,11 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
         !hasExpiredSubscription && managedMemberCount > 0 && permit_state == "revoked"
             && display_state == .blocked && policy_sync_state == .applied
             && applied_policy_version == saved_policy_version && active_flows_count == 0
+    }
+
+    func isConfirmedFlowBlocked(at now: Double) -> Bool {
+        guard let until = blocked_evidence_valid_until, until.isFinite else { return false }
+        return now.isFinite && now < until && isConfirmedFlowBlocked
     }
 
     /// Binds network flows and process rows to the same supervised session and

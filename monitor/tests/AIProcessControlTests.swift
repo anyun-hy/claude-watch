@@ -4,6 +4,14 @@ import Darwin
 @main
 struct AIProcessControlTests {
     @MainActor static func main() async throws {
+        if CommandLine.arguments.contains("--classification-smoke") {
+            // Run only in the isolated test bundle wired to the current candidate
+            // engine/observer. This reads the host inventory and sends no signals.
+            let started = ProcessInfo.processInfo.systemUptime
+            let inventory = try AIProcessInventory.read()
+            print("PASS: Swift → engine → native observer read-only batch; identities=\(inventory.count), roots=\(inventory.filter { $0.rootProduct != nil }.count), seconds=\(ProcessInfo.processInfo.systemUptime - started)")
+            return
+        }
         if CommandLine.arguments.contains("--owned-exec-identity") {
             // Real macOS API verification without sending any signal or sleeping:
             // pipe handshakes synchronize before and after an in-place exec to the
@@ -217,27 +225,29 @@ struct AIProcessControlTests {
         expect(effectAccepted && effects == 1, "effect adapter receives the verified original PID")
         let forceFailed = AIProcessClosePolicy.forceRemaining(plan, lookup: { pid in rows.first { $0.pid == pid } }, force: { _ in false })
         expect(forceFailed.requested == 0 && forceFailed.failed == 3, "failed force requests are never reported as successful")
-        expect(AIProcessInventory.nodeEntry("/usr/bin/node /x/node_modules/@anthropic-ai/claude-code/cli.js")?.hasSuffix("cli.js") == true, "executed node script recognized")
-        expect(AIProcessInventory.nodeEntry("/usr/bin/node -e /x/node_modules/@anthropic-ai/claude-code/cli.js") == nil, "inline code cannot impersonate script entry")
-        expect(AIProcessInventory.nodeEntry("/usr/bin/node /unrelated.js /x/node_modules/@anthropic-ai/claude-code/cli.js") == "/unrelated.js", "later data argument is not an entry")
-        expect(AIProcessInventory.nodeEntry(
-            "/usr/bin/node --require /tmp/preload.js --experimental-vm-modules node_modules/@anthropic-ai/claude-code/cli.js",
-            cwd: "/opt/claude") == "/opt/claude/node_modules/@anthropic-ai/claude-code/cli.js",
-            "nodeEntry skips two-token --require and resolves relative path against cwd")
-        expect(AIProcessClosePolicy.managedCodexAppServer(
-            path: "/Users/test/.codex/packages/app-server-daemon/releases/1.0.0/bin/codex",
-            home: "/Users/test",
-            arguments: "codex app-server daemon"),
-            "managed codex app-server requires release path and daemon subcommand")
-        expect(!AIProcessClosePolicy.managedCodexAppServer(
-            path: "/Users/test/.codex/packages/app-server-daemon/releases/1.0.0/bin/codex",
-            home: "/Users/test",
-            arguments: "codex --version"),
-            "managed codex app-server rejects non-daemon invocation")
-        expect(AIProcessInventory.currentDirectory(getpid()) == FileManager.default.currentDirectoryPath,
-               "production currentDirectory reads live process cwd via PROC_PIDVNODEPATHINFO")
-        expect(AIProcessInventory.arguments(getpid())?.first?.isEmpty == false,
-               "production arguments reads NUL-delimited argv tokens via KERN_PROCARGS2")
+        let echoed = try AIProcessInventory.command(URL(fileURLWithPath: "/bin/echo"), arguments: ["bounded"],
+            deadline: ProcessInfo.processInfo.systemUptime + 2)
+        expect(String(decoding: echoed, as: UTF8.self) == "bounded\n", "bounded command returns complete output")
+        do {
+            _ = try AIProcessInventory.command(URL(fileURLWithPath: "/bin/echo"), arguments: ["too-long"],
+                deadline: ProcessInfo.processInfo.systemUptime + 2, maxBytes: 3)
+            fatalError("oversize output accepted")
+        } catch AIProcessInventoryFailure.outputTooLarge {
+            expect(true, "oversize output fails closed")
+        }
+        let pidFile = FileManager.default.temporaryDirectory.appendingPathComponent("cw-owned-read-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: pidFile) }
+        let started = ProcessInfo.processInfo.systemUptime
+        do {
+            _ = try AIProcessInventory.command(URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "echo $$ > \"$1\"; exec /bin/sleep 30", "owned-reader", pidFile.path],
+                deadline: started + 0.2)
+            fatalError("deadline accepted a hung child")
+        } catch AIProcessInventoryFailure.timeout {
+            let pid = Int32(try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines))!
+            expect(ProcessInfo.processInfo.systemUptime - started < 2, "hung command respects the deadline")
+            expect(Darwin.kill(pid, 0) == -1 && errno == ESRCH, "timed-out owned child was terminated and reaped")
+        }
         let fixture = AIProcessControl(isFixture: true)
         let mock = [WatchedProcess(id: "p", pid: 999999, started: "mock", kind: "code", authorized: true)]
         let prepared = try await fixture.prepare(.claude, sampled: mock, backendPID: nil)

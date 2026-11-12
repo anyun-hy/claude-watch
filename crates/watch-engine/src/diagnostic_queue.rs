@@ -635,42 +635,21 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
     #[test]
-    fn channel_cutoff_precedes_full_or_failed_log_queue() {
-        use claude_watch_core::config::Config;
-        use claude_watch_runtime::{
-            channel_enforcer::LocalTunnelEnforcer,
-            channel_policy_status::read_guard_summary,
-            channel_supervisor::{ChannelSupervisor, SupervisionEvent},
-        };
-        let (path, store) = fixture();
-        let config = Config { guard_enabled: true, ..Config::default_for_new_install() };
-        store.atomic_json(&store.paths.config(), &config.value().unwrap()).unwrap();
-        let enforcer = Arc::new(LocalTunnelEnforcer::new("queue-fixture"));
-        enforcer.activate_interception(1000.0).unwrap();
-        let mut supervisor = ChannelSupervisor::new(store.clone(), Some(enforcer), None).unwrap();
-        let mut cutoff = |at| {
-            supervisor.handle_event(SupervisionEvent::ProcessInventoryUnavailable {
-                family: "claude".into(), observed_at: at,
-            }).unwrap();
-            let receipt = read_guard_summary(&store, at);
-            assert_eq!(receipt["families"][0]["channel_state"], "blocked");
-            assert_eq!(receipt["families"][0]["process_preserved"], true);
-            receipt
-        };
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let queue = DiagnosticQueue {
-            sender,
-            dropped: Arc::new(AtomicU64::new(0)),
-            failed: Arc::new(AtomicU64::new(0)),
-        };
-        queue.send("sampling-state", EventFields::default(), 1000.0);
-        GuardHistory::default().observe(&queue, &cutoff(1001.0), 1001.0);
-        assert!(queue.dropped.load(Ordering::Relaxed) > 0);
+    fn guard_history_is_bounded_when_its_log_queue_is_full_or_fails() {
+        let (path,store)=fixture();
+        store.initialize().unwrap();
+        let (sender,receiver)=mpsc::sync_channel(1);
+        let queue=DiagnosticQueue { sender,dropped:Arc::new(AtomicU64::new(0)),failed:Arc::new(AtomicU64::new(0)) };
+        queue.send("sampling-state",EventFields::default(),1000.);
+        let receipt=json!({"status":"protection_triggered","action":"disconnect-channel",
+            "session_guard":{"state":"locked","reason":{"code":"egress_ip_changed"}}});
+        GuardHistory::default().observe(&queue,&receipt,1001.);
+        assert!(queue.dropped.load(Ordering::Relaxed)>0);
         drop(receiver);
         fs::create_dir(store.paths.base().join("events.jsonl")).unwrap();
-        let failing = DiagnosticQueue::new(store.clone());
-        GuardHistory::default().observe(&failing, &cutoff(1002.0), 1002.0);
-        wait_for(|| failing.failed.load(Ordering::Relaxed) > 0);
+        let failing=DiagnosticQueue::new(store);
+        GuardHistory::default().observe(&failing,&receipt,1001.);
+        wait_for(||failing.failed.load(Ordering::Relaxed)>0);
         drop(failing);
         fs::remove_dir_all(path).unwrap();
     }

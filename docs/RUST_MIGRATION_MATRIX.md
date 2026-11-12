@@ -27,9 +27,9 @@
 | M04 | TAG 内核归属、连接关联、同内核 fake-IP、实际模式及完整选择链 | tag_flow/tag_policy/local_http/fakeip_probe → sampler/macos | 系统采样适配已修复，包内组件三轮真实 TAG 监听/控制接口/TUN/规则核对通过；完整真实流量关联与界面仍待验收 |
 | M05 | 多源出口、Geo/ASN/质量复用、缓存合并、限流、明确查询错误 | network_client/macos/coffee_dispatch → 环境与评分页面 | 已接；字段、冲突及限流合同通过；连续跨页显示未验收 |
 | M06 | 四 STUN 端点、预算、重试、失败明细 | stun_probe/online_probes → AuditSystem | 已接；回环/超时合同通过；常驻跨轮资源上限需最终核对 |
-| M07 | DNS/WebRTC 同轮回执、地区/CN 风险、时效和 WebView 桥 | receipts/receipt_store/leak_refresh → GUI回执/审计/Controller | 已接；回执和桥协议合同通过；真实图形刷新与连续恢复未验收 |
+| M07 | DNS/WebRTC 同轮回执、地区/CN 风险、时效和 WebView 桥 | receipts/receipt_store/leak_refresh → GUI回执/审计/ChannelSupervisor | 独立风险按配置动作及原始证据时效处理；真实图形刷新与连续恢复另验 |
 | M08 | 全量预检、时区/地区日期/出口一致、英文独立、服务状态区分 | core audit/observation/region → AuditStore → GUI/engine | 已接；逐项及失败/恢复合同通过；专项命令已按核准范围接入；真实窗口仍待验收 |
-| M09 | 自动固定会话 IP、pending/active/idle/locked、异常停止、并发/CAS | Controller/SessionStore/NativeDesktop → launch/guard worker | 已接；隔离异常拦截及延迟退出合同通过；真实控制动作本阶段未执行 |
+| M09 | 会话出口基线、pending/active/idle/locked、风险处置、并发/CAS | ChannelSupervisor → SessionStore → enforcer/process dispatcher；Controller 只负责显式启动和只读摘要 | 单一保护决策路径；兼容旧会话数据不保留旧同步执行器；真实控制动作另验 |
 | M10 | 首次自动检测、候选与变更预览、应用读回、冲突恢复 | onboarding/environment_capture → setup_dispatch/GUI | 已接；成功、失败恢复及上下文变化隔离合同通过；旧编码仅作恢复数据 |
 | M11 | A/B 建档切换、树清单、hash/clone、旧 journal 恢复、失败回滚 | accounts/account_native → account/GUI | 已接；首次 A/B、故障、外部冲突及恢复隔离通过；真实账号未操作 |
 | M12 | 修复、地区适配、设置恢复、代理专用动作、受管理规则范围 | repair/rules/platform_mutator/proxy_mutations → repair/setup | 已接；原生写入/恢复用受控适配器验证；真实系统动作与中断恢复需最终核对 |

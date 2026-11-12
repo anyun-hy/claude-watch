@@ -120,9 +120,65 @@ mod logging_tests {
     }
 
     #[test]
+    fn cancelled_queued_audit_never_invokes_runner() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let (event_tx, event_rx) = mpsc::channel();
+        let (requests, worker) = ChannelSupervisor::spawn_async_audit_worker(
+            stop.clone(), event_tx, move |request| {
+                recorded.lock().unwrap().push(request.request_id);
+                if request.request_id == 1 {
+                    started_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv_timeout(Duration::from_secs(2))
+                        .map_err(|_| CoreError::new("fixture_release_timeout", "first audit not released"))?;
+                }
+                Ok((json!({}), json!({}), request.requested_at + 0.01))
+            },
+        ).unwrap();
+        let request = |request_id| AsyncAuditRequest {
+            request_id, family: "claude".into(), target: LaunchTarget::ClaudeCli,
+            session_id: None, context_id: None,
+            policy_version: PolicyVersion { policy_digest: "fixture".into(), guard_policy_digest: "fixture".into() },
+            vpn_epoch: None, upstream_endpoint: String::new(), requested_at: crate::native::now(),
+            timeout_seconds: 5.0, cancellation: Some(Arc::new(AtomicBool::new(false))),
+        };
+        requests.send(request(1)).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let retired = request(2);
+        requests.send(retired.clone()).unwrap();
+        retired.cancellation.unwrap().store(true, Ordering::Release);
+        release_tx.send(()).unwrap();
+        let first = event_rx.recv_timeout(Duration::from_secs(2));
+        // No completion for the cancelled queued request. Also let the first
+        // runner finish before using a third request as the queue-drained anchor.
+        let cancelled = event_rx.recv_timeout(Duration::from_millis(100));
+        requests.send(request(3)).unwrap();
+        let last = event_rx.recv_timeout(Duration::from_secs(2));
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap();
+        assert!(matches!(first, Ok(SupervisionEvent::AsyncAuditCompleted {
+            request_id: 1, outcome: AsyncAuditOutcome::Succeeded { .. }, ..
+        })));
+        assert!(matches!(cancelled, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert!(matches!(last, Ok(SupervisionEvent::AsyncAuditCompleted {
+            request_id: 3, outcome: AsyncAuditOutcome::Succeeded { .. }, ..
+        })));
+        assert_eq!(*calls.lock().unwrap(), vec![1, 3]);
+    }
+
+    #[test]
     fn repeated_audit_failures_back_off_without_permanently_stopping_recovery() {
         let now = 1_800_000_000.0;
         let (mut supervisor, _enforcer) = blocked_supervisor(now);
+        supervisor.handle_event(SupervisionEvent::ProcessInventoryUpdated {
+            family: "claude".into(), desktops: vec![],
+            processes: vec![BoundProcessToken::with_system_identity(7200, 501, 900, 1, ProcessRole::Cli)
+                .with_audit_token([501, 501, 20, 501, 20, 7200, 0, 9])], observed_at: now,
+        }).unwrap();
         let (tx, rx) = mpsc::channel();
         supervisor.audit_tx = Some(tx);
         let mut clock = now;
@@ -212,6 +268,45 @@ mod logging_tests {
         assert_eq!(recovered.families["claude"].policy_sync_state, PolicySyncState::Applied);
         assert_eq!(recovered.families["claude"].command_seq, command_seq);
         assert_eq!(supervisor.tracks["claude"].latest_receipt.as_ref().unwrap().observed_at, now + 24.0);
+    }
+
+    #[test]
+    fn published_graph_block_deadline_tracks_receipt_without_new_event() {
+        let now = 1_800_000_000.0;
+        let (mut supervisor, enforcer) = blocked_supervisor(now);
+        let session: session::Session = serde_json::from_value(json!({
+            "schema": 1, "state": "locked", "session_id": "graph-fixture",
+            "baseline": {"ip": "1.1.1.1", "country": "JP", "observed_at": now, "source": "fixture"},
+        })).unwrap();
+        supervisor.tracks.get_mut("claude").unwrap().processes = vec![
+            BoundProcessToken::with_system_identity(7200, 501, 900, 1, ProcessRole::Cli)
+                .with_audit_token([501, 501, 20, 501, 20, 7200, 0, 9]),
+        ];
+        supervisor.coverage_scopes.insert("claude".into(), BackendCoverageScope {
+            backend: NetworkBackendKind::Seatbelt, configured_entries: vec!["graph-fixture".into()],
+            protected_pids: vec![7200], server_identity_verified: true, ..Default::default()
+        });
+        supervisor.issue_family_command("claude", Some(&session), ChannelPermitState::Revoked,
+            "vpn_observation_stale", now).unwrap();
+        let seq = supervisor.event_seq;
+        let observed_at = now + DEFAULT_PERMIT_TTL + 1.0;
+        let receipt = enforcer.receipt_for("claude", observed_at).unwrap().unwrap();
+        assert!(supervisor.ingest_receipt(receipt, observed_at).unwrap());
+        assert_eq!(supervisor.event_seq, seq, "refresh is not a state event");
+        let deadline = observed_at + MAX_ENFORCEMENT_RECEIPT_AGE;
+        supervisor.publish(&supervisor.snapshot(deadline - 1.0));
+        let frame = crate::channel_policy_status::read_frame(&supervisor.storage);
+        assert_eq!(frame["families"]["claude"]["blocked_evidence_valid_until"], json!(deadline));
+        assert!(frame["events"].as_array().unwrap().iter()
+            .all(|event| event["family_state"]["blocked_evidence_valid_until"].is_null()));
+        if let Some(dir) = std::env::var_os("CW_CHANNEL_CONTRACT_DIR") {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(std::path::Path::new(&dir).join("graph-block-deadline.json"),
+                serde_json::to_vec(&frame).unwrap()).unwrap();
+        }
+        supervisor.publish(&supervisor.snapshot(deadline));
+        let expired = crate::channel_policy_status::read_frame(&supervisor.storage);
+        assert!(expired["families"]["claude"]["blocked_evidence_valid_until"].is_null());
     }
 
     #[test]
@@ -583,6 +678,14 @@ impl FamilyRuntimeTrack {
         changed
     }
 
+    fn cancel_audit(&mut self) {
+        if let Some(request) = self.audit_in_flight.take() {
+            if let Some(cancel) = request.cancellation {
+                cancel.store(true, Ordering::Release);
+            }
+        }
+    }
+
     fn record_previous_process_result(&mut self, receipt: ProcessDispositionReceipt) {
         self.previous_process_receipts.push(receipt);
         self.previous_process_receipts.sort_by(|a, b| a.observed_at.total_cmp(&b.observed_at));
@@ -737,9 +840,21 @@ impl ChannelSupervisor {
         value["authoritative_permits"] = json!(self.tracks.iter()
             .filter_map(|(family, t)| t.current_permit.as_ref().map(|p| (family, p)))
             .collect::<BTreeMap<_, _>>());
-        value["enforcement_receipts"] = json!(self.tracks.iter()
-            .filter_map(|(family, t)| t.latest_receipt.as_ref().map(|r| (family, r)))
-            .collect::<BTreeMap<_, _>>());
+        let mut receipts = BTreeMap::new();
+        for (family, track) in &self.tracks {
+            let Some(receipt) = track.latest_receipt.as_ref() else { continue; };
+            receipts.insert(family, receipt);
+            // A receipt refresh is a snapshot update, not a new state event.
+            let until = receipt.observed_at + MAX_ENFORCEMENT_RECEIPT_AGE;
+            if matches!(track.verdict, Some(ChannelSupervisionVerdict::IsolatedKeepProcess))
+                && self.expected_executor_boot_id.as_deref() == Some(receipt.executor_boot_id.as_str())
+                && until.is_finite() && now < until
+                && receipt.observed_at <= now + CLOCK_ROLLBACK_TOLERANCE_SECONDS
+            {
+                value["families"][family]["blocked_evidence_valid_until"] = json!(until);
+            }
+        }
+        value["enforcement_receipts"] = json!(receipts);
         value["process_receipts"] = json!(self.tracks.iter()
             .filter_map(|(family, t)| t.latest_process_receipt.as_ref().map(|r| (family, r)))
             .collect::<BTreeMap<_, _>>());
@@ -991,6 +1106,7 @@ impl ChannelSupervisor {
                     }
                     let Ok(req) = req_rx.recv_timeout(std::time::Duration::from_millis(50)) else { continue; };
                     if stop.load(Ordering::Acquire) { break; }
+                    if req.is_cancelled() { continue; }
                     let send = |outcome, completed_at| {
                         let _ = event_tx.send(SupervisionEvent::AsyncAuditCompleted {
                             request_id: req.request_id, family: req.family.clone(), session_id: req.session_id.clone(),
@@ -1006,7 +1122,7 @@ impl ChannelSupervisor {
                     }
                     let runner = Arc::clone(&run_audit);
                     let (result_tx, result_rx) = mpsc::channel();
-                    let cancellation = Arc::new(AtomicBool::new(false));
+                    let cancellation = req.cancellation.clone().unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
                     let mut req_clone = req.clone();
                     req_clone.cancellation = Some(cancellation.clone());
                     let started = std::time::Instant::now();
@@ -1020,9 +1136,10 @@ impl ChannelSupervisor {
                             detail: "审计工作线程启动失败".into() }, crate::native::now()); continue; }
                     };
                     loop {
-                        if stop.load(Ordering::Acquire) || started.elapsed() >= timeout {
+                        if stop.load(Ordering::Acquire) || cancellation.load(Ordering::Acquire) || started.elapsed() >= timeout {
+                            let was_cancelled = cancellation.load(Ordering::Acquire);
                             cancellation.store(true, Ordering::Release);
-                            if !stop.load(Ordering::Acquire) {
+                            if !stop.load(Ordering::Acquire) && !was_cancelled {
                                 send(AsyncAuditOutcome::TimedOut { elapsed_seconds: started.elapsed().as_secs_f64() }, crate::native::now());
                             }
                             break;
@@ -1173,7 +1290,7 @@ impl ChannelSupervisor {
                 for family in family_ids {
                     if let Some(track) = self.tracks.get_mut(&family) {
                         if epoch_changed {
-                            track.audit_in_flight = None;
+                            track.cancel_audit();
                             track.audit_retry_count = 0;
                             track.audit_retry_not_before = None;
                             track.audit_last_failure_code = None;
@@ -1190,7 +1307,7 @@ impl ChannelSupervisor {
                 let family_ids: Vec<String> = self.tracks.keys().cloned().collect();
                 for family in family_ids {
                     if let Some(track) = self.tracks.get_mut(&family) {
-                        track.audit_in_flight = None;
+                        track.cancel_audit();
                         if newly_unavailable { track.evidence_invalidated_at = Some(now); }
                     }
                     self.evaluate_family(&family, now)?;
@@ -1204,7 +1321,7 @@ impl ChannelSupervisor {
                         track.permit_generation = track.permit_generation.saturating_add(1);
                         track.revoked_at = Some(now);
                         track.evidence_invalidated_at = Some(source_at);
-                        track.audit_in_flight = None;
+                        track.cancel_audit();
                         track.audit_retry_count = 0;
                         track.audit_retry_not_before = None;
                         track.audit_last_failure_code = None;
@@ -1263,13 +1380,13 @@ impl ChannelSupervisor {
                         // A concurrent collector owns the session transaction.
                         // Keep known members, revoke now and retry on inventory.
                         track.inventory_failed = true;
-                        track.audit_in_flight = None;
+                        track.cancel_audit();
                     }
                 } else if let Some(track) = self.tracks.get_mut(&family) {
                     if !track.processes.iter().any(|p| processes.contains(p)) && track.processes != processes {
                         // An audit of a replaced/execed process cannot authorize
                         // the new instance, even if its PID was reused.
-                        track.audit_in_flight = None;
+                        track.cancel_audit();
                         track.audit_retry_count = 0;
                         track.audit_retry_not_before = None;
                     }
@@ -1283,7 +1400,7 @@ impl ChannelSupervisor {
                 if let Some(track) = self.tracks.get_mut(&family) {
                     // Retain managed membership; uncertainty revokes permission.
                     track.inventory_failed = true;
-                    track.audit_in_flight = None;
+                    track.cancel_audit();
                 }
                 self.evaluate_family(&family, now)?;
             }
@@ -1321,7 +1438,7 @@ impl ChannelSupervisor {
                             track.permit_generation = track.permit_generation.saturating_add(1);
                             track.policy_sync_state = PolicySyncState::PendingApply;
                             // Invalidate any in-flight slow audit started under the old policy
-                            track.audit_in_flight = None;
+                            track.cancel_audit();
                             track.audit_retry_count = 0;
                             track.audit_retry_not_before = None;
                             track.audit_last_failure_code = None;
@@ -1518,7 +1635,7 @@ impl ChannelSupervisor {
                 self.cancel_process_intent(family, now);
                 let code = vm.reason_code().to_string();
                 if let Some(track) = self.tracks.get_mut(family) {
-                    track.audit_in_flight = None;
+                    track.cancel_audit();
                     track.audit_retry_count = 0;
                     track.audit_retry_not_before = None;
                     if track.current_permit.as_ref().is_none_or(|p| p.reason_code != code) {
@@ -1589,6 +1706,7 @@ impl ChannelSupervisor {
         // Check if there is an active risk on the current session or environment,
         // or if key evidence (egress / local_guard / path) has expired while a session is active.
         let mut risk_code: Option<String> = None;
+        let mut observed_risk_deadline = f64::INFINITY;
         let mut evidence_expired_or_missing = false;
         if self.latest_local_guard["proxy"] == "fail"
             || (tun_required_by_guard && self.latest_local_guard["tun"] == "fail")
@@ -1609,19 +1727,30 @@ impl ChannelSupervisor {
             if !evidence_valid && had_active_or_permitted {
                 risk_code = Some("egress_evidence_expired".into());
                 evidence_expired_or_missing = true;
-            } else if exit.country == "CN" {
-                risk_code = Some("egress_country_cn".into());
-            } else if let Some(s) = session.as_ref() {
-                if s.state == Phase::Active && exit.ip != s.baseline.ip {
-                    risk_code = Some("egress_ip_changed".into());
-                } else if s.state == Phase::Active {
+            } else {
+                // Independent observations retain their own configured action.
+                // A warn-only IP change must not hide a current DNS force (or
+                // vice versa); a stored lock reason is never process evidence.
+                let mut risks = Vec::new();
+                if exit.country == "CN" { risks.push(("egress_country_cn".to_owned(), exit.observed_at + session::GUARD_EGRESS_TTL)); }
+                if let Some(s) = session.as_ref().filter(|s| matches!(s.state, Phase::Active | Phase::Locked)) {
+                    if exit.ip != s.baseline.ip { risks.push(("egress_ip_changed".to_owned(), exit.observed_at + session::GUARD_EGRESS_TTL)); }
                     let extra = serde_json::to_value(&s.extra).unwrap_or(Value::Null);
                     let drift = receipts_store.probe_drift_risk(&extra, now);
                     if drift["state"] == "risk" {
-                        if let Some(c) = drift["reason"]["code"].as_str() {
-                            risk_code = Some(c.into());
+                        if let (Some(code),Some(at)) = (drift["reason"]["code"].as_str(),drift["observed_at"].as_f64()) {
+                            risks.push((code.to_owned(), at + session::RISK_EVIDENCE_TTL));
                         }
                     }
+                }
+                let priority = |code: &str| match self.config.close_action(code, provider).as_str() {
+                    "force" => 3, "close" => 2, _ => 1,
+                };
+                if let Some((code, deadline)) = risks.into_iter().reduce(|selected, next| {
+                    if priority(&next.0) > priority(&selected.0) { next } else { selected }
+                }) {
+                    risk_code = Some(code);
+                    observed_risk_deadline = deadline;
                 }
             }
         } else if had_active_or_permitted {
@@ -1648,12 +1777,19 @@ impl ChannelSupervisor {
                         "egress_country_cn" => exit.country == "CN",
                         other => drift["state"] == "risk" && drift["reason"]["code"] == other,
                     };
-                    if still_observed { process_risk = Some(intent.risk_code); }
+                    if still_observed {
+                        if !matches!(intent.risk_code.as_str(),"egress_ip_changed" | "egress_country_cn") {
+                            observed_risk_deadline = drift["observed_at"].as_f64()
+                                .map_or(0.0,|at|at + session::RISK_EVIDENCE_TTL);
+                        }
+                        process_risk = Some(intent.risk_code);
+                    }
                 }
             }
         }
         let process_deadline = self.latest_environment_at.map(|at| at + crate::process_disposition::INTENT_TTL)
-            .unwrap_or(0.0).min(fresh_exit.as_ref().map(|exit| exit.observed_at + session::GUARD_EGRESS_TTL).unwrap_or(f64::INFINITY));
+            .unwrap_or(0.0).min(fresh_exit.as_ref().map(|exit| exit.observed_at + session::GUARD_EGRESS_TTL).unwrap_or(f64::INFINITY))
+            .min(observed_risk_deadline);
         if process_risk.is_none() { self.cancel_process_intent(family, now); }
 
         // Determine desired permit state without blocking on slow audits
@@ -1664,26 +1800,36 @@ impl ChannelSupervisor {
                 self.config.close_action(&code, provider)
             };
             if action == "warn" {
-                (ChannelPermitState::Permitted, code)
+                if self.tracks.get(family).and_then(|track| track.current_permit.as_ref())
+                    .is_some_and(|permit| permit.state == ChannelPermitState::Revoked) {
+                    self.request_async_audit_if_needed(family, session.as_ref().map(|s|s.session_id.clone()), audit_context_id.clone(), now);
+                    (ChannelPermitState::Revoked, "awaiting_recovery_verification".into())
+                } else {
+                    (ChannelPermitState::Permitted, code)
+                }
             } else {
                 if let Some(s) = session.as_ref() {
-                    let _ = sessions.mark_failure(
-                        Some(&s.session_id),
-                        now,
-                        &code,
-                        "通道保护检测到环境或出口风险（或关键证据已过期）；网络与进程的执行结果分别核对",
-                        true,
-                    );
-                    session = sessions.load(now)?;
+                    // Refreshing the same observed risk must not move its
+                    // transaction fence past every in-flight recovery audit.
+                    if s.state != Phase::Locked || s.reason.as_ref().is_none_or(|r|r.code != code) {
+                        let _ = sessions.mark_failure(
+                            Some(&s.session_id), now, &code,
+                            "通道保护检测到环境或出口风险（或关键证据已过期）；网络与进程的执行结果分别核对", true,
+                        );
+                        session = sessions.load(now)?;
+                    }
                 }
-                if evidence_expired_or_missing {
+                if evidence_expired_or_missing || session.as_ref().is_some_and(|s|s.state == Phase::Locked) {
                     let sid = session.as_ref().map(|s| s.session_id.clone());
                     self.request_async_audit_if_needed(family, sid, audit_context_id.clone(), now);
                 }
                 (ChannelPermitState::Revoked, code)
             }
-        } else if desktops.is_empty() && self.tracks.get(family).is_none_or(|t| t.processes.is_empty()) {
-            (ChannelPermitState::PendingVerification, "idle_no_process".into())
+        } else if self.tracks.get(family).is_none_or(|t| t.processes.is_empty()) {
+            let observed_only = !desktops.is_empty()
+                || self.unmanaged_member_pids.get(family).is_some_and(|pids| !pids.is_empty());
+            (ChannelPermitState::PendingVerification,
+                if observed_only { "unmanaged_existing_processes" } else { "idle_no_process" }.into())
         } else if let Some(s) = session.as_ref() {
             let was_revoked = self
                 .tracks
@@ -1782,13 +1928,21 @@ impl ChannelSupervisor {
         let Some(track) = self.tracks.get_mut(family) else {
             return;
         };
+        // Observation alone cannot become controlled membership. Do not start
+        // expensive verification which can only fail adoption after completion.
+        // Known members are retained on incomplete inventory, so their existing
+        // fail-closed and recovery path is unchanged.
+        if track.processes.is_empty() {
+            track.cancel_audit();
+            return;
+        }
         if let Some(in_flight) = track.audit_in_flight.clone() {
             if in_flight.session_id != session_id
                 || in_flight.context_id != context_id
                 || in_flight.policy_version != self.saved_policy_version
                 || in_flight.vpn_epoch != current_vpn_epoch
             {
-                track.audit_in_flight = None;
+                track.cancel_audit();
                 track.audit_retry_count = 0;
                 track.audit_retry_not_before = None;
                 track.audit_last_failure_code = None;
@@ -1797,7 +1951,7 @@ impl ChannelSupervisor {
             {
                 // Logic Fix 4: Timeout cleanup so a hung or lost audit request never
                 // wedges `audit_in_flight` forever.
-                track.audit_in_flight = None;
+                track.cancel_audit();
                 track.audit_retry_count = track.audit_retry_count.saturating_add(1);
                 track.audit_last_failure_code = Some("async_audit_timeout".into());
                 track.audit_retry_not_before = Some(now + async_audit_retry_delay(track.audit_retry_count));
@@ -1829,20 +1983,20 @@ impl ChannelSupervisor {
             upstream_endpoint: self.upstream_endpoint.clone(),
             requested_at: now,
             timeout_seconds: DEFAULT_ASYNC_AUDIT_TIMEOUT_SECONDS,
-            cancellation: None,
+            cancellation: Some(Arc::new(AtomicBool::new(false))),
         };
         if let Some(tx) = &self.audit_tx {
             if tx.send(req.clone()).is_ok() {
                 track.audit_in_flight = Some(req);
             } else {
                 // Logic Fix 4: Send failure must NOT leave `audit_in_flight` set.
-                track.audit_in_flight = None;
+                track.cancel_audit();
                 track.audit_retry_count = track.audit_retry_count.saturating_add(1);
                 track.audit_last_failure_code = Some("async_audit_channel_closed".into());
                 track.audit_retry_not_before = Some(now + async_audit_retry_delay(track.audit_retry_count));
             }
         } else {
-            track.audit_in_flight = None;
+            track.cancel_audit();
             track.audit_retry_count = track.audit_retry_count.saturating_add(1);
             track.audit_last_failure_code = Some("async_audit_worker_missing".into());
             track.audit_retry_not_before = Some(now + async_audit_retry_delay(track.audit_retry_count));
@@ -1887,7 +2041,7 @@ impl ChannelSupervisor {
             let timeout_limit = in_flight.timeout_seconds;
             let audit_target = in_flight.target;
             let audit_vpn_epoch = in_flight.vpn_epoch.clone();
-            track.audit_in_flight = None;
+            track.cancel_audit();
             let invalidated_since_request = track
                 .evidence_invalidated_at
                 .is_some_and(|invalidated_at| invalidated_at > requested_at);
@@ -2488,7 +2642,7 @@ impl ChannelSupervisor {
             } else {
                 if permit.state == ChannelPermitState::Permitted && receipt.permit_state == ChannelPermitState::Revoked {
                     autonomous_cutoff = Some(receipt.error_code.clone().unwrap_or_else(|| "executor_autonomous_cutoff".into()));
-                    track.audit_in_flight = None;
+                    track.cancel_audit();
                 }
                 if receipt.enforcement_state != ChannelEnforcementState::Failed {
                     track.applied_policy_version = Some(receipt.policy_version.clone());
@@ -2694,7 +2848,7 @@ impl ChannelSupervisor {
         latest_vpn_epoch: Option<VpnEpoch>,
         latest_vpn_match: Option<VpnMatch>,
         coverage_scope: Option<BackendCoverageScope>,
-        unmanaged_member_pids: Vec<u32>,
+        mut unmanaged_member_pids: Vec<u32>,
         now: f64,
     ) -> FamilyChannelMonitorState {
         let permit_state = track
@@ -2720,16 +2874,28 @@ impl ChannelSupervisor {
                 }
             });
         let display_label_zh = match &track.verdict {
+            _ if reason_code == "unmanaged_existing_processes"
+                && display_state == ChannelMonitorDisplayState::PendingVerification => "未受保护".into(),
             Some(ChannelSupervisionVerdict::EnforcementFailed {
                 status_label_zh, ..
             }) => status_label_zh.clone(),
             _ => display_state.label_zh().to_string(),
         };
-        let active_member_pids = track
-            .desktops
-            .iter()
-            .map(|(d, _, _)| d.pid)
-            .collect::<Vec<_>>();
+        let mut active_member_pids = Vec::new();
+        for (desktop, _, _) in &track.desktops {
+            if track.processes.iter().any(|token| token.pid == desktop.pid
+                && token.start_seconds == desktop.start_seconds
+                && token.start_microseconds == desktop.start_microseconds)
+            {
+                active_member_pids.push(desktop.pid);
+            } else {
+                unmanaged_member_pids.push(desktop.pid);
+            }
+        }
+        active_member_pids.sort_unstable();
+        active_member_pids.dedup();
+        unmanaged_member_pids.sort_unstable();
+        unmanaged_member_pids.dedup();
         let (
             active_flows_count,
             terminated_flows_count,

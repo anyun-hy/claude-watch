@@ -40,6 +40,81 @@ struct AIProcessExitEvidence {
     let unconfirmed: Int
     var complete: Bool { remaining.isEmpty && unconfirmed == 0 }
 }
+enum AIProcessInventoryFailure: Error {
+    case malformed, incomplete, stale, identityChanged, engineUnavailable
+    case timeout, outputTooLarge, readFailed, commandFailed
+}
+/// Wire decoding and identity binding only. Product classification belongs to Rust's sampler.
+struct AIProcessClassificationBatch: Decodable {
+    struct Identity: Decodable {
+        let pid, parent: Int32
+        let uid: UInt32
+        let executable: String
+        let start_seconds, start_microseconds: UInt64
+        func matches(_ value: AIProcessIdentity) -> Bool {
+            pid == value.pid && uid == value.uid && executable == value.executable
+                && start_seconds == value.startSeconds && start_microseconds == value.startMicroseconds
+        }
+    }
+    struct Target: Decodable {
+        let identity: Identity
+        let product: String
+        let desktop_main: Bool
+    }
+    let schema: Int
+    let status, mode, state: String
+    let uid: UInt32
+    let observed_at: TimeInterval
+    let grants_launch_permission, grants_close_permission: Bool
+    let targets: [Target]
+
+    static func apply(_ data: Data, to before: [AIProcessIdentity], uid: UInt32, now: TimeInterval,
+                      lookup: (Int32) -> AIProcessPresence) throws -> [AIProcessIdentity] {
+        let batch = try JSONDecoder().decode(Self.self, from: data)
+        guard batch.schema == 1, batch.status == "ok", batch.mode == "read_only", batch.uid == uid,
+              !batch.grants_launch_permission, !batch.grants_close_permission,
+              batch.targets.count <= 65_536 else { throw AIProcessInventoryFailure.malformed }
+        guard batch.state == "ok" else { throw AIProcessInventoryFailure.incomplete }
+        guard batch.observed_at.isFinite, batch.observed_at > 0,
+              batch.observed_at <= now + 2, now - batch.observed_at <= 20 else {
+            throw AIProcessInventoryFailure.stale
+        }
+        var inventory = before
+        var indices: [Int32: Int] = [:]
+        for index in inventory.indices {
+            guard indices.updateValue(index, forKey: inventory[index].pid) == nil else {
+                throw AIProcessInventoryFailure.malformed
+            }
+            inventory[index].rootProduct = nil; inventory[index].desktopMain = false
+        }
+        var seen = Set<Int32>()
+        for target in batch.targets {
+            let expected = target.identity
+            guard expected.pid > 1, expected.uid == uid, expected.start_seconds > 0,
+                  expected.start_microseconds < 1_000_000, expected.executable.hasPrefix("/"),
+                  seen.insert(expected.pid).inserted else { throw AIProcessInventoryFailure.malformed }
+            let product: MonitoredProduct
+            switch target.product {
+            case "claude": product = .claude
+            case "openai": product = .openAI
+            default: throw AIProcessInventoryFailure.malformed
+            }
+            guard let index = indices[expected.pid],
+                  expected.matches(before[index]) else { throw AIProcessInventoryFailure.identityChanged }
+            switch lookup(expected.pid) {
+            case .gone: continue
+            case .unavailable: throw AIProcessInventoryFailure.identityChanged
+            case .live(let current):
+                // The native audit token brackets the entire Rust classification batch.
+                guard before[index].sameProcess(as: current) else { throw AIProcessInventoryFailure.identityChanged }
+                inventory[index] = current
+                inventory[index].rootProduct = product
+                inventory[index].desktopMain = target.desktop_main
+            }
+        }
+        return inventory
+    }
+}
 enum AIProcessCloseScope: Equatable, Sendable {
     case desktopBundleOnly
     case allProductProcesses
@@ -70,164 +145,6 @@ enum AIProcessClosePolicy {
             }
         }
         return scoped
-    }
-    static func resolveLexicalPath(_ value: String, cwd: String? = nil) -> String? {
-        guard !value.isEmpty else { return nil }
-        let combined: String
-        if value.hasPrefix("/") {
-            combined = value
-        } else if let cwd, cwd.hasPrefix("/") {
-            combined = cwd + "/" + value
-        } else {
-            return nil
-        }
-        var stack: [String] = []
-        for part in combined.split(separator: "/", omittingEmptySubsequences: true) {
-            if part == "." { continue }
-            if part == ".." {
-                guard !stack.isEmpty else { return nil }
-                stack.removeLast()
-                continue
-            }
-            stack.append(String(part))
-        }
-        return "/" + stack.joined(separator: "/")
-    }
-    static func nodeEntryTokens(_ tokens: [String], cwd: String? = nil) -> String? {
-        guard let first = tokens.first,
-              ["node", "nodejs", "bun"].contains(URL(fileURLWithPath: first).lastPathComponent) else { return nil }
-        var index = 1
-        while index < tokens.count {
-            let token = tokens[index]
-            index += 1
-            if token == "--" {
-                guard index < tokens.count else { return nil }
-                return resolveLexicalPath(tokens[index], cwd: cwd)
-            }
-            if ["--no-warnings", "--enable-source-maps", "--watch-preserve-output"].contains(token)
-                || token.hasPrefix("--experimental-")
-                || token.hasPrefix("--trace-")
-                || token.hasPrefix("--disable-warning=")
-                || token.hasPrefix("--require=")
-                || token.hasPrefix("--import=")
-                || token.hasPrefix("--conditions=")
-                || token.hasPrefix("--loader=") {
-                continue
-            }
-            if ["--require", "--import", "--conditions", "--loader"].contains(token) {
-                guard index < tokens.count else { return nil }
-                index += 1
-                continue
-            }
-            guard !token.hasPrefix("-") else { return nil }
-            return resolveLexicalPath(token, cwd: cwd)
-        }
-        return nil
-    }
-    static func nodeEntry(_ command: String, cwd: String? = nil) -> String? {
-        // Fallback for string command lines: reject ambiguous shell quoting.
-        // Production inventory reads NUL-delimited KERN_PROCARGS2 tokens via
-        // nodeEntryTokens(_:cwd:) so script paths with spaces are preserved.
-        guard !command.contains("\""), !command.contains("'") else { return nil }
-        let tokens = command.split(whereSeparator: \.isWhitespace).map(String.init)
-        return nodeEntryTokens(tokens, cwd: cwd)
-    }
-    static func managedCodexAppServerPath(_ path: String, home: String) -> Bool {
-        guard let normalizedPath = resolveLexicalPath(path),
-              let normalizedHome = resolveLexicalPath(home) else { return false }
-        let prefix = (normalizedHome == "/" ? "" : normalizedHome) + "/.codex/packages/app-server-daemon/releases/"
-        guard normalizedPath.hasPrefix(prefix) else { return false }
-        let parts = normalizedPath.dropFirst(prefix.count)
-            .split(separator: "/", omittingEmptySubsequences: false)
-            .map(String.init)
-        return parts.count == 3 && !parts[0].isEmpty && parts[1] == "bin" && parts[2] == "codex"
-    }
-    static func managedCodexAppServerTokens(path: String, home: String, tokens: [String]?) -> Bool {
-        guard managedCodexAppServerPath(path, home: home),
-              let tokens, tokens.count >= 3,
-              URL(fileURLWithPath: tokens[0]).lastPathComponent == "codex",
-              tokens[1] == "app-server" else { return false }
-        if tokens[2] == "daemon" { return true }
-        if tokens[2] == "--listen", tokens.count >= 4, !tokens[3].isEmpty, !tokens[3].hasPrefix("-") {
-            return true
-        }
-        return false
-    }
-    static func managedCodexAppServer(path: String, home: String, arguments: String?) -> Bool {
-        guard let arguments, !arguments.contains("\""), !arguments.contains("'") else { return false }
-        let tokens = arguments.split(whereSeparator: \.isWhitespace).map(String.init)
-        return managedCodexAppServerTokens(path: path, home: home, tokens: tokens)
-    }
-    static func classifyRoot(
-        executable: String,
-        bundleIdentifier: String? = nil,
-        argumentTokens: [String]? = nil,
-        arguments: String? = nil,
-        cwd: String? = nil,
-        home: String,
-        trustedClaudePaths: Set<String> = [],
-        trustedCodexPaths: Set<String> = [],
-        resolveScript: (String) -> String? = { $0 }
-    ) -> (product: MonitoredProduct?, desktopMain: Bool) {
-        if managedCodexAppServerPath(executable, home: home) {
-            let matched = argumentTokens != nil
-                ? managedCodexAppServerTokens(path: executable, home: home, tokens: argumentTokens)
-                : managedCodexAppServer(path: executable, home: home, arguments: arguments)
-            return matched ? (.openAI, false) : (nil, false)
-        }
-        if trustedClaudePaths.contains(executable)
-            || executable.hasPrefix(home + "/.local/share/claude/versions/")
-            || executable.hasSuffix("/node_modules/@anthropic-ai/claude-code/cli.js") {
-            return (.claude, false)
-        }
-        if trustedCodexPaths.contains(executable)
-            || (executable.contains("/Caskroom/codex/") && executable.hasSuffix("/bin/codex"))
-            || executable.hasSuffix("/node_modules/@openai/codex/bin/codex.js")
-            || (executable.contains("/node_modules/@openai/codex/") && executable.hasSuffix("/codex")) {
-            return (.openAI, false)
-        }
-        if let bundleRange = executable.range(of: ".app/Contents/") {
-            let bundlePath = String(executable[..<bundleRange.lowerBound]) + ".app"
-            let bundleName = URL(fileURLWithPath: bundlePath).lastPathComponent
-            let id = bundleIdentifier ?? ""
-            if ["com.openai.codex", "com.openai.chat"].contains(id)
-                && (executable.hasSuffix("/Resources/codex")
-                    || executable.contains("/Resources/codex-cli/")
-                    || executable.hasSuffix("/CodexCLI.app/Contents/MacOS/codex")) {
-                return (.openAI, false)
-            }
-            let main = executable.hasPrefix(bundlePath + "/Contents/MacOS/")
-            switch (id, bundleName) {
-            case ("com.anthropic.claudefordesktop", _):
-                return (.claude, main)
-            case ("com.openai.codex", "Codex.app"),
-                 ("com.openai.chat", "ChatGPT.app"),
-                 ("com.openai.codex", "ChatGPT.app"):
-                return (.openAI, main)
-            default:
-                break
-            }
-        }
-        if ["node", "nodejs", "bun"].contains(URL(fileURLWithPath: executable).lastPathComponent) {
-            let entry: String?
-            if let argumentTokens {
-                entry = nodeEntryTokens(argumentTokens, cwd: cwd)
-            } else if let arguments {
-                entry = nodeEntry(arguments, cwd: cwd)
-            } else {
-                entry = nil
-            }
-            if let script = entry {
-                let resolved = resolveScript(script) ?? script
-                if resolved.hasSuffix("/node_modules/@anthropic-ai/claude-code/cli.js") {
-                    return (.claude, false)
-                }
-                if resolved.hasSuffix("/node_modules/@openai/codex/bin/codex.js") {
-                    return (.openAI, false)
-                }
-            }
-        }
-        return (nil, false)
     }
     static func plan(_ product: MonitoredProduct, inventory: [AIProcessIdentity], uid: UInt32,
                      protected: Set<Int32>) -> AIProcessClosePlan {
@@ -364,125 +281,49 @@ enum AIProcessInventory {
         if pid > 1, Darwin.kill(pid, 0) == -1, errno == ESRCH { return .gone }
         return .unavailable
     }
-    static func currentDirectory(_ pid: Int32) -> String? {
-        guard pid > 1 else { return nil }
-        var info = proc_vnodepathinfo()
-        let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
-        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else { return nil }
-        let value = withUnsafePointer(to: &info.pvi_cdir.vip_path) { pointer in
-            pointer.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
-        }
-        return value.hasPrefix("/") ? value : nil
+    static let maximumReadSeconds: TimeInterval = 8
+    static func read(engine explicitEngine: URL? = nil, timeout: TimeInterval = maximumReadSeconds) throws -> [AIProcessIdentity] {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        let listing = try command(URL(fileURLWithPath: "/bin/ps"), arguments: ["-axo", "pid="], deadline: deadline)
+        let before = String(decoding: listing, as: UTF8.self).split(whereSeparator: \.isWhitespace)
+            .compactMap { Int32($0) }.compactMap(identity)
+        let engine = try classificationEngine(explicitEngine)
+        let data = try command(engine, arguments: ["observe", "--processes-only", "--home",
+            FileManager.default.homeDirectoryForCurrentUser.path], deadline: deadline)
+        return try AIProcessClassificationBatch.apply(data, to: before, uid: getuid(),
+                                                      now: Date().timeIntervalSince1970, lookup: presence)
     }
-    static func arguments(_ pid: Int32) -> [String]? {
-        guard pid > 1 else { return nil }
-        var mib = [Int32(CTL_KERN), Int32(KERN_PROCARGS2), pid]
-        var size = 0
-        guard sysctl(&mib, UInt32(mib.count), nil, &size, nil, 0) == 0,
-              size >= 4, size <= 1_048_576 else { return nil }
-        var bytes = [UInt8](repeating: 0, count: size)
-        let result = bytes.withUnsafeMutableBytes { pointer in
-            sysctl(&mib, UInt32(mib.count), pointer.baseAddress, &size, nil, 0)
-        }
-        guard result == 0, size >= 4 else { return nil }
-        let argc = bytes.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }
-        guard argc >= 0, argc <= 131_072 else { return nil }
-        var offset = 4
-        // KERN_PROCARGS2 has argc, executable path, NUL padding, then exactly argc argv strings.
-        while offset < size && bytes[offset] != 0 { offset += 1 }
-        while offset < size && bytes[offset] == 0 { offset += 1 }
-        var args: [String] = []
-        var total = 0
-        for _ in 0..<min(Int(argc), 256) {
-            guard offset < size else { return nil }
-            let start = offset
-            while offset < size && bytes[offset] != 0 { offset += 1 }
-            guard offset < size, offset - start <= 16_384 else { return nil }
-            total += offset - start
-            guard total <= 65_536,
-                  let text = String(bytes: bytes[start..<offset], encoding: .utf8) else { return nil }
-            args.append(text)
-            offset += 1
-        }
-        return args
-    }
-    static func read() throws -> [AIProcessIdentity] {
-        let output = try command(["-axo", "pid="])
-        var identities = output.split(whereSeparator: \.isWhitespace).compactMap { Int32($0) }.compactMap(identity)
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let trusted = trustedCLIPaths(home: home)
-        for index in identities.indices where identities[index].uid == getuid() {
-            let path = identities[index].executable
-            let bundleId: String?
-            if let bundleRange = path.range(of: ".app/Contents/") {
-                let bundlePath = String(path[..<bundleRange.lowerBound]) + ".app"
-                bundleId = Bundle(path: bundlePath)?.bundleIdentifier ?? ""
-            } else {
-                bundleId = nil
+    private static func classificationEngine(_ explicit: URL?) throws -> URL {
+        #if PROCESS_HELPER
+        guard let own = Bundle.main.executableURL else { throw AIProcessInventoryFailure.engineUnavailable }
+        let packaged = own.deletingLastPathComponent().appendingPathComponent("watch-engine").standardizedFileURL
+        let candidate = explicit?.standardizedFileURL ?? packaged
+        if let explicit {
+            guard explicit.path.hasPrefix("/"),
+                  let parent = identity(getppid()), parent.uid == getuid(),
+                  parent.executable == candidate.path,
+                  let latest = identity(parent.pid), parent.sameProcess(as: latest) else {
+                throw AIProcessInventoryFailure.engineUnavailable
             }
-            let needsArgs = AIProcessClosePolicy.managedCodexAppServerPath(path, home: home)
-                || ["node", "nodejs", "bun"].contains(URL(fileURLWithPath: path).lastPathComponent)
-            var verifiedArgTokens: [String]? = nil
-            var verifiedArgs: String? = nil
-            var verifiedCwd: String? = nil
-            if needsArgs {
-                let pid = identities[index].pid
-                let tokens = arguments(pid)
-                let fallbackArgs = tokens == nil ? (try? command(["-ww", "-p", String(pid), "-o", "args="])) : nil
-                let cwd = currentDirectory(pid)
-                if let verified = identity(pid),
-                   identities[index].sameProcess(as: verified) {
-                    verifiedArgTokens = tokens
-                    verifiedArgs = fallbackArgs
-                    verifiedCwd = cwd
-                }
+        }
+        if candidate != packaged {
+            #if PROCESS_HELPER_DEVELOPMENT
+            guard explicit != nil, candidate.path == ProcessHelperDevelopment.enginePath else {
+                throw AIProcessInventoryFailure.engineUnavailable
             }
-            let classified = AIProcessClosePolicy.classifyRoot(
-                executable: path,
-                bundleIdentifier: bundleId,
-                argumentTokens: verifiedArgTokens,
-                arguments: verifiedArgs,
-                cwd: verifiedCwd,
-                home: home,
-                trustedClaudePaths: trusted.claude,
-                trustedCodexPaths: trusted.codex,
-                resolveScript: { script in
-                    FileManager.default.fileExists(atPath: script)
-                        ? URL(fileURLWithPath: script).resolvingSymlinksInPath().path
-                        : script
-                }
-            )
-            identities[index].rootProduct = classified.product
-            identities[index].desktopMain = classified.desktopMain
+            #else
+            throw AIProcessInventoryFailure.engineUnavailable
+            #endif
         }
-        return identities
-    }
-    static func trustedCLIPaths(home: String) -> (claude: Set<String>, codex: Set<String>) {
-        let known: [(String, MonitoredProduct)] = [
-            (home + "/.local/bin/claude", .claude), (home + "/.claude/local/claude", .claude),
-            ("/opt/homebrew/bin/claude", .claude), ("/usr/local/bin/claude", .claude),
-            ("/opt/homebrew/bin/codex", .openAI), ("/usr/local/bin/codex", .openAI)
-        ]
-        var claude = Set<String>()
-        var codex = Set<String>()
-        for (entry, product) in known where FileManager.default.fileExists(atPath: entry) {
-            let resolved = URL(fileURLWithPath: entry).resolvingSymlinksInPath().path
-            if product == .claude { claude.insert(resolved) } else { codex.insert(resolved) }
+        #else
+        guard explicit == nil, let candidate = Bundle.main.url(forResource: "watch-engine", withExtension: nil) else {
+            throw AIProcessInventoryFailure.engineUnavailable
         }
-        return (claude, codex)
-    }
-    static func nativeCLI(_ path: String) -> MonitoredProduct? {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let trusted = trustedCLIPaths(home: home)
-        return AIProcessClosePolicy.classifyRoot(
-            executable: path,
-            home: home,
-            trustedClaudePaths: trusted.claude,
-            trustedCodexPaths: trusted.codex
-        ).product
-    }
-    static func nodeEntry(_ command: String, cwd: String? = nil) -> String? {
-        AIProcessClosePolicy.nodeEntry(command, cwd: cwd)
+        #endif
+        guard FileManager.default.isExecutableFile(atPath: candidate.path) else {
+            throw AIProcessInventoryFailure.engineUnavailable
+        }
+        return candidate
     }
     static func protectedIDs(in inventory: [AIProcessIdentity], backendPID: Int?) -> Set<Int32> {
         var result: Set<Int32> = [1, getpid()]
@@ -494,22 +335,56 @@ enum AIProcessInventory {
         if let pid = backendPID, pid > 1, pid <= Int(Int32.max) { result.insert(Int32(pid)) }
         return result
     }
-    private static func command(_ arguments: [String]) throws -> String {
+    /// One bounded synchronous boundary for both inventory commands. No reader or timer thread survives it.
+    static func command(_ executable: URL, arguments: [String], deadline: TimeInterval,
+                        maxBytes: Int = 4_000_000) throws -> Data {
         let task = Process(), pipe = Pipe()
-        task.executableURL = URL(fileURLWithPath: "/bin/ps"); task.arguments = arguments
+        task.executableURL = executable; task.arguments = arguments
         task.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"]
+        task.standardInput = FileHandle.nullDevice
         task.standardOutput = pipe; task.standardError = FileHandle.nullDevice
-        try task.run()
-        let deadline = DispatchWorkItem { if task.isRunning { task.terminate() } }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: deadline)
-        defer { deadline.cancel() }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile(); task.waitUntilExit()
-        guard task.terminationStatus == 0, let text = String(data: data, encoding: .utf8) else {
-            throw NSError(domain: "ClaudeWatch.ProcessControl", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "无法读取当前进程身份，未关闭任何进程。"])
+        let handle = pipe.fileHandleForReading
+        let descriptor = handle.fileDescriptor
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) >= 0 else {
+            throw AIProcessInventoryFailure.readFailed
         }
-        return text
+        try task.run()
+        try? pipe.fileHandleForWriting.close()
+        defer {
+            // This is only the Process instance created above, never a monitored target.
+            if task.isRunning { _ = Darwin.kill(task.processIdentifier, SIGKILL) }
+            task.waitUntilExit()
+            try? handle.close()
+        }
+        var data = Data(), buffer = [UInt8](repeating: 0, count: 65_536)
+        var eof = false
+        while !eof || task.isRunning {
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                throw AIProcessInventoryFailure.timeout
+            }
+            if !eof {
+                let count = buffer.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, $0.count) }
+                if count > 0 {
+                    guard data.count + count <= maxBytes else { throw AIProcessInventoryFailure.outputTooLarge }
+                    data.append(contentsOf: buffer.prefix(count))
+                    continue
+                }
+                if count == 0 { eof = true }
+                else if errno != EAGAIN && errno != EINTR { throw AIProcessInventoryFailure.readFailed }
+            }
+            if eof && !task.isRunning { break }
+            var pollfd = pollfd(fd: eof ? -1 : descriptor, events: Int16(POLLIN), revents: 0)
+            let remaining = max(1, min(100, Int((deadline - ProcessInfo.processInfo.systemUptime) * 1_000)))
+            if poll(&pollfd, 1, Int32(remaining)) < 0 && errno != EINTR {
+                throw AIProcessInventoryFailure.readFailed
+            }
+        }
+        task.waitUntilExit()
+        guard task.terminationStatus == 0 else { throw AIProcessInventoryFailure.commandFailed }
+        return data
     }
+
 }
 
 #if !PROCESS_HELPER

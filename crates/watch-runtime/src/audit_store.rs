@@ -29,6 +29,14 @@ pub trait AuditSystem {
     ) -> Result<Value> {
         self.local(config)
     }
+    /// Bind guard sampling to the daemon's immutable process observation. The
+    /// adapter still rechecks selected identities and network context now.
+    fn local_from_process_round(
+        &self, config: &Config, target: claude_watch_core::processes::LaunchTarget,
+        _round: &crate::sampler::ProcessRound,
+    ) -> Result<Value> {
+        self.local_for_target(config, target)
+    }
     fn network_and_local(&self, config: &Config, target: claude_watch_core::processes::LaunchTarget) -> Result<(Value, Value)> {
         Ok((self.network()?, self.local_for_target(config, target)?))
     }

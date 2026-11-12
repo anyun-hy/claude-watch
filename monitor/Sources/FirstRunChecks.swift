@@ -177,7 +177,7 @@ final class FirstRunChecks: InitializationChecking {
             let error = kind == .dns ? store.switcher.dnsReceiptError : store.switcher.webRTCReceiptError
             let timeoutDetail = timeoutStage.map { Self.timeoutDescription($0) + value.verdict.detail }
             return .failed(code: kind == .dns ? "dns_not_passed" : "webrtc_not_passed",
-                           detail: timeoutDetail ?? (error.isEmpty ? value.verdict.detail : error))
+                           detail: error.isEmpty ? (timeoutDetail ?? value.verdict.detail) : error)
         }
         if let failure = backendReceiptFailure(kind) {
             store.leakChecks.invalidateInitializationReceipt(kind)

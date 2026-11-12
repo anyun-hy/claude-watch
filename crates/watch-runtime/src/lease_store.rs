@@ -4,6 +4,7 @@ use crate::storage::StateStore;
 use claude_watch_core::{
     error::{CoreError, Result},
     processes::{self, Identity, Kind, Lease, Provider, Target},
+    session::Desktop,
 };
 use serde_json::json;
 use std::{collections::BTreeMap, fs, path::PathBuf};
@@ -12,6 +13,45 @@ pub struct LeaseStore {
     pub storage: StateStore,
 }
 impl LeaseStore {
+    /// The lease record names the supervised service, parsed back by the
+    /// lease store's provider table.
+    pub fn save_desktop(
+        &self,
+        desktop: &Desktop,
+        stamp: &str,
+        now: f64,
+        provider: Provider,
+    ) -> Result<()> {
+        if stamp.contains(['|', '\n', '\r']) || stamp.is_empty() {
+            return Err(CoreError::new(
+                "desktop_identity_unavailable",
+                "主进程启动时间未能确认",
+            ));
+        }
+        let name = match provider {
+            Provider::Claude => "claude",
+            Provider::Codex => "codex",
+            Provider::Chatgpt => "chatgpt",
+            Provider::Openai => "openai",
+        };
+        let path = self
+            .storage
+            .paths
+            .watch()
+            .join(format!("state/sessions/rust-{}.session", desktop.pid));
+        self.storage.atomic_bytes(
+            &path,
+            format!(
+                "desktop|{name}|{}|{}|0|-|{}\n",
+                desktop.pid,
+                stamp,
+                now.floor()
+            )
+            .as_bytes(),
+            0o600,
+        )
+    }
+
     pub fn save_cli(&self, provider: Provider, owner: &Identity, created: f64) -> Result<CliLease> {
         let id = self.save(
             &Lease {

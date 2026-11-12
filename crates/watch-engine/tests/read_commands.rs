@@ -42,6 +42,20 @@ fn fields(v: &Value, keys: &[&str]) {
 }
 
 #[test]
+fn process_inventory_observation_has_no_network_or_write_authority() {
+    let home = Home::new();
+    let receipt = home.run(&["observe", "--processes-only"]);
+    assert_eq!(receipt["schema"], 1);
+    assert_eq!(receipt["mode"], "read_only");
+    assert_eq!(receipt["grants_launch_permission"], false);
+    assert_eq!(receipt["grants_close_permission"], false);
+    assert!(receipt["targets"].is_array());
+    assert!(receipt.get("tag").is_none());
+    assert!(receipt.get("sockets").is_none());
+    assert_eq!(fs::read_dir(&home.0).unwrap().count(), 0, "read-only classification wrote application state");
+}
+
+#[test]
 fn diagnostic_export_reads_offline_without_overwrite_or_runtime_mutation() {
     let home = Home::new();
     let destination = fs::canonicalize(&home.0).unwrap().join("diagnostics.json");

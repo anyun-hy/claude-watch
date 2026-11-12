@@ -1,4 +1,5 @@
 """Exercise build entry points and the collector parent using private fixtures."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -213,11 +214,17 @@ class NativeDaemonStartupRegression(unittest.TestCase):
             root = Path(directory)
             runtime, home = root / "runtime", root / "home"
             runtime.mkdir(); home.mkdir()
+            runtime_artifacts = {}
             for name, source in [("watch-engine", engine), ("watch-native-observer", Path(components["native_observer"])),
                                  ("watch-process-control", Path(components["process_control"])),
                                  ("watch-native-collector.zsh", ROOT / "monitor/Resources/watch-native-collector.zsh")]:
                 shutil.copy2(source, runtime / name)
                 (runtime / name).chmod(0o700)
+                actual_hash = hashlib.sha256((runtime / name).read_bytes()).hexdigest()
+                source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+                self.assertEqual(actual_hash, source_hash)
+                runtime_artifacts[name] = {"path":str(runtime / name), "sha256":actual_hash,
+                                           "source_path":str(source), "source_sha256":source_hash}
             for index in range(24):
                 bundle = home / f"Applications/Private {index:02}.app/Contents"
                 (bundle / "MacOS").mkdir(parents=True)
@@ -231,11 +238,40 @@ class NativeDaemonStartupRegression(unittest.TestCase):
             broken.mkdir(parents=True)
             (broken / "Info.plist").write_text("not a property list")
             env = {key: value for key, value in os.environ.items() if not key.startswith(("CW_", "WATCH_"))}
+            env["HOME"] = str(home)
             started = time.monotonic()
             parent = subprocess.Popen(["/bin/zsh", "-f", str(runtime / "watch-native-collector.zsh"),
                                        "--home", str(home), "daemon", "--apply", "--observe-only"],
                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
             producer = None
+            owned = {}
+            def owned_rows():
+                # Include zombies, which the native live-identity observer
+                # intentionally excludes. Keep only this private process tree
+                # or an already observed lifetime; no installed process is a
+                # cleanup target or part of the recorded evidence.
+                result = subprocess.run(["/bin/ps", "-ww", "-axo", "pid=,ppid=,uid=,lstart=,stat=,comm="],
+                                        capture_output=True, text=True, timeout=2)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rows = {}
+                for line in result.stdout.splitlines():
+                    fields = line.split(None, 9)
+                    if len(fields) == 10 and fields[0].isdigit() and int(fields[2]) == os.getuid():
+                        rows[int(fields[0])] = {"parent":int(fields[1]), "start":" ".join(fields[3:8]),
+                                               "state":fields[8], "image":fields[9]}
+                descendants = {parent.pid}
+                if producer is not None:
+                    descendants.add(producer["pid"])
+                while True:
+                    expanded = descendants | {pid for pid, row in rows.items() if row["parent"] in descendants}
+                    if expanded == descendants:
+                        break
+                    descendants = expanded
+                selected = {pid:row for pid, row in rows.items()
+                            if pid in descendants or row["image"].startswith(str(runtime) + "/")
+                            or (pid in owned and row["start"] == owned[pid]["start"])}
+                owned.update(selected)
+                return selected
             def identity():
                 request = {"schema": 1, "round_id": "owned-startup-regression", "targets": [producer]}
                 check = subprocess.run([str(runtime / "watch-native-observer"), "identities"], input=json.dumps(request),
@@ -266,7 +302,9 @@ class NativeDaemonStartupRegression(unittest.TestCase):
                 self.assertEqual(readback.returncode, 0, readback.stderr)
                 self.assertEqual(json.loads(readback.stdout)["health"]["state"], "unavailable", "unregistered private publisher must fail the normal launchd verifier")
                 captures, proxy_samples, ages = set(), set(), []
-                until = time.monotonic() + 16
+                sustained_started = time.monotonic()
+                until = sustained_started + 16
+                next_children = sustained_started
                 while time.monotonic() < until and parent.poll() is None:
                     current = json.loads(snapshot_path.read_text())
                     self.assertEqual(current["producer"], producer)
@@ -278,10 +316,15 @@ class NativeDaemonStartupRegression(unittest.TestCase):
                     if isinstance(proxy.get("observedAt"), (float, int)):
                         proxy_samples.add(proxy["observedAt"])
                     self.assertLess(ages[-1], 8, "slow/partial application discovery must not stale the real publisher")
+                    if time.monotonic() >= next_children:
+                        owned_rows()
+                        next_children = time.monotonic() + 2
                     time.sleep(0.1)
                 self.assertIsNone(parent.poll(), "private daemon must remain alive throughout observation")
                 self.assertGreaterEqual(len(captures), 6, "need sustained fresh rounds, not just the bootstrap heartbeat")
                 self.assertGreaterEqual(len(proxy_samples), 2, "need two actual proxy observations, not rereads stamped fresh")
+                sustained_seconds = time.monotonic() - sustained_started
+                owned_rows()
                 stopped = time.monotonic()
                 parent.send_signal(signal.SIGTERM)
                 stdout, stderr = parent.communicate(timeout=5)
@@ -289,7 +332,30 @@ class NativeDaemonStartupRegression(unittest.TestCase):
                 self.assertEqual(parent.returncode, 0, (stdout[-1000:], stderr[-1000:]))
                 ended = identity()
                 self.assertEqual((ended["state"], ended["code"]), ("unknown", "process_exited"))
+                remaining = owned_rows()
+                # The collector owns a two-second sampling interval and exits
+                # after its reader closes. Include that actual descendant
+                # cleanup in the existing five-second shutdown budget.
+                while remaining and time.monotonic() - stopped < 5:
+                    time.sleep(0.05)
+                    remaining = owned_rows()
+                cleanup_seconds = time.monotonic() - stopped
+                self.assertFalse(remaining, f"private descendants survived shutdown: {remaining}")
+                self.assertLess(cleanup_seconds, 5, "private worker and descendants must finish within the existing stop budget")
+                evidence = {"clock":"monotonic", "first_observation_seconds":publication_seconds,
+                            "sustained_seconds":sustained_seconds, "snapshot_count":len(captures),
+                            "proxy_sample_count":len(proxy_samples), "max_snapshot_wall_age_seconds":max(ages),
+                            "parent_stop_seconds":stop_seconds, "all_owned_descendants_exit_seconds":cleanup_seconds,
+                            "observed_owned_lifetimes":len(owned), "remaining_owned_descendants":len(remaining),
+                            "runtime_artifacts":runtime_artifacts,
+                            "boundary":"private observe-only daemon; no registered service or AI launch"}
+                evidence_dir = os.environ.get("CW_CHANNEL_CONTRACT_DIR")
+                if evidence_dir:
+                    destination = Path(evidence_dir)
+                    destination.mkdir(parents=True, exist_ok=True)
+                    (destination / "private-daemon-lifecycle.json").write_text(json.dumps(evidence, indent=2) + "\n")
                 print(f"private native daemon: first observation={publication_seconds:.3f}s; captures={len(captures)}; proxy samples={len(proxy_samples)}; max age={max(ages):.3f}s; stop={stop_seconds:.3f}s; original worker exit verified; no registered service or AI launch")
+                print(f"private daemon lifecycle: {json.dumps(evidence, sort_keys=True)}")
             finally:
                 if parent.poll() is None:
                     parent.terminate()

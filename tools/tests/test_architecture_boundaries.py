@@ -5,7 +5,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 CONTROLLED = (ROOT / "crates/watch-runtime/src/controlled.rs").read_text(encoding="utf-8")
 LAUNCH = (ROOT / "crates/watch-runtime/src/controlled/launch.rs").read_text(encoding="utf-8")
-FAILURE = (ROOT / "crates/watch-runtime/src/controlled/sampling_failure.rs").read_text(encoding="utf-8")
+LEASES = (ROOT / "crates/watch-runtime/src/lease_store.rs").read_text(encoding="utf-8")
+SESSIONS = (ROOT / "crates/watch-runtime/src/session_store.rs").read_text(encoding="utf-8")
 MONITOR = (ROOT / "monitor/Sources/MonitorStore.swift").read_text(encoding="utf-8")
 SNAPSHOT = (ROOT / "monitor/Sources/MonitorSnapshotReader.swift").read_text(encoding="utf-8")
 CONTEXT = (ROOT / "monitor/Sources/DiagnosticContextTracker.swift").read_text(encoding="utf-8")
@@ -15,20 +16,22 @@ HELPER = (ROOT / "monitor/tools/ProcessHelper.swift").read_text(encoding="utf-8"
 
 
 class ArchitectureBoundaries(unittest.TestCase):
-    def test_guard_controller_keeps_family_coordination_not_launch_effects(self):
+    def test_guard_controller_only_projects_the_supervisor_frame(self):
         self.assertIn("mod launch;", CONTROLLED)
-        self.assertIn("mod sampling_failure;", CONTROLLED)
         self.assertIn("pub fn guard_tick<S: DesktopSystem>", CONTROLLED)
-        self.assertNotIn("fn record_launch(", CONTROLLED)
-        self.assertNotIn("pub fn launch_cli", CONTROLLED)
-        self.assertNotIn("fn sampling_failure", CONTROLLED)
+        self.assertIn("channel_policy_status::read_frame", CONTROLLED)
+        for retired in ["FamilyChannelLedger", "guard_tick_family", "enforce_channel",
+                        "guard-heartbeat.json", "read_process_real_uid", "atomic_json"]:
+            self.assertNotIn(retired, CONTROLLED)
 
-    def test_launch_lifecycle_has_a_single_authoritative_implementation(self):
-        for key in ["pub fn launch<", "pub fn launch_cli", "fn observation_audit<",
-                    "pub(crate) fn lease("]:
+    def test_launch_and_lease_storage_have_one_owner(self):
+        for key in ["pub fn launch<", "pub fn launch_cli", "fn observation_audit<"]:
             self.assertIn(key, LAUNCH)
-        self.assertIn('self.finish_current_stop(', CONTROLLED)
-        self.assertIn("pub(super) fn sampling_failure<", FAILURE)
+        self.assertNotIn("begin_verified", LAUNCH)
+        self.assertNotIn("desktop-pending", LAUNCH)
+        self.assertNotIn("controlled::Controller", SESSIONS)
+        self.assertIn("pub fn save_desktop(", LEASES)
+        self.assertIn("LeaseStore", LAUNCH)
 
     def test_monitor_presentation_is_not_its_snapshot_reader(self):
         self.assertIn("final class MonitorStore: ObservableObject", MONITOR)
@@ -57,7 +60,7 @@ class ArchitectureBoundaries(unittest.TestCase):
         self.assertIn("TASK_AUDIT_TOKEN", PROCESS)
         self.assertIn("proc_pidpath_audittoken(&token, &path, UInt32(path.count))", PROCESS)
         self.assertIn("auditToken == other.auditToken", PROCESS)
-        self.assertIn("identities[index].sameProcess(as: verified)", PROCESS)
+        self.assertIn("before[index].sameProcess(as: current)", PROCESS)
 
 
 if __name__ == "__main__":

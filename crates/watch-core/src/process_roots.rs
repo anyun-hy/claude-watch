@@ -303,3 +303,47 @@ pub fn classify_with_evidence(
     }
     RootClassification::other(NotTarget)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_process_classifier_uses_verified_catalogs_and_exact_entrypoints() {
+        let home = Path::new("/fixture");
+        let bundle = PathBuf::from("/fixture/Renamed.app");
+        let executable = bundle.join("Contents/MacOS/App");
+        let claude_script = "/fixture/AI Tools/node_modules/@anthropic-ai/claude-code/cli.js";
+        let codex_script = "/fixture/AI Tools/node_modules/@openai/codex/bin/codex.js";
+        let trusted = TrustedCliPaths {
+            desktop_catalog: Some(vec![(bundle.clone(), "com.openai.codex".into(), executable.clone())]),
+            exact_cli_catalog: true,
+            claude: ["/fixture/approved-claude".into(), claude_script.into()].into_iter().collect(),
+            codex: ["/fixture/approved-codex".into(), codex_script.into()].into_iter().collect(),
+            ..Default::default()
+        };
+        let classify = |path: &str, args: &[&str], bundle_path: Option<&str>, bundle_id: Option<&str>| {
+            let identity = Identity { pid: 70, parent: 1, uid: 501, executable: path.into(),
+                start_seconds: 100, start_microseconds: 1, start_stamp: String::new() };
+            let tokens = args.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
+            super::classify(RootEvidence { identity: &identity, bundle_path, bundle_id,
+                arguments: Some(&tokens), cwd: Some("/fixture") }, home, &trusted, |_| None)
+        };
+        use Classification::{NotTarget, Root};
+        assert_eq!(classify(executable.to_str().unwrap(), &[], Some(bundle.to_str().unwrap()), Some("com.openai.codex")), Root(Kind::CodexMain));
+        assert_eq!(classify("/fixture/Fake.app/Contents/MacOS/App", &[], Some("/fixture/Fake.app"), Some("com.openai.codex")), NotTarget);
+        assert_eq!(classify("/fixture/approved-claude", &[], None, None), Root(Kind::ClaudeCode));
+        assert_eq!(classify("/fixture/approved-codex", &[], None, None), Root(Kind::CodexCli));
+        assert_eq!(classify("/fixture/untrusted/node_modules/@openai/codex/bin/codex.js", &[], None, None), NotTarget);
+        assert_eq!(classify("/usr/bin/node", &["node", claude_script], None, None), Root(Kind::ClaudeCode));
+        assert_eq!(classify("/usr/bin/node", &["node", "--require", "/tmp/preload.js", "--import=file:///tmp/boot.mjs", "AI Tools/node_modules/@openai/codex/bin/codex.js"], None, None), Root(Kind::CodexCli));
+        assert_eq!(classify("/usr/bin/node", &["node", "--", codex_script], None, None), Root(Kind::CodexCli));
+        assert_eq!(classify("/usr/bin/node", &["node", "-e", codex_script], None, None), NotTarget);
+        assert_eq!(classify("/usr/bin/node", &["node", "/fixture/unrelated.js", codex_script], None, None), NotTarget);
+        let managed = "/fixture/.codex/packages/app-server-daemon/releases/1.2.3/bin/codex";
+        assert_eq!(classify(managed, &["codex", "app-server", "daemon"], None, None), Root(Kind::CodexCli));
+        assert_eq!(classify(managed, &["codex", "app-server", "--listen", "127.0.0.1:4500"], None, None), Root(Kind::CodexCli));
+        assert_eq!(classify(managed, &["codex", "--help"], None, None), NotTarget);
+        assert_eq!(classify(managed, &["codex", "app-server", "--listen", "--bad"], None, None), NotTarget);
+    }
+}

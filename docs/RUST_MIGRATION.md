@@ -68,7 +68,9 @@ startup 在共享 operation/launch 锁内完成审计、owner 身份复核、租
 | dns-check | ReceiptStore 的 DNS 泄漏回执及同轮上下文 → core 同一 DNS 判定 | 默认读共享样本并标时间；显式联网只请求既有 DNS 刷新桥；不跑无关 STUN/ASN/服务检测；不授权 | 已改专项视图，相关隔离测试通过 |
 | dns-probe | 原生系统 DNS 路径及 HTTP 参考采样 | 原始诊断，不作为“无泄漏”结论或启动许可 | 保留，与 dns-check 明确区分 |
 | audit | AuditStore 完整审计 | 与全量检查使用相同判定；是否保存由接口参数决定；不授权 | 保留 |
-| launch/launch-desktop | Controller → fresh full audit → SessionStore → NativeDesktop | 公开启动需 `--apply`；不消费检查回执作许可 | 唯一 Claude 受控启动路径 |
+| launch/launch-desktop | Controller → fresh full audit → NativeDesktop 受控入口 → LeaseStore | 公开启动需 `--apply`；不消费检查回执作许可，不自行签发家族通道许可 | 桌面目标共用启动路径；会话与保护决策归 ChannelSupervisor |
+| guard-tick | 已发布 channel-supervision 帧 → 只读摘要 | 不采样、不写会话、不发执行命令 | 自动保护只由 ChannelSupervisor 决策，enforcer/dispatcher 执行并返回真实回执 |
+| observe --processes-only | Sampler → Rust 直接分类证据 → 身份绑定的批量投影 | 只读，不采集 sockets/TAG，不授予关闭或启动权限 | Swift 使用同一分类结果；关闭前仍用原生 PID/启动时间/路径/audit token 复核 |
 | status/service-status/snapshot | 共享配置、SessionStore、服务状态和已发布观察回合 | 只读；不能由文件存在推断健康 | 保留；会话基准以 SessionStore 为准 |
 | account、setup、repair、protection、services、update、安装/卸载 | 各自既有 Rust 事务服务和受限系统适配 | 保留预览绑定、明确执行、读回、冲突处理及恢复 | 已接主体，逐项按清单验证，不在本轮真实执行 |
 | AI/评分/服务器参考/通知/进程活动 | 已接网络客户端、采样器和事件服务 | 使用既有缓存、来源与限流；不产生启动权限 | 保留实际调用，按对应协议验证 |

@@ -48,6 +48,35 @@ impl ReadRunner for Fixture {
     }
 }
 
+/// Supply observations to the current supervisor instead of synthesizing its
+/// protection result. The executor has no real listener, app, or process target.
+fn publish_idle_guard(store: &StateStore, config: &mut Config, now: f64) {
+    use claude_watch_core::vpn::{ObservationConsistency, ObservedField, UpstreamProtocol, VpnEpoch, VpnExpectation, VpnObservation};
+    use claude_watch_runtime::{channel_enforcer::LocalTunnelEnforcer, channel_supervisor::{ChannelSupervisor, SupervisionEvent}};
+    config.proxy_mode = "surge".into();
+    config.proxy_url = "http://127.0.0.1:7890".into();
+    config.vpn_expectation = Some(VpnExpectation {
+        configured:true, proxy_mode:config.proxy_mode.clone(), proxy_url:config.proxy_url.clone(),
+        running_mode:Some("rule".into()), ..Default::default()
+    });
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("local-observation-fixture"));
+    enforcer.activate_interception(now).unwrap();
+    let mut supervisor = ChannelSupervisor::new_with_config(store.clone(), config.clone(), None, Some(enforcer), None).unwrap();
+    supervisor.handle_event(SupervisionEvent::VpnObservationUpdated {
+        observation:VpnObservation {
+            source:"surge".into(), source_instance:Some("fixture-vpn".into()), source_revision:Some("1".into()),
+            upstream_endpoint:Some(config.proxy_url.clone()), upstream_protocol:ObservedField::Known(UpstreamProtocol::MixedHttp),
+            running_mode:ObservedField::Known("rule".into()), tun_enabled:ObservedField::Known(true), system_proxy_enabled:ObservedField::Known(true),
+            selected_group:ObservedField::Known(String::new()), selected_node:ObservedField::Known("fixture".into()),
+            proxy_chain:ObservedField::Known(vec![]), rules_digest:ObservedField::Unknown("not_required".into()),
+            sample_started_at:now, observed_at:now, valid_until:now+30.0, consistency:ObservationConsistency::RevisionVerified,
+            source_error:None, sample_seq:1, epoch:VpnEpoch::new("local-observation-vpn",1),
+        }, observed_at:now,
+    }).unwrap();
+    store.atomic_json(&store.paths.watch().join("state/guard-service-heartbeat.json"),
+        &json!({"schema":1,"pid":77,"start_stamp":"Mon Oct 26 01:02:03 2026","time":now})).unwrap();
+}
+
 #[test]
 fn guard_liveness_survives_a_degraded_monitoring_round_without_claiming_complete_sampling() {
     let home = Home::new();
@@ -73,6 +102,9 @@ fn guard_liveness_survives_a_degraded_monitoring_round_without_claiming_complete
         &host.storage.paths.base().join("guard-heartbeat.json"),
         &json!({"time":now,"status":"ok","guard_policy_v1":claude_watch_runtime::config_store::guard_policy_digest(&config).unwrap()}),
     ).unwrap();
+    assert_eq!(AuditSystem::local(&host, &config).unwrap()["guard"], false,
+        "a legacy heartbeat is not execution evidence even when the backend is alive");
+    publish_idle_guard(&host.storage, &mut config, now);
     let local = AuditSystem::local(&host, &config).unwrap();
     assert_eq!(local["backend_healthy"], false);
     assert_eq!(local["guard_backend_healthy"], true);
@@ -219,12 +251,7 @@ fn service_status_uses_one_backend_snapshot_for_liveness_and_sampling_quality() 
             0o600,
         )
         .unwrap();
-    host.storage
-        .atomic_json(
-            &host.storage.paths.base().join("guard-heartbeat.json"),
-            &json!({"time":now,"status":"ok","guard_policy_v1":claude_watch_runtime::config_store::guard_policy_digest(&config).unwrap()}),
-        )
-        .unwrap();
+    publish_idle_guard(&host.storage, &mut config, now);
     let status = claude_watch_runtime::services::service_status(&host, &config).unwrap();
     assert_eq!(status["backend_healthy"], false);
     assert_eq!(status["guard_backend_healthy"], true);

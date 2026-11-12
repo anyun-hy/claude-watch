@@ -401,6 +401,15 @@ fn bounded_pid_list(pids: &[u32], maximum: usize) -> Result<String> {
         .join(","))
 }
 impl<R: ReadRunner + ?Sized> ReadRunner for &R {
+    fn loopback_tcp_reachable(&self, port: u16, timeout: Duration) -> bool {
+        (*self).loopback_tcp_reachable(port, timeout)
+    }
+    fn process_start_time_any_user(&self, pid: u32) -> Option<(u64, u32)> {
+        (*self).process_start_time_any_user(pid)
+    }
+    fn observed_process_identity(&self, pid: u32) -> Option<claude_watch_system::ProcessKernelIdentity> {
+        (*self).observed_process_identity(pid)
+    }
     fn process_identity(&self, pid: u32) -> Option<claude_watch_core::processes::Identity> {
         (*self).process_identity(pid)
     }
@@ -409,6 +418,15 @@ impl<R: ReadRunner + ?Sized> ReadRunner for &R {
     }
 }
 impl<R: ReadRunner + ?Sized> ReadRunner for std::sync::Arc<R> {
+    fn loopback_tcp_reachable(&self, port: u16, timeout: Duration) -> bool {
+        self.as_ref().loopback_tcp_reachable(port, timeout)
+    }
+    fn process_start_time_any_user(&self, pid: u32) -> Option<(u64, u32)> {
+        self.as_ref().process_start_time_any_user(pid)
+    }
+    fn observed_process_identity(&self, pid: u32) -> Option<claude_watch_system::ProcessKernelIdentity> {
+        self.as_ref().observed_process_identity(pid)
+    }
     fn process_identity(&self, pid: u32) -> Option<claude_watch_core::processes::Identity> {
         self.as_ref().process_identity(pid)
     }
@@ -434,6 +452,18 @@ impl Output {
     }
 }
 pub trait ReadRunner {
+    /// Bounded connection observation only; sends no application request.
+    fn loopback_tcp_reachable(&self, port: u16, timeout: Duration) -> bool {
+        std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), timeout).is_ok()
+    }
+    /// Existing cross-user birth-time observation; not an action identity.
+    fn process_start_time_any_user(&self, pid: u32) -> Option<(u64, u32)> {
+        claude_watch_system::process_start_time_any_user(pid)
+    }
+    /// Read-only identity including the kernel exec generation when accessible.
+    fn observed_process_identity(&self, pid: u32) -> Option<claude_watch_system::ProcessKernelIdentity> {
+        claude_watch_system::inspect_process_identity(pid)
+    }
     /// A bounded kernel query for one already selected PID. Native listener
     /// provenance must not pay for a whole-machine inventory every read.
     fn process_identity(&self, pid: u32) -> Option<claude_watch_core::processes::Identity> {
@@ -465,6 +495,20 @@ impl<'a, R> DeadlineRunner<'a, R> {
     }
 }
 impl<R: ReadRunner> ReadRunner for DeadlineRunner<'_, R> {
+    fn loopback_tcp_reachable(&self, port: u16, timeout: Duration) -> bool {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        !remaining.is_zero() && self.runner.loopback_tcp_reachable(port, timeout.min(remaining)) && Instant::now() < self.deadline
+    }
+    fn process_start_time_any_user(&self, pid: u32) -> Option<(u64, u32)> {
+        if Instant::now() >= self.deadline { return None; }
+        let start = self.runner.process_start_time_any_user(pid)?;
+        (Instant::now() < self.deadline).then_some(start)
+    }
+    fn observed_process_identity(&self, pid: u32) -> Option<claude_watch_system::ProcessKernelIdentity> {
+        if Instant::now() >= self.deadline { return None; }
+        let identity = self.runner.observed_process_identity(pid)?;
+        (Instant::now() < self.deadline).then_some(identity)
+    }
     fn process_identity(&self, pid: u32) -> Option<claude_watch_core::processes::Identity> {
         if Instant::now() >= self.deadline { return None; }
         let identity = self.runner.process_identity(pid)?;

@@ -176,71 +176,48 @@ struct AIProcessExitEvidenceTests {
         let manualClaudePlan = AIProcessClosePolicy.plan(.claude, inventory: manualClaudeScoped, uid: 501, protected: [])
         expect(manualClaudePlan.targets.map(\.pid) == [40, 41, 42, 43],
                "manual Claude close plan includes both desktop and standalone CLI trees")
-        let home = "/Users/test"
-        expect(AIProcessClosePolicy.classifyRoot(
-            executable: "/opt/homebrew/bin/node",
-            arguments: "/opt/homebrew/bin/node --require /tmp/preload.js --import=file:///tmp/boot.mjs node_modules/@anthropic-ai/claude-code/cli.js",
-            cwd: "/opt/claude",
-            home: home) == (.claude, false),
-            "nodeEntry skips --require and --import flags and resolves relative script with cwd")
-        expect(AIProcessClosePolicy.classifyRoot(
-            executable: "/usr/bin/node",
-            arguments: "/usr/bin/node -- /opt/node_modules/@openai/codex/bin/codex.js",
-            home: home) == (.openAI, false),
-            "nodeEntry supports -- argument separator")
-        expect(AIProcessClosePolicy.classifyRoot(
-            executable: "/opt/homebrew/bin/node",
-            argumentTokens: [
-                "/opt/homebrew/bin/node",
-                "/Users/test/AI Tools/node_modules/@anthropic-ai/claude-code/cli.js"
-            ],
-            home: home) == (.claude, false),
-            "nodeEntryTokens preserves absolute script paths containing spaces")
-        expect(AIProcessClosePolicy.classifyRoot(
-            executable: "/opt/homebrew/bin/node",
-            argumentTokens: [
-                "/opt/homebrew/bin/node",
-                "AI Tools/node_modules/@openai/codex/bin/codex.js"
-            ],
-            cwd: "/Users/test",
-            home: home) == (.openAI, false),
-            "nodeEntryTokens resolves relative script paths containing spaces against cwd")
-        let daemonBin = "/Users/test/.codex/packages/app-server-daemon/releases/1.2.3/bin/codex"
-        expect(AIProcessClosePolicy.classifyRoot(
-            executable: daemonBin,
-            arguments: daemonBin + " app-server daemon",
-            home: home) == (.openAI, false),
-            "managed codex app-server daemon is attributed to OpenAI CLI role")
-        expect(AIProcessClosePolicy.classifyRoot(
-            executable: daemonBin,
-            arguments: daemonBin + " app-server --listen 127.0.0.1:4500",
-            home: home) == (.openAI, false),
-            "managed codex app-server --listen <addr> is attributed to OpenAI CLI role")
-        expect(AIProcessClosePolicy.classifyRoot(
-            executable: daemonBin,
-            arguments: daemonBin + " --help",
-            home: home) == (nil, false),
-            "managed codex binary without app-server arguments is not classified as daemon")
-        expect(AIProcessClosePolicy.classifyRoot(
-            executable: daemonBin,
-            arguments: daemonBin + " app-server --listen --bad",
-            home: home) == (nil, false),
-            "managed codex app-server with flag instead of listen address is rejected")
-        expect(AIProcessClosePolicy.classifyRoot(
-            executable: "/Applications/ChatGPT.app/Contents/Resources/codex",
-            bundleIdentifier: "com.openai.chat",
-            home: home) == (.openAI, false),
-            "bundled Codex CLI inside ChatGPT.app is classified as OpenAI non-desktopMain")
-        expect(AIProcessClosePolicy.classifyRoot(
-            executable: "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
-            bundleIdentifier: "com.openai.chat",
-            home: home) == (.openAI, true),
-            "ChatGPT.app main executable is classified as OpenAI desktopMain")
-        expect(AIProcessClosePolicy.classifyRoot(
-            executable: "/Applications/Fake.app/Contents/MacOS/Fake",
-            bundleIdentifier: "com.openai.chat",
-            home: home) == (nil, false),
-            "mismatched OpenAI bundle name is rejected")
+        let classified = row(70, path: "/fixture/Renamed.app/Contents/MacOS/App")
+        func batch(_ change: (inout [String: Any]) -> Void = { _ in }) -> Data {
+            var value: [String: Any] = [
+                "schema": 1, "status": "ok", "mode": "read_only", "state": "ok", "uid": 501,
+                "observed_at": 100.0, "grants_launch_permission": false, "grants_close_permission": false,
+                "targets": [["identity": ["pid": 70, "parent": 1, "uid": 501,
+                    "executable": classified.executable, "start_seconds": 100, "start_microseconds": 1],
+                    "product": "openai", "desktop_main": true]]
+            ]
+            change(&value)
+            return try! JSONSerialization.data(withJSONObject: value)
+        }
+        let mapped = try! AIProcessClassificationBatch.apply(batch(), to: [classified], uid: 501, now: 101,
+            lookup: { _ in .live(classified) })
+        expect(mapped.first?.rootProduct == .openAI && mapped.first?.desktopMain == true,
+               "Swift accepts the Rust product projection without matching application names")
+        let completed = try! AIProcessClassificationBatch.apply(batch(), to: [classified], uid: 501, now: 101,
+            lookup: { _ in .gone })
+        expect(completed.first?.rootProduct == nil, "confirmed exit creates no new close target")
+        func rejects(_ data: Data, before: [AIProcessIdentity] = [classified],
+                     lookup: (Int32) -> AIProcessPresence = { _ in .live(classified) }) -> Bool {
+            do { _ = try AIProcessClassificationBatch.apply(data, to: before, uid: 501, now: 101, lookup: lookup); return false }
+            catch { return true }
+        }
+        expect(rejects(batch { $0["state"] = "partial" }), "partial classification cannot claim an empty complete inventory")
+        expect(rejects(batch { $0["observed_at"] = 1 }), "expired classification is rejected")
+        expect(rejects(batch { $0["observed_at"] = 104 }), "future classification is rejected")
+        expect(rejects(batch { $0["uid"] = 502 }), "foreign owner classification is rejected")
+        expect(rejects(batch { $0["grants_close_permission"] = true }), "read-only classification cannot grant close authority")
+        expect(rejects(batch { value in
+            let targets = value["targets"] as! [[String: Any]]
+            value["targets"] = targets + targets
+        }), "duplicate classified PID is rejected")
+        expect(rejects(batch(), before: []), "new root absent from the original identity capture is rejected")
+        expect(rejects(batch(), lookup: { _ in .unavailable }), "unknown native identity blocks classification")
+        expect(rejects(batch(), lookup: { _ in .live(row(70, start: 101, path: classified.executable)) }),
+               "PID reuse during batch classification is rejected")
+        expect(rejects(batch(), lookup: { _ in .live(row(70, path: "/fixture/replacement")) }),
+               "executable replacement during batch classification is rejected")
+        var reexecuted = classified; reexecuted.auditToken = [501, 501, 20, 501, 20, 70, 1000, 2]
+        expect(rejects(batch(), lookup: { _ in .live(reexecuted) }),
+               "in-place exec with unchanged PID/start/path is rejected by the audit token")
         print("AIProcessExitEvidenceTests: \(checks) assertions passed; all identities and actions mocked")
     }
 }

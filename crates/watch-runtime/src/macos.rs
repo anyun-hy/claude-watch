@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, fs, io::Read, os::unix::fs::{MetadataExt, OpenOptionsExt}, time::Duration};
 
 /// Match complete executable prefixes, never a display name or command argument.
-fn proxy_mode(executable: &str) -> Option<&'static str> {
+pub(crate) fn proxy_mode(executable: &str) -> Option<&'static str> {
     for (mode, prefixes) in [
         ("tag", &["/Applications/TAG.app/Contents/"][..]),
         (
@@ -115,6 +115,36 @@ pub struct Macos<R: ReadRunner, T: Transport, M: Mutator> {
     pub authority: Authority,
     pub mutator: M,
     pub probes: std::sync::Arc<dyn crate::online_probes::OnlineProbes>,
+}
+
+fn observed_identity(identity: &claude_watch_system::ProcessKernelIdentity) -> Value {
+    json!({"pid":identity.pid,"uid":identity.uid,"executable":identity.executable_path,
+        "start_seconds":identity.start_seconds,"start_microseconds":identity.start_microseconds,"audit_token":identity.audit_token})
+}
+
+fn guard_process_candidate(row: &Value, uid: u32, backend: &std::path::Path) -> bool {
+    let executable = row["executable"].as_str().unwrap_or("");
+    ((row["uid"] == 0 || row["uid"] == uid) && proxy_mode(executable).is_some())
+        || Some(executable) == backend.to_str()
+}
+
+/// Compare only the proxy/backend set from an in-flight round with a newer
+/// primary observation. Missing or stale input is never an unchanged context.
+pub fn guard_round_matches(current: &ProcessRound, newer: &ProcessRound, backend: &std::path::Path) -> bool {
+    let context = |round: &ProcessRound| -> Option<Value> {
+        let observation = round.system_processes.as_ref()?;
+        let now = native::now();
+        if ![round.observed_at, observation.observed_at].iter()
+            .all(|at| (0.0..=crate::process_disposition::INTENT_TTL).contains(&(now - at))) { return None; }
+        let processes = observation.processes.as_ref().ok()?.iter()
+            .filter(|(_, row)| guard_process_candidate(row, round.uid, backend))
+            .map(|(pid, row)| json!({"pid":pid,"uid":row["uid"],"executable":row["executable"],"stamp":row["stamp"],
+                "birth":if row["uid"] == 0 { observation.root_starts.get(pid).map(|start| json!(start)) }
+                    else { round.identities.get(pid).map(|identity| json!((identity.start_seconds,identity.start_microseconds))) }}))
+            .collect::<Vec<_>>();
+        Some(json!({"uid":round.uid,"processes":processes}))
+    };
+    context(current).zip(context(newer)).is_some_and(|(current, newer)| current == newer)
 }
 
 struct BackendFacts {
@@ -456,7 +486,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         let evidence = crate::channel_policy_status::guard_summary(&frame, config, at);
         guard_heartbeat_confirmed(config, backend, at, &evidence)
     }
-    pub fn backend_health_from_frame(&self, frame: &crate::channel_policy_status::FrameEvidence<'_>, evidence: &Value) -> crate::services::BackendHealthSnapshot {
+    pub fn backend_health_from_frame(&self, frame: &crate::channel_policy_status::StatusFrame<'_>, evidence: &Value) -> crate::services::BackendHealthSnapshot {
         let mut facts = self.backend_facts();
         let guard_healthy = guard_heartbeat_confirmed(frame.config, facts.guard_healthy, frame.now, evidence);
         facts.diagnostics["guard"] = crate::guard_readiness::read(
@@ -470,18 +500,36 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         }
     }
     fn local_facts(&self, c: &Config) -> Result<Value> {
+        self.local_facts_from_round(c, None)
+    }
+    fn local_facts_from_round(&self, c: &Config, round: Option<&ProcessRound>) -> Result<Value> {
         let env = self.environment()?;
         let uid = env["uid"]
             .as_u64()
             .and_then(|v| u32::try_from(v).ok())
             .ok_or_else(|| CoreError::new("invalid_native_observation", "未取得当前用户身份"))?;
         let sampler = Sampler::new(&self.runner, self.storage.paths.clone());
-        let table = sampler.process_table();
-        let native_inventory = Observer {
-            runner: &self.runner,
-        }
-        .inventory();
-        let mut identity_unavailable = !native_inventory.as_ref().is_ok_and(|v| v.uid == uid);
+        let table_at = round.and_then(|round| round.system_processes.as_ref()).map_or_else(native::now, |observation| observation.observed_at);
+        let mut guard_identities = Vec::new();
+        let table = if let Some(round) = round {
+            let observation = round.system_processes.as_ref().ok_or_else(||
+                CoreError::new("process_observation_missing", "本轮系统进程观察缺失"))?;
+            let now = native::now();
+            if round.uid != uid || ![round.observed_at, observation.observed_at].iter()
+                .all(|at| (0.0..=crate::process_disposition::INTENT_TTL).contains(&(now - at))) {
+                return Err(CoreError::new("process_observation_stale", "本轮进程观察已过期或用户身份不符"));
+            }
+            let table = observation.processes.as_ref().map_err(Clone::clone)?;
+            guard_identities = self.guard_process_identities(round, table, &sampler)?;
+            Ok(table.clone())
+        } else { sampler.process_table() };
+        let native_identities = if let Some(round) = round {
+            Ok((round.uid, round.identities.clone()))
+        } else {
+            Observer { runner: &self.runner }.inventory().map(|inventory|
+                (inventory.uid, inventory.processes.into_iter().map(|(pid, record)| (pid, record.identity)).collect()))
+        };
+        let mut identity_unavailable = !native_identities.as_ref().is_ok_and(|(owner, _)| *owner == uid);
         let mut candidates = BTreeMap::<&str, Vec<Value>>::new();
         if let Ok(table) = &table {
             for (pid, process) in table {
@@ -494,24 +542,24 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                         identity["pid"] = json!(pid);
                         identity["start_stamp"] = identity["stamp"].clone();
                         if process["uid"] == uid {
-                            if let Some(record) = native_inventory
+                            if let Some(identity_record) = native_identities
                                 .as_ref()
                                 .ok()
-                                .and_then(|v| v.processes.get(pid))
+                                .and_then(|(_, identities)| identities.get(pid))
                                 .filter(|record| {
-                                    record.identity.uid == uid
-                                        && record.identity.executable
+                                    record.uid == uid
+                                        && record.executable
                                             == process["executable"].as_str().unwrap_or("")
                                         && claude_watch_core::processes::normalized_stamp(
-                                            &record.identity.start_stamp,
+                                            &record.start_stamp,
                                         ) == claude_watch_core::processes::normalized_stamp(
                                             process["stamp"].as_str().unwrap_or(""),
                                         )
                                 })
                             {
-                                identity["start_seconds"] = json!(record.identity.start_seconds);
+                                identity["start_seconds"] = json!(identity_record.start_seconds);
                                 identity["start_microseconds"] =
-                                    json!(record.identity.start_microseconds);
+                                    json!(identity_record.start_microseconds);
                                 identity["native_identity"] = json!(true);
                             } else {
                                 identity_unavailable = true;
@@ -570,6 +618,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                 complete: true,
                 observed_at: native::now(),
                 discovery: None,
+                system_processes: Some(crate::sampler::ProcessTableObservation { observed_at: table_at, processes: table.clone(), root_starts: BTreeMap::new() }),
             };
             let sockets = SocketRound {
                 flows: vec![],
@@ -632,7 +681,120 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         } else {
             json!({"state":"unknown","detail":"未取得当前代理的实际规则证据"})
         };
+        if let Some(round) = round {
+            // TAG/controller and launchd reads also perform I/O. Recheck the
+            // same identities at the end, including exec generation, rather
+            // than treating the pre-I/O identity as a new observation.
+            let mut environment_at = round.observed_at.min(table_at);
+            if selected == "tag" {
+                out["guard_listener"] = tag["entry"]["owners"].clone();
+                let listener_at = tag["listener_observed_at"].as_f64()
+                    .filter(|at| (0.0..=crate::vpn_observer::DEFAULT_VPN_OBSERVATION_TTL_SECONDS).contains(&(native::now() - at)))
+                    .ok_or_else(|| CoreError::new("proxy_listener_unavailable", "TAG监听观察不可读或已经过期"))?;
+                out["guard_listener_observed_at"] = json!(listener_at);
+                environment_at = environment_at.min(listener_at);
+            }
+            if selected != "tag" && proxy == "ok" {
+                let endpoint = if c.proxy_url.trim().is_empty() { crate::network_client::DEFAULT_PROXY } else { &c.proxy_url };
+                let url = url::Url::parse(endpoint).ok()
+                    .filter(|_| claude_watch_core::config::valid_loopback_proxy(endpoint))
+                    .ok_or_else(|| CoreError::new("proxy_listener_unavailable", "未取得受控代理监听端点"))?;
+                let port = url.port_or_known_default().ok_or_else(|| CoreError::new("proxy_listener_unavailable", "代理端口无效"))?;
+                let address = match url.host() {
+                    Some(url::Host::Ipv4(address)) => std::net::IpAddr::V4(address),
+                    Some(url::Host::Ipv6(address)) => std::net::IpAddr::V6(address),
+                    _ => return Err(CoreError::new("proxy_listener_unavailable", "代理必须使用明确的回环地址")),
+                };
+                let listener_at = native::now();
+                let listener = sampler.command_evidence(ReadCommand::LsofTcpListener { port }, Duration::from_secs(3), "lsof");
+                let (owner, listener_at) = match listener.as_ref().ok().and_then(|listener| crate::vpn_observer::listener_owner_at(listener, port, Some(address))) {
+                    Some(owner) => (Some(owner), listener_at),
+                    None => {
+                        // Reuse the VPN observer's authenticated kernel-frame
+                        // fallback for root listeners that lsof cannot expose.
+                        let kernel = crate::vpn_observer::read_vpn_kernel_snapshot(&self.runner, Duration::from_secs(3))
+                            .filter(|kernel| (0.0..=crate::vpn_observer::DEFAULT_VPN_OBSERVATION_TTL_SECONDS)
+                                .contains(&(native::now() - kernel.captured_at)))
+                            .ok_or_else(|| CoreError::new("proxy_listener_unavailable", "代理监听快照不可读或已经过期"))?;
+                        (crate::vpn_observer::kernel_listener_owner_at(&kernel.evidence, port, address), kernel.captured_at)
+                    }
+                };
+                let owner = owner
+                    .filter(|owner| processes.iter().any(|process| process["pid"] == *owner))
+                    .ok_or_else(|| CoreError::new("proxy_listener_changed", "代理监听者不属于本轮已核验候选"))?;
+                out["guard_listener"] = json!({"endpoint":endpoint,"owner":owner});
+                out["guard_listener_observed_at"] = json!(listener_at);
+                environment_at = environment_at.min(listener_at);
+            }
+            let current = self.guard_process_identities(round, table.as_ref().map_err(Clone::clone)?, &sampler)?;
+            if current != guard_identities {
+                return Err(CoreError::new("process_identity_changed", "环境采样期间代理或后台身份已经变化"));
+            }
+            out["process_observed_at"] = json!(round.observed_at.min(table_at));
+            out["environment_observed_at"] = json!(environment_at);
+            out["process_round_id"] = json!(round.id);
+            out["guard_identity_evidence"] = json!(guard_identities);
+        }
         Ok(out)
+    }
+    fn guard_process_identities(
+        &self, round: &ProcessRound, table: &BTreeMap<u32, Value>, sampler: &Sampler<&R>,
+    ) -> Result<Vec<Value>> {
+        let changed = || CoreError::new("process_identity_changed", "本轮代理或后台进程身份已经变化或无法复核");
+        let backend = self.storage.paths.watch().join("runtime/watch-engine");
+        let candidates = table.iter().filter(|(_, row)| guard_process_candidate(row, round.uid, &backend)).collect::<Vec<_>>();
+        let root_pids = candidates.iter().filter_map(|(pid, row)| (row["uid"] == 0).then_some(**pid)).collect::<Vec<_>>();
+        // A root helper normally cannot expose a Mach task token to this UID.
+        // Keep its existing ps path/UID proof, bound on both sides to the
+        // already available any-user microsecond birth-time observation.
+        let root_before = root_pids.iter().map(|pid| self.runner.process_start_time_any_user(*pid)
+            .map(|start| (*pid, start)).ok_or_else(changed)).collect::<Result<BTreeMap<_, _>>>()?;
+        let root_table = sampler.process_table_pids(&root_pids)?;
+        let mut identities = Vec::new();
+        for (pid, row) in candidates {
+            if row["uid"] == 0 {
+                let start = root_before.get(pid).copied().ok_or_else(changed)?;
+                let current = root_table.get(pid).ok_or_else(changed)?;
+                if round.system_processes.as_ref().and_then(|observation| observation.root_starts.get(pid)).copied() != Some(start)
+                    || self.runner.process_start_time_any_user(*pid) != Some(start)
+                    || ["uid", "executable", "stamp"].iter().any(|key| current[*key] != row[*key])
+                    || claude_watch_system::process_start_stamp(start.0).as_deref().map(claude_watch_core::processes::normalized_stamp)
+                        != row["stamp"].as_str().map(claude_watch_core::processes::normalized_stamp) {
+                    return Err(changed());
+                }
+                identities.push(json!({"pid":pid,"uid":0,"executable":row["executable"],
+                    "start_seconds":start.0,"start_microseconds":start.1,"audit_token":Value::Null}));
+                continue;
+            }
+            let current = self.runner.observed_process_identity(*pid).ok_or_else(changed)?;
+            let stamp = claude_watch_system::process_start_stamp(current.start_seconds);
+            if row["uid"] != current.uid || row["executable"] != current.executable_path
+                || stamp.as_deref().map(claude_watch_core::processes::normalized_stamp)
+                    != row["stamp"].as_str().map(claude_watch_core::processes::normalized_stamp)
+                || !round.identities.get(pid).is_some_and(|expected|
+                    expected.uid == current.uid && expected.executable == current.executable_path
+                        && expected.start_seconds == current.start_seconds && expected.start_microseconds == current.start_microseconds) {
+                return Err(changed());
+            }
+            identities.push(observed_identity(&current));
+        }
+        Ok(identities)
+    }
+    fn local_for_target_using(
+        &self, c: &Config, target: claude_watch_core::processes::LaunchTarget,
+        round: Option<&ProcessRound>,
+    ) -> Result<Value> {
+        let mut local = self.local_facts_from_round(c, round)?;
+        if target.cli() {
+            let overrides = if target == claude_watch_core::processes::LaunchTarget::ClaudeCli {
+                crate::config_store::cli_proxy_overrides(&self.runner, &self.storage.paths.home)
+            } else { Ok(Vec::new()) };
+            local["cli_proxy"] = match overrides {
+                Ok(values) => claude_watch_core::audit::cli_proxy_state(local["verified_proxy_url"].as_str(), &values),
+                Err(error) => json!({"state":"unknown","detail":error.message}),
+            };
+        }
+        Ok(local)
     }
     fn online_facts(
         &self,
@@ -931,22 +1093,13 @@ impl<R: ReadRunner, T: Transport, M: Mutator> AuditSystem for Macos<R, T, M> {
         c: &Config,
         target: claude_watch_core::processes::LaunchTarget,
     ) -> Result<Value> {
-        let mut local = self.local_facts(c)?;
-        if target.cli() {
-            let overrides = if target == claude_watch_core::processes::LaunchTarget::ClaudeCli {
-                crate::config_store::cli_proxy_overrides(&self.runner, &self.storage.paths.home)
-            } else {
-                Ok(Vec::new())
-            };
-            local["cli_proxy"] = match overrides {
-                Ok(values) => claude_watch_core::audit::cli_proxy_state(
-                    local["verified_proxy_url"].as_str(),
-                    &values,
-                ),
-                Err(e) => json!({"state":"unknown","detail":e.message}),
-            };
-        }
-        Ok(local)
+        self.local_for_target_using(c, target, None)
+    }
+    fn local_from_process_round(
+        &self, c: &Config, target: claude_watch_core::processes::LaunchTarget,
+        round: &ProcessRound,
+    ) -> Result<Value> {
+        self.local_for_target_using(c, target, Some(round))
     }
     fn network_and_local(&self, c: &Config, target: claude_watch_core::processes::LaunchTarget) -> Result<(Value, Value)> {
         let local = self.local_for_target(c, target)?;
@@ -1123,7 +1276,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> ServiceSystem for Macos<R, T, M> {
     ) -> Result<crate::services::BackendHealthSnapshot> {
         let at = native::now();
         let frame = crate::channel_policy_status::read_frame(&self.storage);
-        let frame = crate::channel_policy_status::FrameEvidence::new(&frame, config, at);
+        let frame = crate::channel_policy_status::StatusFrame::new(&frame, config, at);
         Ok(self.backend_health_from_frame(&frame, &frame.guard_summary()))
     }
     fn service_job(&self, name: &str) -> Result<Value> {

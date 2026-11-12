@@ -9,9 +9,11 @@ use claude_watch_core::{
         MAX_ENFORCEMENT_RECEIPT_AGE,
     },
     config::Config,
+    controlled_launch::ManagedLaunchInstance,
 };
 use claude_watch_system::ProcessKernelIdentity;
 use serde_json::{json, Value};
+use std::cell::OnceCell;
 
 pub const FRAME_PATH: &str = "state/channel-supervision.json";
 
@@ -19,158 +21,159 @@ pub fn read_frame(store: &StateStore) -> Value {
     store.read_json(&store.paths.watch().join(FRAME_PATH), Value::Null).unwrap_or(Value::Null)
 }
 
-/// One read of the authority frame at a fixed observation time. Each consumer
-/// uses the same checked command and execution verdict for this frame.
-pub struct FrameEvidence<'a> {
+/// Fixed inputs for the read projections of one frame. Live identity and
+/// backend observations are taken by each consumer at its existing boundary.
+pub struct StatusFrame<'a> {
     pub(crate) value: &'a Value,
     pub(crate) config: &'a Config,
     pub(crate) now: f64,
-    pub(crate) policy: claude_watch_core::error::Result<PolicyVersion>,
-    pub(crate) boot: Option<&'a str>,
-    pub(crate) families: Vec<FamilyEvidence<'a>>,
+    captured_at: Option<f64>,
+    fresh: bool,
+    executor_boot: Option<&'a str>,
+    policy: OnceCell<Option<FramePolicy>>,
+    families: OnceCell<Vec<FrameFamily<'a>>>,
 }
 
-pub(crate) struct FamilyEvidence<'a> {
-    pub(crate) family: &'a str,
-    pub(crate) state: &'a Value,
-    pub(crate) permit: Option<ChannelPermit>,
-    pub(crate) receipt: Option<ChannelEnforcementReceipt>,
-    verdict: Option<ChannelSupervisionVerdict>,
-    pub(crate) sync: PolicySyncState,
+struct FramePolicy {
+    version: PolicyVersion,
+    wire: Value,
+    header_matches: bool,
 }
 
-impl<'a> FrameEvidence<'a> {
+struct FrameFamily<'a> {
+    name: &'a str,
+    state: &'a Value,
+    permit: Option<ChannelPermit>,
+    receipt: Option<ChannelEnforcementReceipt>,
+    verdict: OnceCell<ChannelSupervisionVerdict>,
+    policy_sync: OnceCell<PolicySyncState>,
+}
+
+impl FrameFamily<'_> {
+    fn verdict(&self, permit: &ChannelPermit, policy: &PolicyVersion, boot: &str, now: f64) -> &ChannelSupervisionVerdict {
+        self.verdict.get_or_init(|| evaluate_channel_supervision_with_boot_id(
+            permit, self.receipt.as_ref(), policy, Some(boot), now,
+        ))
+    }
+}
+
+impl<'a> StatusFrame<'a> {
     pub fn new(value: &'a Value, config: &'a Config, now: f64) -> Self {
-        Self::with_producer(value, config, now, producer_is_current)
-    }
-
-    pub(crate) fn with_producer(
-        value: &'a Value, config: &'a Config, now: f64, producer_current: impl FnOnce(&Value) -> bool,
-    ) -> Self {
-        let policy = ChannelSupervisor::compute_policy_version(config);
-        let version = json!(policy.as_ref().ok());
-        let boot = value["executor_boot_id"].as_str().filter(|id| {
-            !id.is_empty() && policy.is_ok() && value["saved_policy_version"] == version
-                && value["producer_boot_id"].as_str().is_some_and(|id| !id.is_empty())
-                && value["captured_at"].as_f64().is_some_and(|at| fresh(at, now))
-                && producer_current(value)
-        });
-        let mut families = Vec::new();
-        if let (Some(boot), Ok(policy), Some(rows)) = (boot, &policy, value["families"].as_object()) {
-            let backend = config.effective_network_backend();
-            for (family, state) in rows {
-                if state["producer_boot_id"] != value["producer_boot_id"] || state["saved_policy_version"] != version {
-                    continue;
-                }
-                let permit = serde_json::from_value::<ChannelPermit>(value["authoritative_permits"][family].clone()).ok()
-                    .filter(|p| p.family == *family && p.policy_version == *policy && p.backend == backend
-                        && state["command_seq"].as_u64() == Some(p.command_seq)
-                        && state["permit_generation"].as_u64() == Some(p.permit_generation));
-                let receipt = serde_json::from_value::<ChannelEnforcementReceipt>(value["enforcement_receipts"][family].clone()).ok();
-                let verdict = permit.as_ref().map(|p|
-                    evaluate_channel_supervision_with_boot_id(p, receipt.as_ref(), policy, Some(boot), now));
-                // Status and readiness have a tighter receipt clock bound than
-                // the executor evaluator. Foreign/stale receipts stay pending.
-                let sync = match (&permit, &receipt, &verdict) {
-                    (Some(_), None, _) if state["policy_sync_state"] == "apply_failed" => PolicySyncState::ApplyFailed,
-                    (Some(p), Some(r), Some(verdict)) if r.family == *family && r.policy_version == *policy
-                        && r.backend == backend && r.session_id == p.session_id && r.executor_boot_id == boot
-                        && r.command_seq == p.command_seq && r.permit_generation == p.permit_generation
-                        && fresh(r.observed_at, now) && r.observed_at + CLOCK_ROLLBACK_TOLERANCE_SECONDS >= p.issued_at => {
-                        if r.enforcement_state == ChannelEnforcementState::Failed || state["policy_sync_state"] == "apply_failed"
-                            || matches!(verdict, ChannelSupervisionVerdict::EnforcementFailed { .. }) {
-                            PolicySyncState::ApplyFailed
-                        } else if state["policy_sync_state"] == "applied" && state["applied_policy_version"] == version {
-                            PolicySyncState::Applied
-                        } else { PolicySyncState::PendingApply }
-                    }
-                    _ => PolicySyncState::PendingApply,
-                };
-                families.push(FamilyEvidence { family, state, permit, receipt, verdict, sync });
-            }
+        let captured_at = value["captured_at"].as_f64();
+        Self {
+            value, config, now, captured_at,
+            fresh: captured_at.is_some_and(|at| fresh(at, now)),
+            executor_boot: value["executor_boot_id"].as_str().filter(|id| !id.is_empty()),
+            policy: OnceCell::new(), families: OnceCell::new(),
         }
-        Self { value, config, now, policy, boot, families }
-    }
-
-    pub(crate) fn family(&self, id: &str) -> Option<&FamilyEvidence<'a>> {
-        self.families.iter().find(|evidence| evidence.family == id)
     }
 
     pub fn value(&self) -> &Value { self.value }
 
-    pub fn policy_sync_state(&self) -> PolicySyncState {
-        if self.families.iter().any(|f| f.sync == PolicySyncState::ApplyFailed) {
-            PolicySyncState::ApplyFailed
-        } else if !self.families.is_empty()
-            && self.value["families"].as_object().is_some_and(|rows| rows.len() == self.families.len())
-            && self.families.iter().all(|f| f.sync == PolicySyncState::Applied) {
-            PolicySyncState::Applied
-        } else { PolicySyncState::PendingApply }
+    fn policy(&self) -> Option<&FramePolicy> {
+        self.policy.get_or_init(|| {
+            let version = ChannelSupervisor::compute_policy_version(self.config).ok()?;
+            let wire = json!(version);
+            let header_matches = self.value["saved_policy_version"] == wire
+                && self.value["producer_boot_id"].as_str().is_some_and(|id| !id.is_empty());
+            Some(FramePolicy { version, wire, header_matches })
+        }).as_ref()
+    }
+
+    pub(crate) fn policy_wire(&self) -> Option<&Value> {
+        self.policy().map(|policy| &policy.wire)
+    }
+
+    pub(crate) fn readiness_frame_current(&self, producer_current: bool) -> bool {
+        producer_current && self.policy().is_some_and(|policy| policy.header_matches)
+            && self.executor_boot.is_some()
+            && self.captured_at.is_some_and(|at| self.now.is_finite() && at.is_finite()
+                && (0.0..MAX_ENFORCEMENT_RECEIPT_AGE).contains(&(self.now - at)))
+    }
+
+    fn families(&self) -> &[FrameFamily<'a>] {
+        self.families.get_or_init(|| {
+            let Some(policy) = self.policy() else { return Vec::new(); };
+            let backend = self.config.effective_network_backend();
+            self.value["families"].as_object().into_iter().flatten().map(|(name, state)| {
+                let permit = serde_json::from_value::<ChannelPermit>(self.value["authoritative_permits"][name].clone())
+                    .ok().filter(|p| p.family == *name && p.backend == backend && p.policy_version == policy.version
+                        && state["producer_boot_id"] == self.value["producer_boot_id"]
+                        && state["command_seq"].as_u64() == Some(p.command_seq)
+                        && state["permit_generation"].as_u64() == Some(p.permit_generation));
+                let receipt = serde_json::from_value(self.value["enforcement_receipts"][name].clone()).ok();
+                FrameFamily { name, state, permit, receipt, verdict: OnceCell::new(), policy_sync: OnceCell::new() }
+            }).collect()
+        })
     }
 
     pub fn guard_summary(&self) -> Value {
-        use claude_watch_core::{channel::ChannelPermitState, policy::PolicyCatalog};
-        if !self.config.enabled || !self.config.guard_enabled {
-            return json!({"status":"disabled","action":"observe"});
-        }
-        let Ok(policy) = &self.policy else {
-            return json!({"status":"unknown","action":"observe","code":"guard_policy_unverified"});
+        summarize(self, producer_is_current)
+    }
+}
+
+/// Shared read-only projection for status, readiness and guard history.
+/// Neither the projection nor a service pulse grants execution authority.
+pub fn guard_summary(frame: &Value, config: &Config, now: f64) -> Value {
+    StatusFrame::new(frame, config, now).guard_summary()
+}
+
+fn summarize(prepared: &StatusFrame<'_>, producer_current: impl FnOnce(&Value) -> bool) -> Value {
+    use claude_watch_core::{channel::ChannelPermitState, policy::PolicyCatalog};
+    let (frame, config, now) = (prepared.value, prepared.config, prepared.now);
+    if !config.enabled || !config.guard_enabled {
+        return json!({"status":"disabled","action":"observe"});
+    }
+    let Some(policy) = prepared.policy() else {
+        return json!({"status":"unknown","action":"observe","code":"guard_policy_unverified"});
+    };
+    let current = policy.header_matches && prepared.fresh && producer_current(frame);
+    let rows = PolicyCatalog::families().iter().filter(|spec| PolicyCatalog::guard_target(spec).is_some()).map(|spec| {
+        let family = spec.id;
+        let pending = |code| json!({"family":family,"time":frame["captured_at"],"status":"unknown","action":"observe",
+            "code":code,"session_guard":{"state":"pending_verification","reason":{"code":code}}});
+        let Some(boot) = prepared.executor_boot.filter(|_| current) else { return pending("execution_evidence_stale_or_mismatched"); };
+        let Some(row) = prepared.families().iter().find(|row| row.name == family) else {
+            return pending("execution_evidence_stale_or_mismatched");
         };
-        let frame = self.value;
-        let rows = PolicyCatalog::families().iter().filter(|spec| PolicyCatalog::guard_target(spec).is_some()).map(|spec| {
-            let family = spec.id;
-            let pending = |code| json!({"family":family,"time":frame["captured_at"],"status":"unknown","action":"observe",
-                "code":code,"session_guard":{"state":"pending_verification","reason":{"code":code}}});
-            let Some(FamilyEvidence { state, permit: Some(permit), receipt, verdict: Some(verdict), .. }) = self.family(family) else {
-                return pending("execution_evidence_stale_or_mismatched");
-            };
-            if receipt.is_none() && state["policy_sync_state"] != "apply_failed" {
-                return pending("execution_not_confirmed");
-            }
-            let missing_sample = matches!(permit.reason_code.as_str(), "vpn_observation_unknown" | "vpn_observation_stale"
-                | "egress_evidence_expired" | "channel_inventory_incomplete" | "permit_lease_expired"
-                | "authority_evidence_unavailable");
-            let (status, guard_state, execution_state) = match &verdict {
-                ChannelSupervisionVerdict::ForwardingVerified => ("ok", "safe", "forwarding"),
-                ChannelSupervisionVerdict::PendingVerification { .. } if permit.reason_code == "idle_no_process" => ("ok", "idle", "pending_verification"),
-                ChannelSupervisionVerdict::IsolatedKeepProcess if missing_sample => ("unknown", "pending_verification", "blocked"),
-                ChannelSupervisionVerdict::IsolatedKeepProcess => ("protection_triggered", "locked", "blocked"),
-                ChannelSupervisionVerdict::PendingIsolation { .. } => ("pending", "pending_verification", "disconnecting"),
-                ChannelSupervisionVerdict::PendingVerification { .. } => ("pending", "pending_verification", "pending_verification"),
-                ChannelSupervisionVerdict::EnforcementFailed { code, .. } if code == "enforcement_receipt_expired" =>
-                    ("pending", "pending_verification", "pending_verification"),
-                ChannelSupervisionVerdict::EnforcementFailed { .. } => ("protection_unavailable", "unknown", "failed"),
-            };
-            let process_state = state["process_execution_state"].as_str();
-            let action = match process_state {
-                Some("partially_terminated") => "disconnect-and-partial-force-quit",
-                Some("confirmed" | "already_exited") if state["process_preserved"] == false => "disconnect-and-force-quit",
-                _ if permit.state == ChannelPermitState::Revoked => "disconnect-channel",
-                _ => "observe",
-            };
-            json!({"family":family,"session_id":permit.session_id,"time":frame["captured_at"],
-                "status":status,"action":action,"policy":policy.policy_digest,"guard_policy_v1":policy.guard_policy_digest,
-                "channel_permit":permit,"channel_receipt":receipt,"channel_supervision":verdict,
-                "channel_state":execution_state,"channel_execution_state":execution_state,
-                "channel_status_label":verdict.display_state().label_zh(),
-                "process_execution_state":process_state,"process_preserved":state["process_preserved"],
-                "process_disposition_receipt":state["process_disposition_receipt"],
-                "session_guard":{"state":guard_state,"current":frame["egress"][family],
-                    "reason":{"code":permit.reason_code,"detail":verdict.display_state().label_zh()}}})
-        }).collect();
-        fold_guard_receipts(rows)
-    }
-}
-
-pub fn guard_summary(value: &Value, config: &Config, now: f64) -> Value {
-    FrameEvidence::new(value, config, now).guard_summary()
-}
-
-pub fn read_guard_summary(store: &StateStore, now: f64) -> Value {
-    match (crate::config_store::ConfigStore { storage: store.clone() }).load() {
-        Ok(config) => guard_summary(&read_frame(store), &config, now),
-        Err(error) => json!({"status":"unknown","action":"observe","code":error.code}),
-    }
+        let Some(permit) = &row.permit else { return pending("execution_evidence_stale_or_mismatched"); };
+        let (state, receipt) = (row.state, &row.receipt);
+        if receipt.is_none() && state["policy_sync_state"] != "apply_failed" {
+            return pending("execution_not_confirmed");
+        }
+        let verdict = row.verdict(permit, &policy.version, boot, now);
+        let missing_sample = matches!(permit.reason_code.as_str(), "vpn_observation_unknown" | "vpn_observation_stale"
+            | "egress_evidence_expired" | "channel_inventory_incomplete" | "permit_lease_expired"
+            | "authority_evidence_unavailable");
+        let (status, guard_state, execution_state) = match verdict {
+            ChannelSupervisionVerdict::ForwardingVerified => ("ok", "safe", "forwarding"),
+            ChannelSupervisionVerdict::PendingVerification { .. } if permit.reason_code == "idle_no_process" => ("ok", "idle", "pending_verification"),
+            ChannelSupervisionVerdict::IsolatedKeepProcess if missing_sample => ("unknown", "pending_verification", "blocked"),
+            ChannelSupervisionVerdict::IsolatedKeepProcess => ("protection_triggered", "locked", "blocked"),
+            ChannelSupervisionVerdict::PendingIsolation { .. } => ("pending", "pending_verification", "disconnecting"),
+            ChannelSupervisionVerdict::PendingVerification { .. } => ("pending", "pending_verification", "pending_verification"),
+            ChannelSupervisionVerdict::EnforcementFailed { code, .. } if code == "enforcement_receipt_expired" =>
+                ("pending", "pending_verification", "pending_verification"),
+            ChannelSupervisionVerdict::EnforcementFailed { .. } => ("protection_unavailable", "unknown", "failed"),
+        };
+        let process_state = state["process_execution_state"].as_str();
+        let action = match process_state {
+            Some("partially_terminated") => "disconnect-and-partial-force-quit",
+            Some("confirmed" | "already_exited") if state["process_preserved"] == false => "disconnect-and-force-quit",
+            _ if permit.state == ChannelPermitState::Revoked => "disconnect-channel",
+            _ => "observe",
+        };
+        json!({"family":family,"session_id":permit.session_id,"time":frame["captured_at"],
+            "status":status,"action":action,"policy":policy.version.policy_digest,"guard_policy_v1":policy.version.guard_policy_digest,
+            "channel_permit":permit,"channel_receipt":receipt,"channel_supervision":verdict,
+            "channel_state":execution_state,"channel_execution_state":execution_state,
+            "channel_status_label":verdict.display_state().label_zh(),
+            "process_execution_state":process_state,"process_preserved":state["process_preserved"],
+            "process_disposition_receipt":state["process_disposition_receipt"],
+            "session_guard":{"state":guard_state,"current":frame["egress"][family],
+                "reason":{"code":permit.reason_code,"detail":verdict.display_state().label_zh()}}})
+    }).collect();
+    fold_guard_receipts(rows)
 }
 
 fn identity_value(identity: &ProcessKernelIdentity) -> Value {
@@ -187,30 +190,57 @@ pub(crate) fn producer_is_current(value: &Value) -> bool {
 }
 
 /// Read-only explanation. It never grants a permit or changes registry state.
+pub(crate) type ProcessPolicy = (Config, PolicyVersion, Value);
+pub(crate) type ProcessRegistry = (Value, Option<Vec<ManagedLaunchInstance>>);
+
+pub(crate) const PROCESS_REGISTRY_PATH: &str = "state/managed-launch-instances.json";
+
+pub(crate) fn read_process_registry(store: &StateStore) -> ProcessRegistry {
+    use serde::Deserialize;
+    let raw = store.read_json(&store.paths.watch().join(PROCESS_REGISTRY_PATH), Value::Null)
+        .unwrap_or(Value::Null);
+    let instances = Vec::<ManagedLaunchInstance>::deserialize(&raw).ok();
+    (raw, instances)
+}
+
 pub(crate) fn process_protection(
-    store: &StateStore, frame: Option<&FrameEvidence<'_>>, identity: &claude_watch_core::processes::Identity,
+    store: &StateStore, value: &Value, identity: &claude_watch_core::processes::Identity,
     kind: claude_watch_core::processes::Kind, now: f64,
 ) -> Value {
-    use claude_watch_core::{controlled_launch::{ManagedInstanceState, ManagedLaunchInstance}, policy::PolicyCatalog};
+    process_protection_in_snapshot(store, value, identity, kind, now, &OnceCell::new(), &OnceCell::new())
+}
+
+pub(crate) fn process_protection_in_snapshot(
+    store: &StateStore, value: &Value, identity: &claude_watch_core::processes::Identity,
+    kind: claude_watch_core::processes::Kind, now: f64,
+    policy_input: &OnceCell<Option<ProcessPolicy>>, registry_input: &OnceCell<ProcessRegistry>,
+) -> Value {
+    use claude_watch_core::{controlled_launch::ManagedInstanceState, policy::PolicyCatalog};
     let mut result = json!({"state":"unknown","reason_code":"protection_evidence_unavailable","observed_at":now});
     let Some(live) = claude_watch_system::inspect_process_identity(identity.pid).filter(|live|
         live.uid == identity.uid && live.start_seconds == identity.start_seconds
             && live.start_microseconds == identity.start_microseconds && live.executable_path == identity.executable) else {
         result["reason_code"] = json!("current_process_identity_unverified"); return result;
     };
-    let Some(frame) = frame else { return result; };
-    let Ok(policy) = &frame.policy else { return result; };
+    let Some((config, policy, policy_wire)) = policy_input.get_or_init(|| {
+        let config = (crate::config_store::ConfigStore { storage: store.clone() }).load().ok()?;
+        let policy = ChannelSupervisor::compute_policy_version(&config).ok()?;
+        let wire = json!(policy);
+        Some((config, policy, wire))
+    }).as_ref() else { return result; };
     let Some(family) = PolicyCatalog::family_for(kind.provider()).map(|f| f.id) else { return result; };
-    let (Some(boot), Some(evidence)) = (frame.boot, frame.family(family)) else {
+    let state = &value["families"][family];
+    if !producer_is_current(value) || value["producer_boot_id"].as_str().is_none_or(str::is_empty)
+        || state["producer_boot_id"] != value["producer_boot_id"]
+        || !value["captured_at"].as_f64().is_some_and(|at| fresh(at, now))
+        || &value["saved_policy_version"] != policy_wire || &state["saved_policy_version"] != policy_wire {
         result["reason_code"] = json!("authority_stale_or_mismatched"); return result;
-    };
-    let value = frame.value;
-    let state = evidence.state;
+    }
+    let Some(boot) = value["executor_boot_id"].as_str().filter(|s| !s.is_empty()) else { return result; };
     result["producer_boot_id"] = value["producer_boot_id"].clone();
     result["executor_boot_id"] = json!(boot);
-    result["policy_version"] = json!(policy);
-    let raw_instances = store.read_json(&store.paths.watch().join("state/managed-launch-instances.json"), Value::Null).unwrap_or(Value::Null);
-    let instances = serde_json::from_value::<Vec<ManagedLaunchInstance>>(raw_instances.clone()).ok();
+    result["policy_version"] = policy_wire.clone();
+    let (raw_instances, instances) = registry_input.get_or_init(|| read_process_registry(store));
     let Some(instances) = instances else { result["reason_code"] = json!("registry_evidence_unavailable"); return result; };
     let instance = instances.iter().find(|inst| inst.uid == identity.uid &&
         ((inst.pid == identity.pid && inst.start_seconds == identity.start_seconds && inst.start_microseconds == identity.start_microseconds)
@@ -258,21 +288,24 @@ pub(crate) fn process_protection(
         && scope.gateway_endpoint_protection_method.as_ref().is_some_and(|s| !s.is_empty()))) {
         result["reason_code"] = json!("gateway_endpoint_proof_missing"); return result;
     }
-    let Some(receipt) = &evidence.receipt else { result["reason_code"] = json!("execution_receipt_missing"); return result; };
-    let (Some(permit), Some(verdict)) = (&evidence.permit, &evidence.verdict) else {
-        result["reason_code"] = json!("current_permit_identity_or_epoch_unverified"); return result;
-    };
-    if state["vpn_epoch"] != json!(permit.vpn_epoch)
+    let permit = serde_json::from_value::<ChannelPermit>(value["authoritative_permits"][family].clone());
+    let receipt = serde_json::from_value::<ChannelEnforcementReceipt>(value["enforcement_receipts"][family].clone());
+    let (Ok(permit), Ok(receipt)) = (permit, receipt) else { result["reason_code"] = json!("execution_receipt_missing"); return result; };
+    if permit.family != family || &permit.policy_version != policy || permit.backend != config.effective_network_backend()
+        || state["command_seq"].as_u64() != Some(permit.command_seq)
+        || state["permit_generation"].as_u64() != Some(permit.permit_generation)
+        || state["vpn_epoch"] != json!(permit.vpn_epoch)
         || (permit.state == claude_watch_core::channel::ChannelPermitState::Permitted && permit.vpn_epoch.is_none()) {
         result["reason_code"] = json!("current_permit_identity_or_epoch_unverified"); return result;
     }
-    if state["policy_sync_state"] != "applied" || state["applied_policy_version"] != json!(policy) {
+    if state["policy_sync_state"] != "applied" || &state["applied_policy_version"] != policy_wire {
         if state["policy_sync_state"] == "apply_failed" { result["state"] = json!("unprotected"); }
         result["reason_code"] = json!(if state["policy_sync_state"] == "apply_failed" { "execution_failed" } else { "pending_apply" }); return result;
     }
     result["command_seq"] = json!(permit.command_seq);
     result["permit_generation"] = json!(permit.permit_generation);
     result["vpn_epoch"] = json!(permit.vpn_epoch);
+    let verdict = evaluate_channel_supervision_with_boot_id(&permit, Some(&receipt), policy, Some(boot), now);
     match verdict {
         ChannelSupervisionVerdict::ForwardingVerified | ChannelSupervisionVerdict::IsolatedKeepProcess => {
             // A revoke is not renewed like a forwarding lease. Its confirmed
@@ -284,7 +317,7 @@ pub(crate) fn process_protection(
                 let observation = serde_json::from_value::<claude_watch_core::vpn::VpnObservation>(vpn["observation"].clone()).ok();
                 let matched = observation.as_ref().is_some_and(|observation| {
                     vpn["captured_at"] == value["captured_at"] && permit.vpn_epoch.as_ref() == Some(&observation.epoch)
-                        && frame.config.vpn_expectation.as_ref().is_some_and(|expected|
+                        && config.vpn_expectation.as_ref().is_some_and(|expected|
                             matches!(claude_watch_core::vpn::compare_vpn(expected, observation, now), claude_watch_core::vpn::VpnMatch::Matched))
                 });
                 if !matched { result["reason_code"] = json!("current_vpn_path_evidence_unverified"); return result; }
@@ -312,56 +345,82 @@ pub(crate) fn current_producer_identity() -> Value {
 /// Missing, stale or inconsistent evidence always remains pending. A matched
 /// failure receipt is reported separately from both pending and applied.
 pub fn read_policy_sync_state(store: &StateStore, config: &Config, now: f64) -> PolicySyncState {
-    FrameEvidence::new(&read_frame(store), config, now).policy_sync_state()
+    policy_sync_state(&read_frame(store), config, now)
 }
 
-pub(crate) fn fresh(at: f64, now: f64) -> bool {
+pub fn policy_sync_state(value: &Value, config: &Config, now: f64) -> PolicySyncState {
+    StatusFrame::new(value, config, now).policy_sync_state()
+}
+
+fn fresh(at: f64, now: f64) -> bool {
     at.is_finite()
         && now.is_finite()
         && at <= now + CLOCK_ROLLBACK_TOLERANCE_SECONDS
         && now - at < MAX_ENFORCEMENT_RECEIPT_AGE
 }
 
-/// Fold one receipt per supervised family into a single heartbeat. The top
-/// level carries the most severe family's receipt verbatim so the existing UI
-/// and diagnostics keep reading the fields they know (`status`, `action`,
-/// `stop_state`, `session_guard`, `session_id`), while the `families` array
-/// keeps every family's full receipt. Adding a service is a new entry in the
-/// policy table; nothing here needs to know about it.
-fn fold_guard_receipts(receipts: Vec<Value>) -> Value {
-    let severity = |status: &str| -> u8 {
-        match status {
-            "protection_unavailable" => 6,
-            "protection_triggered" => 5,
-            "unknown" => 4,
-            "degraded" | "pending" => 3,
-            "ok" => 2,
-            "disabled" => 1,
-            _ => 0,
-        }
-    };
-    let rank = |receipt: &Value| -> (u8, u8) {
-        // A family that actually closed or disconnected outranks one that only reported.
-        let acted = u8::from(matches!(
-            receipt["action"].as_str(),
-            Some("close-desktop" | "disconnect-channel" | "disconnect-and-force-quit")
-        ));
-        (severity(receipt["status"].as_str().unwrap_or("")), acted)
-    };
-    let mut primary: Option<Value> = None;
-    for receipt in &receipts {
-        let take = primary
-            .as_ref()
-            .is_none_or(|current| rank(receipt) > rank(current));
-        if take {
-            primary = Some(receipt.clone());
-        }
+impl<'a> StatusFrame<'a> {
+    pub fn policy_sync_state(&self) -> PolicySyncState {
+        if self.policy().is_none() { return PolicySyncState::PendingApply; }
+        self.project_policy_sync_state(producer_is_current(self.value))
     }
-    let mut folded = primary.unwrap_or_else(|| {
-        serde_json::json!({"status":"disabled","action":"observe"})
-    });
-    folded["families"] = serde_json::json!(receipts);
-    folded
+
+    fn project_policy_sync_state(&self, producer_valid: bool) -> PolicySyncState {
+        if !producer_valid || !self.fresh || self.executor_boot.is_none()
+            || !self.policy().is_some_and(|policy| policy.header_matches)
+            || self.families().is_empty()
+        {
+            return PolicySyncState::PendingApply;
+        }
+        let mut result = PolicySyncState::Applied;
+        for (_, state) in self.family_policy_states() {
+            if state == PolicySyncState::ApplyFailed { return state; }
+            if state == PolicySyncState::PendingApply { result = state; }
+        }
+        result
+    }
+
+    /// Per-family projection only. Its callers check producer liveness and
+    /// frame freshness at their own observation points before using it.
+    pub(crate) fn family_policy_states(&self) -> impl Iterator<Item = (&'a str, PolicySyncState)> + '_ {
+        self.families().iter().map(move |row| (row.name, self.family_policy_state(row)))
+    }
+
+    fn family_policy_state(&self, row: &FrameFamily<'_>) -> PolicySyncState {
+        *row.policy_sync.get_or_init(|| {
+            let (Some(policy), Some(boot), Some(permit)) = (self.policy(), self.executor_boot, &row.permit) else {
+                return PolicySyncState::PendingApply;
+            };
+            let state = row.state;
+            if state["saved_policy_version"] != policy.wire { return PolicySyncState::PendingApply; }
+            let Some(receipt) = &row.receipt else {
+                // The current supervisor may have failed before the executor
+                // produced a receipt. Readiness still examines the raw frame.
+                return if state["policy_sync_state"] == "apply_failed" {
+                    PolicySyncState::ApplyFailed
+                } else { PolicySyncState::PendingApply };
+            };
+            let matched = receipt.family == row.name
+                && receipt.backend == permit.backend
+                && receipt.policy_version == policy.version
+                && receipt.session_id == permit.session_id
+                && receipt.executor_boot_id == boot
+                && receipt.command_seq == permit.command_seq
+                && receipt.permit_generation == permit.permit_generation
+                && fresh(receipt.observed_at, self.now)
+                && receipt.observed_at + CLOCK_ROLLBACK_TOLERANCE_SECONDS >= permit.issued_at;
+            if !matched {
+                PolicySyncState::PendingApply
+            } else if receipt.enforcement_state == ChannelEnforcementState::Failed
+                || state["policy_sync_state"] == "apply_failed"
+                || matches!(row.verdict(permit, &policy.version, boot, self.now), ChannelSupervisionVerdict::EnforcementFailed { .. })
+            {
+                PolicySyncState::ApplyFailed
+            } else if state["policy_sync_state"] == "applied" && state["applied_policy_version"] == policy.wire {
+                PolicySyncState::Applied
+            } else { PolicySyncState::PendingApply }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -420,8 +479,7 @@ mod tests {
         let root = store.paths.home.clone();
         let registry_path = store.paths.watch().join("state/managed-launch-instances.json");
         let live = claude_watch_system::inspect_process_identity(identity.pid).unwrap();
-        let project = |v: &Value, i: &Identity, at|
-            process_protection(&store, Some(&FrameEvidence::new(v, &config, at)), i, Kind::ClaudeCode, at);
+        let project = |v: &Value, i: &Identity, at| process_protection(&store, v, i, Kind::ClaudeCode, at);
         assert_eq!(project(&value, &identity, now)["state"], "protected");
         assert_eq!(project(&value, &identity, now)["reason_code"], "blocked_verified");
         let mut forward = value.clone();
@@ -493,7 +551,7 @@ mod tests {
         let mut cases = Vec::new();
         let mut record = |name: &str, authority: &Value, id: &Identity, inst: &ManagedLaunchInstance, at: f64, expected: &str| {
             store.atomic_json(&registry_path, &json!([inst])).unwrap();
-            let proof = process_protection(&store, Some(&FrameEvidence::new(authority, &config, at)), id, Kind::ClaudeCode, at);
+            let proof = process_protection(&store, authority, id, Kind::ClaudeCode, at);
             let permit: ChannelPermit = serde_json::from_value(authority["authoritative_permits"]["claude"].clone()).unwrap();
             let receipt: ChannelEnforcementReceipt = serde_json::from_value(authority["enforcement_receipts"]["claude"].clone()).unwrap();
             let saved: PolicyVersion = serde_json::from_value(authority["saved_policy_version"].clone()).unwrap();
@@ -519,7 +577,7 @@ mod tests {
             let round = crate::sampler::ProcessRound {
                 id: "deadline-unit".into(), uid: id.uid, targets: vec![Target { identity: id.clone(), kind: Kind::ClaudeCode }],
                 identities: [(id.pid, id.clone())].into(), roles: json!({}), match_evidence: Default::default(),
-                unavailable: vec![], diagnostic_reasons: Default::default(), confirmed_exited_count: 0, complete: true, observed_at: at, discovery:None,
+                unavailable: vec![], diagnostic_reasons: Default::default(), confirmed_exited_count: 0, complete: true, observed_at: at, discovery:None, system_processes:None,
             };
             let mut row = crate::monitor_snapshot::process_rows(&round, &[]).remove(0);
             row["protection"] = proof;
@@ -597,7 +655,7 @@ mod tests {
     }
 
     fn fixture() -> (Value, Config) {
-        let config = Config::default_for_new_install();
+        let config = Config { enabled: true, guard_enabled: true, ..Config::default_for_new_install() };
         let policy = ChannelSupervisor::compute_policy_version(&config).unwrap();
         let permit = json!({"family":"claude", "session_id":"s", "policy_version":policy,
             "permit_generation":2, "command_seq":3, "state":"revoked", "reason_code":"risk",
@@ -622,7 +680,7 @@ mod tests {
     fn policy_application_requires_current_live_producer_policy_boot_command_and_fresh_receipt() {
         let (value, config) = fixture();
         let project = |v: &Value, now, live| {
-            FrameEvidence::with_producer(v, &config, now, |_| live).policy_sync_state()
+            StatusFrame::new(v, &config, now).project_policy_sync_state(live)
         };
         assert_eq!(project(&value, 103.0, true), PolicySyncState::Applied);
         assert_eq!(project(&value, 103.0, false), PolicySyncState::PendingApply);
@@ -666,4 +724,109 @@ mod tests {
             PolicySyncState::PendingApply
         );
     }
+
+    #[test]
+    fn status_projections_preserve_separate_receipt_and_policy_rules() {
+        let (value, config) = fixture();
+        let project = |raw: &Value, now| {
+            let frame = StatusFrame::new(raw, &config, now);
+            let summary = summarize(&frame, |_| true);
+            let claude = summary["families"].as_array().unwrap().iter()
+                .find(|row| row["family"] == "claude").unwrap().clone();
+            (claude, frame.project_policy_sync_state(true))
+        };
+        let mut blocked = value.clone();
+        blocked["authoritative_permits"]["claude"]["valid_until"] = json!(100.5);
+        blocked["families"]["claude"]["process_preserved"] = json!(true);
+        let (guard, sync) = project(&blocked, 103.0);
+        assert_eq!(guard["channel_state"], "blocked");
+        assert_eq!(guard["action"], "disconnect-channel");
+        assert_eq!(guard["process_preserved"], true);
+        assert_eq!(guard["time"], json!(102.0));
+        assert_eq!(sync, PolicySyncState::Applied);
+
+        let mut forward = value.clone();
+        forward["authoritative_permits"]["claude"]["state"] = json!("permitted");
+        forward["enforcement_receipts"]["claude"]["permit_state"] = json!("permitted");
+        forward["enforcement_receipts"]["claude"]["enforcement_state"] = json!("forwarding");
+        let (guard, sync) = project(&forward, 103.0);
+        assert_eq!(guard["channel_state"], "forwarding");
+        assert_eq!(sync, PolicySyncState::Applied);
+
+        let mut disconnecting = value.clone();
+        let receipt = &mut disconnecting["enforcement_receipts"]["claude"];
+        receipt["enforcement_state"] = json!("disconnecting");
+        receipt["active_flows_closed"] = json!(false);
+        receipt["active_flows_count"] = json!(1);
+        assert_eq!(project(&disconnecting, 103.0).0["channel_state"], "disconnecting");
+
+        // The guard evaluator allows more receipt clock skew than policy sync.
+        let mut ahead = value.clone();
+        ahead["enforcement_receipts"]["claude"]["observed_at"] = json!(103.2);
+        let (guard, sync) = project(&ahead, 103.0);
+        assert_eq!(guard["channel_state"], "blocked");
+        assert_eq!(sync, PolicySyncState::PendingApply);
+        let (guard, sync) = project(&value, 111.0);
+        assert_eq!(guard["channel_supervision"]["code"], "enforcement_receipt_expired");
+        assert_eq!(guard["channel_state"], "pending_verification");
+        assert_eq!(sync, PolicySyncState::PendingApply);
+
+        // Only policy sync requires the family row's own saved policy version.
+        let mut mixed = value.clone();
+        mixed["families"]["claude"]["saved_policy_version"] = Value::Null;
+        let (guard, sync) = project(&mixed, 103.0);
+        assert_eq!(guard["channel_state"], "blocked");
+        assert_eq!(sync, PolicySyncState::PendingApply);
+        for key in ["families", "authoritative_permits", "enforcement_receipts"] {
+            mixed[key]["openai"] = value[key]["claude"].clone();
+        }
+        mixed["authoritative_permits"]["openai"]["family"] = json!("openai");
+        mixed["enforcement_receipts"]["openai"]["family"] = json!("openai");
+        mixed["enforcement_receipts"]["openai"]["enforcement_state"] = json!("failed");
+        let (guard, sync) = project(&mixed, 103.0);
+        assert_eq!(guard["channel_state"], "blocked");
+        assert_eq!(sync, PolicySyncState::ApplyFailed);
+    }
+}
+
+/// Fold one receipt per supervised family into a single heartbeat. The top
+/// level carries the most severe family's receipt verbatim so the existing UI
+/// and diagnostics keep reading the fields they know (`status`, `action`,
+/// `stop_state`, `session_guard`, `session_id`), while the `families` array
+/// keeps every family's full receipt. Adding a service is a new entry in the
+/// policy table; nothing here needs to know about it.
+fn fold_guard_receipts(receipts: Vec<Value>) -> Value {
+    let severity = |status: &str| -> u8 {
+        match status {
+            "protection_unavailable" => 6,
+            "protection_triggered" => 5,
+            "unknown" => 4,
+            "degraded" | "pending" => 3,
+            "ok" => 2,
+            "disabled" => 1,
+            _ => 0,
+        }
+    };
+    let rank = |receipt: &Value| -> (u8, u8) {
+        // A family that actually closed or disconnected outranks one that only reported.
+        let acted = u8::from(matches!(
+            receipt["action"].as_str(),
+            Some("close-desktop" | "disconnect-channel" | "disconnect-and-force-quit")
+        ));
+        (severity(receipt["status"].as_str().unwrap_or("")), acted)
+    };
+    let mut primary: Option<Value> = None;
+    for receipt in &receipts {
+        let take = primary
+            .as_ref()
+            .is_none_or(|current| rank(receipt) > rank(current));
+        if take {
+            primary = Some(receipt.clone());
+        }
+    }
+    let mut folded = primary.unwrap_or_else(|| {
+        serde_json::json!({"status":"disabled","action":"observe"})
+    });
+    folded["families"] = serde_json::json!(receipts);
+    folded
 }

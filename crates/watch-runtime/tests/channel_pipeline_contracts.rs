@@ -6,7 +6,7 @@ use claude_watch_core::{
     config::Config,
     error::Result,
     processes::{LaunchTarget, ProcessRole},
-    session::{Desktop, Launcher},
+    session::Desktop,
 };
 use claude_watch_runtime::{
     background_evidence::ProbeKind,
@@ -103,6 +103,11 @@ fn bound(pid: u32, role: ProcessRole) -> BoundProcessToken {
     BoundProcessToken::with_system_identity(pid, 501, 900 + pid as u64, 1, role)
         .with_audit_token([501, 501, 20, 501, 20, pid, 0, 9])
 }
+fn desktop_bound(desktop: &Desktop) -> BoundProcessToken {
+    BoundProcessToken::with_system_identity(
+        desktop.pid, 501, desktop.start_seconds, desktop.start_microseconds, ProcessRole::DesktopMain,
+    ).with_audit_token([501, 501, 20, 501, 20, desktop.pid, 0, 9])
+}
 fn inventory_event(family: &str, processes: Vec<BoundProcessToken>, at: f64) -> SupervisionEvent {
     let desktops = processes.iter().filter(|p| p.role == ProcessRole::DesktopMain).map(|p|
         (Desktop { pid: p.pid, start_seconds: p.start_seconds, start_microseconds: p.start_microseconds }, true, "fixture".into())).collect();
@@ -128,7 +133,7 @@ fn desktop_and_cli_share_continuity_baseline_and_risk_in_both_start_orders() {
         for desktop_first in [false, true] {
             let (_dir, store) = setup_store(); let now = 1_710_000_000.;
             seed_receipts(&store, now, "JP");
-            let enforcer = Arc::new(LocalTunnelEnforcer::new("mixed", Some(store.clone())));
+            let enforcer = Arc::new(LocalTunnelEnforcer::new("mixed"));
             enforcer.activate_interception(now).unwrap();
             let (tx, rx) = mpsc::channel();
             let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer.clone()), Some(tx)).unwrap();
@@ -147,7 +152,7 @@ fn desktop_and_cli_share_continuity_baseline_and_risk_in_both_start_orders() {
             // Also exercise the real Controller launch path in a process that
             // has no daemon registry: it must not replace a running CLI session.
             if family == "claude" && !desktop_first {
-                let mut launcher = ChannelSystem::new(store.clone(), Some(enforcer.clone()), true);
+                let mut launcher = ChannelSystem::new(store.clone(), Some(enforcer.clone()));
                 launcher.claude_mains.clear(); launcher.open_adds_desktop = true;
                 assert_eq!(Controller::new(store.clone()).launch(&mut launcher).unwrap()["status"], "ok");
                 assert_eq!(sessions.load(now + 0.1).unwrap().unwrap().session_id, original.session_id);
@@ -155,12 +160,16 @@ fn desktop_and_cli_share_continuity_baseline_and_risk_in_both_start_orders() {
             }
             let mixed = supervisor.handle_event(inventory_event(family, vec![desktop.clone(), cli.clone()], now + 0.2)).unwrap();
             assert_eq!(mixed.families[family].permit_state, ChannelPermitState::Permitted);
+            assert_eq!(mixed.families[family].active_member_pids, vec![desktop.pid]);
+            assert!(mixed.families[family].unmanaged_member_pids.is_empty());
             let continuing = sessions.load(now + 0.2).unwrap().unwrap();
             assert_eq!(continuing.session_id, original.session_id);
             assert_eq!(continuing.baseline, original.baseline);
             assert!(rx.try_recv().is_err(), "a normal member joining is not a new environmental audit");
             let cli_only = supervisor.handle_event(inventory_event(family, vec![cli.clone()], now + 0.3)).unwrap();
             assert_eq!(cli_only.families[family].permit_state, ChannelPermitState::Permitted);
+            assert!(cli_only.families[family].active_member_pids.is_empty());
+            assert!(cli_only.families[family].unmanaged_member_pids.is_empty());
             assert_eq!(sessions.load(now + 0.3).unwrap().unwrap().session_id, original.session_id);
             assert!(rx.try_recv().is_err());
             sessions.mark_failure(Some(&original.session_id), now + 0.4, "egress_ip_changed", "fixture", true).unwrap();
@@ -169,8 +178,8 @@ fn desktop_and_cli_share_continuity_baseline_and_risk_in_both_start_orders() {
             let stored = sessions.load(now + 0.5).unwrap().unwrap();
             assert_eq!(stored.state, Phase::Locked); assert_eq!(stored.session_id, original.session_id);
             assert_eq!(stored.baseline, original.baseline, "member changes cannot erase a latched risk");
-            let mut monitor = ChannelSystem::new(store.clone(), Some(enforcer.clone()), true);
-            monitor.delegated = true; monitor.claude_mains.clear(); monitor.openai_mains.clear(); monitor.now = now + 0.5;
+            let mut monitor = ChannelSystem::new(store.clone(), Some(enforcer.clone()));
+            monitor.claude_mains.clear(); monitor.openai_mains.clear(); monitor.now = now + 0.5;
             let heartbeat = Controller::new(store.clone()).guard_tick(&mut monitor).unwrap();
             let family_status = heartbeat["families"].as_array().unwrap().iter().find(|v| v["family"] == family).unwrap();
             assert_eq!(family_status["status"], "protection_triggered");
@@ -178,7 +187,10 @@ fn desktop_and_cli_share_continuity_baseline_and_risk_in_both_start_orders() {
             monitor.enforcer = None;
             let missing = Controller::new(store.clone()).guard_tick(&mut monitor).unwrap();
             let family_status = missing["families"].as_array().unwrap().iter().find(|v| v["family"] == family).unwrap();
-            assert_eq!(family_status["status"], "protection_unavailable", "only actual execution receipts can promote status");
+            assert_eq!(family_status["status"], "protection_triggered", "consumers read the published execution frame, not their own enforcer handles");
+            fs::remove_file(store.paths.watch().join(claude_watch_runtime::channel_policy_status::FRAME_PATH)).unwrap();
+            let missing=Controller::new(store.clone()).guard_tick(&mut monitor).unwrap();
+            assert_eq!(missing["session_guard"]["state"],"pending_verification");
         }
     }
 }
@@ -188,7 +200,7 @@ fn autonomous_rust_cutoffs_require_supervisor_recovery() {
     use claude_watch_core::channel::ChannelPermitState;
     {
         let (_dir, store) = setup_store(); let now = 1_710_000_000.; seed_receipts(&store, now, "JP");
-        let enforcer = Arc::new(LocalTunnelEnforcer::new("autonomous", Some(store.clone())));
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("autonomous"));
         enforcer.activate_interception(now).unwrap();
         let (tx, rx) = mpsc::channel();
         let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer.clone()), Some(tx)).unwrap();
@@ -235,7 +247,7 @@ fn standalone_cli_is_discovered_audited_and_rebound_after_exec_without_a_launche
         let (_dir, store) = setup_store();
         let now = 1_710_000_000.;
         seed_receipts(&store, now, "JP");
-        let enforcer = Arc::new(LocalTunnelEnforcer::new("cli-adoption", Some(store.clone())));
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("cli-adoption"));
         enforcer.activate_interception(now).unwrap(); // In-memory executor fixture only.
         let (tx, rx) = mpsc::channel();
         let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer.clone()), Some(tx)).unwrap();
@@ -269,11 +281,10 @@ fn standalone_cli_is_discovered_audited_and_rebound_after_exec_without_a_launche
         let adopted = sessions.load(now + 0.1).unwrap().unwrap();
         assert!(adopted.desktop.is_none() && adopted.launcher.is_none());
         assert_eq!(adopted.extra["adopted_from"], "running_processes");
-        let permits_path = store.paths.watch().join("state/channel-permits.json");
-        let commands = store.read_json(&permits_path, json!({})).unwrap();
+        let frame = claude_watch_runtime::channel_policy_status::read_frame(&store);
+        let commands = &frame["authoritative_permits"];
         assert_eq!(active.families[family].active_members[0].audit_token, token.audit_token);
-        let mut controller_system = ChannelSystem::new(store.clone(), Some(enforcer.clone()), true);
-        controller_system.delegated = true;
+        let mut controller_system = ChannelSystem::new(store.clone(), Some(enforcer.clone()));
         controller_system.claude_mains.clear(); controller_system.openai_mains.clear();
         controller_system.now = now + 0.1;
         let heartbeat = Controller::new(store.clone()).guard_tick(&mut controller_system).unwrap();
@@ -282,7 +293,7 @@ fn standalone_cli_is_discovered_audited_and_rebound_after_exec_without_a_launche
         assert_eq!(family_heartbeat["session_guard"]["state"], "safe");
         assert_eq!(sessions.load(now + 0.1).unwrap().unwrap().session_id, adopted.session_id);
         assert_eq!(sessions.load(now + 0.1).unwrap().unwrap().state, claude_watch_core::session::Phase::Active);
-        assert_eq!(store.read_json(&permits_path, json!({})).unwrap(), commands, "Desktop controller cannot issue a second CLI authority");
+        assert_eq!(claude_watch_runtime::channel_policy_status::read_frame(&store)["authoritative_permits"], *commands, "Desktop controller cannot issue a second CLI authority");
         assert_eq!((controller_system.closes, controller_system.forces), (0, 0));
 
         // Same PID and birth after exec is still managed, but old permission
@@ -314,7 +325,7 @@ fn audit_completed_in_time_but_delivered_after_deadline_stays_revoked() {
 
     let (_dir, store) = setup_store();
     let now = 1_710_000_000.;
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("audit-delivery", Some(store.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("audit-delivery"));
     enforcer.activate_interception(now).unwrap();
     seed_receipts(&store, now, "JP");
     let (tx, rx) = mpsc::channel();
@@ -380,9 +391,7 @@ fn fresh_audit_context_recovers_after_network_change_and_next_event_stays_permit
     let (_dir, store) = setup_store();
     let now = 1_710_000_000.;
     let enforcer = Arc::new(LocalTunnelEnforcer::new(
-        "context-recovery",
-        Some(store.clone()),
-    ));
+        "context-recovery"));
     enforcer.activate_interception(now).unwrap();
     seed_receipts(&store, now, "JP");
     let (tx, rx) = mpsc::channel();
@@ -416,7 +425,7 @@ fn fresh_audit_context_recovers_after_network_change_and_next_event_stays_permit
     let inventory = |time| SupervisionEvent::ProcessInventoryUpdated {
         family: "claude".into(),
         desktops: vec![(desktop.clone(), true, "u501:900:1".into())],
-        processes: vec![],
+        processes: vec![desktop_bound(&desktop)],
         observed_at: time,
     };
     supervisor.handle_event(inventory(now + 0.1)).unwrap();
@@ -557,8 +566,6 @@ fn fixture_probe(kind: ProbeKind, now: f64, dns_country: &str) -> Value {
 struct ChannelSystem {
     store: StateStore,
     enforcer: Option<Arc<LocalTunnelEnforcer>>,
-    channel_mode: bool,
-    delegated: bool,
     open_adds_desktop: bool,
     family: &'static str,
     now: f64,
@@ -572,12 +579,10 @@ struct ChannelSystem {
 }
 
 impl ChannelSystem {
-    fn new(store: StateStore, enforcer: Option<Arc<LocalTunnelEnforcer>>, channel_mode: bool) -> Self {
+    fn new(store: StateStore, enforcer: Option<Arc<LocalTunnelEnforcer>>) -> Self {
         Self {
             store,
             enforcer,
-            channel_mode,
-            delegated: false,
             open_adds_desktop: false,
             family: "claude",
             now: 1_710_000_000.0,
@@ -609,14 +614,6 @@ impl DesktopSystem for ChannelSystem {
         }
     }
 
-    fn set_family(&mut self, family_id: &str) -> Result<()> {
-        self.family = if family_id == "openai" {
-            "openai"
-        } else {
-            "claude"
-        };
-        Ok(())
-    }
 
     fn now(&self) -> f64 {
         self.now
@@ -630,36 +627,7 @@ impl DesktopSystem for ChannelSystem {
         self.monotonic += dur;
     }
 
-    fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
-        let list = if self.family == "openai" {
-            &self.openai_mains
-        } else {
-            &self.claude_mains
-        };
-        Ok(list
-            .iter()
-            .cloned()
-            .map(|d| {
-                let stamp = format!("u501:{}:{}", d.start_seconds, d.start_microseconds);
-                (d, true, stamp)
-            })
-            .collect())
-    }
 
-    fn desktop_alive(&mut self, desktop: &Desktop) -> Result<bool> {
-        Ok(self.desktops()?.iter().any(|(d, _, _)| d == desktop))
-    }
-
-    fn desktop_tree_running(&mut self) -> Result<bool> {
-        Ok(!self.desktops()?.is_empty())
-    }
-
-    fn launcher(&mut self) -> Result<Launcher> {
-        Ok(Launcher {
-            pid: 100,
-            start: "launcher-1".into(),
-        })
-    }
 
     fn full_audit(&mut self) -> Result<Value> {
         Ok(fixture_audit(
@@ -675,17 +643,11 @@ impl DesktopSystem for ChannelSystem {
         fixture_egress(self.now, &self.ip, &self.country)
     }
 
-    fn local_guard(&mut self) -> Result<Value> {
-        Ok(fixture_local())
-    }
 
     fn backend_healthy(&mut self) -> Result<bool> {
         Ok(true)
     }
 
-    fn launcher_matches(&mut self, _: &Launcher) -> Result<bool> {
-        Ok(true)
-    }
 
     fn open_desktop(&mut self) -> Result<()> {
         if self.open_adds_desktop {
@@ -707,41 +669,10 @@ impl DesktopSystem for ChannelSystem {
         }).collect())
     }
 
-    fn quit_desktop(&mut self) -> Result<()> {
-        self.closes += 1;
-        Ok(())
-    }
 
-    fn quit_for_confirmed_ip_risk(&mut self, forced: &mut Option<u32>) -> Result<()> {
-        self.forces += 1;
-        *forced = Some(1);
-        Ok(())
-    }
 
-    fn channel_mode(&self) -> bool {
-        self.channel_mode
-    }
-    fn delegates_slow_audit_to_worker(&self) -> bool { self.delegated }
 
-    fn enforce_channel(
-        &mut self,
-        command: &claude_watch_core::channel::ChannelEnforcementCommand,
-    ) -> Result<Option<claude_watch_core::channel::ChannelEnforcementReceipt>> {
-        let Some(enforcer) = &self.enforcer else {
-            return Ok(None);
-        };
-        Ok(Some(enforcer.apply_command(command, self.now)?))
-    }
 
-    fn channel_receipt(
-        &mut self,
-        family: &str,
-    ) -> Result<Option<claude_watch_core::channel::ChannelEnforcementReceipt>> {
-        let Some(enforcer) = &self.enforcer else {
-            return Ok(None);
-        };
-        enforcer.receipt_for(family, self.now)
-    }
 }
 
 fn setup_store() -> (TempRoot, StateStore) {
@@ -776,24 +707,39 @@ fn seed_receipts(store: &StateStore, now: f64, country: &str) {
     .unwrap();
 }
 
+fn configured_egress(store: &StateStore, now: f64, ip: &str, country: &str) -> Value {
+    let config = ConfigStore { storage:store.clone() }.load().unwrap();
+    let mut value = fixture_egress(now, ip, country);
+    value["policy_version"] = json!(ChannelSupervisor::compute_policy_version(&config).unwrap());
+    value["upstream_endpoint"] = json!(config.proxy_url);
+    value
+}
+
+fn active_fixture_supervisor(
+    store: &StateStore, enforcer: Option<Arc<dyn ChannelEnforcer>>, processes: Vec<BoundProcessToken>,
+    family: &str, now: f64,
+) -> ChannelSupervisor {
+    let (tx, rx) = mpsc::channel();
+    let mut supervisor = fixture_supervisor(store.clone(), enforcer, Some(tx)).unwrap();
+    supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+        egress:configured_egress(store,now,"1.1.1.1","JP"), local_guard:fixture_local(), observed_at:now,
+    }).unwrap();
+    supervisor.handle_event(inventory_event(family, processes, now)).unwrap();
+    let request = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let mut completion = audit_completion(store, request, now + 0.1);
+    if let SupervisionEvent::AsyncAuditCompleted { outcome:claude_watch_runtime::channel_supervisor::AsyncAuditOutcome::Succeeded { egress, .. }, .. } = &mut completion {
+        *egress = configured_egress(store,now+0.1,"1.1.1.1","JP");
+    }
+    supervisor.handle_event(completion).unwrap();
+    supervisor
+}
+
 #[test]
 fn real_tcp_connection_traces_permit_forwarding_revocation_disconnecting_and_confirmed_blocked_while_preserving_process() {
     let (_dir, store) = setup_store();
 
-    let mut cfg = (ConfigStore {
-        storage: store.clone(),
-    })
-    .load()
-    .unwrap();
-    cfg.proxy_url = "http://127.0.0.1:7890".into();
-    cfg.vpn_expectation.as_mut().unwrap().proxy_url = cfg.proxy_url.clone();
-    (ConfigStore {
-        storage: store.clone(),
-    })
-    .save(cfg.value().unwrap())
-    .unwrap();
 
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-live-1", Some(store.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-live-1"));
     let channel_logs = claude_watch_runtime::channel_diagnostics::ChannelDiagnostics::new(store.clone());
     enforcer.set_diagnostics(channel_logs.clone()).unwrap();
     // Verify Item 2: At construction, interception_active and direct_fallback_blocked
@@ -830,10 +776,14 @@ fn real_tcp_connection_traces_permit_forwarding_revocation_disconnecting_and_con
     enforcer.set_defer_auto_flow_confirm(true).unwrap();
 
     let controller = Controller::new(store.clone());
-    let mut system = ChannelSystem::new(store.clone(), Some(enforcer.clone()), true);
+    let mut system = ChannelSystem::new(store.clone(), Some(enforcer.clone()));
     seed_receipts(&store, system.now, "JP");
 
-    // Round 1: Adopt running Claude & OpenAI desktops and grant `Permitted` channel leases
+    // Drive the production supervisor; Controller only projects its frame.
+    let claude_proc = bound(4100, ProcessRole::DesktopMain);
+    let mut supervisor = active_fixture_supervisor(&store, Some(enforcer.clone()),
+        vec![claude_proc.clone()], "claude", system.now);
+    system.now += 0.1;
     let hb1 = controller.guard_tick(&mut system).unwrap();
     let families1 = hb1["families"].as_array().unwrap();
     assert_eq!(families1[0]["family"], "claude");
@@ -844,13 +794,6 @@ fn real_tcp_connection_traces_permit_forwarding_revocation_disconnecting_and_con
     );
 
     // Connect a real TCP socket from Claude's verified process through the enforcer
-    let claude_proc = BoundProcessToken::with_system_identity(
-        4100,
-        501,
-        900,
-        1,
-        ProcessRole::DesktopMain,
-    );
     let (flow_id, mut client_stream) = enforcer
         .connect_supervised_tcp("claude", &claude_proc, system.now)
         .unwrap();
@@ -881,6 +824,9 @@ fn real_tcp_connection_traces_permit_forwarding_revocation_disconnecting_and_con
     // Round 2: Trigger exit IP drift ("1.1.1.1" -> "8.8.8.8")
     system.now += 1.0;
     system.ip = "8.8.8.8".into();
+    supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+        egress: fixture_egress(system.now, &system.ip, "JP"), local_guard: fixture_local(), observed_at: system.now,
+    }).unwrap();
     let hb2 = controller.guard_tick(&mut system).unwrap();
     let families2 = hb2["families"].as_array().unwrap();
 
@@ -892,7 +838,6 @@ fn real_tcp_connection_traces_permit_forwarding_revocation_disconnecting_and_con
 
     // Verify Item 3: Before `confirm_flow_terminated`, state is `disconnecting` ("正在断开"),
     // NEVER `"blocked"` ("已阻断")!
-    assert_eq!(families2[0]["stop_state"], "disconnecting");
     assert_eq!(families2[0]["channel_state"], "disconnecting");
     assert_eq!(families2[0]["channel_status_label"], "正在断开");
     assert!(
@@ -945,9 +890,11 @@ fn real_tcp_connection_traces_permit_forwarding_revocation_disconnecting_and_con
     assert_eq!(confirmed_receipt.terminated_flows_count, 1);
 
     system.now += 0.5;
+    supervisor.handle_event(SupervisionEvent::EnforcementReceiptArrived {
+        receipt: confirmed_receipt, received_at: system.now,
+    }).unwrap();
     let hb3 = controller.guard_tick(&mut system).unwrap();
     let families3 = hb3["families"].as_array().unwrap();
-    assert_eq!(families3[0]["stop_state"], "channel_blocked");
     assert_eq!(families3[0]["channel_state"], "blocked");
     assert_eq!(families3[0]["channel_status_label"], "已阻断");
     assert!(
@@ -998,44 +945,31 @@ fn real_tcp_connection_traces_permit_forwarding_revocation_disconnecting_and_con
 }
 
 #[test]
-fn missing_or_failed_enforcer_reports_protection_unavailable_or_failed_never_blocked() {
+fn missing_enforcer_reports_protection_unavailable_never_blocked() {
     let (_dir, store) = setup_store();
     let controller = Controller::new(store.clone());
-    // Channel mode enabled, but no enforcer is available
-    let mut system = ChannelSystem::new(store.clone(), None, true);
+    let mut system = ChannelSystem::new(store.clone(), None);
     seed_receipts(&store, system.now, "JP");
-    controller.guard_tick(&mut system).unwrap();
-
+    let mut supervisor = active_fixture_supervisor(&store, None,
+        vec![bound(4100, ProcessRole::DesktopMain)], "claude", system.now);
     system.now += 1.0;
-    system.ip = "8.8.8.8".into();
+    supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+        egress: fixture_egress(system.now, "8.8.8.8", "JP"), local_guard: fixture_local(), observed_at: system.now,
+    }).unwrap();
     let hb = controller.guard_tick(&mut system).unwrap();
     let claude = &hb["families"][0];
     assert_eq!((system.closes, system.forces), (0, 0));
-    assert_eq!(claude["status"], "protection_unavailable");
-    assert_eq!(claude["stop_state"], "enforcement_failed");
-    assert_eq!(claude["channel_state"], "failed");
-    assert_eq!(claude["channel_error"], "channel_enforcer_unavailable");
-    assert_eq!(claude["channel_status_label"], "保护不可用");
+    assert_ne!(claude["channel_state"], "blocked");
+    assert_ne!(claude["session_guard"]["state"], "safe");
+    assert_eq!(supervisor.snapshot(system.now).families["claude"].policy_sync_state, PolicySyncState::ApplyFailed);
 }
 
 #[test]
 fn active_lease_expiry_cuts_off_existing_long_lived_connection_with_zero_new_connections() {
     let (_dir, store) = setup_store();
 
-    let mut cfg = (ConfigStore {
-        storage: store.clone(),
-    })
-    .load()
-    .unwrap();
-    cfg.proxy_url = "http://127.0.0.1:7890".into();
-    cfg.vpn_expectation.as_mut().unwrap().proxy_url = cfg.proxy_url.clone();
-    (ConfigStore {
-        storage: store.clone(),
-    })
-    .save(cfg.value().unwrap())
-    .unwrap();
 
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-expiry-1", Some(store.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-expiry-1"));
     enforcer.activate_interception(1_710_000_000.0).unwrap();
     let (upstream_eof_tx, upstream_eof_rx) = mpsc::channel();
     enforcer
@@ -1056,21 +990,18 @@ fn active_lease_expiry_cuts_off_existing_long_lived_connection_with_zero_new_con
         })
         .unwrap();
     let controller = Controller::new(store.clone());
-    let mut system = ChannelSystem::new(store.clone(), Some(enforcer.clone()), true);
+    let mut system = ChannelSystem::new(store.clone(), Some(enforcer.clone()));
     seed_receipts(&store, system.now, "JP");
 
+    let claude_proc = bound(4100, ProcessRole::DesktopMain);
+    let _supervisor = active_fixture_supervisor(&store, Some(enforcer.clone()),
+        vec![claude_proc.clone()], "claude", system.now);
+    system.now += 0.1;
     let hb1 = controller.guard_tick(&mut system).unwrap();
     let valid_until = hb1["families"][0]["channel_permit"]["valid_until"]
         .as_f64()
         .unwrap();
 
-    let claude_proc = BoundProcessToken::with_system_identity(
-        4100,
-        501,
-        900,
-        1,
-        ProcessRole::DesktopMain,
-    );
     let (_flow_id, mut client_stream) = enforcer
         .connect_supervised_tcp("claude", &claude_proc, system.now)
         .unwrap();
@@ -1084,18 +1015,14 @@ fn active_lease_expiry_cuts_off_existing_long_lived_connection_with_zero_new_con
     let watchdog_clock = Arc::new(std::sync::Mutex::new(system.now));
     let clock_for_thread = watchdog_clock.clone();
     let (expired_tx, expired_rx) = mpsc::channel();
+    enforcer.set_receipt_event_sink(move |r| {
+        if r.family == "claude" { let _ = expired_tx.send(r); }
+    }).unwrap();
     let watchdog_handle = enforcer
         .spawn_lease_watchdog(
             watchdog_stop.clone(),
             Duration::from_millis(20),
             move || *clock_for_thread.lock().unwrap(),
-            move |receipts| {
-                for r in receipts {
-                    if r.family == "claude" {
-                        let _ = expired_tx.send(r);
-                    }
-                }
-            },
         )
         .unwrap();
 
@@ -1163,7 +1090,7 @@ fn active_lease_expiry_cuts_off_existing_long_lived_connection_with_zero_new_con
 #[test]
 fn slow_async_audit_does_not_block_revocation_and_policy_hot_reload_discards_stale_audit() {
     let (_dir, store) = setup_store();
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-event-1", Some(store.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-event-1"));
     enforcer.activate_interception(1_710_000_000.0).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let (event_tx, event_rx) = mpsc::channel();
@@ -1240,7 +1167,7 @@ fn slow_async_audit_does_not_block_revocation_and_policy_hot_reload_discards_sta
         .unwrap();
 
     // Update process inventories: Claude has an active session, OpenAI has a new
-    // desktop without a session (which triggers an async slow audit on the background worker)
+    // controlled desktop without a session (which triggers a slow background audit).
     supervisor
         .handle_event(SupervisionEvent::EnvironmentUpdated {
             egress: fixture_egress(now, "1.1.1.1", "JP"),
@@ -1251,24 +1178,17 @@ fn slow_async_audit_does_not_block_revocation_and_policy_hot_reload_discards_sta
     supervisor
         .handle_event(SupervisionEvent::ProcessInventoryUpdated {
             family: "claude".into(),
-            desktops: vec![(claude_desktop, true, "u501:900:1".into())],
-            processes: vec![],
+            desktops: vec![(claude_desktop.clone(), true, "u501:900:1".into())],
+            processes: vec![desktop_bound(&claude_desktop)],
             observed_at: now + 0.1,
         })
         .unwrap();
+    let openai_desktop = Desktop { pid: 5100, start_seconds: 905, start_microseconds: 1 };
     let snap_initial = supervisor
         .handle_event(SupervisionEvent::ProcessInventoryUpdated {
             family: "openai".into(),
-            desktops: vec![(
-                Desktop {
-                    pid: 5100,
-                    start_seconds: 905,
-                    start_microseconds: 1,
-                },
-                true,
-                "u501:905:1".into(),
-            )],
-            processes: vec![],
+            desktops: vec![(openai_desktop.clone(), true, "u501:905:1".into())],
+            processes: vec![desktop_bound(&openai_desktop)],
             observed_at: now + 0.2,
         })
         .unwrap();
@@ -1370,7 +1290,7 @@ fn evidence_expiry_caps_lease_and_prevents_infinite_renewal_on_process_events() 
     use claude_watch_core::session::GUARD_EGRESS_TTL;
 
     let (_dir, store) = setup_store();
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-ev-cap-1", Some(store.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-ev-cap-1"));
     let now = 1_710_000_000.0;
     enforcer.activate_interception(now).unwrap();
     seed_receipts(&store, now, "JP");
@@ -1411,7 +1331,7 @@ fn evidence_expiry_caps_lease_and_prevents_infinite_renewal_on_process_events() 
         .handle_event(SupervisionEvent::ProcessInventoryUpdated {
             family: "claude".into(),
             desktops: vec![(claude_desktop.clone(), true, "u501:900:1".into())],
-            processes: vec![],
+            processes: vec![desktop_bound(&claude_desktop)],
             observed_at: now,
         })
         .unwrap();
@@ -1427,7 +1347,7 @@ fn evidence_expiry_caps_lease_and_prevents_infinite_renewal_on_process_events() 
         .handle_event(SupervisionEvent::ProcessInventoryUpdated {
             family: "claude".into(),
             desktops: vec![(claude_desktop.clone(), true, "u501:900:1".into())],
-            processes: vec![],
+            processes: vec![desktop_bound(&claude_desktop)],
             observed_at: now + 4.0,
         })
         .unwrap();
@@ -1435,13 +1355,8 @@ fn evidence_expiry_caps_lease_and_prevents_infinite_renewal_on_process_events() 
         snap_renewed.families["claude"].permit_state,
         ChannelPermitState::Permitted
     );
-    let cmd_at_4: Value = store
-        .read_json(
-            &store.paths.watch().join("state/channel-command-claude.json"),
-            Value::Null,
-        )
-        .unwrap();
-    let valid_until_4 = cmd_at_4["permit"]["valid_until"].as_f64().unwrap();
+    let frame = claude_watch_runtime::channel_policy_status::read_frame(&store);
+    let valid_until_4 = frame["authoritative_permits"]["claude"]["valid_until"].as_f64().unwrap();
     assert!(
         (valid_until_4 - (now + GUARD_EGRESS_TTL)).abs() < 1e-6,
         "valid_until ({valid_until_4}) must be capped at evidence expiry ({})",
@@ -1454,8 +1369,8 @@ fn evidence_expiry_caps_lease_and_prevents_infinite_renewal_on_process_events() 
     let snap_expired = supervisor
         .handle_event(SupervisionEvent::ProcessInventoryUpdated {
             family: "claude".into(),
-            desktops: vec![(claude_desktop, true, "u501:900:1".into())],
-            processes: vec![],
+            desktops: vec![(claude_desktop.clone(), true, "u501:900:1".into())],
+            processes: vec![desktop_bound(&claude_desktop)],
             observed_at: now + GUARD_EGRESS_TTL,
         })
         .unwrap();
@@ -1479,9 +1394,9 @@ fn mid_dial_policy_session_or_revocation_change_aborts_connection_and_shuts_down
         ChannelEnforcementCommand, ChannelPermit, ChannelPermitState, PolicyVersion,
     };
 
-    let (_dir, store) = setup_store();
+    let (_dir, _store) = setup_store();
     let now = 1_710_000_000.0;
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-dial-race-1", Some(store.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-dial-race-1"));
     enforcer.activate_interception(now).unwrap();
 
     let (upstream_eof_tx, upstream_eof_rx) = mpsc::channel();
@@ -1615,9 +1530,9 @@ fn out_of_order_or_conflicting_commands_do_not_mutate_state_and_duplicate_comman
         ChannelEnforcementCommand, ChannelPermit, ChannelPermitState, PolicyVersion,
     };
 
-    let (_dir, store) = setup_store();
+    let (_dir, _store) = setup_store();
     let now = 1_710_000_000.0;
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-order-1", Some(store)));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-order-1"));
     enforcer.activate_interception(now).unwrap();
 
     let policy_v1 = PolicyVersion {
@@ -1707,6 +1622,83 @@ fn out_of_order_or_conflicting_commands_do_not_mutate_state_and_duplicate_comman
 }
 
 #[test]
+fn completed_but_rejected_audits_back_off_without_authorizing_managed_desktops() {
+    use claude_watch_core::channel::ChannelPermitState;
+    use claude_watch_runtime::channel_supervisor::AsyncAuditOutcome;
+    for scenario in ["initial_unready","epoch_mismatch","recovery_unready"] {
+        let (_dir,store) = setup_store();
+        let now = 1_710_000_000.0;
+        seed_receipts(&store,now,"JP");
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("rejected-audit"));
+        enforcer.activate_interception(now).unwrap();
+        let (tx,rx) = mpsc::channel();
+        let mut supervisor = fixture_supervisor(store.clone(),Some(enforcer),Some(tx)).unwrap();
+        supervisor.handle_event(environment(now)).unwrap();
+        let process = bound(7300,ProcessRole::DesktopMain);
+        supervisor.handle_event(inventory_event("claude",vec![process],now)).unwrap();
+        let mut request = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        if scenario == "recovery_unready" {
+            let adopted = supervisor.handle_event(audit_completion(&store,request,now+0.1)).unwrap();
+            assert_eq!(adopted.families["claude"].permit_state,ChannelPermitState::Permitted);
+            supervisor.handle_event(SupervisionEvent::NetworkContextChanged {
+                context_id:"ctx".into(),observed_at:now+1.0,
+            }).unwrap();
+            request = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        for (index,delay) in [2.0,2.0,15.0,30.0].into_iter().enumerate() {
+            let finished = request.requested_at + 0.1;
+            let mut completion = audit_completion(&store,request,finished);
+            if let SupervisionEvent::AsyncAuditCompleted { outcome:AsyncAuditOutcome::Succeeded { audit,egress }, .. } = &mut completion {
+                if scenario.ends_with("unready") { audit["ready"] = json!(false); }
+                if scenario == "epoch_mismatch" { egress["vpn_epoch"]["change_generation"] = json!(999); }
+            }
+            let failed = supervisor.handle_event(completion).unwrap();
+            assert_ne!(failed.families["claude"].permit_state,ChannelPermitState::Permitted,"{scenario}/{index}");
+            if index >= 2 { assert_eq!(failed.families["claude"].reason_code,"async_audit_retry_wait","{scenario}"); }
+            supervisor.handle_event(environment(finished+0.01)).unwrap();
+            supervisor.handle_event(SupervisionEvent::LeaseExpired {
+                observed_at:finished+delay-0.01,woke_from_sleep:false,
+            }).unwrap();
+            assert!(rx.try_recv().is_err(),"{scenario}: rejected successful probes must retain backoff {delay}");
+            supervisor.handle_event(SupervisionEvent::LeaseExpired {
+                observed_at:finished+delay,woke_from_sleep:false,
+            }).unwrap();
+            request = rx.recv_timeout(Duration::from_secs(1)).expect("rejected audits remain recoverable");
+        }
+    }
+}
+
+#[test]
+fn unmanaged_desktops_stay_visible_without_audit_or_permission() {
+    use claude_watch_core::channel::ChannelPermitState;
+    let (_dir, store) = setup_store();
+    let now = 1_710_000_000.0;
+    seed_receipts(&store, now, "JP");
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("unmanaged-no-audit"));
+    enforcer.activate_interception(now).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer), Some(tx)).unwrap();
+    let desktop = Desktop { pid: 7300, start_seconds: 900, start_microseconds: 1 };
+    for delta in [0.0, 2.0, 20.0, 90.0] {
+        supervisor.handle_event(environment(now + delta)).unwrap();
+        let snapshot = supervisor.handle_event(SupervisionEvent::ProcessInventoryUpdated {
+            family: "claude".into(), desktops: vec![(desktop.clone(), true, "fixture".into())],
+            processes: vec![], observed_at: now + delta,
+        }).unwrap();
+        let family = &snapshot.families["claude"];
+        assert_eq!(family.permit_state, ChannelPermitState::PendingVerification);
+        assert_eq!(family.reason_code, "unmanaged_existing_processes");
+        assert_eq!(family.display_label_zh, "未受保护");
+        assert_ne!(family.display_state, ChannelMonitorDisplayState::Blocked);
+        assert!(family.active_member_pids.is_empty());
+        assert_eq!(family.unmanaged_member_pids, vec![desktop.pid]);
+        assert!(rx.try_recv().is_err(), "observation cannot schedule adoption work");
+    }
+    assert!(SessionStore::for_family(store, "claude").load(now + 100.0).unwrap().is_none(),
+        "observing an unmanaged desktop cannot create a protected session");
+}
+
+#[test]
 fn async_audit_failure_timeout_and_request_id_mismatch_recover_and_respect_bounded_retries() {
     use claude_watch_core::{
         channel::{ChannelPermitState, PolicyVersion},
@@ -1718,7 +1710,7 @@ fn async_audit_failure_timeout_and_request_id_mismatch_recover_and_respect_bound
 
     let (_dir, store) = setup_store();
     let now = 1_710_000_000.0;
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-audit-retry-1", Some(store.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-audit-retry-1"));
     enforcer.activate_interception(now).unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -1751,14 +1743,14 @@ fn async_audit_failure_timeout_and_request_id_mismatch_recover_and_respect_bound
     // Attempt 1..=MAX_ASYNC_AUDIT_RETRIES: each failed audit sends back
     // `AsyncAuditCompleted` with `AsyncAuditOutcome::Failed`, clears `audit_in_flight`,
     // and after MAX_ASYNC_AUDIT_RETRIES transitions the family to `Revoked`
-    // (`async_audit_retries_exhausted`) instead of hanging in `PendingVerification`!
+    // (`async_audit_retry_wait`) instead of hanging in `PendingVerification`!
     let mut current_time = now;
     for attempt in 1..=MAX_ASYNC_AUDIT_RETRIES {
         let snap = supervisor
             .handle_event(SupervisionEvent::ProcessInventoryUpdated {
                 family: "openai".into(),
                 desktops: vec![(openai_desktop.clone(), true, "u501:905:1".into())],
-                processes: vec![],
+                processes: vec![desktop_bound(&openai_desktop)],
                 observed_at: current_time,
             })
             .unwrap();
@@ -1805,7 +1797,7 @@ fn async_audit_failure_timeout_and_request_id_mismatch_recover_and_respect_bound
             );
             assert_eq!(
                 after_fail.families["openai"].reason_code,
-                "async_audit_retries_exhausted"
+                "async_audit_retry_wait"
             );
             assert_eq!(
                 after_fail.families["openai"].display_state,
@@ -1814,6 +1806,24 @@ fn async_audit_failure_timeout_and_request_id_mismatch_recover_and_respect_bound
         }
         current_time += ASYNC_AUDIT_RETRY_BACKOFF_SECONDS + 0.5;
     }
+
+    // Unchanged healthy observations cannot erase the recovery backoff. The
+    // authority timer must eventually retry even without a VPN/config change.
+    supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+        egress: fixture_egress(current_time, "1.1.1.1", "JP"),
+        local_guard: json!({"proxy":"ok", "tun":"ok"}),
+        observed_at: current_time,
+    }).unwrap();
+    assert!(event_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "unchanged environment must not trigger an immediate audit");
+    let retry_at = current_time + 15.0;
+    let waiting = supervisor.handle_event(SupervisionEvent::LeaseExpired {
+        observed_at: retry_at, woke_from_sleep: false,
+    }).unwrap();
+    assert_ne!(waiting.families["openai"].permit_state, ChannelPermitState::Permitted);
+    let retry = event_rx.recv_timeout(Duration::from_secs(2))
+        .expect("deadline timer schedules another full audit after the short retry limit");
+    assert!(matches!(retry, SupervisionEvent::AsyncAuditCompleted { .. }));
 
     stop.store(true, Ordering::Release);
     let _ = worker_handle.join();
@@ -1825,7 +1835,7 @@ fn receiver_clock_and_executor_boot_id_handshake_reject_delayed_or_pre_restart_r
 
     let (_dir, store) = setup_store();
     let now = 1_710_000_000.0;
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-current-1", Some(store.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-current-1"));
     enforcer.activate_interception(now).unwrap();
     seed_receipts(&store, now, "JP");
 
@@ -1864,8 +1874,8 @@ fn receiver_clock_and_executor_boot_id_handshake_reject_delayed_or_pre_restart_r
     let snap_ok = supervisor
         .handle_event(SupervisionEvent::ProcessInventoryUpdated {
             family: "claude".into(),
-            desktops: vec![(claude_desktop, true, "u501:900:1".into())],
-            processes: vec![],
+            desktops: vec![(claude_desktop.clone(), true, "u501:900:1".into())],
+            processes: vec![desktop_bound(&claude_desktop)],
             observed_at: now + 0.1,
         })
         .unwrap();
@@ -1883,7 +1893,7 @@ fn receiver_clock_and_executor_boot_id_handshake_reject_delayed_or_pre_restart_r
         policy_version: claude_state.saved_policy_version.clone(),
         permit_generation: claude_state.permit_generation,
         command_seq: claude_state.command_seq,
-        permit_state: claude_watch_core::channel::ChannelPermitState::Permitted,
+        receipt_seq: 0, permit_state: claude_watch_core::channel::ChannelPermitState::Permitted,
         enforcement_state: ChannelEnforcementState::Forwarding,
         interception_active: true,
         direct_fallback_blocked: true,
@@ -1910,11 +1920,11 @@ fn receiver_clock_and_executor_boot_id_handshake_reject_delayed_or_pre_restart_r
         .unwrap();
     assert_eq!(
         snap_bad_boot.families["claude"].display_state,
-        ChannelMonitorDisplayState::Failed
+        ChannelMonitorDisplayState::Forwarding
     );
     assert_eq!(
         snap_bad_boot.families["claude"].policy_sync_state,
-        PolicySyncState::ApplyFailed
+        PolicySyncState::Applied
     );
 
     // 2. A receipt with the correct `boot-current-1` and `observed_at = now + 0.2`,
@@ -1935,12 +1945,13 @@ fn receiver_clock_and_executor_boot_id_handshake_reject_delayed_or_pre_restart_r
         .unwrap();
     assert_eq!(
         snap_delayed.families["claude"].display_state,
-        ChannelMonitorDisplayState::Failed
+        ChannelMonitorDisplayState::PendingVerification
     );
     assert_eq!(
         snap_delayed.families["claude"].policy_sync_state,
-        PolicySyncState::ApplyFailed
+        PolicySyncState::PendingApply
     );
+    assert_eq!(snap_delayed.families["claude"].display_label_zh, "执行回执已过期，当前结果待核验");
 
     // 3. Handshaking a new executor boot ID bumps `permit_generation` so old
     // sequence numbers cannot be reused!
@@ -1964,7 +1975,7 @@ impl DummyReceiptExt for claude_watch_core::channel::FamilyChannelMonitorState {
             policy_version: self.saved_policy_version,
             permit_generation: self.permit_generation,
             command_seq: self.command_seq,
-            permit_state: self.permit_state,
+            receipt_seq: 0, permit_state: self.permit_state,
             enforcement_state: ChannelEnforcementState::Forwarding,
             interception_active: true,
             direct_fallback_blocked: true,
@@ -1988,8 +1999,8 @@ impl DummyReceiptExt for claude_watch_core::channel::FamilyChannelMonitorState {
 
 #[test]
 fn upstream_tag_connect_handshake_verifies_200_and_clears_read_timeout_or_rejects() {
-    let (_dir, store) = setup_store();
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-tag-1", Some(store)));
+    let (_dir, _store) = setup_store();
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-tag-1"));
     enforcer.activate_interception(1_710_000_000.0).unwrap();
 
     // 1. Success case: Upstream proxy returns HTTP/1.1 200 Connection Established
@@ -2134,10 +2145,10 @@ fn daemon_restart_resync_with_producer_boot_id() {
 #[test]
 fn launch_failure_in_channel_mode_preserves_process_without_inventing_permission() {
     let (_dir, store) = setup_store();
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-lnch-1", Some(store.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-lnch-1"));
     enforcer.activate_interception(1_710_000_000.0).unwrap();
 
-    let mut system = ChannelSystem::new(store.clone(), Some(enforcer), true);
+    let mut system = ChannelSystem::new(store.clone(), Some(enforcer.clone()));
     // Desktops empty initially so launch check proceeds past `already_running`
     system.claude_mains.clear();
 
@@ -2153,13 +2164,13 @@ fn launch_failure_in_channel_mode_preserves_process_without_inventing_permission
 
     // A failed launch cannot invent a permit or a successful cutoff receipt.
     // The gateway holds newly discovered sources until the supervisor binds them.
-    assert!(system.channel_receipt("claude").unwrap().is_none());
+    assert!(enforcer.receipt_for("claude", system.now).unwrap().is_none());
 }
 
 #[test]
 fn controlled_path_evidence_and_authoritative_permit_are_hard_requirements() {
     let (_dir, store) = setup_store();
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-path-1", Some(store.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-path-1"));
     enforcer.activate_interception(1_710_000_000.0).unwrap();
     let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer.clone()), None).unwrap();
 
@@ -2240,8 +2251,8 @@ fn controlled_path_evidence_and_authoritative_permit_are_hard_requirements() {
     assert!(claude_state1.valid_until.is_some_and(|u| u > now));
 
     // Check authoritative permit file on disk
-    let permits_path = store.paths.watch().join("state/channel-permits.json");
-    let permits_val: serde_json::Value = store.read_json(&permits_path, json!({})).unwrap();
+    let frame = claude_watch_runtime::channel_policy_status::read_frame(&store);
+    let permits_val = &frame["authoritative_permits"];
     assert_eq!(permits_val["claude"]["state"], "permitted");
     assert!(permits_val["claude"]["valid_until"].as_f64().unwrap() > now);
     assert_eq!(permits_val["claude"]["members"][0]["pid"], 1234);
@@ -2301,4 +2312,94 @@ fn controlled_path_evidence_and_authoritative_permit_are_hard_requirements() {
         claude_state3.reason_code,
         "evidence_not_from_controlled_path"
     );
+}
+
+#[test]
+fn independent_current_risks_keep_their_configured_action_and_warn_recovers_without_rebasing() {
+    use claude_watch_core::{channel::ChannelPermitState, processes::Provider};
+    for (ip_action,dns_action,expected_reason,expected_action) in [
+        ("warn","force","dns_egress_changed","force"),
+        ("force","warn","egress_ip_changed","force"),
+        ("warn","close","dns_egress_changed","close"),
+        ("close","warn","egress_ip_changed","close"),
+        ("warn","warn","egress_ip_changed","warn"),
+    ] {
+        let (_dir,store)=setup_store(); let now=1_710_000_000.;
+        let config_store=ConfigStore { storage:store.clone() };
+        let mut config=config_store.load().unwrap().value().unwrap();
+        config["claude_close_ip"]=json!(ip_action); config["claude_close_dns"]=json!(dns_action);
+        let config=config_store.save(config).unwrap();
+        seed_receipts(&store,now,"JP");
+        let enforcer=Arc::new(LocalTunnelEnforcer::new("independent-risk"));
+        enforcer.activate_interception(now).unwrap();
+        let mut supervisor=active_fixture_supervisor(&store,Some(enforcer.clone()),
+            vec![bound(9100,ProcessRole::DesktopMain)],"claude",now);
+        let sessions=SessionStore::new(store.clone()); let before=sessions.load(now+0.1).unwrap().unwrap();
+        seed_receipts(&store,now+1.,"US");
+        let changed=supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+            egress:configured_egress(&store,now+1.,"8.8.8.8","JP"),local_guard:fixture_local(),observed_at:now+1.,
+        }).unwrap();
+        let permit=&changed.families["claude"];
+        assert_eq!(claude_watch_runtime::channel_policy_status::read_frame(&store)["authoritative_permits"]["claude"]["reason_code"],expected_reason,"{ip_action}/{dns_action}");
+        assert_eq!(config.close_action(expected_reason,Provider::Claude),expected_action);
+        assert_eq!(permit.permit_state,if expected_action=="warn" { ChannelPermitState::Permitted } else { ChannelPermitState::Revoked });
+        if expected_action=="warn" {
+            seed_receipts(&store,now+2.,"JP");
+            let healthy=supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+                egress:configured_egress(&store,now+2.,"1.1.1.1","JP"),local_guard:fixture_local(),observed_at:now+2.,
+            }).unwrap();
+            assert_eq!(healthy.families["claude"].permit_state,ChannelPermitState::Permitted);
+            assert_eq!(claude_watch_runtime::channel_policy_status::read_frame(&store)["authoritative_permits"]["claude"]["reason_code"],"active");
+            let after=sessions.load(now+2.).unwrap().unwrap();
+            assert_eq!(after.session_id,before.session_id); assert_eq!(after.baseline,before.baseline);
+        }
+    }
+}
+
+#[test]
+fn managed_multi_main_membership_preserves_continuity_and_fast_risk_across_join_exit_and_pid_reuse() {
+    use claude_watch_core::channel::ChannelPermitState;
+    for family in ["claude","openai"] {
+        let (_dir,store)=setup_store(); let now=1_710_000_000.; seed_receipts(&store,now,"JP");
+        let enforcer=Arc::new(LocalTunnelEnforcer::new("multi-main-authority"));
+        enforcer.activate_interception(now).unwrap();
+        let a=bound(9200,ProcessRole::DesktopMain); let b=bound(9201,ProcessRole::DesktopMain);
+        let child=bound(9202,ProcessRole::Child);
+        let mut supervisor=active_fixture_supervisor(&store,Some(enforcer),vec![a.clone(),b.clone()],family,now);
+        let sessions=SessionStore::for_family(store.clone(),family); let before=sessions.load(now+0.1).unwrap().unwrap();
+        let mut reused=a.clone(); reused.start_seconds+=1; reused.audit_token.as_mut().unwrap()[7]+=1;
+        for (offset,members) in [(0.2,vec![b.clone(),a.clone(),child.clone()]),
+            (0.3,vec![b.clone(),child.clone()]),(0.4,vec![b.clone(),reused.clone(),child.clone()])] {
+            let observed=supervisor.handle_event(inventory_event(family,members.clone(),now+offset)).unwrap();
+            assert_eq!(observed.families[family].permit_state,ChannelPermitState::Permitted);
+            assert_eq!(observed.families[family].active_members.len(),members.len());
+            let current=sessions.load(now+offset).unwrap().unwrap();
+            assert_eq!(current.session_id,before.session_id); assert_eq!(current.baseline,before.baseline);
+        }
+        let risk=supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+            egress:configured_egress(&store,now+1.,"8.8.8.8","JP"),local_guard:fixture_local(),observed_at:now+1.,
+        }).unwrap();
+        assert_eq!(risk.families[family].permit_state,ChannelPermitState::Revoked);
+        assert_eq!(claude_watch_runtime::channel_policy_status::read_frame(&store)["authoritative_permits"][family]["reason_code"],"egress_ip_changed");
+        assert_eq!(sessions.load(now+1.).unwrap().unwrap().baseline,before.baseline);
+    }
+}
+
+impl ChannelSystem {
+
+    fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
+        let list = if self.family == "openai" {
+            &self.openai_mains
+        } else {
+            &self.claude_mains
+        };
+        Ok(list
+            .iter()
+            .cloned()
+            .map(|d| {
+                let stamp = format!("u501:{}:{}", d.start_seconds, d.start_microseconds);
+                (d, true, stamp)
+            })
+            .collect())
+    }
 }

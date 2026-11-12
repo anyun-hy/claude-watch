@@ -1,8 +1,6 @@
-//! Controlled launch, observation leases and CLI execution. These effects
-//! never belong in the background guard tick: the guard only supervises.
+//! Controlled entry auditing and identity leases. The supervisor owns sessions.
 use super::*;
 use claude_watch_core::processes::Lease;
-use std::fs;
 
 impl Controller {
     fn record_launch(&self, target: LaunchTarget, pid: u32, now: f64) -> Option<Value> {
@@ -20,155 +18,12 @@ impl Controller {
             .err()
             .map(|e| json!({"code":e.code,"message":e.message}))
     }
-    fn pending_path(&self) -> std::path::PathBuf {
-        self.storage.paths.watch().join("state/desktop-pending")
-    }
-    fn clear_pending(&self) -> Result<()> {
-        let path = self.pending_path();
-        self.storage.guarded(&path)?;
-        if path.exists() {
-            fs::remove_file(path)
-                .map_err(|_| CoreError::new("pending_cleanup_failed", "启动等待记录无法清理"))?
-        }
-        Ok(())
-    }
-    /// The lease record names the supervised service, parsed back by the
-    /// lease store's provider table.
-    pub(crate) fn lease(
-        &self,
-        desktop: &Desktop,
-        stamp: &str,
-        now: f64,
-        provider: Provider,
-    ) -> Result<()> {
-        if stamp.contains(['|', '\n', '\r']) || stamp.is_empty() {
-            return Err(CoreError::new(
-                "desktop_identity_unavailable",
-                "主进程启动时间未能确认",
-            ));
-        }
-        let name = match provider {
-            Provider::Claude => "claude",
-            Provider::Codex => "codex",
-            Provider::Chatgpt => "chatgpt",
-            Provider::Openai => "openai",
-        };
-        let path = self
-            .storage
-            .paths
-            .watch()
-            .join(format!("state/sessions/rust-{}.session", desktop.pid));
-        self.storage.atomic_bytes(
-            &path,
-            format!(
-                "desktop|{name}|{}|{}|0|-|{}\n",
-                desktop.pid,
-                stamp,
-                now.floor()
-            )
-            .as_bytes(),
-            0o600,
-        )
-    }
     pub fn launch<S: DesktopSystem>(&self, system: &mut S) -> Result<Value> {
         if system.launch_target().cli() {
-            return Err(CoreError::new(
-                "invalid_target_entry",
-                "CLI必须使用带生命周期的共享入口",
-            ));
+            return Err(CoreError::new("invalid_target_entry", "CLI必须使用带生命周期的共享入口"));
         }
-        // The caller has already bound the supervised target via `select_target`
-        // (see runtime.rs) before entering here. A launch must honor that target
-        // instead of re-binding to Claude: ChatGPT/Codex route through the
-        // observation path below, Claude through the protected session path.
         let _launch = self.storage.lock("launch", None)?;
-        if system.channel_mode() || !system.launch_target().protected() {
-            // Launching is not a second authority for the family's network
-            // session. Discovery joins the new desktop just like a new CLI,
-            // including when this command runs outside the daemon process.
-            return self.launch_observation(system);
-        }
-        if !system.desktops()?.is_empty() {
-            return Err(CoreError::new(
-                "claude_already_running",
-                "Claude 已在运行（未受控实例 running_unprotected），不能补建受控启动会话或伪造已保护状态",
-            ));
-        }
-        // The audit is the slow stage: it measures the exit, DNS, WebRTC and
-        // the service endpoints. Announce it before it starts so the user sees
-        // which part of the pre-launch check is running instead of a button
-        // that stops answering.
-        crate::setup_progress::emit(crate::setup_progress::Phase::CollectEvidence);
-        let audit = system.full_audit()?;
-        let current = system.egress();
-        if !system.desktops()?.is_empty() {
-            return Err(CoreError::new(
-                "claude_already_running",
-                "预检期间Claude已由其他入口启动，未补建保护会话",
-            ));
-        }
-        let sessions = SessionStore::new(self.storage.clone());
-        let receipts = ReceiptStore {
-            storage: self.storage.clone(),
-        };
-        crate::setup_progress::emit(crate::setup_progress::Phase::VerifyLaunchConditions);
-        let pending = sessions.begin_verified(&receipts, &audit, &current, system.now())?;
-        let id = pending.session_id.clone();
-        let result: Result<Value> = (|| {
-            let launcher = system.launcher()?;
-            sessions.bind_launcher(&id, launcher.clone(), system.now())?;
-            self.storage.atomic_bytes(
-                &self.pending_path(),
-                format!(
-                    "{}|{}|{}\n",
-                    launcher.pid,
-                    launcher.start,
-                    system.now().floor()
-                )
-                .as_bytes(),
-                0o600,
-            )?;
-            crate::setup_progress::emit(crate::setup_progress::Phase::BindSession);
-            system.open_desktop()?;
-            crate::setup_progress::emit(crate::setup_progress::Phase::OpenApplication);
-            let deadline = system.monotonic() + Duration::from_secs(10);
-            while system.monotonic() < deadline {
-                let processes = system.desktops()?;
-                let mains: Vec<_> = processes.into_iter().filter(|p| p.1).collect();
-                if mains.len() == 1 {
-                    let (desktop, _, stamp) = &mains[0];
-                    sessions.bind_desktop(&id, desktop.clone(), system.now())?;
-                    self.lease(desktop, stamp, system.now(), Provider::Claude)?;
-                    self.clear_pending()?;
-                    let logging_error =
-                        self.record_launch(LaunchTarget::ClaudeDesktop, desktop.pid, system.now());
-                    return Ok(
-                        json!({"status":"ok","session_id":id,"audit":audit,"logging_error":logging_error,"message":"已通过受控入口启动，不代表账号服务可用"}),
-                    );
-                }
-                system.wait(Duration::from_millis(200));
-            }
-            Err(CoreError::new(
-                "desktop_identity_unavailable",
-                "启动后未能确认唯一Claude主进程",
-            ))
-        })();
-        if result.is_err() {
-            let _ = sessions.mark_failure(
-                Some(&id),
-                system.now(),
-                "launch_failed",
-                "Claude受控启动未完成",
-                true,
-            );
-            let _ = self.clear_pending();
-            // The supervisor consumes the failed session for channel launches.
-            // No launch adapter can issue a second channel command.
-            if !system.channel_mode() {
-                let _ = sessions.close_if_current(Some(&id), system.now(), || system.quit_desktop());
-            }
-        }
-        result
+        self.launch_observation(system)
     }
     fn require_launch_backend<S: DesktopSystem>(system: &mut S) -> Result<()> {
         if !system.backend_healthy()? {

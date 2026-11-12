@@ -61,13 +61,16 @@ impl Drop for Fixture {
 }
 
 impl Fixture {
-    fn start() -> Self {
+    fn start() -> Self { Self::with_actions("force", None) }
+
+    fn with_actions(ip: &str, dns: Option<&str>) -> Self {
         let root = PathBuf::from("/private/tmp").join(format!("cw-x-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
         fs::create_dir(&root).unwrap();
         let storage = StateStore::new(Paths::new(&root).unwrap());
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut config = fixture::config(&storage, &upstream.local_addr().unwrap().to_string());
-        config.policy_actions.insert("claude_close_ip".into(), "force".into());
+        config.policy_actions.insert("claude_close_ip".into(), ip.into());
+        if let Some(dns)=dns { config.policy_actions.insert("claude_close_dns".into(),dns.into()); }
         let config = (ConfigStore { storage: storage.clone() }).save(config.value().unwrap()).unwrap();
         let policy = ChannelSupervisor::compute_policy_version(&config).unwrap();
         let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/watch-sandbox-launcher").canonicalize().unwrap();
@@ -350,4 +353,58 @@ fn v1_worker_deadline_retains_unconfirmed_exit_when_observation_is_withheld() {
     assert!(!receipt.target_results[0].terminated && receipt.target_results[0].signal_sent_at.is_some());
     wait_until_exited(&actual);
     export("process-disposition-deadline.json", &json!({"snapshot":snapshot,"elapsed_ms":elapsed.as_secs_f64()*1000.0}));
+}
+
+#[test]
+fn independent_risks_submit_only_the_configured_force_intent_for_verified_members() {
+    for (ip,dns,expected,dns_age) in [("warn","force",Some("dns_egress_changed"),0.),
+        ("force","warn",Some("egress_ip_changed"),0.),("close","force",Some("dns_egress_changed"),0.),
+        ("close","warn",None,0.),("warn","warn",None,0.),
+        ("warn","force",Some("dns_egress_changed"),299.5),("warn","force",None,301.)] {
+        let mut fixture=Fixture::with_actions(ip,Some(dns));
+        let image=fixture.sleeper(); let target=fixture.launch(LaunchTarget::ClaudeCli,&image,vec![]);
+        let identity=inspect_process_identity(target.0.id()).unwrap();
+        let mut supervisor=fixture.supervisor(&["claude"]);
+        let original=SessionStore::new(fixture.storage.clone()).load(native::now()).unwrap().unwrap();
+        let (events,_receipts)=mpsc::channel(); let (requests,received)=mpsc::channel();
+        let (dispatcher,worker)=ProcessDispositionDispatcher::start_with(
+            fixture.storage.clone(),fixture.stop.clone(),events,move |_,job,_| {
+                requests.send(job.intent.clone()).unwrap(); None
+            }).unwrap();
+        fixture.workers.push(worker);
+        supervisor.install_process_disposition_dispatcher(dispatcher);
+        supervisor.set_process_disposition_registry(fixture.registry.clone());
+        if ip=="close" && dns=="force" {
+            fixture.environment(&mut supervisor,"claude","9.9.9.9",native::now());
+            assert_eq!(SessionStore::new(fixture.storage.clone()).load(native::now()).unwrap().unwrap().state,Phase::Locked);
+            assert!(received.try_recv().is_err(),"a close risk alone cannot enqueue force");
+        }
+        let sampled_at=native::now();
+        fixture::seed_probe_receipts(&fixture.storage,sampled_at,"JP");
+        // Advance the injected receiver clock; retain the real cached probe's
+        // original timestamp and current kernel-verified process identity.
+        let now=sampled_at+dns_age;
+        if dns_age>0. {
+            fixture.enforcer.set_clock(move || now).unwrap();
+            fixture.observation(&mut supervisor,2,now);
+        }
+        fixture.environment(&mut supervisor,"claude","9.9.9.9",now);
+        if let Some(reason)=expected {
+            let intent=received.recv_timeout(Duration::from_secs(2)).expect("Supervisor must submit the actual force job");
+            assert_eq!(intent.action,"force"); assert_eq!(intent.risk_code,reason);
+            assert_eq!(intent.session_id,original.session_id); assert_eq!(intent.family,"claude");
+            assert_eq!(intent.target_identities.len(),1);
+            let token=&intent.target_identities[0];
+            assert!(token.matches_process(identity.pid,identity.uid,identity.start_seconds,identity.start_microseconds,Some(&identity.audit_token)));
+            assert_eq!(intent.target_executables[&identity.pid],identity.executable_path);
+            assert_eq!(intent.policy_version,fixture.policy);
+            if reason=="dns_egress_changed" { assert!(intent.valid_until <= sampled_at + claude_watch_core::session::RISK_EVIDENCE_TTL,
+                "rereading a cached probe cannot extend its process authority"); }
+            assert_eq!(supervisor.snapshot(now).families["claude"].process_execution_state.as_deref(),Some("executing"));
+        } else {
+            assert!(received.recv_timeout(Duration::from_millis(150)).is_err(),"close/warn cannot queue process effects");
+            assert!(supervisor.snapshot(now).families["claude"].process_disposition_action.is_none());
+        }
+        assert_eq!(inspect_process_identity(identity.pid),Some(identity),"the capture executor never signals the owned process");
+    }
 }

@@ -1,10 +1,9 @@
 use claude_watch_core::{
     channel::{ChannelEnforcementReceipt, ChannelEnforcementState, ChannelPermit, ChannelPermitState},
     error::{CoreError, Result},
-    session::{Desktop, Launcher, Phase},
+    session::Desktop,
 };
 use claude_watch_runtime::{
-    channel_policy_status::read_guard_summary,
     controlled::{Controller, DesktopSystem},
     receipt_store::ReceiptStore,
     session_store::SessionStore,
@@ -59,26 +58,21 @@ struct Fake {
     running: bool,
     opens: u32,
     closes: u32,
+    ip_force_calls: u32,
     ready: bool,
     fail_open: bool,
-    fail_quit: bool,
+
     egress_calls: u32,
-    freeze_session: Option<PathBuf>,
-    proxy: &'static str,
+
     ip: &'static str,
     country: &'static str,
     egress_age: f64,
-    replace_on_open: Option<StateStore>,
+
     target: claude_watch_core::processes::LaunchTarget,
     root_kind: Option<claude_watch_core::processes::Kind>,
     root_uid: u32,
     no_main: bool,
-    desktop_pid: u32,
-    hide_main: bool,
-    alive_override: Option<bool>,
-    tree_running_override: Option<bool>,
-    native_liveness: bool,
-    native_start: Option<(u64, u32)>,
+
     reuse_root: bool,
     root_reads: u32,
     audits: u32,
@@ -89,14 +83,17 @@ struct Fake {
     fail_spawn: bool,
     fail_wait: bool,
     interrupt_code: Option<i32>,
-    spawn_test_process: bool,
-    test_child: Option<TestChild>,
+
     family: &'static str,
     /// When true, the OpenAI family also reports a running desktop so a test
     /// can drive its automatic disposition. Defaults false so the existing
     /// Claude-only contracts keep the OpenAI tick idle.
     supervise_openai: bool,
-    channel_mode_enabled: bool,
+
+    desktop_reads: u32,
+
+    supervisor_receipt_reads: u32,
+    terminated_supervised: Vec<claude_watch_core::channel::BoundProcessToken>,
 
 }
 impl Default for Fake {
@@ -106,26 +103,21 @@ impl Default for Fake {
             running: false,
             opens: 0,
             closes: 0,
+            ip_force_calls: 0,
             ready: true,
             fail_open: false,
-            fail_quit: false,
+
             egress_calls: 0,
-            freeze_session: None,
-            proxy: "ok",
+
             ip: "1.1.1.1",
             country: "JP",
             egress_age: 0.0,
-            replace_on_open: None,
+
             target: Default::default(),
             root_kind: None,
             root_uid: 501,
             no_main: false,
-            desktop_pid: 77,
-            hide_main: false,
-            alive_override: None,
-            tree_running_override: None,
-            native_liveness: false,
-            native_start: None,
+
             reuse_root: false,
             root_reads: 0,
             audits: 0,
@@ -136,43 +128,16 @@ impl Default for Fake {
             fail_spawn: false,
             fail_wait: false,
             interrupt_code: None,
-            spawn_test_process: false,
-            test_child: None,
+
             family: "claude",
             supervise_openai: false,
-            channel_mode_enabled: false,
+
+            desktop_reads: 0,
+
+            supervisor_receipt_reads: 0,
+            terminated_supervised: Vec::new(),
+
         }
-    }
-}
-struct TestChild(std::process::Child);
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn native_test_start(pid: u32) -> Result<(u64, u32)> {
-    let runner = claude_watch_runtime::commands::SystemRunner::development()?;
-    let inventory = claude_watch_runtime::native::Observer { runner: &runner }.inventory()?;
-    let record = inventory
-        .processes
-        .get(&pid)
-        .ok_or_else(|| CoreError::new("fixture_process_missing", "测试进程未被原生采样识别"))?;
-    Ok((
-        record.identity.start_seconds,
-        record.identity.start_microseconds,
-    ))
-}
-impl std::ops::Deref for TestChild {
-    type Target = std::process::Child;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl std::ops::DerefMut for TestChild {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-impl Drop for TestChild {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
     }
 }
 struct FakeCliChild {
@@ -202,9 +167,7 @@ impl claude_watch_runtime::controlled::CliProcess for FakeCliChild {
     }
 }
 impl DesktopSystem for Fake {
-    fn channel_mode(&self) -> bool {
-        self.channel_mode_enabled
-    }
+
     fn prepare_cli(&mut self) -> Result<()> {
         Ok(())
     }
@@ -231,23 +194,7 @@ impl DesktopSystem for Fake {
     fn launch_target(&self) -> claude_watch_core::processes::LaunchTarget {
         self.target
     }
-    fn set_family(&mut self, family_id: &str) -> Result<()> {
-        // Mirror the real system: a family's tick runs against that family's
-        // own guard target, and the audit it collects declares that target.
-        // Keeping the target on ClaudeDesktop here is what let a test pass
-        // while production rejected the same audit with
-        // `launch_target_mismatch`.
-        // Even if this fixture has no running members in the selected family,
-        // its target must switch exactly as the production adapter does. The
-        // process-presence toggle affects inventory only, never audit target.
-        let family = claude_watch_core::policy::PolicyCatalog::family(family_id)
-            .ok_or_else(|| CoreError::new("target_adapter_unavailable", "测试目标家族不存在"))?;
-        let target = claude_watch_core::policy::PolicyCatalog::guard_target(family)
-            .ok_or_else(|| CoreError::new("target_adapter_unavailable", "测试目标不可监管"))?;
-        self.family = family.id;
-        self.target = target;
-        Ok(())
-    }
+
     fn observation_owner(&mut self) -> Result<claude_watch_core::processes::Identity> {
         Ok(claude_watch_core::processes::Identity {
             pid: 88,
@@ -277,11 +224,7 @@ impl DesktopSystem for Fake {
                 _ => Kind::ClaudeMain,
             }),
             identity: Identity {
-                pid: self
-                    .test_child
-                    .as_ref()
-                    .map(|child| child.id())
-                    .unwrap_or(77),
+                pid: 77,
                 parent: 1,
                 uid: self.root_uid,
                 executable: "/fixture/ChatGPT.app/Contents/MacOS/ChatGPT".into(),
@@ -304,79 +247,7 @@ impl DesktopSystem for Fake {
     fn wait(&mut self, d: Duration) {
         self.now += d.as_secs_f64()
     }
-    fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
-        // `supervise_openai` repurposes `running` as the OpenAI family's
-        // process state and leaves the Claude family empty, so a test can
-        // drive the OpenAI disposition in isolation. The default (false)
-        // keeps the original Claude-only fixture semantics.
-        let present = if self.supervise_openai {
-            self.running && self.family == "openai"
-        } else {
-            self.running && self.family == "claude"
-        };
-        Ok(if present {
-            vec![(
-                Desktop {
-                    pid: self
-                        .test_child
-                        .as_ref()
-                        .map(|child| child.id())
-                        .unwrap_or(self.desktop_pid),
-                    start_seconds: self.native_start.map_or(900, |v| v.0),
-                    start_microseconds: self.native_start.map_or(1, |v| v.1),
-                },
-                !self.hide_main,
-                "Tue Nov 14 22:12:50 2023".into(),
-            )]
-        } else {
-            vec![]
-        })
-    }
-    fn desktop_alive(&mut self, expected: &Desktop) -> Result<bool> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if self.native_liveness {
-            // A wait receipt for this exact owned child proves its exit without
-            // depending on whether unrelated host processes are readable.
-            if self.native_start == Some((expected.start_seconds, expected.start_microseconds)) {
-                if let Some(child) = self.test_child.as_mut().filter(|c| c.id() == expected.pid) {
-                    if child.try_wait().map_err(|_| {
-                        CoreError::new("fixture_child_wait_failed", "无法确认自有测试进程的退出状态")
-                    })?.is_some() {
-                        return Ok(false);
-                    }
-                }
-            }
-            let runner = claude_watch_runtime::commands::SystemRunner::development()?;
-            let helper = claude_watch_runtime::native::built_process_control_path().unwrap();
-            let desktop = claude_watch_runtime::desktop_native::NativeDesktop::new(
-                runner,
-                helper.into(),
-                claude_watch_runtime::macos::Authority::ReadOnly,
-            )?;
-            return desktop.desktop_alive(expected);
-        }
-        if let Some(value) = self.alive_override {
-            return Ok(value);
-        }
-        Ok(self
-            .desktops()?
-            .iter()
-            .any(|(desktop, main, _)| *main && desktop == expected))
-    }
-    fn desktop_tree_running(&mut self) -> Result<bool> {
-        let present = if self.supervise_openai {
-            self.family == "openai"
-        } else {
-            self.family == "claude"
-        };
-        Ok(self.tree_running_override.unwrap_or(self.running && present))
-    }
-    fn launcher(&mut self) -> Result<Launcher> {
-        Ok(Launcher {
-            pid: 88,
-            start: "Tue Nov 14 22:12:49 2023".into(),
-        })
-    }
+
     fn full_audit(&mut self) -> Result<Value> {
         self.audits += 1;
         if self.start_during_audit {
@@ -392,211 +263,34 @@ impl DesktopSystem for Fake {
     }
     fn egress(&mut self) -> Value {
         self.egress_calls += 1;
-        if let Some(path) = self.freeze_session.take() {
-            assert!(std::process::Command::new("/usr/bin/chflags")
-                .arg("uchg")
-                .arg(path)
-                .status()
-                .unwrap()
-                .success());
-        }
         json!({"ip":self.ip,"country":self.country,"observed_at":self.now - self.egress_age,"source":"fixture HTTP exit"})
     }
-    fn local_guard(&mut self) -> Result<Value> {
-        Ok(json!({"proxy":self.proxy,"tun":"ok"}))
-    }
+
     fn backend_healthy(&mut self) -> Result<bool> {
         Ok(true)
     }
-    fn launcher_matches(&mut self, _: &Launcher) -> Result<bool> {
-        Ok(true)
-    }
+
     fn open_desktop(&mut self) -> Result<()> {
         self.opens += 1;
         self.now += 0.1;
-        if let Some(storage) = self.replace_on_open.take() {
-            SessionStore::new(storage.clone()).begin_verified(
-                &ReceiptStore { storage },
-                &audit(self.now),
-                &self.egress(),
-                self.now,
-            )?;
-            return Err(CoreError::new("fixture_open_failed", "fixture"));
-        }
         if self.fail_open {
             return Err(CoreError::new("fixture_open_failed", "fixture"));
-        }
-        if self.spawn_test_process {
-            self.test_child = Some(TestChild(
-                std::process::Command::new("/bin/sleep")
-                    .arg("300")
-                    .spawn()
-                    .map_err(|_| {
-                        CoreError::new("test_child_failed", "isolated test child failed to start")
-                    })?,
-            ));
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            if self.native_liveness {
-                self.native_start =
-                    Some(native_test_start(self.test_child.as_ref().unwrap().id())?);
-            }
         }
         self.running = true;
         Ok(())
     }
-    fn quit_desktop(&mut self) -> Result<()> {
-        self.closes += 1;
-        if self.fail_quit {
-            return Err(CoreError::new("fixture_quit_failed", "fixture"));
-        }
-        if let Some(mut child) = self.test_child.take() {
-            child.kill().map_err(|_| {
-                CoreError::new(
-                    "test_child_stop_failed",
-                    "isolated test child failed to stop",
-                )
-            })?;
-            child.wait().map_err(|_| {
-                CoreError::new(
-                    "test_child_wait_failed",
-                    "isolated test child failed to exit",
-                )
-            })?;
-        }
-        self.running = false;
-        Ok(())
-    }
 
 }
 
 #[test]
-fn enabled_guard_resumes_from_saved_config_and_explicit_disable_persists() {
-    let fixture = Fixture::new();
-    let first = read_guard_summary(&fixture.storage, 1000.0);
-    assert_eq!(first["status"], "unknown");
-    assert_eq!(first["session_guard"]["state"], "pending_verification");
-    let mut config = claude_watch_runtime::config_store::ConfigStore {
-        storage: fixture.storage.clone(),
-    }
-    .load()
-    .unwrap()
-    .value()
-    .unwrap();
-    config["guard_enabled"] = json!(false);
-    fixture
-        .storage
-        .atomic_json(&fixture.storage.paths.config(), &config)
-        .unwrap();
-    let disabled = read_guard_summary(&fixture.storage, 1000.0);
-    assert_eq!(disabled["status"], "disabled");
-}
-
-#[test]
-fn enabling_timezone_keeps_the_running_guard_and_session() {
-    use claude_watch_runtime::{
-        config_store::{guard_policy_digest, ConfigStore},
-        services::{self, ServiceSystem},
-    };
-    struct Clock {
-        target: Value,
-    }
-    impl ServiceSystem for Clock {
-        fn now(&self) -> f64 {
-            1001.0
-        }
-        fn backend_healthy(&self) -> bool {
-            true
-        }
-        fn guard_status(&self, config: &claude_watch_core::config::Config) -> Result<bool> {
-            Ok(config.enabled && config.guard_enabled)
-        }
-        fn service_job(&self, name: &str) -> Result<Value> {
-            if name == "watchdog" {
-                Ok(
-                    json!({"registered":!self.target.is_null(),"trusted":true,"definition":"fixture"}),
-                )
-            } else {
-                Ok(json!({"registered":false,"trusted":true}))
-            }
-        }
-        fn watchdog_state(&self) -> Result<Value> {
-            Ok(json!({"target":self.target,"registered":!self.target.is_null()}))
-        }
-        fn admin_helper_status(&self) -> Result<Value> {
-            Ok(json!({"trusted":true,"abi":1}))
-        }
-        fn runtime_present(&self) -> bool {
-            true
-        }
-        fn apply_service(&mut self, action: &Value) -> Result<()> {
-            self.target = action["after"].clone();
-            Ok(())
-        }
-    }
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut desktop = Fake::default();
-    controller.launch(&mut desktop).unwrap();
-    let session = fs::read(fixture.storage.paths.session()).unwrap();
-    let configs = ConfigStore { storage: fixture.storage.clone() };
-    let previous_policy = guard_policy_digest(&configs.load().unwrap()).unwrap();
-    fixture
-        .storage
-        .atomic_json(
-            &fixture.storage.paths.base().join("last-audit.json"),
-            &json!({"ready":true,"context_transition":{"state":"stable"},
-                "egress_reference":{"checked_at":1001.,"country":"JP","timezone":"Asia/Tokyo"}}),
-        )
-        .unwrap();
-    let mut clock = Clock {
-        target: Value::Null,
-    };
-    let changes = json!({"timezone_watchdog":true});
-    let plan = services::protection_preview(&fixture.storage, &clock, &changes).unwrap();
-    services::protection_apply(
-        &fixture.storage,
-        &mut clock,
-        &changes,
-        plan["id"].as_str().unwrap(),
-    )
-    .unwrap();
-    let config = claude_watch_runtime::config_store::ConfigStore {
-        storage: fixture.storage.clone(),
-    }
-    .load()
-    .unwrap();
-    assert!(config.guard_enabled && config.timezone_watchdog);
-    assert_eq!(guard_policy_digest(&config).unwrap(), previous_policy);
-    assert_eq!(fs::read(fixture.storage.paths.session()).unwrap(), session);
-    assert!(desktop.running);
-    assert_eq!(desktop.closes, 0);
-}
-#[test]
-fn controlled_launch_builds_immutable_baseline_and_legacy_lease_only_after_full_audit() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    let result = controller.launch(&mut system).unwrap();
-    assert_eq!(result["status"], "ok");
-    assert_eq!(system.opens, 1);
-    let session = SessionStore::new(fixture.storage.clone())
-        .load(system.now)
-        .unwrap()
-        .unwrap();
-    assert_eq!(session.state, Phase::Active);
-    assert_eq!(session.baseline.ip, "1.1.1.1");
-    assert_eq!(session.desktop.as_ref().unwrap().pid, 77);
-    assert!(!fixture
-        .storage
-        .paths
-        .watch()
-        .join("state/desktop-pending")
-        .exists());
-    let entries = fs::read_dir(fixture.storage.paths.watch().join("state/sessions"))
-        .unwrap()
-        .count();
-    assert_eq!(entries, 1);
-
+fn desktop_launch_creates_only_observation_lease_not_supervisor_authority() {
+    let fixture=Fixture::new(); let mut system=Fake::default();
+    let result=Controller::new(fixture.storage.clone()).launch(&mut system).unwrap();
+    assert_eq!(result["status"],"ok"); assert_eq!(result["authorization_scope"],"observation");
+    assert_eq!((system.opens,system.audits),(1,1));
+    assert!(!fixture.storage.paths.session().exists());
+    assert!(!fixture.storage.paths.watch().join("state/desktop-pending").exists());
+    assert_eq!(fs::read_dir(fixture.storage.paths.watch().join("state/sessions")).unwrap().count(),1);
 }
 
 #[test]
@@ -627,49 +321,16 @@ fn failed_audit_or_incomplete_risk_never_opens_and_never_weakens_launch_gate() {
     assert_eq!(launched["status"], "ok");
 }
 #[test]
-fn launch_failure_locks_its_session_and_late_failure_cannot_close_a_new_session() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake {
-        fail_open: true,
-        ..Fake::default()
-    };
-    assert!(controller.launch(&mut system).is_err());
-    let state = SessionStore::new(fixture.storage.clone())
-        .load(system.now)
-        .unwrap()
-        .unwrap();
-    assert_eq!(state.state, Phase::Locked);
-    assert_eq!(system.closes, 1);
-    let mut replacement = Fake {
-        replace_on_open: Some(fixture.storage.clone()),
-        ..Fake::default()
-    };
-    assert!(controller.launch(&mut replacement).is_err());
-    let state = SessionStore::new(fixture.storage.clone())
-        .load(replacement.now)
-        .unwrap()
-        .unwrap();
-    assert_eq!(state.state, Phase::Pending);
-    assert_eq!(replacement.closes, 0);
+fn launch_failure_preserves_preexisting_session_without_granting_a_lease() {
+    let fixture=Fixture::new();
+    let before=b"existing supervisor state is not launcher authority";
+    fixture.storage.atomic_bytes(&fixture.storage.paths.session(),before,0o600).unwrap();
+    let mut system=Fake { fail_open:true,..Default::default() };
+    assert!(Controller::new(fixture.storage.clone()).launch(&mut system).is_err());
+    assert_eq!(fs::read(fixture.storage.paths.session()).unwrap(),before);
+    assert!(!fixture.storage.paths.watch().join("state/sessions").exists());
 }
-#[test]
-fn invalid_configuration_reports_without_authorising_a_stop() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    let before = fs::read(fixture.storage.paths.session()).unwrap();
-    fs::write(fixture.storage.paths.config(), b"{invalid-config").unwrap();
-    let result = read_guard_summary(&fixture.storage, 1016.0);
-    assert_eq!(result["status"], "unknown");
-    assert_eq!(result["action"], "observe");
-    assert!(result["code"].is_string());
-    assert_eq!(system.closes, 0);
-    assert!(system.running);
-    assert_eq!(fs::read(fixture.storage.paths.session()).unwrap(), before);
-    assert!(!fixture.storage.paths.base().join("last-guard-stop.json").exists());
-}
+
 #[test]
 fn display_preview_cannot_be_reused_as_launch_authority() {
     let f = Fixture::new();
@@ -709,7 +370,9 @@ fn monitor_and_protection_share_the_validated_automatic_session_reference() {
         claude_watch_runtime::monitor_snapshot::empty(store, system.now, "fixture")["hasBaseline"],
         false
     );
-    Controller::new(store.clone()).launch(&mut system).unwrap();
+    let sessions=SessionStore::new(store.clone());
+    let pending=sessions.begin_verified(&ReceiptStore { storage:store.clone() },&audit(system.now),&system.egress(),system.now).unwrap();
+    sessions.bind_desktop(&pending.session_id,Desktop { pid:77,start_seconds:900,start_microseconds:1 },system.now).unwrap();
     assert_eq!(
         SessionStore::new(store.clone())
             .load(system.now)
@@ -787,6 +450,11 @@ fn observed_desktop_uses_shared_fresh_gate_and_only_creates_identity_leases() {
         assert_eq!(leases.load(&inventory, 501, false).unwrap().len(), 1);
         inventory.get_mut(&77).unwrap().start_microseconds += 1;
         assert!(leases.load(&inventory, 501, true).unwrap().is_empty());
+        // Guard reporting cannot infer process effects from a corrupt legacy
+        // session or manufacture authority without a published frame.
+        let guard_receipt = controller.guard_tick(&mut system).unwrap();
+        assert_eq!(guard_receipt["action"], "observe");
+        assert_eq!(system.closes, 0);
         let risk = ReceiptStore {
             storage: storage.clone(),
         };
@@ -981,34 +649,6 @@ fn cli_refusal_spawn_failure_wait_failure_and_interrupts_never_leave_authority()
 }
 
 #[test]
-fn fake_family_switches_target_even_without_a_running_member() {
-    use claude_watch_core::processes::LaunchTarget;
-    // The absence of an OpenAI process does not exempt the adapter from
-    // reporting the actual OpenAI target during its guard tick.
-    let mut fake = Fake::default();
-    assert!(!fake.supervise_openai);
-    DesktopSystem::set_family(&mut fake, "openai").unwrap();
-    assert_eq!(DesktopSystem::launch_target(&fake), LaunchTarget::CodexDesktop);
-    let audit = DesktopSystem::full_audit(&mut fake).unwrap();
-    assert_eq!(audit["launch_target"], "codex-desktop");
-    assert_eq!(audit["authorization_scope"], "observation");
-    assert!(DesktopSystem::desktops(&mut fake).unwrap().is_empty());
-
-    DesktopSystem::set_family(&mut fake, "claude").unwrap();
-    assert_eq!(DesktopSystem::launch_target(&fake), LaunchTarget::ClaudeDesktop);
-    let claude_audit = DesktopSystem::full_audit(&mut fake).unwrap();
-    assert!(claude_audit.get("launch_target").is_none());
-    assert!(claude_audit.get("authorization_scope").is_none());
-
-    let before = DesktopSystem::launch_target(&fake);
-    assert_eq!(
-        DesktopSystem::set_family(&mut fake, "unregistered").unwrap_err().code,
-        "target_adapter_unavailable"
-    );
-    assert_eq!(DesktopSystem::launch_target(&fake), before);
-}
-
-#[test]
 fn n4_supervisor_does_not_import_disk_process_receipt() {
     let fixture = Fixture::new();
     let receipt = claude_watch_core::channel::ProcessDispositionReceipt {
@@ -1072,7 +712,6 @@ fn publish_guard_fixture(fixture: &Fixture, permit: &ChannelPermit, receipt: &Ch
         "executor_boot_id": receipt.executor_boot_id, "saved_policy_version": permit.policy_version,
         "families": {(family): {
             "producer_boot_id": "fixture-supervisor", "session_id": permit.session_id,
-            "saved_policy_version": permit.policy_version,
             "command_seq": permit.command_seq, "permit_generation": permit.permit_generation,
             "process_preserved": true,
         }},
@@ -1100,40 +739,75 @@ fn channel_collector_fixture(fixture: &Fixture) -> (Value, ChannelPermit, Channe
 }
 
 #[test]
-fn guard_reader_uses_only_the_supervisor_frame_and_never_changes_the_session() {
+fn delegated_channel_session_skips_failing_desktop_inventory_and_reads_authority_receipt() {
     let fixture = Fixture::new();
-    let (session, permit, mut receipt) = channel_collector_fixture(&fixture);
-    let store = &fixture.storage;
-    let session_path = store.paths.session_for("claude");
-    store.atomic_json(&session_path, &session).unwrap();
-    let session_bytes = fs::read(&session_path).unwrap();
-    store.atomic_json(&store.paths.watch().join("state/channel-permits.json"), &json!({"claude": permit})).unwrap();
-    store.atomic_json(&store.paths.base().join("guard-heartbeat.json"), &json!({"status":"ok","time":1000.0})).unwrap();
+    let (session, permit, authority_receipt) = channel_collector_fixture(&fixture);
+    publish_guard_fixture(&fixture, &permit, &authority_receipt);
+    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &session).unwrap();
+    let mut system = Fake { running:true, ..Fake::default() };
+    let receipt = Controller::new(fixture.storage.clone()).guard_tick_for_family(&mut system, "claude").unwrap();
+    assert_eq!(system.desktop_reads, 0, "supervisor-owned sessions do not require a second desktop inventory");
+    assert_eq!(system.supervisor_receipt_reads, 0, "the published frame is the only receipt source");
+    assert_eq!(receipt["channel_receipt"]["command_seq"], 41);
+    assert_eq!(receipt["channel_supervision"]["verdict"], "isolated_keep_process");
+    assert_eq!(fixture.storage.read_json(&fixture.storage.paths.session_for("claude"), Value::Null).unwrap(), session);
+    assert_eq!((system.closes, system.ip_force_calls), (0,0));
+    assert!(system.terminated_supervised.is_empty());
+}
 
-    let status = || read_guard_summary(store, 1000.0)["families"][0].clone();
-    assert_eq!(status()["session_guard"]["state"], "pending_verification");
-    assert!(status()["channel_receipt"].is_null());
+#[test]
+fn missing_frame_does_not_import_a_legacy_receipt() {
+    let fixture = Fixture::new();
+    let (session, _, authority_receipt) = channel_collector_fixture(&fixture);
+    fixture.storage.atomic_json(&fixture.storage.paths.watch().join("state/channel-receipts.json"),
+        &json!({"claude":authority_receipt})).unwrap();
+    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &session).unwrap();
+    let mut system = Fake { running:true, ..Fake::default() };
+    let receipt = Controller::new(fixture.storage.clone()).guard_tick_for_family(&mut system, "claude").unwrap();
+    assert_eq!((system.desktop_reads, system.supervisor_receipt_reads), (0, 0));
+    assert_eq!(receipt["session_guard"]["state"], "pending_verification");
+    assert!(receipt["channel_receipt"].is_null());
+    assert_eq!(fixture.storage.read_json(&fixture.storage.paths.session_for("claude"), Value::Null).unwrap(), session);
+    assert_eq!((system.closes, system.ip_force_calls), (0,0));
+    assert!(system.terminated_supervised.is_empty());
+}
 
-    publish_guard_fixture(&fixture, &permit, &receipt);
-    let blocked = status();
-    assert_eq!(blocked["channel_receipt"]["command_seq"], 41);
-    assert_eq!(blocked["channel_supervision"]["verdict"], "isolated_keep_process");
-    assert_eq!(blocked["process_preserved"], true);
-    assert!(blocked["process_disposition_receipt"].is_null());
+#[test]
+fn delegated_channel_expired_receipt_stays_closed_and_projects_pending_verification() {
+    let fixture = Fixture::new();
+    let (session, permit, mut authority_receipt) = channel_collector_fixture(&fixture);
+    authority_receipt.observed_at = 900.;
+    publish_guard_fixture(&fixture, &permit, &authority_receipt);
+    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &session).unwrap();
+    let mut system = Fake { running:true, ..Fake::default() };
+    let receipt = Controller::new(fixture.storage.clone()).guard_tick_for_family(&mut system, "claude").unwrap();
+    assert_eq!(receipt["status"], "pending");
+    assert_eq!(receipt["session_guard"]["state"], "pending_verification");
+    assert_eq!(receipt["channel_state"], "pending_verification");
+    assert_eq!(receipt["channel_execution_state"], "pending_verification");
+    assert_eq!(receipt["channel_supervision"]["verdict"], "enforcement_failed");
+    assert_eq!(receipt["channel_supervision"]["code"], "enforcement_receipt_expired");
+    assert_eq!(receipt["channel_permit"]["state"], "revoked");
+    assert_eq!(receipt["action"], "disconnect-channel");
+    assert_eq!(fixture.storage.read_json(&fixture.storage.paths.session_for("claude"), Value::Null).unwrap(), session);
+    assert_eq!((system.closes, system.ip_force_calls), (0,0));
+}
 
-    receipt.observed_at = 900.0;
-    publish_guard_fixture(&fixture, &permit, &receipt);
-    let expired = status();
-    assert_eq!(expired["channel_execution_state"], "pending_verification");
-    assert_eq!(expired["channel_supervision"]["code"], "enforcement_receipt_expired");
-    assert_eq!(expired["channel_permit"]["state"], "revoked");
-
-    receipt.observed_at = 1000.0;
-    receipt.enforcement_state = ChannelEnforcementState::Failed;
-    receipt.error_code = Some("enforcement_reported_failure".into());
-    publish_guard_fixture(&fixture, &permit, &receipt);
-    let failed = status();
-    assert_eq!(failed["status"], "protection_unavailable");
-    assert_eq!(failed["channel_supervision"]["code"], "enforcement_reported_failure");
-    assert_eq!(fs::read(&session_path).unwrap(), session_bytes);
+#[test]
+fn delegated_channel_reported_execution_failure_keeps_failure_projection() {
+    let fixture = Fixture::new();
+    let (session, permit, mut authority_receipt) = channel_collector_fixture(&fixture);
+    authority_receipt.enforcement_state = ChannelEnforcementState::Failed;
+    authority_receipt.error_code = Some("enforcement_reported_failure".into());
+    publish_guard_fixture(&fixture, &permit, &authority_receipt);
+    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &session).unwrap();
+    let mut system = Fake { running:true, ..Fake::default() };
+    let receipt = Controller::new(fixture.storage.clone()).guard_tick_for_family(&mut system, "claude").unwrap();
+    assert_eq!(receipt["status"], "protection_unavailable");
+    assert_eq!(receipt["session_guard"]["state"], "unknown");
+    assert_eq!(receipt["channel_state"], "failed");
+    assert_eq!(receipt["channel_execution_state"], "failed");
+    assert_eq!(receipt["channel_supervision"]["code"], "enforcement_reported_failure");
+    assert_eq!(receipt["channel_permit"]["state"], "revoked");
+    assert_eq!((system.closes, system.ip_force_calls), (0,0));
 }

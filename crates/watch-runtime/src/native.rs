@@ -25,9 +25,8 @@ pub fn now() -> f64 {
 pub fn notify_channel_update() {
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("/usr/bin/notifyutil")
-            .args(["-p", "io.local.watchpanel.channel_update"])
-            .spawn();
+        // Best-effort wakeup: publishing must not depend on notification delivery.
+        let _ = claude_watch_system::post_darwin_notification("io.local.watchpanel.channel_update");
     }
 }
 pub fn built_observer_path() -> Option<&'static std::path::Path> {

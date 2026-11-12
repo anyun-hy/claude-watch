@@ -88,6 +88,9 @@ final class MonitorStore: ObservableObject {
         self.switcher.onCurrentEnvironment = { [weak self] result in
             self?.refreshEnvironmentQuality(result)
         }
+        // Fixture snapshots have an explicit producer. Live daemon events
+        // must not replace them with reads from a different runtime.
+        guard !self.switcher.isFixture else { return }
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         let name = "io.local.watchpanel.channel_update" as CFString
         let observer = Unmanaged.passUnretained(self).toOpaque()
@@ -98,7 +101,7 @@ final class MonitorStore: ObservableObject {
                 guard let observer = observer else { return }
                 let store = Unmanaged<MonitorStore>.fromOpaque(observer).takeUnretainedValue()
                 DispatchQueue.main.async {
-                    store.refresh(full: false)
+                    store.handleChannelUpdate()
                 }
             },
             name,
@@ -211,7 +214,11 @@ final class MonitorStore: ObservableObject {
         ]
         if next != desktopRunning { desktopRunning = next }
     }
+    func handleChannelUpdate() {
+        refresh(full: false)
+    }
     func refresh(full: Bool, manual: Bool = false) {
+        guard !switcher.isFixture else { return }
         if manual { refreshBackgroundIfNeeded(at: Date(), force: true) }
         let shouldRead = refreshGate.request(manual: manual)
         if refreshing != refreshGate.manualVisible { refreshing = refreshGate.manualVisible }
@@ -297,7 +304,7 @@ final class MonitorStore: ObservableObject {
     }
     func isConfirmedFlowBlocked(for product: MonitoredProduct) -> Bool {
         guard let state = channelState(for: product) else { return false }
-        return state.isConfirmedFlowBlocked
+        return state.isConfirmedFlowBlocked(at: now.timeIntervalSince1970)
     }
     private func refreshBackgroundIfNeeded(at date: Date, force: Bool = false) {
         guard !backgroundReadRunning, !switcher.busy,

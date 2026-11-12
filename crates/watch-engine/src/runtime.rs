@@ -6,7 +6,7 @@ use claude_watch_core::{
 use claude_watch_runtime::{
     accounts::AccountStore,
     audit_store::{AuditOptions, AuditScope, AuditStore},
-    channel_policy_status::{self, FrameEvidence},
+    channel_policy_status::StatusFrame,
     commands::SystemRunner,
     config_store::{policy_digest, ConfigStore},
     desktop_native::NativeDesktop,
@@ -215,11 +215,11 @@ fn background(host: &Host) -> Result<Value> {
     let config = (ConfigStore { storage: host.storage.clone() }).load()?;
     let now = native::now();
     let frame = claude_watch_runtime::channel_policy_status::read_frame(&host.storage);
-    let frame = FrameEvidence::new(&frame, &config, now);
+    let frame = StatusFrame::new(&frame, &config, now);
     let evidence = frame.guard_summary();
     background_from_frame(host, &config, &frame, &evidence, now)
 }
-fn background_from_frame(host: &Host, config: &claude_watch_core::config::Config, frame: &FrameEvidence<'_>, evidence: &Value, now: f64) -> Result<Value> {
+fn background_from_frame(host: &Host, config: &claude_watch_core::config::Config, frame: &StatusFrame<'_>, evidence: &Value, now: f64) -> Result<Value> {
     let health = host.backend_health_from_frame(frame, evidence);
     let mut value = services::service_status_with_health(host, config, health, now)?;
     enrich_background_services(&mut value);
@@ -344,7 +344,7 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
             let env = host.environment().ok();
             let now = native::now();
             let frame = claude_watch_runtime::channel_policy_status::read_frame(&host.storage);
-            let frame = FrameEvidence::new(&frame, &config, now);
+            let frame = StatusFrame::new(&frame, &config, now);
             let evidence = frame.guard_summary();
             let policy_sync_state = frame.policy_sync_state();
             let service_status = background_from_frame(&host, &config, &frame, &evidence, now)?;
@@ -548,10 +548,9 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
     {
         return Ok(None);
     }
-    if request.command == "guard-tick" {
-        return Ok(Some(OperationOutcome::Receipt(channel_policy_status::read_guard_summary(&StateStore::new(paths), native::now()))));
-    }
-    if !(request.command == "account" && request.action.as_deref() == Some("import")) {
+    if request.command != "guard-tick"
+        && !(request.command == "account" && request.action.as_deref() == Some("import"))
+    {
         request.require_apply()?;
     }
     let mut host = host(paths, Authority::ExplicitPermit)?;
@@ -582,7 +581,7 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
             json!({"status":"ok","receipt":receipts.record_webrtc(probe,&local,expected,native::now())?}),
         )));
     }
-    let authority = if request.flag("apply") {
+    let authority = if request.flag("apply") || request.command == "guard-tick" {
         Authority::ExplicitPermit
     } else {
         Authority::ReadOnly
@@ -640,7 +639,13 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
         started: Instant::now(),
         cli: None,
     };
-    Ok(Some(dispatch_launch(request, &storage, &mut desktop_runtime)?))
+    if request.command == "launch" {
+        Ok(Some(dispatch_launch(request, &storage, &mut desktop_runtime)?))
+    } else {
+        Ok(Some(OperationOutcome::Receipt(
+            Controller::new(storage).guard_tick(&mut desktop_runtime)?,
+        )))
+    }
 }
 
 #[cfg(test)]

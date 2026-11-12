@@ -62,6 +62,19 @@ struct ProcessProtectionDeadlineTests {
         require(!label(blocked, at: blocked.now, state: oldProducer).hasPrefix("已保护"), "old producer")
         let oldPolicy = try changedFamily(blocked, "saved_policy_version", ["policy_digest":"old", "guard_policy_digest":"old"])
         require(!label(blocked, at: blocked.now, state: oldPolicy).hasPrefix("已保护"), "old policy")
-        print("ProcessProtectionDeadlineTests: 20 Rust projection cases and receipt/lease/identity presentation boundaries passed")
+
+        let graphData = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2]))
+        let graph = try JSONDecoder().decode(ChannelMonitorSnapshot.self, from: graphData)
+        var subscription = ChannelMonitorSubscriptionStore()
+        subscription.applySnapshot(graph)
+        let family = graph.families["claude"]!
+        let until = family.blocked_evidence_valid_until!
+        require(family.valid_until! < graph.captured_at, "graph fixture must have an expired revoke lease")
+        require(subscription.effectiveState(for: "claude", now: until - 0.01, live: true)?
+            .isConfirmedFlowBlocked(at: until - 0.01) == true, "fresh receipt must confirm blocking")
+        require(subscription.effectiveState(for: "claude", now: until, live: true)?
+            .isConfirmedFlowBlocked(at: until) == false, "graph must expire with the actual receipt")
+        require(!blocked.family.isConfirmedFlowBlocked(at: blocked.now), "legacy snapshot without receipt deadline")
+        print("ProcessProtectionDeadlineTests: 20 process projection cases and production graph receipt deadline passed")
     }
 }

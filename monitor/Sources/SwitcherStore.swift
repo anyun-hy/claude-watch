@@ -1399,8 +1399,10 @@ final class SwitcherStore: ObservableObject {
                 dnsReceiptError = "DNS 检测完成后代理上下文已变化，未接受该回执。"
                 return false
             }
-            guard let receipt = Self.initializationReceiptMetadata(raw, kind: .dns, sampledAt: probe.finishedAt),
-                  receipt.context == expectedContext else {
+            // `expectedContext` is the TAG signature verified above and by
+            // Rust on submission. The receipt carries Rust's network digest;
+            // FirstRunChecks compares that digest with the environment receipt.
+            guard let receipt = Self.initializationReceiptMetadata(raw, kind: .dns, sampledAt: probe.finishedAt) else {
                 onReceiptDiagnostic?(.dns, "receipt_invalid", runID, "receipt_invalid")
                 dnsReceiptError = "DNS 后台回执缺少本轮上下文、时间或判定。"
                 return false
@@ -1458,8 +1460,9 @@ final class SwitcherStore: ObservableObject {
                 return false
             }
             guard generation == leakReceiptGeneration[.webrtc] else { onReceiptDiagnostic?(.webrtc, "receipt_superseded", runID, "receipt_superseded"); return false }
-            guard let receipt = Self.initializationReceiptMetadata(raw, kind: .webrtc, sampledAt: probe.finishedAt),
-                  receipt.context == expectedContext else {
+            // Keep the verified TAG binding separate from Rust's network
+            // digest, which is checked against the environment before entry.
+            guard let receipt = Self.initializationReceiptMetadata(raw, kind: .webrtc, sampledAt: probe.finishedAt) else {
                 onReceiptDiagnostic?(.webrtc, "receipt_invalid", runID, "receipt_invalid")
                 webRTCReceiptError = "WebRTC 后台回执缺少本轮上下文、时间或判定。"
                 return false
@@ -1628,6 +1631,9 @@ final class SwitcherStore: ObservableObject {
         let input = try? JSONSerialization.data(withJSONObject: setupOptions)
         await perform(["setup", "apply", "--candidate-id", setupPlan.candidate_id, "--plan-id", setupPlan.id, "--apply"], input: input, setupProgress: progress)
         self.setupPlan = nil; candidate = nil
+        // A successful setup changes the facts evaluated by the old audit,
+        // including the guard row. Final verification must read them again.
+        if !failure { invalidateCurrentEnvironmentRequest() }
         if !setupPlan.candidate_id.hasPrefix("confirmed-protection:") {
             progress?(.verifySettings)
             await inspectEnvironment()
