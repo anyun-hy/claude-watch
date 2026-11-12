@@ -176,6 +176,20 @@ fn d02_already_running_unmanaged_desktop_is_reported_unprotected_and_never_claim
 
 #[test]
 fn d03_and_d04_direct_child_inherits_protection_while_out_of_tree_launchd_process_stays_unprotected() {
+    if !hardened_helper::hardened_test_process("d03_and_d04_direct_child_inherits_protection_while_out_of_tree_launchd_process_stays_unprotected") {
+        return;
+    }
+    // A failed assertion must not leave the unapproved long-running child
+    // holding the hardened worker's captured output open.
+    struct FixtureChild(std::process::Child);
+    impl Drop for FixtureChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() && self.0.kill().is_err() {
+                return;
+            }
+            let _ = self.0.wait();
+        }
+    }
     let (tmp, store) = make_temp_store("cw-entry-d03-d04");
     let exe = std::env::current_exe()
         .and_then(fs::canonicalize)
@@ -186,7 +200,7 @@ fn d03_and_d04_direct_child_inherits_protection_while_out_of_tree_launchd_proces
         expected_uid: effective_uid(),
         expected_helper_executable: exe_str.clone(),
         expected_helper_sha256: exe_sha.clone(),
-        expected_helper_cdhash: "0".repeat(40),
+        expected_helper_cdhash: hardened_helper::cdhash(&exe),
     };
     let pv = test_policy_version();
     let boot_id = "boot-d03";
@@ -234,7 +248,7 @@ fn d03_and_d04_direct_child_inherits_protection_while_out_of_tree_launchd_proces
         script_source: None,
     };
     let resp = register_helper_with_daemon(&sock_path, req, true, &sbpl).unwrap();
-    assert!(resp.accepted);
+    assert!(resp.accepted, "owned hardened peer registration: {resp:?}");
 
     let client = TcpStream::connect(gw_addr).unwrap();
     let peer_addr = client.local_addr().unwrap();
@@ -254,11 +268,13 @@ fn d03_and_d04_direct_child_inherits_protection_while_out_of_tree_launchd_proces
     assert_eq!(attr.0, "claude");
 
     // D03: Spawn a REAL child process (`fork` + `exec` of `/bin/sleep`) from this registered parent
-    let mut real_child = Command::new(&sleep_real)
+    let mut real_child = FixtureChild(Command::new(&sleep_real)
         .arg("30")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
-        .expect("spawn real child process");
-    let real_child_pid = real_child.id();
+        .expect("spawn real child process"));
+    let real_child_pid = real_child.0.id();
 
     // D04: Spawn a detached/out-of-tree process whose parent exits immediately (so its ppid becomes 1 / launchd)
     let out_of_tree_pid_file = tmp.0.join("out_of_tree.pid");
@@ -278,11 +294,13 @@ fn d03_and_d04_direct_child_inherits_protection_while_out_of_tree_launchd_proces
         .unwrap();
 
     // Also spawn a child running an UNAPPROVED executable (`/usr/bin/tail -f /dev/null`) and verify R3.1 rejects it!
-    let mut unapproved_child = Command::new("/usr/bin/tail")
+    let mut unapproved_child = FixtureChild(Command::new("/usr/bin/tail")
         .args(["-f", "/dev/null"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
-        .expect("spawn unapproved child");
-    let unapproved_child_pid = unapproved_child.id();
+        .expect("spawn unapproved child"));
+    let unapproved_child_pid = unapproved_child.0.id();
 
     // Reconcile live kernel process trees and snapshot real running processes
     registry.reconcile_process_trees(1_700_000_201.0);
@@ -300,8 +318,8 @@ fn d03_and_d04_direct_child_inherits_protection_while_out_of_tree_launchd_proces
             .contains(&unapproved_child_pid),
         "unapproved child executable PID {unapproved_child_pid} must NOT be registered in controlled_subtree_pids"
     );
-    let _ = unapproved_child.kill();
-    let _ = unapproved_child.wait();
+    let _ = unapproved_child.0.kill();
+    let _ = unapproved_child.0.wait();
 
     let live_procs = snapshot_running_processes().expect("live processes");
     let live_child_snap = live_procs
@@ -324,8 +342,8 @@ fn d03_and_d04_direct_child_inherits_protection_while_out_of_tree_launchd_proces
     );
 
     // Clean up real child and verify `reconcile_process_trees` prunes exited child
-    let _ = real_child.kill();
-    let _ = real_child.wait();
+    let _ = real_child.0.kill();
+    let _ = real_child.0.wait();
     unsafe {
         libc::kill(out_of_tree_pid as i32, libc::SIGKILL);
     }
@@ -358,14 +376,43 @@ fn c01_cli_shim_skips_self_in_path_streams_stdin_stdout_stderr_and_executes_via_
     let shim_claude =
         stage_cli_entry_shim(&shim_dir, LaunchTarget::ClaudeCli, &fake_watch).expect("stage shim");
 
-    // Create the real target CLI script at `real_dir/claude` that reads stdin, prints args, cwd, env, and stderr
+    // This transport contract uses an owned native CLI. Arbitrary shell scripts
+    // intentionally require a supported, discovered script source proof; they
+    // are not a valid positive fixture for the native launch API.
     let real_claude = real_dir.join("claude");
+    let native_source = tmp.0.join("owned_cli.c");
     fs::write(
-        &real_claude,
-        b"#!/bin/sh\nread STDIN_LINE\necho \"STDIN=$STDIN_LINE\"\necho \"ARGS=$*\"\necho \"CWD=$(pwd)\"\necho \"CUSTOM=$CW_CUSTOM_VAR\"\necho \"PROXY=$HTTP_PROXY\"\necho \"SANDBOX=$CW_CONTROLLED_SANDBOX\"\necho \"STDERR_DIAG=ok\" >&2\nexit 42\n",
+        &native_source,
+        r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    char input[256], cwd[4096];
+    if (!fgets(input, sizeof(input), stdin) || !getcwd(cwd, sizeof(cwd))) return 70;
+    input[strcspn(input, "\n")] = 0;
+    printf("STDIN=%s\nARGS=", input);
+    for (int i = 1; i < argc; i++) printf("%s%s", i > 1 ? " " : "", argv[i]);
+    printf("\nCWD=%s\nCUSTOM=%s\nPROXY=%s\nSANDBOX=%s\n", cwd,
+        getenv("CW_CUSTOM_VAR") ?: "", getenv("HTTP_PROXY") ?: "", getenv("CW_CONTROLLED_SANDBOX") ?: "");
+    fputs("STDERR_DIAG=ok\n", stderr);
+    return 42;
+}
+"#,
     )
     .unwrap();
-    fs::set_permissions(&real_claude, fs::Permissions::from_mode(0o755)).unwrap();
+    let compiled = Command::new("/usr/bin/clang")
+        .args(["-Wall", "-Wextra"])
+        .arg(&native_source)
+        .arg("-o")
+        .arg(&real_claude)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "native CLI fixture compile: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
 
     let search_paths = vec![shim_dir.clone(), real_dir.clone()];
     let (resolved, resolved_sha) =
@@ -788,7 +835,7 @@ app.run()
     fs::write(
         &real_helper_dispatch,
         format!(
-            "#!/bin/sh\nCW_MOCK_PRESENT_DOCUMENT='{}' CW_MOCK_WINDOW_STATE='{}' CW_MOCK_KEEP_ALIVE='{}' '{}' --launch-json '{}' --registration-socket '{}' >'{}' 2>'{}' &\nfor i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do\n  if [ -f '{}' ]; then break; fi\n  sleep 0.05\ndone\necho '{{\"status\":\"ok\"}}'\nexit 0\n",
+            "#!/bin/sh\nCW_MOCK_PRESENT_DOCUMENT='{}' CW_MOCK_WINDOW_STATE='{}' CW_MOCK_KEEP_ALIVE='{}' '{}' --launch-json '{}' --registration-socket '{}' >'{}' 2>'{}' &\nfixture_pid=$!\nattempt=0\nwhile [ \"$attempt\" -lt 160 ]; do\n  if /usr/bin/grep -q '^WINDOW_READY=1 ' '{}' 2>/dev/null; then echo '{{\"status\":\"ok\"}}'; exit 0; fi\n  if ! kill -0 \"$fixture_pid\" 2>/dev/null; then echo 'owned AppKit target exited before readiness' >&2; exit 71; fi\n  attempt=$((attempt + 1))\n  sleep 0.05\ndone\necho 'owned AppKit target did not confirm a visible window before deadline' >&2\nexit 72\n",
             if require_file_completion { "1" } else { "0" },
             window_state_file.display(),
             keep_alive_file.display(),

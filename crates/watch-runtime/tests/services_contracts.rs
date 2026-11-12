@@ -16,6 +16,7 @@ struct Fake {
     runtime: bool,
     fail_after_apply: bool,
     native_healthy: bool,
+    sampling_healthy: bool,
     guard_healthy: bool,
     diagnostics: Value,
 }
@@ -24,7 +25,7 @@ impl ServiceSystem for Fake {
         self.now
     }
     fn backend_healthy(&self) -> bool {
-        true
+        self.sampling_healthy
     }
     fn guard_status(&self, c: &Config) -> Result<bool> {
         Ok(c.enabled && c.guard_enabled && self.guard_healthy)
@@ -98,6 +99,7 @@ fn fake() -> Fake {
         native_healthy: true,
         guard_healthy: true,
         diagnostics: json!({"reason":"confirmed"}),
+        sampling_healthy: true,
     }
 }
 #[test]
@@ -117,7 +119,8 @@ fn guard_service_reports_verified_failure_without_promoting_settings_to_readines
     let config = Config { enabled:true, guard_enabled:true, ..Config::default_for_new_install() };
     let failed = services::service_status(&f,&config).unwrap();
     let row = &failed["services"][0];
-    assert_eq!(row["state"],"error"); assert_eq!(row["execution_verified"],false);
+    assert_eq!(row["state"],"pending"); assert_eq!(row["execution_verified"],false);
+    assert_eq!(row["backend_alive"],true); assert_eq!(row["protection_ready"],false);
     assert_eq!(row["reason_code"],"gateway_not_installed");
     assert!(row["detail"].as_str().unwrap().contains("受控网关尚未安装完整"));
     f.guard_healthy = true;
@@ -399,7 +402,7 @@ fn failed_service_write_rolls_back_and_does_not_leave_an_unreachable_confirmatio
 }
 
 #[test]
-fn legacy_bodyguard_conflict_is_projected_in_service_status_and_policy_issues() {
+fn independent_bodyguard_is_observed_without_overriding_watch_policy() {
     let (home, store) = store();
     let mut system = fake();
     system.jobs["original"]["registered"] = json!(true);
@@ -410,18 +413,20 @@ fn legacy_bodyguard_conflict_is_projected_in_service_status_and_policy_issues() 
     store.atomic_json(&store.paths.config(), &config.value().unwrap()).unwrap();
 
     let status = services::service_status(&system, &config).unwrap();
-    let arb = &status["authority_arbitration"];
-    assert_eq!(arb["legacy_bodyguard_active"], true);
-    assert_eq!(arb["effective_proxy_loss_enforcement"], "legacy_root_kill");
+    assert!(status.get("authority_arbitration").is_none());
+    assert_eq!(status["external_services"]["legacy_bodyguard_registered"], true);
+    assert_eq!(config.action("claude", "session"), "warn");
 
     let issues = status["policy_issues"].as_array().unwrap();
-    assert!(issues.iter().any(|i| i["id"] == "legacy_bodyguard_overrides_policy"));
+    assert!(issues.iter().all(|i| i["id"] != "legacy_bodyguard_overrides_policy"));
+    assert!(issues.iter().any(|i| i["id"] == "guard"), "Watch's own disabled guard remains visible");
+    assert!(system.applied.is_empty(), "Observing an external service cannot mutate it");
 
     let _ = fs::remove_dir_all(home);
 }
 
 #[test]
-fn dual_timezone_writer_conflict_is_projected() {
+fn independent_timezone_guard_does_not_create_a_watch_launch_issue() {
     let (home, store) = store();
     let mut system = fake();
     system.jobs.as_object_mut().unwrap().insert(
@@ -434,11 +439,11 @@ fn dual_timezone_writer_conflict_is_projected() {
     store.atomic_json(&store.paths.config(), &config.value().unwrap()).unwrap();
 
     let status = services::service_status(&system, &config).unwrap();
-    let arb = &status["authority_arbitration"];
-    assert_eq!(arb["legacy_tz_active"], true);
+    assert_eq!(status["external_services"]["legacy_timezone_registered"], true);
 
     let issues = status["policy_issues"].as_array().unwrap();
-    assert!(issues.iter().any(|i| i["id"] == "dual_timezone_writer_conflict"));
+    assert!(issues.iter().all(|i| i["id"] != "dual_timezone_writer_conflict"));
+    assert!(system.applied.is_empty());
 
     let _ = fs::remove_dir_all(home);
 }
@@ -482,6 +487,92 @@ fn execution_receipt_and_health_basis_are_projected_truthfully() {
     assert_eq!(watchdog_expired["health_basis"], "launchd_registration_only");
 
     let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn service_layers_keep_live_backend_separate_from_stale_evidence() {
+    let mut system = fake();
+    system.guard_healthy = false;
+    system.sampling_healthy = false;
+    system.diagnostics = json!({"reason":"confirmed","sampling_state":"stale","guard":{"reason_code":"guard_heartbeat_stale","evidence_observed_at":20.0}});
+    let config = Config { enabled:true, guard_enabled:true, ..Config::default_for_new_install() };
+    let status = services::service_status(&system, &config).unwrap();
+    assert_eq!(status["backend_alive"],true);
+    assert_eq!(status["backend_sampling_state"],"stale");
+    assert_eq!(status["protection_ready"],false);
+    assert_eq!(status["services"][0]["state"],"pending");
+    assert_eq!(status["services"][0]["execution_verified"],false);
+    assert_eq!(status["services"][0]["evidence_observed_at"],20.0);
+    if let Ok(dir) = std::env::var("CW_SERVICE_WIRE_FIXTURES") {
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(PathBuf::from(dir).join("live-stale-unready.json"),serde_json::to_vec_pretty(&status).unwrap()).unwrap();
+    }
+    system.native_healthy = false;
+    let gone = services::service_status(&system, &config).unwrap();
+    assert_eq!(gone["backend_alive"],false);
+    assert_eq!(gone["services"][0]["state"],"error");
+    assert!(system.applied.is_empty());
+}
+
+#[test]
+fn original_guard_verification_uses_current_read_only_receipt_and_registration() {
+    let mut system = fake();
+    system.now = 1000.0;
+    let config = Config::default();
+    system.jobs["original"]["execution_receipt"] = json!({"schema":1,"time":999.0,"mode":"tag","result":"ok"});
+    // A successful current execution supersedes an older launchd exit code.
+    system.jobs["original"]["last_exit"] = json!(1);
+    let fresh = services::service_status(&system,&config).unwrap();
+    assert_eq!(fresh["services"][1]["execution_verified"],true);
+    assert_eq!(fresh["services"][1]["health_basis"],"root_execution_receipt");
+    assert_eq!(fresh["services"][1]["state"],"scheduled");
+    assert_eq!(fresh["services"][1]["last_success_at"],999.0);
+    if let Ok(dir) = std::env::var("CW_SERVICE_WIRE_FIXTURES") {
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(PathBuf::from(dir).join("original-fresh.json"),serde_json::to_vec_pretty(&fresh).unwrap()).unwrap();
+    }
+    for bad in [json!({"schema":1,"time":960.0,"mode":"tag","result":"ok"}),
+        json!({"schema":1,"time":1001.0,"mode":"tag","result":"ok"}),
+        json!({"schema":1,"time":999.0,"mode":"tag","result":"error"}), Value::Null] {
+        system.jobs["original"]["execution_receipt"] = bad;
+        assert_eq!(services::service_status(&system,&config).unwrap()["services"][1]["execution_verified"],false);
+    }
+    system.jobs["original"]["execution_receipt"] = json!({"schema":1,"time":999.0,"mode":"tag","result":"ok"});
+    system.jobs["original"]["trusted"] = json!(false);
+    assert_eq!(services::service_status(&system,&config).unwrap()["services"][1]["execution_verified"],false);
+    system.jobs["original"]["trusted"] = json!(true);
+    system.jobs["original"]["last_exit"] = json!(0);
+    system.jobs["original"]["execution_receipt"] = Value::Null;
+    let unavailable = services::service_status(&system,&config).unwrap();
+    assert_eq!(unavailable["services"][1]["state"],"scheduled");
+    assert!(unavailable["services"][1]["detail"].as_str().unwrap().contains("尚未确认"));
+    assert!(system.applied.is_empty());
+}
+
+#[test]
+fn original_guard_receipt_reader_rejects_untrusted_or_malformed_files() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use claude_watch_runtime::macos::read_original_guard_receipt;
+    let (home, _) = store();
+    let path = home.join("receipt");
+    fs::write(&path,b"schema=1\ntime=999\nmode=tag\nresult=ok\n").unwrap();
+    fs::set_permissions(&path,fs::Permissions::from_mode(0o644)).unwrap();
+    let uid = fs::metadata(&path).unwrap().uid();
+    assert_eq!(read_original_guard_receipt(&path,uid).unwrap()["result"],"ok");
+    assert!(read_original_guard_receipt(&path,uid+1).is_none());
+    fs::set_permissions(&path,fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(read_original_guard_receipt(&path,uid).is_none());
+    fs::set_permissions(&path,fs::Permissions::from_mode(0o644)).unwrap();
+    let link = home.join("link"); symlink(&path,&link).unwrap();
+    assert!(read_original_guard_receipt(&link,uid).is_none());
+    for bytes in [b"schema=2\ntime=999\nmode=tag\nresult=ok\n".as_slice(),
+        b"schema=1\ntime=NaN\nmode=tag\nresult=ok\n",
+        b"schema=1\ntime=999\ntime=1000\nmode=tag\nresult=ok\n",
+        b"schema=1\ntime=999\nmode=tag\n"] {
+        fs::write(&path,bytes).unwrap();
+        assert!(read_original_guard_receipt(&path,uid).is_none());
+    }
+    fs::remove_dir_all(home).unwrap();
 }
 
 #[test]

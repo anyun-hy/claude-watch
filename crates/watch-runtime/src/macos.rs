@@ -17,7 +17,7 @@ use claude_watch_core::{
     error::{CoreError, Result},
 };
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, fs, os::unix::fs::MetadataExt, time::Duration};
+use std::{collections::BTreeMap, fs, io::Read, os::unix::fs::{MetadataExt, OpenOptionsExt}, time::Duration};
 
 /// Match complete executable prefixes, never a display name or command argument.
 fn proxy_mode(executable: &str) -> Option<&'static str> {
@@ -143,6 +143,79 @@ pub fn guard_heartbeat_confirmed(
         && heartbeat["status"] == "ok"
         && crate::config_store::guard_heartbeat_policy_matches(heartbeat, config) == Some(true)
 }
+
+/// The service pulse is independent of collector completion. A present but
+/// invalid pulse cannot fall back to an older sampling heartbeat.
+fn guard_service_pulse(pulse: &Value, pid: u32, stamp: &str, sample_fresh: bool, now: f64) -> bool {
+    if pulse.is_null() { return sample_fresh; }
+    pulse["schema"] == 1 && pulse["pid"] == pid
+        && pulse["start_stamp"].as_str().is_some_and(|s| s.split_whitespace().eq(stamp.split_whitespace()))
+        && pulse["time"].as_f64().is_some_and(|at| at.is_finite() && (0.0..=15.0).contains(&(now - at)))
+}
+
+#[cfg(test)]
+mod service_liveness_tests {
+    use super::*;
+    #[test]
+    fn authority_pulse_survives_slow_sampling_without_refreshing_protection_evidence() {
+        let pulse = json!({"schema":1,"pid":42,"start_stamp":"same-start","time":999.0});
+        assert!(guard_service_pulse(&pulse,42,"same-start",false,1000.0));
+        let config = Config { enabled:true, guard_enabled:true, ..Config::default_for_new_install() };
+        let evidence = json!({"status":"ok","time":900.0,"completed_at":1000.0,
+            "guard_policy_v1":crate::config_store::guard_policy_digest(&config).unwrap()});
+        assert!(!guard_heartbeat_confirmed(&config,true,1000.0,&evidence));
+        assert!(!guard_service_pulse(&pulse,42,"same-start",true,1015.0));
+        assert!(!guard_service_pulse(&pulse,43,"same-start",true,1000.0));
+        assert!(!guard_service_pulse(&pulse,42,"reused-pid",true,1000.0));
+        assert!(!guard_service_pulse(&pulse,42,"same-start",true,998.0));
+        assert!(!guard_service_pulse(&json!({"invalid":true}),42,"same-start",true,1000.0));
+        assert!(guard_service_pulse(&Value::Null,42,"same-start",true,1000.0));
+        assert!(!guard_service_pulse(&Value::Null,42,"same-start",false,1000.0));
+    }
+}
+
+/// Observe the original tool's existing receipt only. This never installs,
+/// starts, configures, or writes to that independent service.
+pub fn read_original_guard_receipt(path: &std::path::Path, expected_uid: u32) -> Option<Value> {
+    // The independent writer replaces this file atomically every second. One
+    // bounded retry handles a rename during the metadata sandwich without
+    // relaxing ownership, no-follow, size, or content validation.
+    (0..2).find_map(|_| read_original_guard_receipt_once(path, expected_uid))
+}
+
+fn read_original_guard_receipt_once(path: &std::path::Path, expected_uid: u32) -> Option<Value> {
+    #[cfg(target_os = "macos")]
+    const NOFOLLOW: i32 = 0x100;
+    #[cfg(not(target_os = "macos"))]
+    const NOFOLLOW: i32 = 0x20000;
+    let before = fs::symlink_metadata(path).ok()?;
+    let trusted = |m: &fs::Metadata| m.is_file() && !m.file_type().is_symlink()
+        && m.uid() == expected_uid && m.mode() & 0o022 == 0 && m.len() > 0 && m.len() <= 4096;
+    if !trusted(&before) { return None; }
+    let file = fs::OpenOptions::new().read(true).custom_flags(NOFOLLOW).open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    if !trusted(&opened) || before.dev() != opened.dev() || before.ino() != opened.ino() { return None; }
+    let mut bytes = Vec::new();
+    file.take(4097).read_to_end(&mut bytes).ok()?;
+    let after = fs::symlink_metadata(path).ok()?;
+    if bytes.len() > 4096 || !trusted(&after) || before.dev() != after.dev()
+        || before.ino() != after.ino() || before.mode() != after.mode()
+        || before.mtime() != after.mtime() || before.mtime_nsec() != after.mtime_nsec()
+        || before.len() != after.len() { return None; }
+    let mut fields = BTreeMap::new();
+    for line in std::str::from_utf8(&bytes).ok()?.lines() {
+        let (key, value) = line.split_once('=')?;
+        if fields.insert(key, value).is_some() { return None; }
+    }
+    if fields.get("schema") != Some(&"1") { return None; }
+    let at = fields.get("time")?.parse::<f64>().ok()?;
+    if !at.is_finite() || at <= 0.0 { return None; }
+    let mode = *fields.get("mode")?;
+    let result = *fields.get("result")?;
+    if mode.is_empty() || mode.len() > 32 || !mode.bytes().all(|v| v.is_ascii_alphanumeric() || v == b'-')
+        || result.is_empty() || result.len() > 64 || !result.bytes().all(|v| v.is_ascii_alphanumeric() || matches!(v, b'-' | b'_')) { return None; }
+    Some(json!({"schema":1,"time":at,"mode":mode,"result":result}))
+}
 impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
     pub fn environment(&self) -> Result<Value> {
         Observer {
@@ -226,11 +299,17 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                 || json!({"registered":null,"trusted":false,"state":"unknown","definition":null}),
             )
     }
-    fn backend_facts(&self) -> BackendFacts {
+    fn backend_facts(&self) -> BackendFacts { self.backend_facts_using(None) }
+
+    fn backend_facts_using(&self, table: Option<&Result<BTreeMap<u32, Value>>>) -> BackendFacts {
         let mut diagnostics = json!({"reason":"unavailable","observed_at":native::now()});
         let unavailable = |reason, detail, mut diagnostics: Value| {
             diagnostics["reason"] = json!(reason);
             diagnostics["detail"] = json!(detail);
+            if diagnostics["sampling_state"] != "stale" {
+                diagnostics["sampling_state"] = json!("incomplete");
+            }
+            diagnostics["backend_alive"] = json!(false);
             BackendFacts {
                 sampling_healthy: false,
                 guard_healthy: false,
@@ -241,46 +320,55 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                 diagnostics,
             }
         };
-        let bytes = match self
-            .storage
-            .read_bytes(&self.storage.paths.watch().join("state/heartbeat"), 4096)
-        {
-            Ok(Some(bytes)) => {
-                diagnostics["heartbeat_present"] = json!(true);
-                bytes
-            }
-            Ok(None) => {
-                diagnostics["heartbeat_present"] = json!(false);
-                return unavailable("heartbeat_missing", "未找到或无法读取采集后台心跳", diagnostics);
-            }
-            Err(e) => {
-                diagnostics["source_error_code"] = json!(e.code);
-                return unavailable("heartbeat_unreadable", "未找到或无法读取采集后台心跳", diagnostics);
-            }
+        let sample = self.storage.read_bytes(&self.storage.paths.watch().join("state/heartbeat"), 4096);
+        let bytes = sample.as_ref().ok().and_then(Option::as_deref);
+        diagnostics["heartbeat_present"] = json!(bytes.is_some());
+        let monitor = bytes.and_then(|raw| std::str::from_utf8(raw).ok()).and_then(|text| {
+            let fields: Vec<_> = text.trim().split('|').collect();
+            if fields.len() != 5 || !matches!(fields[3], "ok" | "error") { return None; }
+            Some((fields[0].parse::<u32>().ok()?, fields[1], fields[2].parse::<f64>().ok()?, fields[3]))
+        });
+        let now = native::now();
+        let pulse = self.storage.read_json(
+            &self.storage.paths.watch().join("state/guard-service-heartbeat.json"), Value::Null,
+        ).unwrap_or_else(|_| json!({"invalid":true}));
+        let service_identity = pulse["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok())
+            .zip(pulse["start_stamp"].as_str().filter(|stamp| !stamp.is_empty()))
+            .filter(|(pid, stamp)| guard_service_pulse(&pulse, *pid, stamp, false, now));
+        let Some((pid, stamp)) = service_identity.or(monitor.map(|(pid, stamp, _, _)| (pid,stamp))) else {
+            let reason = match &sample {
+                Err(error) => {
+                    diagnostics["source_error_code"] = json!(error.code);
+                    "heartbeat_unreadable"
+                }
+                Ok(Some(_)) => "heartbeat_format",
+                Ok(None) => "heartbeat_missing",
+            };
+            return unavailable(reason, "采样和保护监督均未取得可核对的心跳身份", diagnostics);
         };
-        let Ok(text) = std::str::from_utf8(&bytes) else {
-            return unavailable("heartbeat_encoding", "后台心跳编码无效", diagnostics);
-        };
-        let fields: Vec<_> = text.trim().split('|').collect();
-        if fields.len() != 5 || !matches!(fields[3], "ok" | "error") {
-            return unavailable("heartbeat_format", "心跳质量状态无效", diagnostics);
-        }
-        let sampling_healthy = fields[3] == "ok";
-        let Ok(pid) = fields[0].parse::<u32>() else {
-            return unavailable("pid_invalid", "心跳 PID 无效", diagnostics);
-        };
+        let matching_sample = monitor.filter(|(sample_pid, sample_stamp, _, _)|
+            *sample_pid == pid && sample_stamp.split_whitespace().eq(stamp.split_whitespace()));
+        let age = matching_sample.map(|(_,_,at,_)| now - at).filter(|age| age.is_finite());
+        let sampling_fresh = age.is_some_and(|age| (0.0..=30.0).contains(&age));
+        let sampling_complete = matching_sample.is_some_and(|(_,_,_,status)| status == "ok");
+        let sampling_healthy = sampling_fresh && sampling_complete;
         diagnostics["heartbeat_pid"] = json!(pid);
-        diagnostics["heartbeat_status"] = json!(fields[3]);
-        let Ok(sampled) = fields[2].parse::<f64>() else {
-            return unavailable("time_invalid", "心跳时间字段无效", diagnostics);
-        };
-        let age = native::now() - sampled;
-        diagnostics["heartbeat_age_seconds"] = json!(age.is_finite().then_some(age));
-        if !(0.0..=30.0).contains(&age) {
-            return unavailable("heartbeat_stale", "后台心跳已过期或时间异常", diagnostics);
-        }
-        let sampler = Sampler::new(&self.runner, self.storage.paths.clone());
-        let table = match sampler.process_table() {
+        diagnostics["heartbeat_status"] = json!(matching_sample.map(|(_,_,_,status)| status));
+        diagnostics["heartbeat_age_seconds"] = json!(age);
+        diagnostics["sampling_state"] = json!(if age.is_some() && !sampling_fresh { "stale" }
+            else if sampling_healthy { "complete" } else { "incomplete" });
+        let service_fresh = guard_service_pulse(&pulse, pid, stamp, sampling_fresh, now);
+        diagnostics["service_heartbeat_present"] = json!(!pulse.is_null());
+        diagnostics["service_heartbeat_age_seconds"] = pulse["time"].as_f64()
+            .and_then(|at| (now - at).is_finite().then_some(json!(now - at))).unwrap_or(Value::Null);
+        let sampled_table;
+        let table = match match table {
+            Some(table) => table,
+            None => {
+                sampled_table = Sampler::new(&self.runner, self.storage.paths.clone()).process_table();
+                &sampled_table
+            }
+        } {
             Ok(table) => table,
             Err(e) => {
                 diagnostics["source_error_code"] = json!(e.code);
@@ -300,7 +388,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         };
         let same_stamp = process["stamp"]
             .as_str()
-            .is_some_and(|v| v.split_whitespace().eq(fields[1].split_whitespace()));
+            .is_some_and(|v| v.split_whitespace().eq(stamp.split_whitespace()));
         let job = self.job_observation(ReadCommand::LaunchctlGuiAgent { uid });
         diagnostics["start_identity_matches"] = json!(same_stamp);
         diagnostics["launchd_registered"] = job["registered"].clone();
@@ -318,7 +406,9 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             false
         };
         let identity_healthy = same_stamp && (direct_job || worker);
-        let guard_native = identity_healthy
+        diagnostics["sampling_state"] = json!(if age.is_some() && !sampling_fresh { "stale" }
+            else if sampling_complete && identity_healthy { "complete" } else { "incomplete" });
+        let guard_native = identity_healthy && service_fresh
             && process["executable"].as_str()
                 == self
                     .storage
@@ -330,6 +420,8 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             "心跳 PID 的启动身份不匹配"
         } else if !identity_healthy {
             "launchd 任务、PID 或运行状态未通过核对"
+        } else if !service_fresh {
+            "保护监督循环心跳已过期或身份不匹配"
         } else if !guard_native {
             "当前采集后台为旧组件，不支持原生观察租约"
         } else if !sampling_healthy {
@@ -338,7 +430,8 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             "原生采集后台身份与心跳已核对"
         };
         diagnostics["native_path_matches"] = json!(process["executable"].as_str() == self.storage.paths.watch().join("runtime/watch-engine").to_str());
-        diagnostics["reason"] = json!(if !same_stamp { "identity_mismatch" } else if !identity_healthy { "job_unconfirmed" } else if !guard_native { "native_path_mismatch" } else { "confirmed" });
+        diagnostics["backend_alive"] = json!(guard_native);
+        diagnostics["reason"] = json!(if !same_stamp { "identity_mismatch" } else if !identity_healthy { "job_unconfirmed" } else if !service_fresh { "guard_service_heartbeat_stale" } else if !guard_native { "native_path_mismatch" } else { "confirmed" });
         diagnostics["detail"] = json!(guard_detail);
         BackendFacts {
             // Preserve the strict historical monitor verdict: sampling health
@@ -358,14 +451,23 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         }
     }
     fn guard_heartbeat(&self, config: &Config, backend: bool) -> bool {
-        let heartbeat = self
-            .storage
-            .read_json(
-                &self.storage.paths.base().join("guard-heartbeat.json"),
-                Value::Null,
-            )
-            .ok();
-        heartbeat.is_some_and(|v| guard_heartbeat_confirmed(config, backend, native::now(), &v))
+        let at = native::now();
+        let frame = crate::channel_policy_status::read_frame(&self.storage);
+        let evidence = crate::channel_policy_status::guard_summary(&frame, config, at);
+        guard_heartbeat_confirmed(config, backend, at, &evidence)
+    }
+    pub fn backend_health_from_frame(&self, frame: &crate::channel_policy_status::FrameEvidence<'_>, evidence: &Value) -> crate::services::BackendHealthSnapshot {
+        let mut facts = self.backend_facts();
+        let guard_healthy = guard_heartbeat_confirmed(frame.config, facts.guard_healthy, frame.now, evidence);
+        facts.diagnostics["guard"] = crate::guard_readiness::read(
+            frame, facts.guard_healthy, guard_healthy, evidence,
+        );
+        crate::services::BackendHealthSnapshot {
+            sampling_healthy: facts.sampling_healthy,
+            guard_backend_healthy: facts.guard_healthy,
+            guard_healthy,
+            diagnostics: facts.diagnostics,
+        }
     }
     fn local_facts(&self, c: &Config) -> Result<Value> {
         let env = self.environment()?;
@@ -504,7 +606,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             identity["group"] = tag["expected_group"].clone();
         }
         let context = crate::config_store::policy_digest(&identity)?;
-        let backend = self.backend_facts();
+        let backend = self.backend_facts_using(Some(&table));
         let guard = self.guard_heartbeat(c, backend.guard_healthy);
         let mut out = json!({"proxy":proxy,"proxy_detail":detail,"tun":tun,"mode":selected,"candidates":candidates.keys().collect::<Vec<_>>(),"context":context,"context_id":context,"timezone":env.get("timezone"),"locale":env.get("locale"),"language":env.get("language"),"app_language":env.get("app_language"),"date_format":env.get("date_format"),"ipv6":env.get("ipv6"),"ipv6_method":env.get("ipv6_method"),"network":env.get("network"),"network_identity":identity,"service":env.pointer("/network/service"),"interface":interface,"processes":processes,"tag":tag,"observation_unavailable":unavailable,"backend_healthy":backend.sampling_healthy,"backend_native":backend.sampling_native,"backend_detail":backend.sampling_detail,"guard_backend_healthy":backend.guard_healthy,"guard_backend_native":backend.guard_native,"guard_backend_detail":backend.guard_detail,"guard":guard,"guard_state":if guard{"ok"}else if !c.guard_enabled{"disabled"}else{"unknown"},"guard_detail":if guard{"保护心跳已确认"}else if !c.guard_enabled{"保护策略已禁用"}else{"保护心跳或后台身份未能确认"}});
         out["verified_proxy_url"] = if selected == "tag"
@@ -809,15 +911,17 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         self.mutator.apply(a)
     }
 }
+fn network_identity(environment: &Value) -> Value {
+    json!({"service":environment.pointer("/network/service"),"interface":environment.pointer("/network/interface"),
+        "service_id":environment.pointer("/network/service_id")})
+}
 impl<R: ReadRunner, T: Transport, M: Mutator> AuditSystem for Macos<R, T, M> {
     fn now(&self) -> f64 {
         native::now()
     }
     fn network(&self) -> Result<Value> {
         let e = self.environment()?;
-        Ok(
-            json!({"service":e.pointer("/network/service"),"interface":e.pointer("/network/interface"),"service_id":e.pointer("/network/service_id")}),
-        )
+        Ok(network_identity(&e))
     }
     fn local(&self, c: &Config) -> Result<Value> {
         self.local_facts(c)
@@ -843,6 +947,10 @@ impl<R: ReadRunner, T: Transport, M: Mutator> AuditSystem for Macos<R, T, M> {
             };
         }
         Ok(local)
+    }
+    fn network_and_local(&self, c: &Config, target: claude_watch_core::processes::LaunchTarget) -> Result<(Value, Value)> {
+        let local = self.local_for_target(c, target)?;
+        Ok((network_identity(&local), local))
     }
     fn online(&mut self, c: &Config, l: &Value) -> Result<Value> {
         // The environment view is not tied to one family: it reports both
@@ -922,9 +1030,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> RepairSystem for Macos<R, T, M> {
     }
     fn egress_reference(&self, c: &Config) -> Result<Value> {
         let local = self.local_facts(c)?;
-        let online = self.online_facts(c, &local, true, false)?;
-        let trace = &online["trace"];
-        Ok(json!({"trace":{"ip":trace["ip"],"loc":trace["loc"]},"geo":online["geo"]}))
+        self.egress_for_local(c, &local)
     }
     fn restore(&mut self, a: &Value) -> Result<bool> {
         if self.authority != Authority::ExplicitPermit {
@@ -943,6 +1049,16 @@ impl<R: ReadRunner, T: Transport, M: Mutator> RepairSystem for Macos<R, T, M> {
     }
 }
 impl<R: ReadRunner, T: Transport, M: Mutator> OnboardingSystem for Macos<R, T, M> {
+    fn egress_for_local(&self, config: &Config, local: &Value) -> Result<Value> {
+        // The caller already checked this local sample. Exit confirmation
+        // needs the exit and its metadata, not another Claude service probe.
+        let online = self.online_facts(config, local, false, false)?;
+        let trace = &online["trace"];
+        Ok(json!({"trace":{"ip":trace["ip"],"loc":trace["loc"]},"geo":online["geo"]}))
+    }
+    fn setup_watchdog_state(&self, _: &Config) -> Result<Value> {
+        ServiceSystem::watchdog_state(self)
+    }
     fn packaged_backend(&self) -> Option<claude_watch_core::channel::NetworkBackendKind> {
         let mut directories = vec![self.storage.paths.watch().join("runtime"), self.storage.paths.base().join("bin")];
         if let Ok(exe) = std::env::current_exe() {
@@ -955,20 +1071,27 @@ impl<R: ReadRunner, T: Transport, M: Mutator> OnboardingSystem for Macos<R, T, M
             .and_then(|path| crate::sandbox_launch::lookup_packaged_network_backend(&path))
     }
     fn vpn_observation(&self, expectation: &claude_watch_core::vpn::VpnExpectation) -> Result<claude_watch_core::vpn::VpnObservation> {
-        use crate::vpn_observer::{resolve_vpn_controller_credentials, HttpControllerVpnReader, VpnSourceReader};
+        use crate::vpn_observer::{resolve_vpn_controller_credentials, HttpControllerVpnReader};
         if expectation.proxy_mode != "tag" {
             return Err(CoreError::new("vpn_observation_unavailable", "首次 VPN 预期确认目前仅支持已核验的 TAG 入口"));
         }
         let credentials = resolve_vpn_controller_credentials(&self.storage, &expectation.proxy_mode)?;
+        // TAG may run Mihomo as root; supply the kernel listener table so the
+        // reader can anchor the controller owner's lifetime across users.
         let reader = HttpControllerVpnReader::new_live(&expectation.proxy_mode, credentials);
+        let snapshot_probe = |timeout| crate::vpn_observer::read_vpn_kernel_snapshot(&self.runner, timeout);
         // The reader records the real start time; slow or stale samples must
         // expire instead of being renewed at the time setup receives them.
-        Ok(reader.read_observation(expectation, true, 1, claude_watch_core::vpn::VpnEpoch {
+        Ok(reader.read_observation_with_snapshot_probe(expectation, true, 1, claude_watch_core::vpn::VpnEpoch {
             observer_boot_id: uuid::Uuid::new_v4().to_string(), change_generation: 1,
-        }, native::now()))
+        }, native::now(), &snapshot_probe))
     }
     fn network(&self) -> Result<Value> {
         AuditSystem::network(self)
+    }
+    fn network_and_local(&self, config: &Config) -> Result<(Value, Value)> {
+        let local = RepairSystem::local(self, config)?;
+        Ok((network_identity(&local), local))
     }
     fn now(&self) -> f64 {
         native::now()
@@ -998,17 +1121,10 @@ impl<R: ReadRunner, T: Transport, M: Mutator> ServiceSystem for Macos<R, T, M> {
         &self,
         config: &Config,
     ) -> Result<crate::services::BackendHealthSnapshot> {
-        let mut facts = self.backend_facts();
-        let guard_healthy = self.guard_heartbeat(config, facts.guard_healthy);
-        facts.diagnostics["guard"] = crate::guard_readiness::read(
-            &self.storage, config, native::now(), facts.guard_healthy, guard_healthy,
-        );
-        Ok(crate::services::BackendHealthSnapshot {
-            sampling_healthy: facts.sampling_healthy,
-            guard_backend_healthy: facts.guard_healthy,
-            guard_healthy,
-            diagnostics: facts.diagnostics,
-        })
+        let at = native::now();
+        let frame = crate::channel_policy_status::read_frame(&self.storage);
+        let frame = crate::channel_policy_status::FrameEvidence::new(&frame, config, at);
+        Ok(self.backend_health_from_frame(&frame, &frame.guard_summary()))
     }
     fn service_job(&self, name: &str) -> Result<Value> {
         let mut observation = match name {
@@ -1034,6 +1150,11 @@ impl<R: ReadRunner, T: Transport, M: Mutator> ServiceSystem for Macos<R, T, M> {
                 observation["trusted"] = json!(false);
                 observation["definition_error"] = json!(error.message);
             }
+        }
+        if name == "original" {
+            observation["execution_receipt"] = read_original_guard_receipt(
+                std::path::Path::new("/Library/Application Support/claude-switcher/claude-bodyguard-health"), 0,
+            ).unwrap_or(Value::Null);
         }
         Ok(observation)
     }

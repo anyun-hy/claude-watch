@@ -125,7 +125,7 @@ struct GraphContinuityStore {
 
     mutating func observe(snapshot: MonitorSnapshot?, selection: NetworkGraphSelection, now: Double,
                           error: String?, automatic: Bool, claudeEgressIP: String? = nil,
-                          egressObservedAt: Double? = nil, safetyBlocked: Bool = false,
+                          egressObservedAt: Double? = nil, blockedProducts: Set<MonitoredProduct> = [],
                           references: [String: ServerReference] = [:]) {
         // A positively observed context change is latched. A later missing
         // snapshot must not bring the old network back into the main canvas.
@@ -135,7 +135,7 @@ struct GraphContinuityStore {
                 let ip = product == .claude ? claudeEgressIP : nil
                 if contextChanged(old, snapshot: snapshot, product: product, now: now, egressIP: ip,
                                   egressObservedAt: product == .claude ? egressObservedAt : nil)
-                    || (product == .claude && safetyBlocked) {
+                    || blockedProducts.contains(product) {
                     retired[product] = old
                     recent.removeValue(forKey: product)
                     if let ip, let oldIP = old.egressIP, ip != oldIP {
@@ -159,7 +159,7 @@ struct GraphContinuityStore {
             let projection = ConnectionGraphProjection(proxy: scopedProxy, processes: scope.processes,
                 selectedFlowID: id, fresh: true, showConfigurationReference: false)
             guard projection.supportsPathAnimation else { continue }
-            if product == .claude && safetyBlocked { continue }
+            if blockedProducts.contains(product) { continue }
             if let old = recent[product] {
                 guard proxy.observedAt >= old.observedAt else { continue }
                 if let ip, let oldIP = old.egressIP, ip != oldIP,
@@ -192,7 +192,7 @@ struct GraphContinuityStore {
                 egressObservedAt: product == .claude ? egressObservedAt : nil)
         } else { changed = false }
         let contextRetired = (old != nil && changed) || (old == nil && retired[product] != nil)
-        let blocked = product == .claude && safetyBlocked
+        let blocked = safetyBlocked
         let history = contextRetired || blocked ? nil : old
         let archive = contextRetired || blocked ? old ?? retired[product] : retired[product]
         func result(_ phase: GraphDisplayPhase, _ title: String, _ detail: String,

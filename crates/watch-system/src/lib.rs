@@ -251,6 +251,17 @@ pub fn inspect_process_identity(pid: u32) -> Option<ProcessKernelIdentity> {
     }
 }
 
+/// Locale-independent `ps lstart` representation of an already verified birth
+/// time. Formatting does not discover processes or establish an identity.
+pub fn process_start_stamp(seconds: u64) -> Option<String> {
+    let seconds = libc::time_t::try_from(seconds).ok()?;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&seconds, &mut tm) }.is_null() { return None; }
+    let day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].get(usize::try_from(tm.tm_wday).ok()?)?;
+    let month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].get(usize::try_from(tm.tm_mon).ok()?)?;
+    Some(format!("{day} {month} {} {:02}:{:02}:{:02} {}", tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, tm.tm_year + 1900))
+}
+
 pub fn verify_sandbox_helper_peer(
     stream: &UnixStream,
     verifier: &SandboxPeerVerifier,
@@ -293,6 +304,23 @@ pub fn inspect_loopback_tcp_listener(listener_addr: SocketAddr) -> Option<Proces
     #[cfg(not(target_os = "macos"))]
     {
         let _ = listener_addr;
+        None
+    }
+}
+
+/// Start time `(seconds, microseconds)` of a live process owned by any user,
+/// read via `KERN_PROC_PID` (which macOS exposes without privileges). Used to
+/// anchor the lifetime of a VPN core started by a root privileged helper, which
+/// same-UID libproc/task inspection cannot read. This is a lifetime anchor
+/// only, not an executable or audit-token identity.
+pub fn process_start_time_any_user(pid: u32) -> Option<(u64, u32)> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::sysctl_process_start(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
         None
     }
 }
@@ -431,6 +459,18 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn sysctl_start_time_matches_libproc_for_self() {
+        let pid = std::process::id();
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as i32;
+        assert_eq!(unsafe { libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(), size) }, size);
+        assert_eq!(super::macos::sysctl_process_start(pid),
+            Some((info.pbi_start_tvsec, info.pbi_start_tvusec as u32)));
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     fn process_token_is_kernel_bound_to_birth_uid_and_executable() {
@@ -780,6 +820,42 @@ mod macos {
             }
         }
         None
+    }
+
+    /// Start time of any live (non-zombie) process via `KERN_PROC_PID`.
+    pub fn sysctl_process_start(pid: u32) -> Option<(u64, u32)> {
+        if pid <= 1 || pid > i32::MAX as u32 {
+            return None;
+        }
+        // Exported `extern_proc` prefix: `p_un.p_starttime`, two pointers,
+        // `p_flag`, `p_stat`, `p_pid` (same layout as `bound_lifetime_exited`).
+        #[repr(C)]
+        struct ProcPrefix {
+            start: libc::timeval,
+            vmspace: *mut libc::c_void,
+            sigacts: *mut libc::c_void,
+            flags: libc::c_int,
+            status: libc::c_char,
+            pid: libc::pid_t,
+        }
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as i32];
+        let mut bytes = [0u8; 4096];
+        let mut size = bytes.len();
+        if unsafe {
+            libc::sysctl(mib.as_mut_ptr(), mib.len() as u32, bytes.as_mut_ptr().cast(),
+                &mut size, ptr::null_mut(), 0)
+        } != 0
+            || size < std::mem::size_of::<ProcPrefix>()
+        {
+            return None;
+        }
+        let info = unsafe { bytes.as_ptr().cast::<ProcPrefix>().read_unaligned() };
+        if info.pid != pid as i32 || info.status == 5 /* SZOMB */ {
+            return None;
+        }
+        let seconds = u64::try_from(info.start.tv_sec).ok().filter(|v| *v > 0)?;
+        let micros = u32::try_from(info.start.tv_usec).ok().filter(|v| *v < 1_000_000)?;
+        Some((seconds, micros))
     }
 
     pub fn list_descendants(root_pids: &[u32], expected_uid: u32) -> Vec<u32> {

@@ -1,12 +1,15 @@
 use claude_watch_core::{
     channel::{
-        BackendCoverageScope, ChannelMonitorSnapshot, NetworkBackendKind, PolicyVersion,
+        BackendCoverageScope, BoundProcessToken, NetworkBackendKind, PolicyVersion,
     },
     cli::Request,
     error::{CoreError, Result},
     policy::PolicyCatalog,
+    session::Desktop,
     vpn::VpnExpectation,
 };
+#[cfg(test)]
+use claude_watch_core::channel::ChannelMonitorSnapshot;
 use claude_watch_runtime::{
     alert_gate::AlertGate,
     channel_enforcer::{
@@ -16,7 +19,6 @@ use claude_watch_runtime::{
     channel_supervisor::{AsyncAuditRequest, ChannelSupervisor, SupervisionEvent},
     channel_diagnostics::ChannelDiagnostics,
     config_store::ConfigStore,
-    controlled::{Controller, DesktopSystem},
     daemon::{DaemonLease, PROCESS_INTERVAL},
     desktop_native::{DesktopRuntime, NativeDesktop},
     events::{Alert, EventFields, EventStore, Severity},
@@ -76,6 +78,44 @@ pub struct ProductionChannelStack {
     target_refresh_worker: Option<thread::JoinHandle<()>>,
     #[cfg(all(test, target_os = "macos"))]
     private_loopback_backend: bool,
+}
+
+/// Slow collectors report facts. Only the authority thread filters identities
+/// and turns these facts into permits. No collector owns a supervisor lock.
+enum GuardObservation {
+    Environment { egress: Value, local_guard: Value, observed_at: f64 },
+    Inventory { family: String, desktops: Vec<(Desktop, bool, String)>,
+        processes: Vec<BoundProcessToken>, observed_at: f64 },
+    InventoryUnavailable { family: String, observed_at: f64 },
+}
+
+#[cfg(test)]
+use claude_watch_runtime::controlled::DesktopSystem;
+
+#[cfg(test)]
+fn collect_guard_observations<S: DesktopSystem>(
+    system: &mut S, mut publish: impl FnMut(GuardObservation) -> Result<()>,
+) -> Result<()> {
+    let egress = system.egress();
+    let local_guard = system.local_guard()
+        .unwrap_or_else(|_| json!({"proxy":"unknown","tun":"unknown"}));
+    publish(GuardObservation::Environment { egress, local_guard, observed_at: system.now() })?;
+    for family in PolicyCatalog::families() {
+        if PolicyCatalog::guard_target(family).is_none() { continue; }
+        let result = system.set_family(family.id).and_then(|()| {
+            Ok((system.desktops()?, system.supervised_processes()?))
+        });
+        let observation = match result {
+            Ok((desktops, processes)) => GuardObservation::Inventory {
+                family: family.id.into(), desktops, processes, observed_at: system.now(),
+            },
+            Err(_) => GuardObservation::InventoryUnavailable {
+                family: family.id.into(), observed_at: system.now(),
+            },
+        };
+        publish(observation)?;
+    }
+    Ok(())
 }
 
 fn refresh_and_stage_production_targets(
@@ -293,7 +333,7 @@ mod m5_tests {
         for (target,path) in [("claude-cli",bundle.to_string_lossy().into_owned()),("claude-desktop","relative.app".into()),("claude-desktop","/tmp/control\n.app".into())] {
             assert!(claude_watch_core::cli::Request::parse(&["launch".into(),"--target".into(),target.into(),"--target-bundle".into(),path,"--apply".into()]).is_err(),"bundle binding requires a desktop target and an absolute, non-control path");
         }
-        let enforcer=LocalTunnelEnforcer::new("m5-boot",None);enforcer.configure_seatbelt_backend(false,native::now()).unwrap();
+        let enforcer=LocalTunnelEnforcer::new("m5-boot");enforcer.configure_seatbelt_backend(false,native::now()).unwrap();
         assert!(!enforcer.sandbox_ready().unwrap());assert!(registry.instances().is_empty(),"discovery/staging/preparation creates no sandbox or protected instance");
         if let Some(dir)=std::env::var_os("CW_CHANNEL_CONTRACT_DIR") {
             fs::create_dir_all(&dir).unwrap();fs::write(std::path::Path::new(&dir).join("target-discovery-staging.json"),
@@ -414,11 +454,12 @@ fn spawn_vpn_observation_worker(
 
                 if let Some(ref reader) = custom_reader {
                     if let Ok(transition) =
-                        observer.observe_from_reader(reader.as_ref(), &expectation, false, now)
+                        observer.observe_from_reader(reader.as_ref(), &expectation, false, native::now())
                     {
+                        let observed_at = transition.observation.observed_at;
                         let _ = event_tx.send(SupervisionEvent::VpnObservationUpdated {
                             observation: transition.observation,
-                            observed_at: now,
+                            observed_at,
                         });
                     }
                 } else if expectation.configured {
@@ -427,13 +468,22 @@ fn spawn_vpn_observation_worker(
                             let reader = HttpControllerVpnReader::new_live(
                                 expectation.proxy_mode.clone(),
                                 creds,
-                            );
+                            )
+                            .with_listener_snapshot_probe(Box::new(|timeout| {
+                                // One bounded kernel frame supplies both the
+                                // controller and upstream listener identities.
+                                let runner = super::runtime::runner().ok()?;
+                                claude_watch_runtime::vpn_observer::read_vpn_kernel_snapshot(
+                                    runner.as_ref(), timeout,
+                                )
+                            }));
                             if let Ok(transition) =
-                                observer.observe_from_reader(&reader, &expectation, false, now)
+                                observer.observe_from_reader(&reader, &expectation, false, native::now())
                             {
+                                let observed_at = transition.observation.observed_at;
                                 let _ = event_tx.send(SupervisionEvent::VpnObservationUpdated {
                                     observation: transition.observation,
-                                    observed_at: now,
+                                    observed_at,
                                 });
                             }
                         }
@@ -519,7 +569,7 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
         std::process::id(),
         &uuid::Uuid::new_v4().simple().to_string()[..12]
     );
-    let enforcer = Arc::new(LocalTunnelEnforcer::new(boot_id.clone(), Some(storage.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new(boot_id.clone()));
     enforcer.set_clock(native::now)?;
     enforcer.set_diagnostics(diagnostics.clone())?;
     enforcer.set_strict_peer_verification(activate_local_interception);
@@ -558,10 +608,6 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
         stop.clone(),
         Duration::from_millis(250),
         native::now,
-        // The ordered receipt sink above already publishes these changes.
-        // Re-sending this earlier snapshot here can overwrite a later relay
-        // closure confirmation from the same command and generation.
-        |_| {},
     )?;
 
     let (vpn_observer_worker, vpn_wake_handle) =
@@ -630,6 +676,7 @@ impl ProductionChannelStack {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn drain_background_events(&mut self) -> Result<()> {
         while let Ok(ev) = self.event_rx.try_recv() {
             self.deliver_background_event(ev)?;
@@ -766,106 +813,137 @@ impl ProductionChannelStack {
         self.enforcer.configure_seatbelt_backend_with_identity_gate(report, now)
     }
 
-    pub fn step_with_system<S: DesktopSystem>(
-        &mut self,
-        system: &mut S,
-    ) -> Result<ChannelMonitorSnapshot> {
-        self.drain_background_events()?;
-        let now = system.now();
-
-        let resolved_cfg = (ConfigStore {
-            storage: self.supervisor.storage.clone(),
-        })
-        .resolve_runtime_config_state(self.packaged_backend);
-        let blocking_reason = resolved_cfg.blocking_reason();
-        if blocking_reason.is_none() {
-            self.synchronize_runtime_policy(resolved_cfg.config, now)?;
-            self.supervisor.set_config_blocking_reason(None, now)?;
-            self.reconcile_controlled_backend(now)?;
-        } else {
-            self.supervisor.set_config_blocking_reason(blocking_reason, now)?;
-        }
-        let egress = system.egress();
-        let local_guard = system
-            .local_guard()
-            .unwrap_or_else(|_| json!({"proxy": "unknown", "tun": "unknown"}));
-        self.supervisor
-            .handle_event(SupervisionEvent::EnvironmentUpdated {
-                egress,
-                local_guard,
-                observed_at: system.now(),
-            })?;
-
-        for family in PolicyCatalog::families() {
-            if PolicyCatalog::guard_target(family).is_none() {
-                continue;
-            }
-            if system.set_family(family.id).is_ok() {
-                let (desktops, mut processes) = match (system.desktops(), system.supervised_processes()) {
-                    (Ok(desktops), Ok(processes)) => (desktops, processes),
-                    _ => {
-                        self.supervisor.handle_event(SupervisionEvent::ProcessInventoryUnavailable {
-                            family: family.id.to_string(), observed_at: system.now(),
-                        })?;
-                        continue;
-                    }
-                };
+    fn apply_guard_observation(&mut self, observation: GuardObservation, delivered_at: f64) -> Result<()> {
+        let event = match observation {
+            GuardObservation::Environment { egress, local_guard, observed_at } =>
+                SupervisionEvent::EnvironmentUpdated { egress, local_guard, observed_at },
+            GuardObservation::InventoryUnavailable { family, observed_at } =>
+                SupervisionEvent::ProcessInventoryUnavailable { family, observed_at },
+            GuardObservation::Inventory { family, desktops, mut processes, observed_at } => {
                 if let Some(ref reg) = self.sandbox_registry {
-                    let verified_tokens = reg.verified_family_tokens(family.id, now);
-                    let mut protected_pids: Vec<u32> =
-                        verified_tokens.iter().map(|t| t.pid).collect();
+                    let verified_tokens = reg.verified_family_tokens(&family, delivered_at);
+                    let mut protected_pids: Vec<u32> = verified_tokens.iter().map(|t| t.pid).collect();
                     protected_pids.sort_unstable();
                     protected_pids.dedup();
-                    let mut unprotected_pids = Vec::new();
-                    for tok in &processes {
-                        if !protected_pids.contains(&tok.pid) {
-                            unprotected_pids.push(tok.pid);
-                        }
-                    }
+                    let mut unprotected_pids: Vec<u32> = processes.iter()
+                        .filter(|t| !protected_pids.contains(&t.pid)).map(|t| t.pid).collect();
                     unprotected_pids.sort_unstable();
                     unprotected_pids.dedup();
-                    // In Seatbelt mode, only verified sandboxed instances receive channel permits;
-                    // discovered processes outside the sandbox registry are reported as unmanaged!
                     processes = verified_tokens;
                     let id_report = reg.identity_report(true, true, true);
-                    self.supervisor.set_family_unmanaged_pids(
-                        family.id,
-                        unprotected_pids.clone(),
-                        now,
-                    );
-                    self.supervisor.set_family_coverage_scope(
-                        family.id,
-                        Some(BackendCoverageScope {
-                            backend: NetworkBackendKind::Seatbelt,
-                            configured_entries: vec![family.id.to_string()],
-                            protected_pids,
-                            unprotected_pids,
-                            uncovered_boundaries: vec![
-                                "unmanaged_existing_processes".into(),
-                                "direct_launch_outside_controlled_entry".into(),
-                            ],
-                            server_identity_verified: id_report.gateway_server_identity_verified,
-                            gateway_endpoint_protection_verified: id_report.gateway_endpoint_protection_verified,
-                            gateway_endpoint_protection_method: id_report.gateway_endpoint_protection_method,
-                        }),
-                        now,
-                    );
+                    self.supervisor.set_family_unmanaged_pids(&family, unprotected_pids.clone(), delivered_at);
+                    self.supervisor.set_family_coverage_scope(&family, Some(BackendCoverageScope {
+                        backend: NetworkBackendKind::Seatbelt, configured_entries: vec![family.clone()],
+                        protected_pids, unprotected_pids,
+                        uncovered_boundaries: vec!["unmanaged_existing_processes".into(),
+                            "direct_launch_outside_controlled_entry".into()],
+                        server_identity_verified: id_report.gateway_server_identity_verified,
+                        gateway_endpoint_protection_verified: id_report.gateway_endpoint_protection_verified,
+                        gateway_endpoint_protection_method: id_report.gateway_endpoint_protection_method,
+                    }), delivered_at);
                 }
-                self.supervisor
-                    .handle_event(SupervisionEvent::ProcessInventoryUpdated {
-                        family: family.id.to_string(),
-                        desktops,
-                        processes,
-                        observed_at: system.now(),
-                    })?;
+                SupervisionEvent::ProcessInventoryUpdated { family, desktops, processes, observed_at }
             }
-        }
-        self.drain_background_events()?;
-        let snapshot = self.supervisor.snapshot(system.now());
-
-        Ok(snapshot)
+        };
+        self.supervisor.handle_queued_event(event, delivered_at)?;
+        Ok(())
     }
 
+    /// Production authority loop: slow network/process reads and guard_ticks
+    /// live on a separate collector thread. Deadlines and VPN updates never wait
+    /// for that thread to finish a round.
+    fn run_authority_loop(
+        &mut self, observations: &Receiver<GuardObservation>, stop: &AtomicBool,
+        worker_finished: impl Fn() -> bool,
+        producer: Option<&claude_watch_core::processes::Identity>,
+    ) -> Result<()> {
+        let mut next_reconcile = Instant::now();
+        let mut next_deadline = Instant::now();
+        let mut next_heartbeat = Instant::now();
+        while !stop.load(Ordering::Acquire) {
+            if worker_finished() {
+                return Err(CoreError::new("guard_collector_failed", "保护采集线程已退出"));
+            }
+            // Only progress of the authority loop proves service liveness.
+            // Slow collector receipts retain their own observation timestamps;
+            // this pulse grants no network permission or protection readiness.
+            if Instant::now() >= next_heartbeat {
+                if let Some(producer) = producer {
+                    self.supervisor.storage.atomic_json(
+                        &self.supervisor.storage.paths.watch().join("state/guard-service-heartbeat.json"),
+                        &json!({"schema":1,"pid":producer.pid,"start_stamp":producer.start_stamp,
+                            "time":native::now()}),
+                    )?;
+                }
+                next_heartbeat = Instant::now() + PROCESS_INTERVAL;
+            }
+            // Bound each drain so an event burst cannot starve lease checks.
+            // Preserve the former loop's fail-closed/retry behavior on a bad
+            // state read instead of terminating every background worker.
+            for _ in 0..64 {
+                let Ok(event) = self.event_rx.try_recv() else { break; };
+                let result = self.deliver_background_event(event);
+                self.retain_authority_after_error(result)?;
+            }
+            for _ in 0..16 {
+                let Ok(observation) = observations.try_recv() else { break; };
+                let result = self.apply_guard_observation(observation, native::now());
+                self.retain_authority_after_error(result)?;
+            }
+            if Instant::now() >= next_deadline {
+                let result = self.deliver_background_event(SupervisionEvent::LeaseExpired {
+                    observed_at: native::now(), woke_from_sleep: false,
+                });
+                self.retain_authority_after_error(result)?;
+                next_deadline = Instant::now() + Duration::from_millis(250);
+            }
+            if Instant::now() >= next_reconcile {
+                let result = self.reconcile_controlled_backend(native::now());
+                self.retain_authority_after_error(result)?;
+                next_reconcile = Instant::now() + PROCESS_INTERVAL;
+            }
+            match self.event_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(event) => {
+                    let result = self.deliver_background_event(event);
+                    self.retain_authority_after_error(result)?;
+                },
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {},
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) =>
+                    return Err(CoreError::new("supervision_channel_closed", "保护事件通道已关闭")),
+            }
+        }
+        Ok(())
+    }
+
+    fn retain_authority_after_error(&self, result: Result<()>) -> Result<()> {
+        if result.is_err() {
+            let now = native::now();
+            for family in PolicyCatalog::families() {
+                self.enforcer.revoke_family(family.id, "authority_evidence_unavailable", now)?;
+            }
+        }
+        Ok(())
+    }
+
+    // Synchronous harness for existing component contracts. Production uses
+    // the same collection and ingestion functions on independent threads.
+    #[cfg(test)]
+    pub fn step_with_system<S: DesktopSystem>(&mut self, system: &mut S) -> Result<ChannelMonitorSnapshot> {
+        self.drain_background_events()?;
+        self.reconcile_controlled_backend(system.now())?;
+        collect_guard_observations(system, |observation| {
+            let at = match &observation {
+                GuardObservation::Environment { observed_at, .. }
+                | GuardObservation::Inventory { observed_at, .. }
+                | GuardObservation::InventoryUnavailable { observed_at, .. } => *observed_at,
+            };
+            self.apply_guard_observation(observation, at)
+        })?;
+        self.drain_background_events()?;
+        Ok(self.supervisor.snapshot(system.now()))
+    }
+
+    #[cfg(test)]
     pub fn wait_or_drain(&mut self, deadline: Instant, stop: &AtomicBool) {
         while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
             let wait_for = deadline
@@ -912,6 +990,63 @@ impl ProductionChannelStack {
 const SUSTAINED_SAMPLING_ROUNDS: u32 = 15;
 /// While an outage continues, remind at most once per half hour.
 const SAMPLING_QUIET: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Default)]
+struct ProtectionNoticeGate {
+    incidents: std::collections::BTreeMap<String, (String, std::collections::BTreeSet<String>)>,
+}
+impl ProtectionNoticeGate {
+    fn pending(&mut self, receipt: &Value) -> Vec<(String, String, String)> {
+        let rows: Vec<&Value> = receipt["families"].as_array()
+            .map(|v| v.iter().collect()).unwrap_or_else(|| vec![receipt]);
+        let mut pending = Vec::new();
+        for row in rows {
+            let family = row["family"].as_str().unwrap_or("claude");
+            if PolicyCatalog::family(family).is_none() { continue; }
+            if row["status"] == "disabled" || row["channel_supervision"]["verdict"] == "forwarding_verified" {
+                self.incidents.remove(family);
+                continue;
+            }
+            if !matches!(row["action"].as_str(), Some("close-desktop" | "disconnect-channel"
+                | "disconnect-and-force-quit" | "disconnect-and-partial-force-quit")) { continue; }
+            let reason = row["channel_permit"]["reason_code"].as_str()
+                .or_else(|| row["session_guard"]["reason"]["code"].as_str()).unwrap_or("unknown");
+            let cause = if matches!(reason, "vpn_observation_stale" | "vpn_observation_unknown") {
+                "VPN 观测证据暂不可确认"
+            } else if reason == "permit_lease_expired" { "通道许可已到期" }
+            else { "保护条件未满足" };
+            let verdict = row["channel_supervision"]["verdict"].as_str().unwrap_or("unconfirmed");
+            let (outcome, result) = if row["process_execution_state"] == "partially_terminated" {
+                ("partially_terminated", "部分进程已退出，其余进程的处置尚未确认")
+            } else if row["process_preserved"] == false
+                && matches!(row["process_execution_state"].as_str(), Some("confirmed" | "already_exited")) {
+                ("terminated", "已确认进程退出")
+            } else if verdict == "isolated_keep_process" {
+                ("blocked", "通道已确认阻断，进程保留")
+            } else if verdict == "pending_isolation" {
+                ("pending", "已请求阻断，等待执行结果")
+            } else { ("unconfirmed", "当前执行结果待核验") };
+            // Command numbers and observation times are not new incidents.
+            let reason_key = if reason.starts_with("vpn_observation_") { "vpn_observation_unavailable" } else { reason };
+            let incident = json!([row["channel_permit"]["session_id"], reason_key]).to_string();
+            if self.incidents.get(family).is_some_and(|(prior, seen)| prior == &incident && seen.contains(outcome)) {
+                continue;
+            }
+            let key = json!([incident, outcome]).to_string();
+            let name = if family == "claude" { "Claude" } else { "ChatGPT / Codex" };
+            pending.push((family.into(), key, format!("{name}：{cause}；{result}。")));
+        }
+        pending
+    }
+    fn accept(&mut self, pending: Vec<(String, String, String)>) {
+        for (family, key, _) in pending {
+            let (incident, outcome): (String, String) = serde_json::from_str(&key).expect("internal incident key");
+            let entry = self.incidents.entry(family).or_default();
+            if entry.0 != incident { entry.0 = incident; entry.1.clear(); }
+            entry.1.insert(outcome);
+        }
+    }
+}
 /// Stable identity of a non-empty evidence set.
 ///
 /// `None` means "nothing to report". Two equal signatures describe the same
@@ -1014,6 +1149,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
     // discovery must not hide an otherwise live, unready publisher for tens
     // of seconds. The normal snapshot reader still verifies this producer.
     runner.publish_listeners(&storage)?;
+    let mut listener_publisher = runner.start_listener_publisher(storage.clone(), stop.clone())?;
     owner.publish_initial_inventory(&identities, native::now())?;
     let sampler = Sampler::new(runner.clone(), paths.clone());
     let discovery_worker = DiscoveryWorker::start(sampler.discovery(), runner.clone(), stop.clone())?;
@@ -1074,6 +1210,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
             .ensure_baseline_audit()
         })?)
     };
+    let (observation_tx, observation_rx) = std::sync::mpsc::channel();
     let guard = if request.flag("observe-only") {
         None
     } else {
@@ -1089,6 +1226,8 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
         let guard_alerts = alerts.clone();
         let guard_channel_diagnostics = channel_diagnostics.clone();
         let audit_paths = paths.clone();
+        let guard_producer = owner.producer.clone();
+        let environment_tx = observation_tx.clone();
         Some(
             thread::Builder::new()
                 .name("claude-session-guard".into())
@@ -1105,60 +1244,68 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                             super::channel_audit::run(&audit_paths, &enforcer, req)
                         },
                     )?;
-                    let controller = Controller::new(store.clone());
-                    let network = host.network.clone();
-                    let mut runtime = DesktopRuntime {
-                        desktop: &mut desktop,
-                        system: &mut host,
-                        network,
-                        storage: store,
-                        started: Instant::now(),
-                        cli: None,
-                    };
-                    // `guard_tick` answers `unknown` whenever the process
-                    // inventory cannot be fully confirmed, which on macOS is
-                    // ordinary churn: a PID disappears between `proc_listpids`
-                    // and the identity sysctl, or the scan hits its deadline.
-                    // Paging on the very first such round is what makes the
-                    // "保护采样异常" dialog reappear after every dismissal, so
-                    // it gets the same sustained-streak gate as the sampling
-                    // alerts instead of firing immediately.
-                    let mut guard_history = super::diagnostic_queue::GuardHistory::default();
-                    let mut unknown_gate =
-                        AlertGate::new(SUSTAINED_SAMPLING_ROUNDS, SAMPLING_QUIET);
-                    let loop_result: Result<()> = (|| {
-                        while !stop.load(Ordering::Acquire) {
-                            let started = Instant::now();
-                            if let Err(error) = channel_stack.step_with_system(&mut runtime) {
-                                channel_stack.enforcer.record_activation_failure(&error.code, native::now())?;
-                            }
-                            let receipt = controller.guard_tick(&mut runtime)?;
-                            guard_history.observe(&guard_diagnostics, &receipt, native::now());
-                            if let Some(alerts) = &guard_alerts {
-                                if matches!(
-                                    receipt["action"].as_str(),
-                                    Some("close-desktop" | "disconnect-channel" | "disconnect-and-force-quit")
-                                ) {
-                                    unknown_gate.observe(false);
-                                    alerts.enqueue(Alert {
-                                        title: "Claude Watch：已触发保护".into(),
-                                        message: "检测到会话风险并已按配置处置受监督的应用。请查看具体检测结果；重新启动仍会执行完整校验。".into(),
-                                        severity: Severity::Warning,
-                                    });
-                                } else if unknown_gate.observe(receipt["status"] == "unknown") {
-                                    alerts.enqueue(Alert {
-                                        title: "Claude Watch：保护采样异常".into(),
-                                        message: "本轮保护证据未能完整取得，后台正在重试。详情见环境状态；这不等于已检测到网络泄漏。".into(),
-                                        severity: Severity::Critical,
-                                    });
+                    let collector_stop = stop.clone();
+                    let enforcer = channel_stack.enforcer.clone();
+                    let collector = thread::Builder::new().name("watch-guard-collector".into())
+                        .spawn(move || -> Result<()> {
+                            let network = host.network.clone();
+                            let mut runtime = DesktopRuntime {
+                                desktop: &mut desktop, system: &mut host, network, storage: store,
+                                started: Instant::now(), cli: None,
+                            };
+                            let mut guard_history = super::diagnostic_queue::GuardHistory::default();
+                            let mut notices = ProtectionNoticeGate::default();
+                            let mut unknown_gate = AlertGate::new(SUSTAINED_SAMPLING_ROUNDS, SAMPLING_QUIET);
+                            let families: Vec<_> = PolicyCatalog::families().iter()
+                                .filter(|family| PolicyCatalog::guard_target(family).is_some())
+                                .map(|family| family.id).collect();
+                            while !collector_stop.load(Ordering::Acquire) {
+                                let started = Instant::now();
+                                let (egress, local_guard) = runtime.sample_guard_environment(&enforcer, &families);
+                                environment_tx.send(GuardObservation::Environment {
+                                    egress: json!({"families":egress}), local_guard, observed_at: native::now(),
+                                }).map_err(|_| CoreError::new("guard_authority_closed", "保护监督器已关闭"))?;
+                                if collector_stop.load(Ordering::Acquire) { break; }
+                                let receipt = claude_watch_runtime::channel_policy_status::read_guard_summary(&runtime.storage, native::now());
+                                guard_history.observe(&guard_diagnostics, &receipt, native::now());
+                                if let Some(alerts) = &guard_alerts {
+                                    let pending = notices.pending(&receipt);
+                                    if !pending.is_empty() {
+                                        unknown_gate.observe(false);
+                                        let message = pending.iter().map(|(_, _, text)| text.as_str())
+                                            .collect::<Vec<_>>().join("；");
+                                        if alerts.enqueue(Alert {
+                                            title: "Claude Watch：保护状态变化".into(), message,
+                                            severity: Severity::Warning,
+                                        }) { notices.accept(pending); }
+                                    } else if unknown_gate.observe(receipt["status"] == "unknown") {
+                                        alerts.enqueue(Alert {
+                                            title: "Claude Watch：保护采样异常".into(),
+                                            message: "保护证据持续未能完整取得，后台正在重试。详情见环境状态。".into(),
+                                            severity: Severity::Critical,
+                                        });
+                                    }
                                 }
+                                sleep_until(started + PROCESS_INTERVAL, &collector_stop);
                             }
-                            channel_stack.wait_or_drain(started + PROCESS_INTERVAL, &stop);
+                            Ok(())
+                        });
+                    let collector = match collector {
+                        Ok(worker) => worker,
+                        Err(_) => {
+                            channel_stack.shutdown();
+                            return Err(CoreError::new("guard_collector_start_failed", "保护采集线程无法启动"));
                         }
-                        Ok(())
-                    })();
+                    };
+                    let loop_result = channel_stack.run_authority_loop(
+                        &observation_rx, &stop, || collector.is_finished(), Some(&guard_producer));
+                    stop.store(true, Ordering::Release);
+                    // Keep the registry alive until the slow collector is no longer
+                    // reading it. All workers share the same cancellation flag.
+                    let collector_result = collector.join().unwrap_or_else(|_| Err(
+                        CoreError::new("guard_collector_panicked", "保护采集线程异常退出")));
                     channel_stack.shutdown();
-                    loop_result
+                    collector_result.and(loop_result)
                 })
                 .map_err(|_| CoreError::new("guard_start_failed", "后台保护工作线程无法启动"))?,
         )
@@ -1184,6 +1331,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
     let outcome = (|| {
         let mut rounds = 0u64;
         loop {
+            if let Some(publisher) = &listener_publisher { publisher.check()?; }
             if stop.load(Ordering::Acquire) {
                 return Ok(json!({"status":"stopped","rounds":rounds}));
             }
@@ -1210,19 +1358,26 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                 storage: storage.clone(),
             }
             .load()?;
-            runner.publish_listeners(&storage)?;
-            if runner.listener_channel_finished() {
-                // EOF may arrive immediately after a successful publication.
-                // Publish the terminal error before exiting, never leave that
-                // preceding listener sample presented as the current source.
-                runner.publish_listeners(&storage)?;
-                return Err(CoreError::new(
-                    "native_listener_worker_failed",
-                    "系统采样通道已结束；后台停止发布，等待已注册任务重新启动",
-                ));
-            }
             let pin = pinned_node(&storage.paths, &config.proxy_group);
-            let sample = publisher.poll(&config.proxy_group, &pin, false);
+            let sample = publisher.poll_with_inventory(&config.proxy_group, &pin, false, |result| {
+                if guard.is_none() { return; }
+                let at = result.as_ref().map_or_else(|_| native::now(), |round| round.observed_at);
+                for family in PolicyCatalog::families() {
+                    let Some(target) = PolicyCatalog::guard_target(family) else { continue; };
+                    let observation = match result.ok().and_then(|round|
+                        claude_watch_runtime::desktop_native::supervision_inventory(round, target.provider()).ok()) {
+                        Some((desktops, processes)) => GuardObservation::Inventory {
+                            family: family.id.into(), desktops, processes, observed_at: at,
+                        },
+                        None => GuardObservation::InventoryUnavailable { family: family.id.into(), observed_at: at },
+                    };
+                    let _ = observation_tx.send(observation);
+                }
+            });
+            if let Some(publisher) = &listener_publisher { publisher.check()?; }
+            if stop.load(Ordering::Acquire) {
+                return Ok(json!({"status":"stopped","rounds":rounds}));
+            }
             let mut log_error = diagnostic_queue.health_message();
             if let Some(note) = channel_diagnostics.health_message() {
                 log_error = Some(log_error.map(|existing| format!("{existing}；{note}")).unwrap_or(note));
@@ -1269,6 +1424,8 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
         }
     })();
     stop.store(true, Ordering::Release);
+    let listener_result = listener_publisher.as_mut().map_or(Ok(()), |publisher| publisher.finish());
+    let outcome = listener_result.and(outcome);
     let _ = events.append(
         "daemon-stop",
         EventFields {
@@ -1311,6 +1468,172 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_collector_does_not_delay_vpn_events_or_expiry() {
+        use claude_watch_core::vpn::{ObservationConsistency, ObservedField, UpstreamProtocol, VpnEpoch, VpnObservation};
+        let root = std::env::temp_dir().join(format!("cw-authority-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let storage = StateStore::new(Paths::new(&root).unwrap());
+        let mut config = claude_watch_core::config::Config::default_for_new_install();
+        config.proxy_mode = "clash-verge".into();
+        config.proxy_url = "http://127.0.0.1:17890".into();
+        config.proxy_group = "AI-Group".into();
+        let mut expectation = VpnExpectation::unconfigured();
+        expectation.configured = true;
+        expectation.running_mode = Some("rule".into());
+        expectation.expected_node = Some("US-West-01".into());
+        expectation.expected_chain = vec!["AI-Group".into(), "US-West-01".into()];
+        config.vpn_expectation = Some(expectation);
+        ConfigStore { storage: storage.clone() }.save(config.value().unwrap()).unwrap();
+        let resources = storage.paths.watch().join("runtime");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(resources.join("components.json"), json!({"network_backend":"seatbelt"}).to_string()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut stack = assemble_production_channel_stack(storage.clone(), stop.clone(), false,
+            |_| panic!("no audit is needed without a protected process")).unwrap();
+        let old_guard = json!({"status":"unknown","time":native::now()-77.0});
+        storage.atomic_json(&storage.paths.base().join("guard-heartbeat.json"),&old_guard).unwrap();
+        let sender = stack.event_tx.clone();
+        let (_observation_tx, observation_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        // A collector stuck in an expensive system read remains blocked through
+        // both checks. The production authority loop must keep making progress.
+        let collector = thread::spawn(move || release_rx.recv_timeout(Duration::from_secs(5)));
+        let loop_stop = stop.clone();
+        let authority = thread::spawn(move || {
+            let producer = claude_watch_core::processes::Identity {
+                pid: 123, parent: 1, uid: 501, executable: "/fixture/watch-engine".into(),
+                start_seconds: 100, start_microseconds: 0, start_stamp: "fixture-start".into(),
+            };
+            let result = stack.run_authority_loop(&observation_rx, &loop_stop, || collector.is_finished(), Some(&producer));
+            stack.shutdown();
+            let _ = collector.join();
+            result
+        });
+        let now = native::now();
+        let observation = VpnObservation {
+            source: "clash-verge".into(), source_instance: Some("fixture-instance".into()),
+            source_revision: Some("fixture-revision".into()),
+            upstream_endpoint: Some("http://127.0.0.1:17890".into()),
+            upstream_protocol: ObservedField::Known(UpstreamProtocol::MixedHttp),
+            running_mode: ObservedField::Known("rule".into()),
+            tun_enabled: ObservedField::Known(false), system_proxy_enabled: ObservedField::Known(false),
+            selected_group: ObservedField::Known("AI-Group".into()),
+            selected_node: ObservedField::Known("US-West-01".into()),
+            proxy_chain: ObservedField::Known(vec!["AI-Group".into(), "US-West-01".into()]),
+            rules_digest: ObservedField::Unknown("not_required".into()),
+            sample_started_at: now, observed_at: now, valid_until: now + 0.5,
+            consistency: ObservationConsistency::RevisionVerified, source_error: None,
+            sample_seq: 17, epoch: VpnEpoch::new("fixture-observer", 1),
+        };
+        sender.send(SupervisionEvent::VpnObservationUpdated { observation: observation.clone(), observed_at: now }).unwrap();
+        let read = || claude_watch_runtime::channel_policy_status::read_frame(&storage)["vpn_supervision"].clone();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut matched = false;
+        let mut expired = false;
+        while Instant::now() < deadline {
+            let state = read();
+            if state["observation"]["sample_seq"] == 17 && state["vpn_match"]["verdict"] == "matched" {
+                matched = true;
+            }
+            if matched && state["vpn_match"]["verdict"] == "stale" { expired = true; break; }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let final_state = read();
+        let live_pulse = storage.read_json(
+            &storage.paths.watch().join("state/guard-service-heartbeat.json"), Value::Null,
+        ).unwrap();
+        // An unreadable session must fail closed without killing the authority;
+        // once repaired, a subsequent valid event must still be consumed.
+        std::fs::write(storage.paths.session(), b"{invalid").unwrap();
+        sender.send(SupervisionEvent::ProcessInventoryUpdated {
+            family: "claude".into(), desktops: vec![], processes: vec![], observed_at: native::now(),
+        }).unwrap();
+        thread::sleep(Duration::from_millis(150));
+        std::fs::remove_file(storage.paths.session()).unwrap();
+        let refreshed_at = native::now();
+        let mut recovered = observation;
+        recovered.sample_seq = 18;
+        recovered.sample_started_at = refreshed_at;
+        recovered.observed_at = refreshed_at;
+        recovered.valid_until = refreshed_at + 3.5;
+        let sent = sender.send(SupervisionEvent::VpnObservationUpdated {
+            observation: recovered, observed_at: refreshed_at,
+        }).is_ok();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut resumed = false;
+        while sent && Instant::now() < deadline {
+            if read()["observation"]["sample_seq"] == 18 { resumed = true; break; }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut pulse_advanced = false;
+        while Instant::now() < deadline {
+            let pulse = storage.read_json(&storage.paths.watch().join("state/guard-service-heartbeat.json"),Value::Null).unwrap();
+            if pulse["time"].as_f64() > live_pulse["time"].as_f64() {
+                pulse_advanced = true; break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let retained_guard = storage.read_json(&storage.paths.base().join("guard-heartbeat.json"),Value::Null).unwrap();
+        // Always release/join before assertions, including the regression case.
+        stop.store(true, Ordering::Release);
+        let _ = release_tx.send(());
+        let result = authority.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+        assert!(matched, "fresh VPN event waited behind collector: {final_state}");
+        assert!(expired, "deadline waited behind collector: {final_state}");
+        assert!(resumed, "transient session error terminated authority");
+        assert!(pulse_advanced,"slow collector prevented independent authority heartbeat renewal");
+        assert_eq!(retained_guard,old_guard,"service liveness must not freshen protection evidence");
+        assert_eq!(live_pulse["schema"], 1);
+        assert_eq!(live_pulse["pid"], 123);
+        assert_eq!(live_pulse["start_stamp"], "fixture-start");
+        assert!(live_pulse["time"].as_f64().is_some_and(|at| at >= now - 1.0));
+    }
+
+    #[test]
+    fn protection_notice_tracks_incidents_and_requires_confirmed_outcomes() {
+        let mut gate = ProtectionNoticeGate::default();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let row = |verdict: &str, seq: u64| json!({"family":"claude", "action":"disconnect-channel",
+            "channel_permit":{"session_id":sid,"reason_code":"vpn_observation_stale","command_seq":seq},
+            "channel_supervision":{"verdict":verdict}, "process_preserved":true});
+        let first = gate.pending(&row("unconfirmed", 1));
+        assert_eq!(first.len(), 1);
+        assert!(first[0].2.contains("待核验"));
+        assert!(!first[0].2.contains("已确认阻断"));
+        // A queue rejection must remain retryable.
+        assert_eq!(gate.pending(&row("unconfirmed", 1)).len(), 1);
+        gate.accept(first);
+        assert!(gate.pending(&row("unconfirmed", 2)).is_empty());
+        gate.pending(&json!({"family":"claude","status":"unknown","action":"observe"}));
+        assert!(gate.pending(&row("unconfirmed", 3)).is_empty());
+        let confirmed = gate.pending(&row("isolated_keep_process", 3));
+        assert_eq!(confirmed.len(), 1);
+        assert!(confirmed[0].2.contains("已确认阻断"));
+        gate.accept(confirmed);
+        assert!(gate.pending(&row("isolated_keep_process", 4)).is_empty());
+        // A transient read mismatch cannot replay previously reported outcomes.
+        assert!(gate.pending(&row("unconfirmed", 4)).is_empty());
+        assert!(gate.pending(&row("isolated_keep_process", 4)).is_empty());
+        let mut partial = row("isolated_keep_process", 4);
+        partial["action"] = json!("disconnect-and-partial-force-quit");
+        partial["process_preserved"] = json!(false);
+        partial["process_execution_state"] = json!("partially_terminated");
+        let notices = gate.pending(&partial);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].2.contains("部分进程已退出"));
+        assert!(!notices[0].2.contains("进程保留"));
+        // Only positive forwarding evidence clears the standing incident.
+        gate.pending(&json!({"family":"claude","channel_supervision":{"verdict":"forwarding_verified"}}));
+        assert_eq!(gate.pending(&row("isolated_keep_process", 5)).len(), 1);
+        let mut other = row("isolated_keep_process", 5);
+        other["family"] = json!("openai");
+        assert_eq!(gate.pending(&json!({"families":[row("isolated_keep_process",5),other]})).len(), 2);
+    }
 
     #[test]
     fn blocked_baseline_does_not_block_other_guard_work() {
@@ -1515,9 +1838,6 @@ mod tests {
                 Ok(())
             }
             fn quit_desktop(&mut self) -> Result<()> {
-                Ok(())
-            }
-            fn quit_for_confirmed_ip_risk(&mut self, _: &mut Option<u32>) -> Result<()> {
                 Ok(())
             }
         }

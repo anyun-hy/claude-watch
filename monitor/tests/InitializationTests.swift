@@ -525,7 +525,20 @@ struct InitializationTests {
         await full.start()
         expect(full.approval?.action == .environment && full.passedCount == 2,
                "full flow stops at the real environment confirmation before any DNS or guard changes")
+        // Supply the continuing background snapshots the production wizard
+        // receives while waiting for receipts and user confirmation.
+        let fullProducer = Task { @MainActor in
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
+                let at = Date()
+                fullStore.acceptSnapshot(snapshot(node: fullNode, at: at.timeIntervalSince1970), receivedAt: at)
+            }
+        }
+        defer { fullProducer.cancel() }
         if let request = full.approval { await full.authorize(request) }
+        expect(fullSwitcher.candidate == nil &&
+               fullSwitcher.setupPlan?.candidate_id.hasPrefix("confirmed-protection:") == true,
+               "protection approval reuses the current audit and does not discover a second environment candidate; \(full.rows.map { ($0.step, $0.code, $0.detail) })")
         expect(full.approval?.action == .protection && full.passedCount == 6 &&
                fullLeaks.initializationReceiptIsCurrent(.dns) && fullLeaks.initializationReceiptIsCurrent(.webrtc),
                "full flow carries the actual two accepted fixture receipts into guard confirmation")
@@ -538,7 +551,8 @@ struct InitializationTests {
         expect(fullSwitcher.settings["guard_enabled"] as? Bool != true, "a backend context mismatch cannot use the old approval")
         await full.retry()
         if full.approval?.action == .environment, let request = full.approval { await full.authorize(request) }
-        expect(full.approval?.action == .protection, "new matching backend receipts permit a fresh guard confirmation")
+        expect(full.approval?.action == .protection,
+               "new matching backend receipts permit a fresh guard confirmation; \(full.rows.map { $0.code })")
         fullSwitcher.setInitializationReadbackForFixture(.dns, sampled: 1)
         full.refreshReadiness()
         expect(full.rows[4].code == "dns_backend_receipt_changed" && full.approval == nil,
@@ -622,6 +636,7 @@ struct InitializationTests {
         await full.enter()
         expect(full.entered && fullWrites == 1 && !fullStore.initializing,
                "full flow revalidates, saves once and hands the same stores to the main view")
+        fullProducer.cancel()
         let partialBackend = backendEvidence(at: Date().timeIntervalSince1970, sampling: false, native: true)
         published.switcher.loadReviewReceipts(published.switcher.currentEnvironment!, background: partialBackend)
         let connectionChecks = FirstRunChecks(store: published, componentCheck: {}, accessibilityTrusted: { true }, requestAccessibility: {})

@@ -169,6 +169,12 @@ impl<R: ReadRunner> SnapshotPublisher<R> {
         self.poll(group, pin, true)
     }
     pub fn poll(&mut self, group: &str, pin: &str, force_network: bool) -> Result<Value> {
+        self.poll_with_inventory(group, pin, force_network, |_| {})
+    }
+    pub fn poll_with_inventory(
+        &mut self, group: &str, pin: &str, force_network: bool,
+        observe: impl FnOnce(std::result::Result<&crate::sampler::ProcessRound, &CoreError>),
+    ) -> Result<Value> {
         let current = Observer {
             runner: &self.sampler.runner,
         }
@@ -182,7 +188,9 @@ impl<R: ReadRunner> SnapshotPublisher<R> {
                 "快照生产者启动身份未通过核对",
             ));
         }
-        let processes = self.sampler.processes()?;
+        let processes = self.sampler.processes();
+        observe(processes.as_ref());
+        let processes = processes?;
         let (due, early_retry) =
             self.last_network
                 .as_ref()
@@ -276,7 +284,7 @@ impl<R: ReadRunner> SnapshotPublisher<R> {
         let registration = registration(&self.store, &self.sampler.runner, self.producer.uid)
             .unwrap_or_else(|_| registration_unknown());
         let mut snapshot = monitor_snapshot::with_registration(
-            monitor_snapshot::assemble(
+            monitor_snapshot::assemble_with_active(
                 &self.store,
                 &processes,
                 tag,
@@ -288,10 +296,10 @@ impl<R: ReadRunner> SnapshotPublisher<R> {
                 },
                 quality,
                 native::now(),
+                &active,
             ),
             &registration,
         );
-        snapshot["processes"] = json!(monitor_snapshot::process_rows(&processes, &active));
         snapshot["activity"] = self.last_activity.clone();
         let mut activity_reasons = std::collections::BTreeMap::<String, u32>::new();
         for value in self.last_activity["unavailable"].as_array().into_iter().flatten() {

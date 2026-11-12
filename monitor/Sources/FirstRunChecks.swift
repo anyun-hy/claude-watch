@@ -89,7 +89,7 @@ final class FirstRunChecks: InitializationChecking {
                 guard connectionNow() < deadline else { return finish(lastFailure) }
                 traceConnection(event: "poll_begin", phase: phase, code: "reading_backend", deadline: deadline,
                                 candidate: candidate, sampled: candidateSample)
-                await store.switcher.refreshBackground()
+                await store.switcher.refreshBackground(maximumAge: 5)
                 let now = connectionNow()
                 let failure = connectionEvidenceFailure(at: now)
                 let observedCode: String
@@ -118,38 +118,42 @@ final class FirstRunChecks: InitializationChecking {
             }
             return finish(.failed(code: "cancelled", detail: "本轮检查已取消，请重新检查。"))
         case .environment:
-            return await prepareEnvironment(enableProtection: false)
+            return await prepareEnvironment()
         case .accessibility:
             return accessResult
         case .dns, .webrtc:
             return await checkNetwork(step, forceNew: false)
         case .protection:
             guard contextMatches, acceptedSettings != nil, acceptedSettings == settingsData else { return changedFailure }
-            guard await store.switcher.detectCurrentEnvironment() else {
+            // The leak checks may already have read back both receipts in a
+            // fresh environment audit. Only acquire a new audit when needed.
+            if !hasCurrentProtectionReadback, !(await store.switcher.detectCurrentEnvironment()) {
                 return .failed(code: "environment_unstable", detail: "启用守护前的环境预检未完成，请重试。")
             }
             requireBackendContextMatch = true
             let precheck = preProtectionEvidence()
             if case .failed = precheck { return precheck }
-            return await prepareEnvironment(enableProtection: true)
+            guard let id = store.switcher.currentEnvironment?.observation_id, !id.isEmpty else {
+                return .failed(code: "environment_not_ready", detail: "环境回执缺少本轮观测编号。")
+            }
+            return await previewSetup(candidateID: "confirmed-protection:\(id)", enableProtection: true)
         case .verification:
             guard contextMatches else { return changedFailure }
-            guard await store.switcher.refreshInitializationStatus(), !recoveryRequired else {
-                return .failed(code: "status_unavailable", detail: "最终后台状态读取未完成或存在待恢复事务。")
-            }
+            guard !recoveryRequired else { return recoveryFailure }
             guard acceptedSettings == settingsData else { return changedFailure }
             // Watch's newly enabled guard needs time to publish its first real
             // heartbeat. Bound this wait; never manufacture readiness from intent.
-            let deadline = Date().addingTimeInterval(12)
+            let deadline = Date().addingTimeInterval(20)
             repeat {
-                await store.switcher.refreshBackground()
+                await store.switcher.refreshBackground(maximumAge: 5)
                 if backgroundIsCurrent { break }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             } while Date() < deadline && !Task.isCancelled
             guard backgroundIsCurrent else { return backgroundFailure }
-            guard await store.switcher.detectCurrentEnvironment() else {
+            if !hasCurrentProtectionReadback, !(await store.switcher.detectCurrentEnvironment()) {
                 return .failed(code: "environment_unstable", detail: "最终环境检测未完成或上下文不稳定，请重新检查。")
             }
+            requireBackendContextMatch = true
             // Re-read configuration as well as service facts after the long
             // audit, so an external change cannot reuse the earlier UI config.
             guard await store.switcher.refreshInitializationStatus() else {
@@ -179,24 +183,21 @@ final class FirstRunChecks: InitializationChecking {
             store.leakChecks.invalidateInitializationReceipt(kind)
             return failure
         }
-        if let failure = await refreshStaleEnvironmentReadback(kind) { return failure }
+        markEnvironmentReadbackPending(kind)
         return .passed("检测通过，结果已提交后台；主界面与保护检查共用本次回执。")
     }
-    /// A receipt re-collected after the environment audit predates it in that
-    /// audit's backend readback. Refresh the audit the same way the protection
-    /// step does, so the readback references this round's receipt instead of
-    /// the next revocation pass condemning the fresh receipt as "changed".
-    private func refreshStaleEnvironmentReadback(_ kind: LeakKind) async -> InitializationResult? {
+    /// Let both leak checks finish before reading them back together. A new
+    /// receipt from the same backend context cannot be judged against the
+    /// previous audit. Protection and final verification still require an
+    /// audit that references both exact receipts.
+    private func markEnvironmentReadbackPending(_ kind: LeakKind) {
         guard requireBackendContextMatch,
+              let environment = store.switcher.currentEnvironment,
               let receipt = kind == .dns ? store.switcher.initializationDNSReceipt : store.switcher.initializationWebRTCReceipt,
-              let observed = kind == .dns ? store.switcher.currentEnvironment?.initialization_receipts?.dns
-                                         : store.switcher.currentEnvironment?.initialization_receipts?.webrtc,
-              observed.state == "ok", observed.context_id == receipt.context,
-              observed.sampled_at != receipt.sampled else { return nil }
-        guard await store.switcher.detectCurrentEnvironment() else {
-            return .failed(code: "environment_unstable", detail: "重新检测后的环境回读未完成，请重试。")
-        }
-        return nil
+              environment.context_id == receipt.context else { return }
+        let observed = kind == .dns ? environment.initialization_receipts?.dns
+                                    : environment.initialization_receipts?.webrtc
+        if observed?.sampled_at != receipt.sampled { requireBackendContextMatch = false }
     }
     func refreshWaitingEvidence() async -> InitializationRefreshOutcome {
         // One predicate defines "still current" for every rerun path: these
@@ -265,14 +266,24 @@ final class FirstRunChecks: InitializationChecking {
             return .passed(request.action == .protection ? "守护设置已应用；实际运行心跳将在最后复核。" : "实测环境已保存并回读，继续核对权限及网络。")
         }
     }
-    private func prepareEnvironment(enableProtection: Bool) async -> InitializationResult {
+    private var hasCurrentProtectionReadback: Bool {
+        let now = Date().timeIntervalSince1970
+        guard let audit = store.switcher.currentEnvironment, !store.switcher.currentEnvironmentIsHistorical,
+              audit.observed_at <= now, now < audit.expires_at else { return false }
+        return [LeakKind.dns, .webrtc].allSatisfy {
+            backendReceiptFailure($0, environmentContext: audit.context_id, requireEnvironment: true) == nil
+        }
+    }
+    private func prepareEnvironment() async -> InitializationResult {
         guard contextMatches else { return changedFailure }
-        await store.switcher.inspectEnvironment()
         guard !recoveryRequired else { return recoveryFailure }
         await store.switcher.detectEnvironment()
         guard let candidate = store.switcher.candidate, !store.switcher.failure else {
             return .failed(code: "environment_unavailable", detail: store.switcher.message)
         }
+        return await previewSetup(candidateID: candidate.id, enableProtection: false)
+    }
+    private func previewSetup(candidateID: String, enableProtection: Bool) async -> InitializationResult {
         store.switcher.setupApplyEnvironment = !enableProtection
         store.switcher.setupEnablePolicy = true
         // First collect/verify the environment. Enabling new protection is a
@@ -280,10 +291,13 @@ final class FirstRunChecks: InitializationChecking {
         store.switcher.setupGuard = enableProtection || store.switcher.isOn(Setting.guardEnabled)
         store.switcher.setupWatchdog = enableProtection || store.switcher.isOn(Setting.timezoneWatchdog)
         store.switcher.setupUpdater = store.switcher.isOn(Setting.autoUpdate)
-        await store.switcher.previewEnvironment()
-        guard let plan = store.switcher.setupPlan, plan.candidate_id == candidate.id,
+        await store.switcher.previewEnvironment(candidateID: candidateID)
+        guard let plan = store.switcher.setupPlan else {
+            return .failed(code: "setup_preview_unavailable", detail: store.switcher.message)
+        }
+        guard plan.candidate_id == candidateID,
               plan.expires_at > Date().timeIntervalSince1970, Self.allowed(plan.actions), contextMatches,
-              !enableProtection || plan.actions.allSatisfy({ ["watchdog", "updater"].contains($0.id) }) else {
+              !enableProtection || plan.actions.allSatisfy({ $0.id == "watchdog" }) else {
             return .failed(code: "setup_preview_invalid", detail: "环境预览不可用、已变化或包含范围外操作；未执行变更。请重新检查。")
         }
         if setupWasApproved && approvedContext == boundContext && plan.actions.isEmpty

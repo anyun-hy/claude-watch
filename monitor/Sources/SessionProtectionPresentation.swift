@@ -9,8 +9,8 @@ struct SessionProtectionEvidence {
 
     static func fromBackground(_ receipt: BackgroundServiceReceipt, error: String = "") -> Self? {
         guard let session = receipt.session_guard else { return nil }
-        let backendReady = (receipt.guard_backend_healthy ?? receipt.backend_healthy) &&
-            receipt.services.first(where: { $0.id == "guard" })?.healthy == true
+        let backendReady = receipt.protection_ready ?? ((receipt.guard_backend_healthy ?? receipt.backend_healthy) &&
+            receipt.services.first(where: { $0.id == "guard" })?.healthy == true)
         return .init(session: session, observedAt: (session.state == "idle" || session.state == "missing" || session.state == "pending") ? receipt.observed_at : (session.sampled_at ?? 0), backendReady: backendReady, readError: error)
     }
 

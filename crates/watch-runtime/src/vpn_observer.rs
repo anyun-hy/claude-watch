@@ -5,21 +5,29 @@
 //! only; any effective VPN state change, source restart, or invalidation advances
 //! `VpnEpoch.change_generation`.
 
-use crate::{local_http::Client, storage::StateStore};
+use crate::{
+    commands::{ReadCommand, ReadRunner},
+    local_http::Client,
+    storage::StateStore,
+};
 use claude_watch_core::{
     channel::CLOCK_ROLLBACK_TOLERANCE_SECONDS,
     error::{CoreError, Result},
     tag_config::Credentials,
+    tag_flow::{listener_fallback_for_port, CommandEvidence},
     vpn::{
         compare_vpn, normalize_loopback_http_endpoint, ObservationConsistency, ObservedField,
         VpnEpoch, VpnExpectation, VpnMatch, VpnObservation,
     },
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use subprocess::{Exec, Job, Redirection};
 use url::Url;
 use uuid::Uuid;
 
 pub const DEFAULT_VPN_OBSERVATION_TTL_SECONDS: f64 = 3.5;
+/// Leave time for publication and consumption inside the unchanged evidence TTL.
+pub const VPN_OBSERVATION_BUDGET: Duration = Duration::from_millis(2500);
 pub const RULES_CACHE_TTL_SECONDS: f64 = 5.0;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -197,6 +205,31 @@ impl VpnObservationState {
             && a.consistency.is_consistent() == b.consistency.is_consistent()
     }
 
+    fn confirmed_fields_changed(a: &VpnObservation, b: &VpnObservation) -> bool {
+        fn known<T: PartialEq>(a: &ObservedField<T>, b: &ObservedField<T>) -> bool {
+            matches!((a, b), (ObservedField::Known(a), ObservedField::Known(b)) if a != b)
+        }
+        fn present<T: PartialEq>(a: &Option<T>, b: &Option<T>) -> bool {
+            matches!((a, b), (Some(a), Some(b)) if a != b)
+        }
+        a.source != b.source
+            || present(&a.source_instance, &b.source_instance)
+            || present(&a.source_revision, &b.source_revision)
+            || present(&a.upstream_endpoint, &b.upstream_endpoint)
+            || known(&a.upstream_protocol, &b.upstream_protocol)
+            || known(&a.running_mode, &b.running_mode)
+            || known(&a.tun_enabled, &b.tun_enabled)
+            || known(&a.system_proxy_enabled, &b.system_proxy_enabled)
+            || known(&a.selected_group, &b.selected_group)
+            || known(&a.selected_node, &b.selected_node)
+            || known(&a.proxy_chain, &b.proxy_chain)
+            || known(&a.rules_digest, &b.rules_digest)
+    }
+
+    fn healthy(sample: &VpnObservation) -> bool {
+        sample.consistency.is_consistent() && sample.source_error.is_none() && sample.source_instance.is_some()
+    }
+
     /// Validates and applies a read-only observation sample.
     /// Rejects stale, out-of-order, or foreign-boot-id samples.
     pub fn apply_sample(
@@ -239,7 +272,7 @@ impl VpnObservationState {
             ));
         }
 
-        let is_healthy = sample.consistency.is_consistent() && sample.source_error.is_none();
+        let is_healthy = Self::healthy(&sample);
         if !is_healthy {
             self.cached_rules_digest = None;
         }
@@ -296,7 +329,16 @@ impl VpnObservationState {
                 // Re-establishing facts after the previous observation expired also rotates epoch
                 // so any diagnostic/recovery started before the gap is invalidated.
                 let prev_expired = !prev.is_fresh(sample.sample_started_at);
-                if !is_healthy || prev_expired || !Self::effective_fields_equal(prev, &sample) {
+                let prev_healthy = Self::healthy(prev);
+                // Evidence loss invalidates once; another failed read is not a
+                // newly observed VPN change. Known changes still rotate even
+                // during an outage, and recovery always needs a new epoch.
+                let changed = if !prev_healthy && !is_healthy {
+                    Self::confirmed_fields_changed(prev, &sample)
+                } else {
+                    prev_healthy != is_healthy || prev_expired || !Self::effective_fields_equal(prev, &sample)
+                };
+                if changed {
                     self.change_generation = self.change_generation.saturating_add(1);
                     true
                 } else {
@@ -341,6 +383,9 @@ pub struct HttpControllerVpnReader {
     pub client: Client,
     pub tun_override: Option<ObservedField<bool>>,
     pub system_proxy_override: Option<ObservedField<bool>>,
+    /// Preferred cross-user owner lookup, bounded by the remaining sample budget.
+    pub listener_owner_probe: Option<ListenerOwnerProbe>,
+    pub listener_snapshot_probe: Option<ListenerSnapshotProbe>,
 }
 
 impl HttpControllerVpnReader {
@@ -357,6 +402,8 @@ impl HttpControllerVpnReader {
             client: Client::new(credentials).with_timeout(Duration::from_millis(800)),
             tun_override: None,
             system_proxy_override: None,
+            listener_owner_probe: None,
+            listener_snapshot_probe: None,
         }
     }
 
@@ -368,7 +415,19 @@ impl HttpControllerVpnReader {
             client: Client::new(credentials).with_timeout(Duration::from_millis(800)),
             tun_override: None,
             system_proxy_override: None,
+            listener_owner_probe: None,
+            listener_snapshot_probe: None,
         }
+    }
+
+    pub fn with_listener_owner_probe(mut self, probe: ListenerOwnerProbe) -> Self {
+        self.listener_owner_probe = Some(probe);
+        self
+    }
+
+    pub fn with_listener_snapshot_probe(mut self, probe: ListenerSnapshotProbe) -> Self {
+        self.listener_snapshot_probe = Some(probe);
+        self
     }
 
     pub fn with_source_pid(mut self, pid: u32) -> Self {
@@ -376,7 +435,15 @@ impl HttpControllerVpnReader {
         self
     }
 
-    fn verify_source_instance(&self, upstream_endpoint: Option<&str>) -> Option<String> {
+    fn verify_source_instance(
+        &self,
+        upstream_endpoint: Option<&str>,
+        probe: Option<&dyn Fn(u16, Duration) -> Option<u32>>,
+        deadline: Instant,
+    ) -> Option<String> {
+        if Instant::now() >= deadline {
+            return None;
+        }
         if let Some(pid) = self.source_pid {
             let proc_id = claude_watch_system::inspect_process_identity(pid)?;
             return Some(format!(
@@ -401,35 +468,193 @@ impl HttpControllerVpnReader {
                 proc_id.pid, proc_id.start_seconds, proc_id.start_microseconds
             ));
         }
-        // Verify the live process owning the controller HTTP port or upstream proxy port via kernel socket inspection
+        // The VPN core may run under another user (TAG starts Mihomo as root via
+        // its privileged helper). Query the authoritative cross-user listener
+        // evidence first; walking every same-UID process and FD cannot find it.
+        // A missing/ambiguous owner fails closed instead of a slower, weaker
+        // same-user fallback overriding the kernel result.
+        let probe = probe?;
+        let mut ports = Vec::new();
         if let Ok(url) = Url::parse(&self.client.base()) {
-            if let (Some(host), Some(port)) = (url.host_str(), url.port()) {
-                if let Ok(addr) = format!("{host}:{port}").parse::<std::net::SocketAddr>() {
-                    if let Some(proc_id) = claude_watch_system::inspect_loopback_tcp_listener(addr)
-                    {
-                        return Some(format!(
-                            "pid:{}:{}:{}",
-                            proc_id.pid, proc_id.start_seconds, proc_id.start_microseconds
-                        ));
-                    }
-                }
-            }
+            ports.extend(url.host_str().filter(|h| is_loopback_host(h)).and(url.port()));
         }
         if let Some(up) = upstream_endpoint.and_then(|u| Url::parse(u).ok()) {
-            if let (Some(host), Some(port)) = (up.host_str(), up.port()) {
-                if let Ok(addr) = format!("{host}:{port}").parse::<std::net::SocketAddr>() {
-                    if let Some(proc_id) = claude_watch_system::inspect_loopback_tcp_listener(addr)
-                    {
-                        return Some(format!(
-                            "pid:{}:{}:{}",
-                            proc_id.pid, proc_id.start_seconds, proc_id.start_microseconds
-                        ));
-                    }
-                }
+            ports.extend(up.host_str().filter(|h| is_loopback_host(h)).and(up.port()));
+        }
+        for port in ports {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { return None; }
+            let Some(pid) = probe(port, remaining) else { continue };
+            let Some((seconds, micros)) = claude_watch_system::process_start_time_any_user(pid)
+            else {
+                continue;
+            };
+            // Re-read so a listener handoff or PID reuse in between fails closed.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { return None; }
+            if probe(port, remaining) != Some(pid)
+                || claude_watch_system::process_start_time_any_user(pid) != Some((seconds, micros))
+                || Instant::now() >= deadline
+            {
+                continue;
             }
+            return Some(format!("pid:{pid}:{seconds}:{micros}"));
         }
         None
     }
+
+    fn bind_snapshot_owner(&self, snapshot: &KernelListenerSnapshot, upstream: Option<&str>) -> Option<(u16, u32, u64, u32)> {
+        let mut ports = Vec::new();
+        for endpoint in [Some(self.client.base().as_str()), upstream].into_iter().flatten() {
+            let url = Url::parse(endpoint).ok()?;
+            if url.host_str().is_some_and(is_loopback_host) {
+                if let Some(port) = url.port() { if !ports.contains(&port) { ports.push(port); } }
+            }
+        }
+        for port in ports {
+            let Some(pid) = kernel_listener_owner(&snapshot.evidence, port) else { continue };
+            let Some((seconds, micros)) = claude_watch_system::process_start_time_any_user(pid) else { continue };
+            return Some((port, pid, seconds, micros));
+        }
+        None
+    }
+
+    fn verify_snapshot_pair(
+        &self,
+        before: Option<&KernelListenerSnapshot>,
+        owner: Option<(u16, u32, u64, u32)>,
+        after: Option<&KernelListenerSnapshot>,
+        upstream: Option<&str>,
+        received_at: f64,
+    ) -> std::result::Result<(String, f64), String> {
+        let (Some(before), Some(after)) = (before, after) else { return Err("vpn_listener_unavailable".into()); };
+        let valid_until = before.captured_at.min(after.captured_at) + DEFAULT_VPN_OBSERVATION_TTL_SECONDS;
+        if !before.captured_at.is_finite() || !after.captured_at.is_finite()
+            || before.captured_at <= 0.0 || after.captured_at <= 0.0
+            || before.captured_at > received_at + CLOCK_ROLLBACK_TOLERANCE_SECONDS
+            || after.captured_at > received_at + CLOCK_ROLLBACK_TOLERANCE_SECONDS
+            || valid_until <= received_at
+        { return Err("vpn_listener_snapshot_stale".into()); }
+        if before.origin_id != after.origin_id
+            || before.sequence.zip(after.sequence).is_some_and(|(a, b)| b < a || (a == b && before.captured_at != after.captured_at))
+        { return Err("vpn_listener_source_changed_during_sample".into()); }
+        let Some((port, pid, seconds, micros)) = owner else { return Err("vpn_listener_owner_unavailable".into()); };
+        if self.bind_snapshot_owner(after, upstream) != Some((port, pid, seconds, micros)) {
+            return Err("vpn_listener_owner_changed_during_sample".into());
+        }
+        Ok((format!("pid:{pid}:{seconds}:{micros}"), valid_until))
+    }
+}
+
+fn reconcile_system_proxy_samples(
+    before: ObservedField<bool>, after: ObservedField<bool>, consistency: &mut ObservationConsistency,
+) -> ObservedField<bool> {
+    match (before, after) {
+        (ObservedField::Known(a), ObservedField::Known(b)) if a != b => {
+            *consistency = ObservationConsistency::InconsistentSnapshot("system_proxy_changed_during_sample".into());
+            ObservedField::Unknown("system_proxy_inconsistent".into())
+        }
+        (ObservedField::Unknown(reason), _) | (_, ObservedField::Unknown(reason)) => {
+            *consistency = ObservationConsistency::Unavailable(reason.clone());
+            ObservedField::Unknown(reason)
+        }
+        (_, after) => after,
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Lazily resolves the single owner PID of a loopback TCP listener port.
+pub type ListenerOwnerProbe = Box<dyn Fn(u16, Duration) -> Option<u32> + Send + Sync>;
+
+pub type ListenerSnapshotProbe = Box<dyn Fn(Duration) -> Option<KernelListenerSnapshot> + Send + Sync>;
+
+/// One kernel table, with its original capture time when supplied by the
+/// authenticated native collector. Re-reading one frame does not renew it.
+#[derive(Clone)]
+pub struct KernelListenerSnapshot {
+    pub evidence: CommandEvidence,
+    pub captured_at: f64,
+    pub origin_id: Option<String>,
+    pub sequence: Option<u64>,
+}
+
+pub fn read_vpn_kernel_snapshot<R: ReadRunner + ?Sized>(runner: &R, timeout: Duration) -> Option<KernelListenerSnapshot> {
+    let started = crate::native::now();
+    let evidence = read_kernel_listeners_with_timeout(runner, timeout)?;
+    if evidence.status != 0 || !evidence.stderr.trim().is_empty() { return None; }
+    let metadata = evidence.stdout.lines().find_map(|line| line.strip_prefix(crate::native_listener::FRAME_META_PREFIX));
+    let (captured_at, origin_id, sequence) = if let Some(metadata) = metadata {
+        let value = crate::storage::strict_json(metadata.as_bytes()).ok()?;
+        let captured_at = value["captured_at"].as_f64().filter(|time| time.is_finite() && *time > 0.0)?;
+        let origin = value["origin_id"].as_str().filter(|id| !id.is_empty() && id.len() <= 256)?.to_owned();
+        let sequence = value["sequence"].as_u64().filter(|seq| *seq > 0)?;
+        (captured_at, Some(origin), Some(sequence))
+    } else {
+        // Plain netstat is a new bounded command, not a cached collector frame.
+        (started, None, None)
+    };
+    Some(KernelListenerSnapshot { evidence, captured_at, origin_id, sequence })
+}
+
+/// Single unambiguous owner PID of a loopback/wildcard TCP listener on `port`,
+/// from the kernel listener table (`ReadCommand::Listeners`, which reports owners
+/// across users). Returns `None` when the table is incomplete or ambiguous.
+pub fn kernel_listener_owner(kernel: &CommandEvidence, port: u16) -> Option<u32> {
+    let empty = CommandEvidence {
+        status: 1,
+        stdout: String::new(),
+        stderr: String::new(),
+        source: "lsof".into(),
+    };
+    let evidence = listener_fallback_for_port(empty, Some(kernel), port);
+    if evidence.status != 0 || !evidence.stderr.trim().is_empty() {
+        return None;
+    }
+    let accepted = [
+        format!("127.0.0.1:{port}"),
+        format!("*:{port}"),
+        format!("0.0.0.0:{port}"),
+        format!("[::]:{port}"),
+    ];
+    let mut owners = std::collections::BTreeSet::new();
+    let mut pid = None;
+    for line in evidence.stdout.lines() {
+        if let Some(raw) = line.strip_prefix('p') {
+            pid = raw.parse::<u32>().ok().filter(|v| *v > 1);
+        } else if let Some(endpoint) = line.strip_prefix('n') {
+            if accepted.iter().any(|v| v == endpoint) {
+                owners.insert(pid?);
+            }
+        }
+    }
+    (owners.len() == 1).then(|| owners.into_iter().next()).flatten()
+}
+
+/// Reads the kernel listener table once through `runner`.
+pub fn read_kernel_listeners<R: ReadRunner + ?Sized>(runner: &R) -> Option<CommandEvidence> {
+    read_kernel_listeners_with_timeout(runner, Duration::from_secs(3))
+}
+
+pub fn read_kernel_listeners_with_timeout<R: ReadRunner + ?Sized>(
+    runner: &R,
+    timeout: Duration,
+) -> Option<CommandEvidence> {
+    if timeout.is_zero() { return None; }
+    let out = runner
+        .run(ReadCommand::Listeners, &[], timeout.min(Duration::from_secs(3)), 4 * 1024 * 1024)
+        .ok()?;
+    Some(CommandEvidence {
+        status: out.status,
+        stdout: out.text().ok()?.into(),
+        stderr: out.error_text().ok()?.into(),
+        source: "netstat".into(),
+    })
 }
 
 /// Resolves read-only Clash/Mihomo controller credentials from the user's local VPN config files
@@ -536,21 +761,55 @@ pub fn parse_scutil_proxy_output(
 fn sample_macos_system_proxy_readonly(
     expected_host: &str,
     expected_port: Option<u16>,
+    deadline: Instant,
 ) -> ObservedField<bool> {
-    let Ok(output) = std::process::Command::new("/usr/sbin/scutil")
-        .arg("--proxy")
-        .env("LC_ALL", "C")
-        .output()
-    else {
-        return ObservedField::Unknown("system_proxy_unavailable".into());
-    };
-    if !output.status.success() {
-        return ObservedField::Unknown("system_proxy_unavailable".into());
+    let command = Exec::cmd("/usr/sbin/scutil").args(&["--proxy"]).env("LC_ALL", "C");
+    match bounded_proxy_output(command, deadline) {
+        Some(text) => parse_scutil_proxy_output(&text, expected_host, expected_port),
+        None => ObservedField::Unknown("system_proxy_unavailable".into()),
     }
-    let Ok(text) = String::from_utf8(output.stdout) else {
-        return ObservedField::Unknown("system_proxy_unavailable".into());
+}
+
+fn bounded_proxy_output(command: Exec, deadline: Instant) -> Option<String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() { return None; }
+    // Bound both output collection and process exit. Only this owned read-only
+    // child is terminated on timeout; VPN processes/settings are never touched.
+    let mut job = match command
+        .stdout(Redirection::Pipe)
+        .stderr(Redirection::Pipe)
+        .start() {
+        Ok(job) => job,
+        Err(_) => return None,
     };
-    parse_scutil_proxy_output(&text, expected_host, expected_port)
+    let output = job.communicate().and_then(|comm| comm
+        .limit_time(deadline.saturating_duration_since(Instant::now()))
+        .limit_size(64 * 1024 + 1)
+        .read());
+    let Ok((stdout, stderr)) = output else {
+        stop_proxy_reader(job);
+        return None;
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let status = if remaining.is_zero() { None } else { job.wait_timeout(remaining).ok().flatten() };
+    if status.is_none() {
+        stop_proxy_reader(job);
+        return None;
+    }
+    if status.and_then(|status| status.code()) != Some(0)
+        || stdout.len() + stderr.len() > 64 * 1024
+        || !stderr.is_empty()
+    {
+        return None;
+    }
+    String::from_utf8(stdout).ok()
+}
+
+fn stop_proxy_reader(job: Job) {
+    let _ = job.kill();
+    if !matches!(job.wait_timeout(Duration::from_millis(50)), Ok(Some(_))) {
+        job.detach();
+    }
 }
 
 impl VpnSourceReader for HttpControllerVpnReader {
@@ -562,6 +821,36 @@ impl VpnSourceReader for HttpControllerVpnReader {
         epoch: VpnEpoch,
         now: f64,
     ) -> VpnObservation {
+        self.read_observation_with_probes(
+            expectation, include_rules, sample_seq, epoch, now,
+            self.listener_owner_probe.as_deref().map(|probe| probe as &dyn Fn(u16, Duration) -> Option<u32>),
+            self.listener_snapshot_probe.as_deref().map(|probe| probe as &dyn Fn(Duration) -> Option<KernelListenerSnapshot>),
+        )
+    }
+}
+
+impl HttpControllerVpnReader {
+    /// The onboarding runner can be borrowed here, so both owner checks read
+    /// fresh evidence instead of closing over one pre-sampled listener table.
+    pub(crate) fn read_observation_with_snapshot_probe(
+        &self, expectation: &VpnExpectation, include_rules: bool, sample_seq: u64,
+        epoch: VpnEpoch, now: f64, probe: &dyn Fn(Duration) -> Option<KernelListenerSnapshot>,
+    ) -> VpnObservation {
+        self.read_observation_with_probes(expectation, include_rules, sample_seq, epoch, now, None, Some(probe))
+    }
+
+    fn read_observation_with_probes(
+        &self,
+        expectation: &VpnExpectation,
+        include_rules: bool,
+        sample_seq: u64,
+        epoch: VpnEpoch,
+        now: f64,
+        probe: Option<&dyn Fn(u16, Duration) -> Option<u32>>,
+        snapshot_probe: Option<&dyn Fn(Duration) -> Option<KernelListenerSnapshot>>,
+    ) -> VpnObservation {
+        let started = Instant::now();
+        let deadline = started + VPN_OBSERVATION_BUDGET;
         let parsed_proxy = normalize_loopback_http_endpoint(&expectation.proxy_url)
             .and_then(|u| Url::parse(&u).ok());
         let expected_host = parsed_proxy
@@ -570,26 +859,42 @@ impl VpnSourceReader for HttpControllerVpnReader {
             .unwrap_or_else(|| "127.0.0.1".into());
         let expected_port = parsed_proxy.as_ref().and_then(Url::port);
 
+        let before_listener = snapshot_probe.and_then(|probe| probe(deadline.saturating_duration_since(Instant::now())));
+        let before_owner = before_listener.as_ref().and_then(|snapshot| {
+            self.bind_snapshot_owner(snapshot, Some(&expectation.proxy_url))
+        });
+
         let pre_sys_proxy = if let Some(ref ov) = self.system_proxy_override {
             Some(ov.clone())
         } else if expectation.require_system_proxy.is_some() {
             Some(sample_macos_system_proxy_readonly(
                 &expected_host,
                 expected_port,
+                deadline,
             ))
         } else {
             None
         };
 
-        match self.client.observe_fast_vpn_state(
+        let mut observation = match self.client.observe_fast_vpn_state_before(
             &expectation.proxy_group,
             &expected_host,
             expected_port,
             include_rules,
+            deadline,
         ) {
             Ok((snap, mut consistency)) => {
-                let verified_instance =
-                    self.verify_source_instance(snap.upstream_endpoint.as_deref());
+                let (verified_instance, source_valid_until, listener_error) = if let Some(snapshot_probe) = snapshot_probe {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let after = (!remaining.is_zero()).then(|| snapshot_probe(remaining)).flatten();
+                    match self.verify_snapshot_pair(before_listener.as_ref(), before_owner,
+                        after.as_ref(), snap.upstream_endpoint.as_deref(), now + started.elapsed().as_secs_f64()) {
+                        Ok((identity, valid_until)) => (Some(identity), Some(valid_until), None),
+                        Err(reason) => (None, None, Some(reason)),
+                    }
+                } else {
+                    (self.verify_source_instance(snap.upstream_endpoint.as_deref(), probe, deadline), None, None)
+                };
                 let system_proxy_enabled = match pre_sys_proxy {
                     Some(pre) => {
                         if self.system_proxy_override.is_some() {
@@ -598,19 +903,19 @@ impl VpnSourceReader for HttpControllerVpnReader {
                             let post = sample_macos_system_proxy_readonly(
                                 &expected_host,
                                 expected_port,
+                                deadline,
                             );
-                            if pre != post {
-                                consistency = ObservationConsistency::InconsistentSnapshot(
-                                    "system_proxy_changed_during_sample".into(),
-                                );
-                                ObservedField::Unknown("system_proxy_inconsistent".into())
-                            } else {
-                                post
-                            }
+                            reconcile_system_proxy_samples(pre, post, &mut consistency)
                         }
                     }
                     None => ObservedField::Unknown("system_proxy_not_sampled".into()),
                 };
+                if let Some(ref reason) = listener_error {
+                    consistency = ObservationConsistency::Unavailable(reason.clone());
+                }
+                let source_error = listener_error.or_else(|| match &consistency {
+                    ObservationConsistency::Unavailable(reason) => Some(reason.clone()), _ => None,
+                });
                 VpnObservation {
                     source: self.source_name.clone(),
                     source_instance: verified_instance,
@@ -629,9 +934,10 @@ impl VpnSourceReader for HttpControllerVpnReader {
                     rules_digest: snap.rules_digest,
                     sample_started_at: now,
                     observed_at: now,
-                    valid_until: now + DEFAULT_VPN_OBSERVATION_TTL_SECONDS,
+                    valid_until: source_valid_until.unwrap_or(now + DEFAULT_VPN_OBSERVATION_TTL_SECONDS)
+                        .min(now + DEFAULT_VPN_OBSERVATION_TTL_SECONDS),
                     consistency,
-                    source_error: None,
+                    source_error,
                     sample_seq,
                     epoch,
                 }
@@ -660,7 +966,23 @@ impl VpnSourceReader for HttpControllerVpnReader {
                     epoch,
                 }
             }
+        };
+        // Keep original sample timestamps. Late complete/partial data must not
+        // become fresh evidence simply because it has finally been published.
+        if Instant::now() >= deadline {
+            let reason = "vpn_observation_budget_exceeded".to_string();
+            observation.source_instance = None;
+            observation.consistency = ObservationConsistency::Unavailable(reason.clone());
+            observation.source_error = Some(reason);
+        } else if snapshot_probe.is_some() && observation.source_error.is_none()
+            && observation.valid_until <= now + started.elapsed().as_secs_f64()
+        {
+            let reason = "vpn_listener_snapshot_stale".to_string();
+            observation.source_instance = None;
+            observation.consistency = ObservationConsistency::Unavailable(reason.clone());
+            observation.source_error = Some(reason);
         }
+        observation
     }
 }
 
@@ -711,5 +1033,97 @@ impl VpnObserver {
                 let _ = store.atomic_json(&path, &val);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{kernel_listener_owner, CommandEvidence};
+
+    #[test]
+    fn failed_system_proxy_read_is_not_a_confirmed_change() {
+        use super::{ObservedField, ObservationConsistency, reconcile_system_proxy_samples};
+        for (before, after) in [
+            (ObservedField::Known(true), ObservedField::Unknown("system_proxy_timeout".into())),
+            (ObservedField::Unknown("system_proxy_timeout".into()), ObservedField::Known(true)),
+        ] {
+            let mut consistency = ObservationConsistency::RevisionVerified;
+            let result = reconcile_system_proxy_samples(before, after, &mut consistency);
+            assert_eq!(result, ObservedField::Unknown("system_proxy_timeout".into()));
+            assert_eq!(consistency, ObservationConsistency::Unavailable("system_proxy_timeout".into()));
+        }
+        let mut consistency = ObservationConsistency::RevisionVerified;
+        assert_eq!(reconcile_system_proxy_samples(ObservedField::Known(true), ObservedField::Known(false), &mut consistency),
+            ObservedField::Unknown("system_proxy_inconsistent".into()));
+        assert!(matches!(consistency, ObservationConsistency::InconsistentSnapshot(_)));
+    }
+
+    #[test]
+    fn repeated_unavailable_samples_invalidate_once_but_known_changes_and_recovery_rotate() {
+        use super::*;
+        let mut state = VpnObservationState::new("stable-failure");
+        let expectation = VpnExpectation::unconfigured();
+        let first = state.invalidate("controller_timeout", &expectation, 1000.0);
+        let mut failed = first.observation;
+        failed.running_mode = ObservedField::Known("rule".into());
+        let initial_epoch = failed.epoch.clone();
+        for seq in 2..=12 {
+            failed.sample_seq = seq;
+            failed.sample_started_at = 1000.0 + (seq as f64 * 4.0);
+            failed.observed_at = failed.sample_started_at;
+            failed.valid_until = failed.observed_at + DEFAULT_VPN_OBSERVATION_TTL_SECONDS;
+            failed.source_error = Some(format!("unavailable_attempt_{seq}"));
+            let result = state.apply_sample(failed.clone(), &expectation, failed.observed_at).unwrap();
+            assert!(!result.epoch_changed);
+            assert_eq!(result.observation.epoch, initial_epoch);
+            assert!(result.observation.source_error.is_some());
+        }
+        failed.sample_seq += 1;
+        failed.running_mode = ObservedField::Known("global".into());
+        let changed = state.apply_sample(failed.clone(), &expectation, failed.observed_at).unwrap();
+        assert!(changed.epoch_changed, "confirmed facts still change during source failure");
+        failed.sample_seq += 1;
+        failed.consistency = ObservationConsistency::RevisionVerified;
+        failed.source_error = None;
+        failed.source_instance = Some("verified-live-source".into());
+        assert!(state.apply_sample(failed.clone(), &expectation, failed.observed_at).unwrap().epoch_changed);
+    }
+
+    #[test]
+    fn stalled_proxy_reader_is_bounded_and_terminated() {
+        let started = std::time::Instant::now();
+        let output = super::bounded_proxy_output(
+            subprocess::Exec::cmd("/bin/sleep").args(&["5"]),
+            started + std::time::Duration::from_millis(40),
+        );
+        assert!(output.is_none());
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    fn table(stdout: &str) -> CommandEvidence {
+        CommandEvidence { status: 0, stdout: stdout.into(), stderr: String::new(), source: "netstat".into() }
+    }
+
+    #[test]
+    fn kernel_listener_owner_reads_root_owned_tag_listener() {
+        let t = table("tcp4 0 0 127.0.0.1.7890 *.* LISTEN 0 0 131072 131072 mihomo-universal:26032 00180 00000006\n\
+                       tcp4 0 0 127.0.0.1.9090 *.* LISTEN 0 0 131072 131072 mihomo-universal:26032 00180 00000006\n\
+                       tcp4 0 0 127.0.0.1.9090 127.0.0.1.61739 TIME_WAIT 0 0 1 1 mihomo-universal:26032 021b1\n");
+        assert_eq!(kernel_listener_owner(&t, 9090), Some(26032));
+        assert_eq!(kernel_listener_owner(&t, 7890), Some(26032));
+        assert_eq!(kernel_listener_owner(&t, 1234), None);
+    }
+
+    #[test]
+    fn kernel_listener_owner_fails_closed_on_ambiguous_or_incomplete_tables() {
+        let two = table("tcp4 0 0 127.0.0.1.9090 *.* LISTEN 0 0 1 1 a:77 0\ntcp4 0 0 *.9090 *.* LISTEN 0 0 1 1 b:78 0\n");
+        assert_eq!(kernel_listener_owner(&two, 9090), None);
+        let ownerless = table("tcp4 0 0 127.0.0.1.9090 *.* LISTEN 0 0 1 1 0\n");
+        assert_eq!(kernel_listener_owner(&ownerless, 9090), None);
+        let mut failed = table("tcp4 0 0 127.0.0.1.9090 *.* LISTEN 0 0 1 1 a:77 0\n");
+        failed.status = 1;
+        assert_eq!(kernel_listener_owner(&failed, 9090), None);
+        let empty = table("");
+        assert_eq!(kernel_listener_owner(&empty, 9090), None);
     }
 }

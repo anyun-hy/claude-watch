@@ -29,6 +29,34 @@ pub(crate) use platform::verify_code as verify_hardened_peer_code;
 fn invalid(message: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, message) }
 fn denied(message: &str) -> io::Error { io::Error::new(io::ErrorKind::PermissionDenied, message) }
 
+#[derive(Debug)]
+struct GatewayStageError {
+    stage: &'static str,
+    source: io::Error,
+}
+impl std::fmt::Display for GatewayStageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.stage, self.source)
+    }
+}
+impl std::error::Error for GatewayStageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.source) }
+}
+fn at_stage<T>(stage: &'static str, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    operation().map_err(|error| {
+        if gateway_error_stage(&error).is_some() { error }
+        else { io::Error::new(error.kind(), GatewayStageError { stage, source: error }) }
+    })
+}
+/// Only fixed source-code labels enter structured logs; never raw error text.
+pub fn gateway_error_stage(error: &io::Error) -> Option<&'static str> {
+    error.get_ref()?.downcast_ref::<GatewayStageError>().map(|error| error.stage)
+}
+pub fn gateway_error_os_code(error: &io::Error) -> Option<i32> {
+    error.get_ref().and_then(|source| source.downcast_ref::<GatewayStageError>())
+        .map_or_else(|| error.raw_os_error(), |error| gateway_error_os_code(&error.source))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayInstallConfig {
@@ -58,18 +86,30 @@ impl GatewayInstallConfig {
     }
 }
 
+/// Broker identity is bound to the kernel-provided audit token and its PID
+/// version. Cross-UID metadata does not expose a start time; do not manufacture
+/// one or reuse the complete process-lifetime identity used for engine owners.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayBrokerIdentity {
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: u32,
+    pub executable_path: String,
+    pub audit_token: [u32; 8],
+}
+
 /// This is intentionally neither Deserialize nor publicly constructible.
 #[derive(Clone, Debug)]
 pub struct GatewayEndpointProtection {
     endpoint: SocketAddr,
-    broker: ProcessKernelIdentity,
+    broker: GatewayBrokerIdentity,
     // Keep the IPv6 reservation alive even if the broker restarts. It never
     // forwards data: supported clients use the advertised IPv4 proxy endpoint.
     _ipv6_reservation: Arc<TcpListener>,
 }
 impl GatewayEndpointProtection {
     pub fn endpoint(&self) -> SocketAddr { self.endpoint }
-    pub fn broker_identity(&self) -> &ProcessKernelIdentity { &self.broker }
+    pub fn broker_identity(&self) -> &GatewayBrokerIdentity { &self.broker }
 }
 pub struct VerifiedGatewayListener {
     listener: TcpListener,
@@ -116,8 +156,8 @@ fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 pub fn load_gateway_install_config() -> io::Result<GatewayInstallConfig> {
-    verify_protected_path(Path::new(CONFIG_PATH), false)?;
-    verify_protected_path(Path::new(BROKER_PATH), false)?;
+    at_stage("gateway_config_path", || verify_protected_path(Path::new(CONFIG_PATH), false))?;
+    at_stage("gateway_broker_path", || verify_protected_path(Path::new(BROKER_PATH), false))?;
     let config: GatewayInstallConfig = serde_json::from_slice(&read_bounded(Path::new(CONFIG_PATH))?).map_err(|_| invalid("gateway configuration JSON invalid"))?;
     config.validate()?;
     if crate::sha256_file_hex(Path::new(BROKER_PATH)).as_deref() != Some(&config.broker_sha256) {
@@ -132,19 +172,57 @@ pub fn acquire_gateway_listener() -> io::Result<VerifiedGatewayListener> {
     #[cfg(target_os = "macos")]
     {
         let config = load_gateway_install_config()?;
-        if crate::effective_uid() != config.engine_uid { return Err(denied("engine UID is not approved")); }
-        verify_protected_path(Path::new(CONTROL_PATH), true)?;
-        let mut stream = UnixStream::connect(CONTROL_PATH)?;
-        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(3)))?;
-        let broker = platform::verify_peer(&stream, 0, BROKER_PATH, &config.broker_sha256, &config.broker_cdhash)?;
-        if broker.ppid != 1 { return Err(denied("broker is not owned by system launchd")); }
-        stream.write_all(WIRE_MAGIC)?;
-        let (listener, ipv6) = receive_listeners(&stream, config.gateway_port)?;
-        validate_protected_listeners(&listener, &ipv6, config.gateway_port)?;
-        let after = platform::verify_peer(&stream, 0, BROKER_PATH, &config.broker_sha256, &config.broker_cdhash)?;
-        if after != broker { return Err(denied("broker identity changed during handoff")); }
-        Ok(VerifiedGatewayListener { listener, protection: GatewayEndpointProtection { endpoint: config.endpoint(), broker, _ipv6_reservation: Arc::new(ipv6) } })
+        acquire_gateway_listener_at(&config, BROKER_PATH, Path::new(CONTROL_PATH))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_gateway_listener_at(config: &GatewayInstallConfig, broker_path: &str, control_path: &Path) -> io::Result<VerifiedGatewayListener> {
+    config.validate()?;
+    if crate::effective_uid() != config.engine_uid { return Err(denied("engine UID is not approved")); }
+    at_stage("gateway_broker_path", || verify_protected_path(Path::new(broker_path), false))?;
+    at_stage("gateway_broker_digest", || {
+        if crate::sha256_file_hex(Path::new(broker_path)).as_deref() != Some(&config.broker_sha256) {
+            return Err(denied("installed broker digest does not match protected configuration"));
+        }
+        Ok(())
+    })?;
+    at_stage("gateway_control_path", || verify_protected_path(control_path, true))?;
+    let mut stream = at_stage("gateway_control_connect", || connect_control_socket(control_path, Duration::from_secs(1)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    let broker = at_stage("gateway_broker_identity", || platform::verify_broker_peer(&stream, broker_path, &config.broker_sha256, &config.broker_cdhash))?;
+    if broker.ppid != 1 { return Err(denied("broker is not owned by system launchd")); }
+    stream.write_all(WIRE_MAGIC)?;
+    let (listener, ipv6) = at_stage("gateway_descriptor_receive", || receive_listeners(&stream, config.gateway_port))?;
+    at_stage("gateway_descriptor_protection", || validate_protected_listeners(&listener, &ipv6, config.gateway_port))?;
+    let after = at_stage("gateway_broker_recheck", || platform::verify_broker_peer(&stream, broker_path, &config.broker_sha256, &config.broker_cdhash))?;
+    if after != broker { return Err(denied("broker identity changed during handoff")); }
+    drop(stream);
+    Ok(VerifiedGatewayListener { listener, protection: GatewayEndpointProtection { endpoint: config.endpoint(), broker, _ipv6_reservation: Arc::new(ipv6) } })
+}
+
+/// Installation may observe the protected IPC socket while the root broker is
+/// starting. Retry only absence/connect readiness; never identity, ACL, code
+/// signature, configuration, or descriptor validation failures.
+pub fn acquire_gateway_listener_for_install() -> io::Result<VerifiedGatewayListener> {
+    wait_for_control_startup(Duration::from_secs(5), acquire_gateway_listener)
+}
+fn wait_for_control_startup<T>(timeout: Duration, mut acquire: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match acquire() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let pending = match gateway_error_stage(&error) {
+                    Some("gateway_control_path") => error.kind() == io::ErrorKind::NotFound,
+                    Some("gateway_control_connect") => matches!(gateway_error_os_code(&error), Some(libc::ENOENT | libc::ECONNREFUSED | libc::EACCES)),
+                    _ => false,
+                };
+                if !pending || std::time::Instant::now() >= deadline { return Err(error); }
+                std::thread::sleep(Duration::from_millis(50).min(deadline.saturating_duration_since(std::time::Instant::now())));
+            }
+        }
     }
 }
 
@@ -158,13 +236,11 @@ fn int_socket_option(fd: RawFd, option: libc::c_int) -> io::Result<libc::c_int> 
     Ok(value)
 }
 fn validate_listener(listener: &TcpListener, expected: SocketAddr) -> io::Result<()> {
-    if !expected.ip().is_unspecified() || expected.port() == 0
-        || listener.local_addr()? != expected
-        || int_socket_option(listener.as_raw_fd(), libc::SO_TYPE)? != libc::SOCK_STREAM
-        || !is_listening_socket(listener.as_raw_fd())?
-        || int_socket_option(listener.as_raw_fd(), libc::SO_REUSEPORT)? != 0 {
-        return Err(denied("gateway descriptor is not the exclusive expected TCP listener"));
-    }
+    if !expected.ip().is_unspecified() || expected.port() == 0 { return Err(denied("gateway requires a wildcard listener on a nonzero port")); }
+    if listener.local_addr()? != expected { return Err(denied("gateway listener address differs from the approved endpoint")); }
+    if int_socket_option(listener.as_raw_fd(), libc::SO_TYPE)? != libc::SOCK_STREAM { return Err(denied("gateway descriptor is not a stream socket")); }
+    if !is_listening_socket(listener.as_raw_fd())? { return Err(denied("gateway socket is not listening")); }
+    if int_socket_option(listener.as_raw_fd(), libc::SO_REUSEPORT)? != 0 { return Err(denied("gateway listener permits port reuse")); }
     Ok(())
 }
 
@@ -179,8 +255,8 @@ fn is_listening_socket(fd: RawFd) -> io::Result<bool> {
 }
 
 fn validate_listeners(v4: &TcpListener, v6: &TcpListener, port: u16) -> io::Result<()> {
-    validate_listener(v4, SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))?;
-    validate_listener(v6, SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)))?;
+    at_stage("gateway_ipv4_listener", || validate_listener(v4, SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))))?;
+    at_stage("gateway_ipv6_listener", || validate_listener(v6, SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))))?;
     let mut only: libc::c_int = 0;
     let mut length = std::mem::size_of_val(&only) as libc::socklen_t;
     if unsafe { libc::getsockopt(v6.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, (&mut only as *mut libc::c_int).cast(), &mut length) } != 0 {
@@ -198,7 +274,7 @@ fn validate_protected_listeners(v4: &TcpListener, v6: &TcpListener, port: u16) -
     if !(1..1024).contains(&port) { return Err(denied("gateway requires a reserved TCP port")); }
     validate_listeners(v4, v6, port)?;
     #[cfg(target_os = "macos")]
-    for socket in [v4, v6] { verify_root_socket(socket)?; }
+    for (socket, stage) in [(v4, "gateway_ipv4_owner"), (v6, "gateway_ipv6_owner")] { at_stage(stage, || verify_root_socket(socket))?; }
     #[cfg(not(target_os = "macos"))]
     return Err(denied("protected launchd listener requires macOS"));
     #[cfg(target_os = "macos")]
@@ -209,11 +285,9 @@ fn validate_protected_listeners(v4: &TcpListener, v6: &TcpListener, port: u16) -
 fn verify_root_socket(socket: &TcpListener) -> io::Result<()> {
     let (kind, ty, protocol, _) = crate::macos::own_socket_properties(socket.as_raw_fd())
         .ok_or_else(|| denied("gateway socket properties unavailable"))?;
-    if kind != 2 || ty != libc::SOCK_STREAM || protocol != libc::IPPROTO_TCP
-        || socket_creator_uid(socket.as_raw_fd())? != 0
-        || int_socket_option(socket.as_raw_fd(), 0x1025)? != 0 { // SO_REUSESHAREUID
-        return Err(denied("gateway socket is not exclusively root-owned"));
-    }
+    if kind != 2 || ty != libc::SOCK_STREAM || protocol != libc::IPPROTO_TCP { return Err(denied("gateway socket has unexpected kernel type or protocol")); }
+    if socket_creator_uid(socket.as_raw_fd())? != 0 { return Err(denied("gateway socket creation credential is not root")); }
+    if int_socket_option(socket.as_raw_fd(), 0x1025)? != 0 { return Err(denied("gateway socket permits cross-UID port sharing")); } // SO_REUSESHAREUID
     Ok(())
 }
 
@@ -382,23 +456,24 @@ pub fn run_gateway_broker_with_events(events: &dyn Fn(GatewayBrokerEvent)) -> io
     return Err(io::Error::new(io::ErrorKind::Unsupported, "launchd gateway requires macOS"));
     #[cfg(target_os = "macos")]
     {
-        if crate::effective_uid() != 0 || unsafe { libc::getppid() } != 1 {
-            return Err(denied("gateway broker requires system launchd"));
-        }
-        let config = load_gateway_install_config()?;
-        if fs::canonicalize(std::env::current_exe()?)? != Path::new(BROKER_PATH) {
-            return Err(denied("broker must run from its protected installed path"));
-        }
-        let listener = TcpListener::from(platform::activated_socket("GatewayV4")?);
-        let ipv6 = TcpListener::from(platform::activated_socket("GatewayV6")?);
-        validate_listeners(&listener, &ipv6, config.gateway_port)?;
-        validate_protected_listeners(&listener, &ipv6, config.gateway_port)?;
-        let control = UnixListener::from(platform::activated_socket("Control")?);
-        if control.local_addr()?.as_pathname() != Some(Path::new(CONTROL_PATH))
-            || !is_listening_socket(control.as_raw_fd())? {
-            return Err(denied("invalid launchd control listener"));
-        }
-        verify_protected_path(Path::new(CONTROL_PATH), true)?;
+        at_stage("gateway_launchd_identity", || {
+            if crate::effective_uid() != 0 || unsafe { libc::getppid() } != 1 { return Err(denied("gateway broker requires system launchd")); }
+            Ok(())
+        })?;
+        let config = at_stage("gateway_config_validation", load_gateway_install_config)?;
+        at_stage("gateway_running_executable", || {
+            if fs::canonicalize(std::env::current_exe()?)? != Path::new(BROKER_PATH) { return Err(denied("broker must run from its protected installed path")); }
+            Ok(())
+        })?;
+        let listener = TcpListener::from(at_stage("gateway_activate_ipv4", || platform::activated_socket("GatewayV4"))?);
+        let ipv6 = TcpListener::from(at_stage("gateway_activate_ipv6", || platform::activated_socket("GatewayV6"))?);
+        at_stage("gateway_listener_protection", || validate_protected_listeners(&listener, &ipv6, config.gateway_port))?;
+        // Only TCP reservations belong to launchd. Current macOS can stage a
+        // SockPathName listener at a different private path. Publish control
+        // IPC ourselves inside the verified root-owned installation directory.
+        let control = at_stage("gateway_control_bind", || bind_control_listener(Path::new(CONTROL_PATH)))?;
+        at_stage("gateway_control_listener", || validate_control_listener(&control, Path::new(CONTROL_PATH)))?;
+        at_stage("gateway_control_path", || verify_protected_path(Path::new(CONTROL_PATH), true))?;
         events(GatewayBrokerEvent { operation: "listener_activation", result: "verified", reason: "protected_listeners_verified" });
         for connection in control.incoming() {
             let mut stream = connection?;
@@ -416,7 +491,10 @@ pub fn run_gateway_broker_with_events(events: &dyn Fn(GatewayBrokerEvent)) -> io
                 failure_reason = "listener_owner_unconfirmed";
                 claim_owner(&peer)?;
                 failure_reason = "descriptor_transfer_failed";
-                send_listeners(&stream, &[&listener, &ipv6])
+                send_listeners(&stream, &[&listener, &ipv6])?;
+                let mut done = [0];
+                let _ = stream.read(&mut done);
+                Ok(())
             })();
             // Never log credentials, request bytes, or raw process metadata.
             events(match result {
@@ -426,6 +504,116 @@ pub fn run_gateway_broker_with_events(events: &dyn Fn(GatewayBrokerEvent)) -> io
         }
         Ok(())
     }
+}
+
+fn validate_control_listener(control: &UnixListener, path: &Path) -> io::Result<()> {
+    if control.local_addr()?.as_pathname() != Some(path) { return Err(denied("gateway control listener path differs from the protected endpoint")); }
+    if !is_listening_socket(control.as_raw_fd())? { return Err(denied("gateway control socket is not listening")); }
+    Ok(())
+}
+
+fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= address.sun_path.len() {
+        return Err(invalid("invalid control socket path"));
+    }
+    address.sun_family = libc::AF_UNIX as _;
+    for (target, byte) in address.sun_path.iter_mut().zip(bytes) { *target = *byte as _; }
+    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    #[cfg(target_os = "macos")] { address.sun_len = length as _; }
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw < 0 { return Err(io::Error::last_os_error()); }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    set_cloexec(fd.as_raw_fd())?;
+    let stream = UnixStream::from(fd);
+    stream.set_nonblocking(true)?;
+    if unsafe { libc::connect(raw, (&address as *const libc::sockaddr_un).cast(), length as _) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) { return Err(error); }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { return Err(io::Error::new(io::ErrorKind::TimedOut, "control connection deadline exceeded")); }
+            let mut poll = libc::pollfd { fd: raw, events: libc::POLLOUT, revents: 0 };
+            let ready = unsafe { libc::poll(&mut poll, 1, remaining.as_millis().clamp(1, i32::MAX as u128) as i32) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted { continue; }
+                return Err(error);
+            }
+            if ready == 0 { continue; }
+            let error = int_socket_option(raw, libc::SO_ERROR)?;
+            if error != 0 { return Err(io::Error::from_raw_os_error(error)); }
+            if poll.revents & libc::POLLOUT == 0 { return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "control connection did not become writable")); }
+            break;
+        }
+    }
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+#[derive(Debug)]
+struct ControlListener {
+    listener: UnixListener,
+    // Close the listener before releasing the singleton lease. The lock inode
+    // stays in the protected directory so restart cannot create a second lock.
+    _lease: fs::File,
+}
+impl std::ops::Deref for ControlListener {
+    type Target = UnixListener;
+    fn deref(&self) -> &Self::Target { &self.listener }
+}
+fn try_control_lock(file: &fs::File) -> io::Result<()> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Err(io::Error::new(io::ErrorKind::AddrInUse, "control endpoint owner is still active"));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+fn bind_control_listener(path: &Path) -> io::Result<ControlListener> {
+    use std::os::unix::fs::PermissionsExt;
+    if crate::effective_uid() != 0 { return Err(denied("only the root broker may create control IPC")); }
+    let parent = path.parent().ok_or_else(|| invalid("control path has no parent"))?;
+    verify_protected_path(parent, false)?;
+    let lease_path = parent.join("control.lock");
+    let lease = OpenOptions::new().read(true).write(true).create(true).mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&lease_path)?;
+    verify_protected_path(&lease_path, false)?;
+    let metadata = lease.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 { return Err(denied("control lease must be a private regular inode")); }
+    try_control_lock(&lease)?;
+    match fs::symlink_metadata(path) {
+        Ok(before) => {
+            verify_protected_path(path, true)?;
+            // The lease excludes a live broker even when its accept queue is
+            // full (macOS may return ECONNREFUSED for that too). Also refuse an
+            // independently active/unknown endpoint rather than overwriting it.
+            match connect_control_socket(path, Duration::from_millis(100)) {
+                Ok(_) => return Err(io::Error::new(io::ErrorKind::AddrInUse, "control endpoint is already active")),
+                Err(error) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {},
+                Err(error) => return Err(error),
+            }
+            let after = fs::symlink_metadata(path)?;
+            if before.dev() != after.dev() || before.ino() != after.ino() {
+                return Err(denied("control endpoint changed during stale-socket check"));
+            }
+            fs::remove_file(path)?;
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error),
+    }
+    let control = UnixListener::bind(path)?;
+    // Socket permissions allow the approved user to connect; authentication
+    // remains the kernel audit token, executable digest and live code identity.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o666))?;
+    verify_protected_path(path, true)?;
+    validate_control_listener(&control, path)?;
+    Ok(ControlListener { listener: control, _lease: lease })
 }
 
 #[cfg(target_os = "macos")]
@@ -505,6 +693,57 @@ mod platform {
         }
         if len != 32 || token[5] <= 1 || token[5] > i32::MAX as u32 { return Err(denied("invalid kernel peer token")); }
         Ok(token)
+    }
+    fn short_process_info(pid: u32) -> io::Result<libc::proc_bsdshortinfo> {
+        if pid == 0 || pid > i32::MAX as u32 { return Err(invalid("invalid broker metadata PID")); }
+        let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as i32;
+        // Unlike PROC_PIDTBSDINFO, Darwin permits SHORTBSDINFO across UIDs.
+        // This is metadata only; connection identity comes from peer_token and
+        // the subsequent audit-token-bound path and live-code checks.
+        let actual = unsafe { libc::proc_pidinfo(pid as i32, libc::PROC_PIDT_SHORTBSDINFO, 0,
+            (&mut info as *mut libc::proc_bsdshortinfo).cast(), size) };
+        if actual <= 0 { return Err(io::Error::last_os_error()); }
+        if actual != size { return Err(invalid("short broker metadata returned an unexpected size")); }
+        if info.pbsi_pid != pid { return Err(denied("broker metadata PID changed")); }
+        Ok(info)
+    }
+    fn inspect_broker_token(token: [u32; 8]) -> io::Result<GatewayBrokerIdentity> {
+        let info = at_stage("gateway_broker_short_info", || short_process_info(token[5]))?;
+        if info.pbsi_uid != token[1] { return Err(denied("broker UID changed")); }
+        let executable = at_stage("gateway_broker_audit_path", || {
+            let mut path = [0i8; 4096];
+            let mut token_copy = token;
+            let actual = unsafe { proc_pidpath_audittoken(&mut token_copy, path.as_mut_ptr().cast(), path.len() as u32) };
+            if actual <= 0 { return Err(io::Error::last_os_error()); }
+            if actual as usize >= path.len() { return Err(invalid("broker executable path is not terminated")); }
+            unsafe { CStr::from_ptr(path.as_ptr()) }.to_str().map(str::to_owned)
+                .map_err(|_| denied("invalid broker executable path"))
+        })?;
+        Ok(GatewayBrokerIdentity { pid: info.pbsi_pid, ppid: info.pbsi_ppid, uid: info.pbsi_uid,
+            executable_path: executable, audit_token: token })
+    }
+    pub(super) fn verify_broker_peer(stream: &UnixStream, executable: &str, sha256: &str, cdhash: &str) -> io::Result<GatewayBrokerIdentity> {
+        let token = at_stage("gateway_broker_peer_token", || peer_token(stream))?;
+        if token[1] != 0 { return Err(denied("gateway broker peer is not root")); }
+        let before = inspect_broker_token(token)?;
+        at_stage("gateway_broker_expected_identity", || {
+            if before.ppid != 1 || before.executable_path != executable {
+                return Err(denied("gateway broker is not the approved launchd executable"));
+            }
+            Ok(())
+        })?;
+        at_stage("gateway_broker_executable_digest", || {
+            if crate::sha256_file_hex(Path::new(executable)).as_deref() != Some(sha256) {
+                return Err(denied("unapproved gateway broker executable digest"));
+            }
+            Ok(())
+        })?;
+        at_stage("gateway_broker_live_code", || verify_code(token, cdhash))?;
+        let after = inspect_broker_token(token)?;
+        let after_token = at_stage("gateway_broker_peer_token_recheck", || peer_token(stream))?;
+        if after != before || after_token != token { return Err(denied("gateway broker identity changed")); }
+        Ok(before)
     }
     fn inspect_token(token: [u32; 8]) -> io::Result<ProcessKernelIdentity> {
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -591,11 +830,206 @@ mod platform {
         if unsafe { libc::proc_pidinfo(owner.pid as i32, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size) } != size { return false; }
         info.pbi_start_tvsec != owner.start_seconds || info.pbi_start_tvusec as u32 != owner.start_microseconds
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn broker_short_metadata_reads_root_and_self_without_inventing_connection_identity() {
+            assert_ne!(crate::effective_uid(), 0, "this read-only regression must run as an ordinary user");
+            let root = short_process_info(1).expect("ordinary user can read launchd short metadata");
+            assert_eq!(root.pbsi_pid, 1);
+            assert_eq!(root.pbsi_uid, 0);
+            let pid = std::process::id();
+            let own = short_process_info(pid).unwrap();
+            let mut full: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of_val(&full) as i32;
+            assert_eq!(unsafe { libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0,
+                (&mut full as *mut libc::proc_bsdinfo).cast(), size) }, size);
+            assert_eq!(own.pbsi_pid, full.pbi_pid);
+            assert_eq!(own.pbsi_uid, full.pbi_uid);
+            assert_eq!(own.pbsi_ppid, full.pbi_ppid);
+            assert_eq!(own.pbsi_uid, crate::effective_uid());
+            assert!(short_process_info(0).is_err());
+            assert!(short_process_info(u32::MAX).is_err());
+            // No audit token is fabricated and no connection authentication is
+            // claimed here. Cross-UID signature/FD handoff is a separate fixture.
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gateway_failures_keep_stage_errno_and_original_rejection() {
+        let error = at_stage("gateway_control_path", || -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(libc::ENOENT))
+        }).unwrap_err();
+        let error = at_stage("gateway_startup", || -> io::Result<()> { Err(error) }).unwrap_err();
+        assert_eq!(gateway_error_stage(&error), Some("gateway_control_path"));
+        assert_eq!(gateway_error_os_code(&error), Some(libc::ENOENT));
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("gateway_control_path"));
+        let error = at_stage("gateway_ipv4_owner", || -> io::Result<()> {
+            Err(denied("gateway socket creation credential is not root"))
+        }).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(gateway_error_os_code(&error), None);
+        assert!(error.to_string().contains("creation credential is not root"));
+    }
+
+    #[test]
+    fn gateway_control_listener_requires_actual_listener_and_matching_path() {
+        let directory = std::env::temp_dir().join(format!("cw-gw-control-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("control.sock");
+        let control = UnixListener::bind(&path).unwrap();
+        let result = validate_control_listener(&control, &path);
+        let wrong_path = validate_control_listener(&control, &directory.join("other.sock"));
+        drop(control);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(directory).unwrap();
+        result.expect("real Unix listener satisfies the production listener check");
+        assert!(wrong_path.is_err());
+    }
+
+    #[test]
+    fn gateway_install_waits_only_for_control_readiness_and_remains_bounded() {
+        let mut calls = 0;
+        let result = wait_for_control_startup(Duration::from_millis(250), || {
+            calls += 1;
+            if calls < 3 { at_stage("gateway_control_path", || Err(io::Error::from_raw_os_error(libc::ENOENT))) }
+            else { Ok("ready") }
+        }).unwrap();
+        assert_eq!(result, "ready");
+        assert_eq!(calls, 3);
+        for stage in ["gateway_config_path", "gateway_broker_identity", "gateway_descriptor_protection"] {
+            let mut calls = 0;
+            let result: io::Result<()> = wait_for_control_startup(Duration::from_secs(5), || {
+                calls += 1;
+                at_stage(stage, || Err(io::Error::from_raw_os_error(libc::EACCES)))
+            });
+            assert_eq!(calls, 1, "trust failure must not be retried");
+            assert_eq!(gateway_error_stage(&result.unwrap_err()), Some(stage));
+        }
+        let start = std::time::Instant::now();
+        let result: io::Result<()> = wait_for_control_startup(Duration::from_millis(60), || {
+            at_stage("gateway_control_connect", || Err(io::Error::from_raw_os_error(libc::ECONNREFUSED)))
+        });
+        assert_eq!(gateway_error_os_code(&result.unwrap_err()), Some(libc::ECONNREFUSED));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn gateway_control_connect_handles_real_ipc_and_full_queue_without_hanging() {
+        let directory = std::env::temp_dir().join(format!("cw-gw-connect-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("control.sock");
+        let control = UnixListener::bind(&path).unwrap();
+        let inode = fs::symlink_metadata(&path).unwrap().ino();
+        let lease_path = directory.join("control.lock");
+        let lease = fs::File::create(&lease_path).unwrap();
+        try_control_lock(&lease).unwrap();
+        let mut client = connect_control_socket(&path, Duration::from_millis(100)).unwrap();
+        assert_eq!(unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK, 0);
+        let (mut server, _) = control.accept().unwrap();
+        client.write_all(b"ok").unwrap();
+        let mut received = [0; 2];
+        server.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"ok");
+        drop(client); drop(server);
+        assert_eq!(unsafe { libc::listen(control.as_raw_fd(), 1) }, 0);
+        let started = std::time::Instant::now();
+        let mut queued = Vec::new();
+        let mut full = false;
+        for _ in 0..16 {
+            match connect_control_socket(&path, Duration::from_millis(50)) {
+                Ok(stream) => queued.push(stream),
+                Err(error) => {
+                    assert!(matches!(error.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock));
+                    full = true;
+                    break;
+                }
+            }
+        }
+        assert!(full, "fixture must actually fill the listen queue");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let contender = fs::File::open(&lease_path).unwrap();
+        assert_eq!(try_control_lock(&contender).unwrap_err().kind(), io::ErrorKind::AddrInUse,
+            "the lease, not a refused connection, proves a live broker still owns the endpoint");
+        assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), inode);
+        drop(queued); drop(control);
+        assert_eq!(connect_control_socket(&path, Duration::from_millis(100)).unwrap_err().raw_os_error(), Some(libc::ECONNREFUSED));
+        drop(contender); drop(lease);
+        fs::remove_file(&path).unwrap(); fs::remove_file(&lease_path).unwrap(); fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires separately approved temporary root launchd fixture; never a normal test or install"]
+    fn gateway_launchd_activation_diagnostic() {
+        assert_eq!(crate::effective_uid(), 0);
+        assert_eq!(unsafe { libc::getppid() }, 1);
+        let exe = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let directory = exe.parent().unwrap();
+        assert_eq!(directory.parent(), Some(Path::new("/Library/PrivilegedHelperTools")));
+        assert!(directory.file_name().unwrap().to_str().unwrap().starts_with("cw-gateway-probe."));
+        verify_protected_path(&exe, false).unwrap();
+        // Deliberately a different reserved port from the product's 1023.
+        // The driver refuses an occupied port and never stops other services.
+        let port = 1022;
+        let v4 = TcpListener::from(platform::activated_socket("GatewayV4").expect("activate IPv4"));
+        let v6 = TcpListener::from(platform::activated_socket("GatewayV6").expect("activate IPv6"));
+        let path = directory.join("control.sock");
+        let control = bind_control_listener(&path).expect("bind protected control IPC");
+        for (label, socket) in [("ipv4", &v4), ("ipv6", &v6)] {
+            println!("{}", serde_json::json!({"socket":label,"address":socket.local_addr().unwrap().to_string(),
+                "properties":crate::macos::own_socket_properties(socket.as_raw_fd()),
+                "creator_uid":socket_creator_uid(socket.as_raw_fd()).unwrap(),
+                "reuseport":int_socket_option(socket.as_raw_fd(), libc::SO_REUSEPORT).unwrap(),
+                "reuse_share_uid":int_socket_option(socket.as_raw_fd(), 0x1025).unwrap()}));
+        }
+        println!("{}", serde_json::json!({"socket":"control", "path":control.local_addr().unwrap().as_pathname(),
+            "properties":crate::macos::own_socket_properties(control.as_raw_fd())}));
+        let network = validate_protected_listeners(&v4, &v6, port);
+        let local = validate_control_listener(&control, &path).and_then(|_| verify_protected_path(&path, true));
+        println!("{}", serde_json::json!({"network_error":network.as_ref().err().map(ToString::to_string),
+            "control_error":local.as_ref().err().map(ToString::to_string)}));
+        network.expect("actual launchd IPv4/IPv6 protection validation");
+        local.expect("actual launchd control endpoint validation");
+        let inode = fs::symlink_metadata(&path).unwrap().ino();
+        assert_eq!(bind_control_listener(&path).unwrap_err().kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), inode, "live endpoint must be preserved");
+        // Transfer actual root TCP reservations over the published control
+        // path. No application traffic is forwarded.
+        let client_path = path.clone();
+        let client = std::thread::spawn(move || {
+            let stream = connect_control_socket(&client_path, Duration::from_millis(100)).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let (v4, v6) = receive_listeners(&stream, port).unwrap();
+            validate_protected_listeners(&v4, &v6, port).unwrap();
+        });
+        let (stream, _) = control.accept().unwrap();
+        send_listeners(&stream, &[&v4, &v6]).unwrap();
+        client.join().unwrap();
+        drop(stream);
+        drop(control);
+        let restarted = bind_control_listener(&path).expect("recover a stale socket after broker exit");
+        validate_control_listener(&restarted, &path).unwrap();
+        drop(restarted);
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"do not overwrite").unwrap();
+        assert!(bind_control_listener(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"do not overwrite");
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(directory.join("probe.plist"), &path).unwrap();
+        assert!(bind_control_listener(&path).is_err());
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        println!("control_handoff_live_owner_stale_recovery_unknown_file_and_symlink: verified");
+        // No proxying, engine start, VPN access or production paths.
+    }
     #[test]
     fn gateway_descriptor_transfer_preserves_reservation_and_cloexec() {
         let listener = TcpListener::bind("0.0.0.0:0").unwrap();
@@ -720,5 +1154,91 @@ mod tests {
         assert!(platform::verify_peer(&server, uid, exe.to_str().unwrap(), &sha, &"0".repeat(40)).is_err());
         assert!(platform::verify_peer(&server, uid, exe.to_str().unwrap(), &"0".repeat(64), cdhash).is_err());
         fs::remove_file(path).unwrap(); fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cross_uid_fixture_config() -> (std::path::PathBuf, GatewayInstallConfig) {
+        let directory = std::path::PathBuf::from(std::env::var("CW_GATEWAY_PEER_FIXTURE_ROOT").expect("explicit fixture root"));
+        assert_eq!(directory.parent(), Some(Path::new("/Library/PrivilegedHelperTools")));
+        assert!(directory.file_name().unwrap().to_str().unwrap().starts_with("cw-gateway-peer-probe."));
+        let path = directory.join("config.json");
+        verify_protected_path(&path, false).unwrap();
+        let config: GatewayInstallConfig = serde_json::from_slice(&read_bounded(&path).unwrap()).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.gateway_port, 1022);
+        (directory, config)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires separately approved temporary root launchd and ordinary-user peer fixture"]
+    fn gateway_cross_uid_server_fixture() {
+        assert_eq!(crate::effective_uid(), 0);
+        assert_eq!(unsafe { libc::getppid() }, 1);
+        let (directory, config) = cross_uid_fixture_config();
+        assert_eq!(fs::canonicalize(std::env::current_exe().unwrap()).unwrap(), directory.join("probe"));
+        let v4 = TcpListener::from(platform::activated_socket("GatewayV4").unwrap());
+        let v6 = TcpListener::from(platform::activated_socket("GatewayV6").unwrap());
+        validate_protected_listeners(&v4, &v6, config.gateway_port).unwrap();
+        let control = bind_control_listener(&directory.join("control.sock")).unwrap();
+        for attempt in 0..2 {
+            let (mut stream, _) = control.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let peer = platform::verify_peer(&stream, config.engine_uid, &config.engine_executable,
+                &config.engine_sha256, &config.engine_cdhash).expect("root verifies the ordinary user's actual signed process");
+            assert!(peer.start_seconds > 0);
+            assert!(platform::verify_peer(&stream, 0, &config.engine_executable,
+                &config.engine_sha256, &config.engine_cdhash).is_err());
+            assert!(platform::verify_peer(&stream, config.engine_uid, &config.engine_executable,
+                &"0".repeat(64), &config.engine_cdhash).is_err());
+            assert!(platform::verify_peer(&stream, config.engine_uid, &config.engine_executable,
+                &config.engine_sha256, &"0".repeat(40)).is_err());
+            let mut magic = [0; 8];
+            if attempt == 0 {
+                assert_eq!(stream.read_exact(&mut magic).unwrap_err().kind(), io::ErrorKind::UnexpectedEof,
+                    "client's negative identity checks must not request descriptors");
+                continue;
+            }
+            stream.read_exact(&mut magic).unwrap();
+            assert_eq!(&magic, WIRE_MAGIC);
+            assert_eq!(platform::verify_peer(&stream, config.engine_uid, &config.engine_executable,
+                &config.engine_sha256, &config.engine_cdhash).unwrap(), peer);
+            send_listeners(&stream, &[&v4, &v6]).unwrap();
+            let mut done = [0];
+            assert_eq!(stream.read(&mut done).unwrap(), 0, "keep broker alive through client's post-handoff identity check");
+            println!("root_verified_user_and_transferred_actual_listeners: uid={} pid={}", peer.uid, peer.pid);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "ordinary-user side of the separately approved temporary cross-UID fixture"]
+    fn gateway_cross_uid_client_fixture() {
+        let (directory, config) = cross_uid_fixture_config();
+        assert_eq!(crate::effective_uid(), config.engine_uid);
+        assert_ne!(crate::effective_uid(), 0);
+        let broker = directory.join("probe");
+        let broker = broker.to_str().unwrap();
+        let control = directory.join("control.sock");
+        let stream = connect_control_socket(&control, Duration::from_secs(1)).unwrap();
+        assert!(platform::verify_broker_peer(&stream, &config.engine_executable,
+            &config.broker_sha256, &config.broker_cdhash).is_err());
+        assert!(platform::verify_broker_peer(&stream, broker,
+            &"0".repeat(64), &config.broker_cdhash).is_err());
+        assert!(platform::verify_broker_peer(&stream, broker,
+            &config.broker_sha256, &"0".repeat(40)).is_err());
+        drop(stream);
+        // This is the complete production acquire path, with only the
+        // separately approved fixture paths replacing product install paths.
+        let verified = acquire_gateway_listener_at(&config, broker, &control)
+            .expect("ordinary user validates root audit token, live signature and actual TCP descriptors");
+        let (listener, proof) = verified.into_parts();
+        assert_eq!(proof.endpoint().port(), 1022);
+        assert_eq!(proof.broker_identity().uid, 0);
+        assert_eq!(proof.broker_identity().ppid, 1);
+        assert_eq!(socket_creator_uid(listener.as_raw_fd()).unwrap(), 0);
+        println!("ordinary_user_verified_root_and_acquired_actual_listeners: uid={} broker_pid={}",
+            crate::effective_uid(), proof.broker_identity().pid);
     }
 }

@@ -5,7 +5,6 @@
 //! forwarding -> revocation request (`Disconnecting` / `正在断开`) -> confirmed
 //! socket termination (`Blocked` / `已阻断`), while keeping interception active
 //! so traffic never falls back to direct routing.
-use crate::storage::StateStore;
 use crate::gateway_budget::{GatewayBudget, Slot, MAX_HTTP_BODY_BYTES, MAX_CHUNK_METADATA_BYTES};
 use claude_watch_core::{
     channel::{
@@ -261,6 +260,7 @@ struct EnforcerInner {
     families: BTreeMap<String, FamilyEnforcerState>,
     traces: Vec<ConnectionTraceEvent>,
     next_trace_seq: u64,
+    next_receipt_seq: AtomicU64,
     strict_peer_verification: bool,
 }
 
@@ -283,7 +283,6 @@ pub struct LocalTunnelEnforcer {
     receipt_publication: Arc<Mutex<ReceiptPublication>>,
     next_flow_id: Arc<AtomicU64>,
     gateway_budget: Arc<GatewayBudget>,
-    storage: Option<StateStore>,
 }
 
 impl LocalTunnelEnforcer {
@@ -297,7 +296,7 @@ impl LocalTunnelEnforcer {
     /// Critical invariant: `local_proxy_ready`, `sandbox_ready`, `interception_active`, and
     /// `direct_fallback_blocked` start as `false` and are NEVER defaulted to
     /// `true` at construction!
-    pub fn new(boot_id: impl Into<String>, storage: Option<StateStore>) -> Self {
+    pub fn new(boot_id: impl Into<String>) -> Self {
         let mut local_control_endpoints = BTreeSet::new();
         local_control_endpoints.insert("127.0.0.1:ipc".into());
         local_control_endpoints.insert("localhost:ipc".into());
@@ -330,12 +329,12 @@ impl LocalTunnelEnforcer {
                 families: BTreeMap::new(),
                 traces: Vec::new(),
                 next_trace_seq: 1,
+                next_receipt_seq: AtomicU64::new(1),
                 strict_peer_verification: false,
             })),
             next_flow_id: Arc::new(AtomicU64::new(1)),
             gateway_budget: Arc::new(GatewayBudget::default()),
             receipt_publication: Arc::new(Mutex::new(ReceiptPublication::default())),
-            storage,
         }
     }
 
@@ -707,8 +706,11 @@ impl LocalTunnelEnforcer {
         let receipt = {
             let mut guard = self.lock()?;
             let now = guard.execution_now(|| now);
-            if !guard.families.contains_key(family) {
+            let Some(state) = guard.families.get(family) else {
                 return Ok(None);
+            };
+            if state.local_revoke_reason.as_deref() == Some(reason) {
+                return Self::build_receipt_locked(&guard, family, now).map(Some);
             }
             Self::begin_autonomous_revoke_locked(&mut guard, family, reason, now);
             Self::build_receipt_locked(&guard, family, now)?
@@ -847,7 +849,7 @@ impl LocalTunnelEnforcer {
             }
             timed_out_receipts
         };
-        timed_out_receipts.iter().map(|r| self.publish_current_receipt(r)).collect()
+        Ok(timed_out_receipts)
     }
 
     /// Strict process attribution check (Requirement 5):
@@ -2580,16 +2582,14 @@ impl LocalTunnelEnforcer {
     /// lease deadlines (`now >= valid_until`) at a fixed interval, cutting off
     /// existing connections even when Rust stops renewing leases and no new
     /// connections arrive.
-    pub fn spawn_lease_watchdog<F, C>(
+    pub fn spawn_lease_watchdog<F>(
         self: &Arc<Self>,
         stop: Arc<AtomicBool>,
         interval: Duration,
         mut clock: F,
-        mut on_expired: C,
     ) -> Result<thread::JoinHandle<()>>
     where
         F: FnMut() -> f64 + Send + 'static,
-        C: FnMut(Vec<ChannelEnforcementReceipt>) + Send + 'static,
     {
         let enforcer = Arc::clone(self);
         thread::Builder::new()
@@ -2602,8 +2602,8 @@ impl LocalTunnelEnforcer {
                     if let Ok(mut timeouts) = enforcer.check_disconnect_timeouts_with_clock(&mut clock) {
                         emitted.append(&mut timeouts);
                     }
-                    if !emitted.is_empty() {
-                        on_expired(emitted);
+                    for receipt in emitted {
+                        let _ = enforcer.publish_current_receipt(&receipt);
                     }
                     thread::sleep(interval);
                 }
@@ -2681,7 +2681,6 @@ impl LocalTunnelEnforcer {
         }).map_err(|_| CoreError::new("gateway_relay_worker_failed", "网关发送线程无法启动"))?;
 
         let inner_done = self.inner.clone();
-        let storage_done = self.storage.clone();
         let publication_done = self.receipt_publication.clone();
         thread::Builder::new().name("channel-relay-download".into()).spawn(move || {
             let _slot = flow_slot;
@@ -2748,7 +2747,7 @@ impl LocalTunnelEnforcer {
                 };
                 if let Some(receipt) = maybe_receipt {
                     let _ = Self::publish_current_receipt_shared(
-                        &inner_done, &publication_done, storage_done.as_ref(), &receipt,
+                        &inner_done, &publication_done, &receipt,
                     );
                 }
             }
@@ -2857,6 +2856,7 @@ impl LocalTunnelEnforcer {
             permit_generation: state.last_permit_generation,
             command_seq: state.last_command_seq,
             executor_boot_id: guard.boot_id.clone(),
+            receipt_seq: guard.next_receipt_seq.fetch_add(1, Ordering::Relaxed),
             permit_state: if state.local_revoke_reason.is_some() { ChannelPermitState::Revoked } else { cmd.permit.state },
             enforcement_state: state.enforcement_state,
             interception_active: guard.interception_active,
@@ -2971,53 +2971,31 @@ impl LocalTunnelEnforcer {
     }
 
     fn publish_current_receipt(&self, prior: &ChannelEnforcementReceipt) -> Result<ChannelEnforcementReceipt> {
-        Self::publish_current_receipt_shared(&self.inner, &self.receipt_publication, self.storage.as_ref(), prior)
+        Self::publish_current_receipt_shared(&self.inner, &self.receipt_publication, prior)
     }
 
     fn publish_current_receipt_shared(
         inner: &Arc<Mutex<EnforcerInner>>,
         publication: &Arc<Mutex<ReceiptPublication>>,
-        storage: Option<&StateStore>,
         prior: &ChannelEnforcementReceipt,
     ) -> Result<ChannelEnforcementReceipt> {
-        // A watchdog snapshot can become stale before it reaches disk or its
-        // callback: the relay may already have confirmed actual socket closure.
-        // Serialize publication and re-read authority inside that ordering.
-        // Never hold the authority lock while doing I/O or calling a sink.
-        let (receipt, persisted, dispatch) = {
+        // Asynchronous producers emit through this queue only. Refresh the
+        // actual state under the publication order before dispatching.
+        let (receipt, dispatch) = {
             let mut publisher = publication.lock().map_err(|_| CoreError::new(
                 "receipt_publication_poisoned", "通道回执发布锁不可用"))?;
-            let (receipt, sink, diagnostics) = {
+            let (receipt, sink) = {
                 let guard = inner.lock().map_err(|_| CoreError::new(
                     "enforcer_poisoned", "通道执行器状态锁不可用"))?;
-                // A real clock sample must stay truthful even if it moved
-                // backwards; consumers must see and reject that condition.
-                // Clockless fixtures retain their caller-driven timeline.
                 let now = guard.clock.as_ref().map(|clock| clock()).unwrap_or_else(||
                     prior.observed_at.max(guard.families.get(&prior.family)
                         .map(|s| s.last_updated_at).unwrap_or(prior.observed_at)));
-                (Self::build_receipt_locked(&guard, &prior.family, now)?, guard.receipt_sink.clone(), guard.diagnostics.clone())
+                (Self::build_receipt_locked(&guard, &prior.family, now)?, guard.receipt_sink.clone())
             };
-            let persisted = if let Some(store) = storage { store.atomic_json(
-                &store
-                    .paths
-                    .watch()
-                    .join(format!("state/channel-receipt-{}.json", receipt.family)),
-                &json!(receipt),
-            ) } else { Ok(()) };
-            if let (Some(logger), Err(error)) = (&diagnostics, &persisted) {
-                logger.persistence_failed(crate::channel_diagnostics::ChannelDiagnostic {
-                    component: "channel_enforcer".into(), stage: "persist_receipt".into(),
-                    executor_boot_id: Some(receipt.executor_boot_id.clone()), family: Some(receipt.family.clone()),
-                    session_id: receipt.session_id.clone(), policy_version: Some(receipt.policy_version.clone()),
-                    permit_generation: Some(receipt.permit_generation), command_seq: Some(receipt.command_seq),
-                    ..Default::default()
-                }, error, receipt.observed_at);
-            }
             if let Some(sink) = sink { publisher.pending.push_back((receipt.clone(), sink)); }
             let dispatch = !publisher.dispatching && !publisher.pending.is_empty();
             if dispatch { publisher.dispatching = true; }
-            (receipt, persisted, dispatch)
+            (receipt, dispatch)
         };
         if dispatch {
             loop {
@@ -3035,7 +3013,6 @@ impl LocalTunnelEnforcer {
                 sink(event);
             }
         }
-        persisted?;
         Ok(receipt)
     }
 
@@ -3305,16 +3282,8 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
             }
             Self::build_receipt_locked(&guard, &command.family, now)?
         };
-        if let Some(store) = &self.storage {
-            store.atomic_json(
-                &store
-                    .paths
-                    .watch()
-                    .join(format!("state/channel-command-{}.json", command.family)),
-                &json!(command),
-            )?;
-        }
-        let receipt = self.publish_current_receipt(&receipt)?;
+        // The caller ingests this result inline. Only autonomous executor
+        // transitions go through the event sink.
         Ok(receipt)
     }
 
@@ -3328,6 +3297,7 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
         {
             return Ok(None);
         }
+        let now = guard.execution_now(|| now);
         Ok(Some(Self::build_receipt_locked(&guard, family, now)?))
     }
 
@@ -3387,7 +3357,7 @@ impl LocalTunnelEnforcer {
             }
             updated
         };
-        updated.iter().map(|r| self.publish_current_receipt(r)).collect()
+        Ok(updated)
     }
 }
 
@@ -3472,7 +3442,7 @@ mod control_rpc_contracts {
     }
 
     fn clock_fixture() -> (Arc<LocalTunnelEnforcer>, Arc<AtomicU64>) {
-        let enforcer = Arc::new(LocalTunnelEnforcer::new("publication-boot", None));
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("publication-boot"));
         enforcer.activate_interception(100.).unwrap();
         let millis = Arc::new(AtomicU64::new(100_000));
         let read_clock = millis.clone();
@@ -3607,12 +3577,8 @@ mod control_rpc_contracts {
 
     #[test]
     fn delayed_disconnect_publication_cannot_overwrite_confirmed_socket_closure() {
-        use crate::storage::Paths;
         use std::sync::mpsc;
-        let dir = std::env::temp_dir().join(format!("cw-publication-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
-        let store = StateStore::new(Paths::new(&dir).unwrap());
-        let enforcer = Arc::new(LocalTunnelEnforcer::new("publication-boot", Some(store.clone())));
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("publication-boot"));
         enforcer.activate_interception(100.).unwrap();
         enforcer.set_defer_auto_flow_confirm(true).unwrap();
         enforcer.set_clock(|| 101.).unwrap();
@@ -3652,16 +3618,12 @@ mod control_rpc_contracts {
         let events: Vec<_> = event_rx.try_iter().collect();
         let terminal = events.iter().position(|r| r.enforcement_state == ChannelEnforcementState::Blocked).unwrap();
         assert!(events[terminal..].iter().all(|r| r.active_flows_closed && r.active_flows_count == 0));
-        let persisted = store.read_json(&store.paths.watch().join("state/channel-receipt-claude.json"), json!(null)).unwrap();
-        assert_eq!(persisted["active_flows_closed"], true);
-        assert_eq!(persisted["active_flows_count"], 0);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn receipt_callback_can_reenter_without_deadlock_or_notification_reordering() {
         use std::sync::mpsc;
-        let enforcer = Arc::new(LocalTunnelEnforcer::new("publication-boot", None));
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("publication-boot"));
         enforcer.activate_interception(100.).unwrap();
         let weak = Arc::downgrade(&enforcer);
         let first = AtomicBool::new(true);
@@ -3674,8 +3636,10 @@ mod control_rpc_contracts {
                 enforcer.revoke_family("claude", "reentrant_fixture", 101.).unwrap();
             }
         }).unwrap();
+        let applied = enforcer.apply_command(&publication_command(), 100.).unwrap();
+        assert!(event_rx.try_recv().is_err(), "command result must not also enter the event queue");
         let (done_tx, done_rx) = mpsc::channel();
-        let worker = thread::spawn(move || { done_tx.send(enforcer.apply_command(&publication_command(), 100.)).unwrap(); });
+        let worker = thread::spawn(move || { done_tx.send(enforcer.publish_current_receipt(&applied)).unwrap(); });
         done_rx.recv_timeout(Duration::from_secs(2)).expect("sink mutation must not deadlock publication").unwrap();
         worker.join().unwrap();
         let events: Vec<_> = event_rx.try_iter().collect();
@@ -3686,12 +3650,14 @@ mod control_rpc_contracts {
 
     #[test]
     fn receipt_publication_reports_the_real_clock_even_when_it_moves_backwards() {
-        let enforcer = LocalTunnelEnforcer::new("publication-boot", None);
+        let enforcer = LocalTunnelEnforcer::new("publication-boot");
         enforcer.activate_interception(100.).unwrap();
         let old = enforcer.apply_command(&publication_command(), 100.).unwrap();
         enforcer.set_clock(|| 90.).unwrap();
         let published = enforcer.publish_current_receipt(&old).unwrap();
         assert_eq!(published.observed_at, 90., "a queued receipt cannot conceal clock rollback with max(old_time)");
+        let refreshed = enforcer.receipt_for("claude", 110.).unwrap().unwrap();
+        assert_eq!(refreshed.observed_at, 90., "refresh must sample the executor clock, not the caller's later time");
     }
 
     #[test]
@@ -3720,7 +3686,7 @@ mod control_rpc_contracts {
     #[test]
     fn gateway_denies_unattributed_body_and_preserves_owned_flow_at_capacity() {
         use crate::gateway_budget::Limits;
-        let mut enforcer = LocalTunnelEnforcer::new("publication-boot", None);
+        let mut enforcer = LocalTunnelEnforcer::new("publication-boot");
         enforcer.gateway_budget = Arc::new(GatewayBudget::with_limits(Limits {
             connections: 1, unattributed: 1, bytes: 8, bytes_per_source: 8, ..Limits::default()
         }));
@@ -3810,7 +3776,7 @@ mod control_rpc_contracts {
 
     #[test]
     fn revoke_closes_the_actual_ingress_without_waiting_for_the_gateway_writer() {
-        let enforcer = Arc::new(LocalTunnelEnforcer::new("publication-boot", None));
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("publication-boot"));
         enforcer.activate_interception(100.).unwrap();
         enforcer.set_clock(|| 100.).unwrap();
         let command = publication_command();
@@ -3886,7 +3852,7 @@ mod control_rpc_contracts {
 
     #[test]
     fn retired_control_protocol_cannot_fetch_authority() {
-        let enforcer = Arc::new(LocalTunnelEnforcer::new("live-boot", None));
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("live-boot"));
         enforcer.set_strict_peer_verification(true);
         let (mut client, server) = UnixStream::pair().unwrap();
         client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();

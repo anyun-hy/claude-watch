@@ -135,6 +135,11 @@ impl Fake {
         std::fs::write(self.layout.trash().join("unrelated-user-file"), "keep trash")
             .expect("other trash");
         make_app(&self.layout.app, "3.0.0", "313");
+        let engine = self.layout.project.join("target/aarch64-apple-darwin/release/claude-watch-engine");
+        std::fs::create_dir_all(engine.parent().unwrap()).unwrap();
+        std::fs::write(&engine, b"fixture current uninstall engine").unwrap();
+        set_mode(&engine, 0o755);
+
         write_plist(
             &self.layout.agent(),
             json!({"Label": "io.local.claudewatch.agent"}),
@@ -267,6 +272,18 @@ impl Runner for Fake {
         let command = args[0].as_str();
         let fail = self.fail.borrow().clone();
         match command {
+            "/bin/ps" if args.get(2).map(String::as_str) == Some("pid=,uid=,comm=") => {
+                let mut executable_rows = "7 0 /usr/bin/true\n".to_owned();
+                for row in self.process_output.borrow().lines() {
+                    // Existing ps fixture rows are uid + argv. Only named
+                    // fixture processes contribute their real executable.
+                    let Some((uid, command)) = row.split_once(' ') else { continue; };
+                    if let Some(executable) = command.strip_suffix(" daemon").or_else(|| command.strip_suffix(" inventory")) {
+                        executable_rows.push_str(&format!("91 {uid} {executable}\n"));
+                    }
+                }
+                Ok(result(0, &executable_rows, ""))
+            }
             "/bin/ps" => Ok(result(0, &self.process_output.borrow(), "")),
             "/bin/date" => Ok(result(0, "20261103-010101\n", "")),
             "/fixture/xcrun" => Ok(result(
@@ -924,27 +941,17 @@ fn current_state_change_after_confirmation_stops() {
 }
 
 #[test]
-fn leftovers_of_the_retired_copy_do_not_block_a_fresh_install() {
-    // Repro of the reinstall that stalled after data cleanup: the bundle and
-    // the data directory were already gone, but a process started from the
-    // old paths was still listed. Blocking there leaves the machine without
-    // an app at all, so a retired leftover must be reported, not obeyed.
+fn residual_observer_is_not_ignored_after_old_bundle_and_data_move() {
     let h = Harness::new();
     std::fs::remove_dir_all(&h.fake.layout.app).expect("app removed");
     std::fs::remove_dir_all(h.fake.layout.base()).expect("data removed");
     *h.fake.process_output.borrow_mut() = format!(
-        "{} {}/runtime/watch-engine daemon\n",
-        h.fake.uid,
-        h.fake.layout.base().display()
+        "{} {}/runtime/watch-native-observer inventory\n",
+        h.fake.uid, h.fake.layout.base().display()
     );
-    assert_eq!(
-        h.perform("3.0.0", "314", false, "y").expect("flow must finish"),
-        flow::Outcome::Installed
-    );
-    assert_eq!(
-        h.fake.identity(&h.fake.layout.app),
-        ("3.0.0".into(), "314".into())
-    );
+    h.blocked(h.perform("3.0.0", "314", false, "y"), "watch-native-observer");
+    assert!(!h.fake.calls().iter().any(|call| call[0] == "/bin/bash"));
+    h.assert_preserved();
 }
 
 #[test]

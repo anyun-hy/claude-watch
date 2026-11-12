@@ -35,6 +35,8 @@ impl ObserverAction {
 pub enum ReadCommand {
     Observer(ObserverAction),
     ProcessTable,
+    /// Metadata only for known listener owners; never scans all processes.
+    ProcessTablePids { pids: Vec<u32> },
     Interfaces,
     Plist(PathBuf),
     Listeners,
@@ -125,7 +127,7 @@ impl ReadCommand {
     fn key(&self) -> Key {
         match self {
             Self::Observer(action) => Key::Observer(*action),
-            Self::ProcessTable => Key::ProcessTable,
+            Self::ProcessTable | Self::ProcessTablePids { .. } => Key::ProcessTable,
             Self::Interfaces => Key::Interfaces,
             Self::Plist(_) => Key::Plist,
             Self::Listeners => Key::Listeners,
@@ -162,6 +164,14 @@ impl ReadCommand {
                     .map(Into::into)
                     .collect(),
             ),
+            Self::ProcessTablePids { pids } => {
+                if pids.is_empty() || pids.len() > 2048 || pids.iter().any(|pid| *pid <= 1 || *pid > i32::MAX as u32) {
+                    return Err(CoreError::new("invalid_process_targets", "定点进程元数据目标无效"));
+                }
+                ("/bin/ps".into(), vec!["-ww".into(), "-p".into(),
+                    pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",").into(),
+                    "-o".into(), "pid=,ppid=,uid=,lstart=,comm=".into()])
+            }
             Self::Interfaces => ("/sbin/ifconfig".into(), vec![]),
             Self::Plist(path) => {
                 if !path.is_absolute() || path.extension().is_none_or(|v| v != "plist") {
@@ -391,11 +401,17 @@ fn bounded_pid_list(pids: &[u32], maximum: usize) -> Result<String> {
         .join(","))
 }
 impl<R: ReadRunner + ?Sized> ReadRunner for &R {
+    fn process_identity(&self, pid: u32) -> Option<claude_watch_core::processes::Identity> {
+        (*self).process_identity(pid)
+    }
     fn run(&self, c: ReadCommand, i: &[u8], t: Duration, l: usize) -> Result<Output> {
         (*self).run(c, i, t, l)
     }
 }
 impl<R: ReadRunner + ?Sized> ReadRunner for std::sync::Arc<R> {
+    fn process_identity(&self, pid: u32) -> Option<claude_watch_core::processes::Identity> {
+        self.as_ref().process_identity(pid)
+    }
     fn run(&self, c: ReadCommand, i: &[u8], t: Duration, l: usize) -> Result<Output> {
         self.as_ref().run(c, i, t, l)
     }
@@ -418,6 +434,16 @@ impl Output {
     }
 }
 pub trait ReadRunner {
+    /// A bounded kernel query for one already selected PID. Native listener
+    /// provenance must not pay for a whole-machine inventory every read.
+    fn process_identity(&self, pid: u32) -> Option<claude_watch_core::processes::Identity> {
+        let id = claude_watch_system::inspect_process_identity(pid)?;
+        Some(claude_watch_core::processes::Identity {
+            pid: id.pid, parent: id.ppid, uid: id.uid, executable: id.executable_path,
+            start_seconds: id.start_seconds, start_microseconds: id.start_microseconds,
+            start_stamp: claude_watch_system::process_start_stamp(id.start_seconds)?,
+        })
+    }
     fn run(
         &self,
         command: ReadCommand,
@@ -425,6 +451,36 @@ pub trait ReadRunner {
         timeout: Duration,
         limit: usize,
     ) -> Result<Output>;
+}
+
+/// Carries a caller's total budget through compound native-listener validation.
+/// Nested process/launchd checks must not each restart a three-second timeout.
+pub(crate) struct DeadlineRunner<'a, R> {
+    runner: &'a R,
+    deadline: Instant,
+}
+impl<'a, R> DeadlineRunner<'a, R> {
+    pub(crate) fn new(runner: &'a R, budget: Duration) -> Self {
+        Self { runner, deadline: Instant::now() + budget }
+    }
+}
+impl<R: ReadRunner> ReadRunner for DeadlineRunner<'_, R> {
+    fn process_identity(&self, pid: u32) -> Option<claude_watch_core::processes::Identity> {
+        if Instant::now() >= self.deadline { return None; }
+        let identity = self.runner.process_identity(pid)?;
+        (Instant::now() < self.deadline).then_some(identity)
+    }
+    fn run(&self, command: ReadCommand, input: &[u8], timeout: Duration, limit: usize) -> Result<Output> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(CoreError::new("command_timeout", "系统只读采样超出本轮总时限"));
+        }
+        let output = self.runner.run(command, input, timeout.min(remaining), limit)?;
+        if Instant::now() >= self.deadline {
+            return Err(CoreError::new("command_timeout", "系统只读采样超出本轮总时限"));
+        }
+        Ok(output)
+    }
 }
 pub struct SystemRunner {
     observer: PathBuf,
@@ -507,6 +563,10 @@ impl SystemRunner {
     pub fn listener_channel_finished(&self) -> bool {
         self.listeners.as_ref().is_some_and(|s| s.is_finished())
     }
+    pub fn start_listener_publisher(self: &std::sync::Arc<Self>, store: crate::storage::StateStore,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<Option<crate::native_listener::ListenerCachePublisher>> {
+        self.listeners.as_ref().map(|stream| stream.start_publisher(store, self.clone(), stop)).transpose()
+    }
     fn reap_or_block(&self, key: Key) -> Result<()> {
         let mut pending = self
             .pending
@@ -551,10 +611,10 @@ impl ReadRunner for SystemRunner {
                 "系统采样参数或资源上限无效",
             ));
         }
-        let key = command.key();
         if matches!(command, ReadCommand::Listeners) {
+            let bounded = DeadlineRunner { runner: self, deadline: Instant::now() + timeout };
             if let Some(stream) = &self.listeners {
-                return stream.read(self);
+                return stream.read_with_timeout(&bounded, timeout);
             }
             // The published cache is a hardened path, never the only source.
             // A stale frame, a rejected frame boundary or a changed sampling
@@ -563,12 +623,24 @@ impl ReadRunner for SystemRunner {
             // listener, and every UI-spawned engine stays "unconfirmed".
             if let Some(store) = &self.listener_cache {
                 if crate::native_listener::cache_exists(store) {
-                    if let Ok(output) = crate::native_listener::read_cached(store, self) {
+                    if let Ok(output) = crate::native_listener::read_cached(store, &bounded) {
                         return Ok(output);
                     }
                 }
             }
+            // Cache validation consumes the same budget as the netstat fallback.
+            let remaining = bounded.deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(CoreError::new("command_timeout", "系统监听采样超出本轮总时限"));
+            }
+            return self.run_uncached(command, input, remaining, limit);
         }
+        self.run_uncached(command, input, timeout, limit)
+    }
+}
+impl SystemRunner {
+    fn run_uncached(&self, command: ReadCommand, input: &[u8], timeout: Duration, limit: usize) -> Result<Output> {
+        let key = command.key();
         self.reap_or_block(key)?;
         let (program, args) = command.spec(&self.observer)?;
         let started = Instant::now();
@@ -646,7 +718,66 @@ impl ReadRunner for SystemRunner {
 
 #[cfg(test)]
 mod agent_identity_tests {
-    use super::loaded_agent_identity;
+    use super::{loaded_agent_identity, DeadlineRunner, Output, ReadCommand, ReadRunner};
+    use std::{cell::RefCell, time::{Duration, Instant}};
+    #[test]
+    fn wrapped_identity_readers_preserve_overrides_and_deadlines() {
+        use claude_watch_core::processes::Identity;
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        struct Source(Arc<AtomicUsize>);
+        impl ReadRunner for Source {
+            fn process_identity(&self, pid: u32) -> Option<Identity> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Some(Identity { pid, parent: 1, uid: 501, executable: "/fixture/source".into(),
+                    start_seconds: 123, start_microseconds: 4, start_stamp: "fixture-start".into() })
+            }
+            fn run(&self, _: ReadCommand, _: &[u8], _: Duration, _: usize) -> claude_watch_core::error::Result<Output> {
+                panic!("identity lookup must use the supplied reader");
+            }
+        }
+        fn read<R: ReadRunner>(r: R) -> Option<Identity> { r.process_identity(42) }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(Source(calls.clone()));
+        assert_eq!(read(source.clone()).unwrap().executable, "/fixture/source");
+        assert_eq!(read(source.as_ref()).unwrap().start_microseconds, 4);
+        let expired = Arc::new(DeadlineRunner::new(source.as_ref(), Duration::ZERO));
+        assert!(read(expired.clone()).is_none());
+        assert!(read(expired.as_ref()).is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "wrapping must not bypass the expired deadline");
+    }
+    #[test]
+    fn targeted_process_table_rejects_unbounded_or_invalid_pid_lists() {
+        let observer = std::path::Path::new("/fixture/observer");
+        for pids in [vec![], vec![0], vec![1], vec![u32::MAX], vec![10; 2049]] {
+            assert_eq!(ReadCommand::ProcessTablePids { pids }.spec(observer).err().unwrap().code, "invalid_process_targets");
+        }
+        let (program, args) = ReadCommand::ProcessTablePids { pids: vec![20, 30] }.spec(observer).unwrap();
+        assert_eq!(program, std::path::Path::new("/bin/ps"));
+        assert_eq!(args, ["-ww", "-p", "20,30", "-o", "pid=,ppid=,uid=,lstart=,comm="].map(std::ffi::OsString::from));
+    }
+    #[test]
+    fn compound_listener_reads_share_one_deadline() {
+        struct Source(RefCell<Vec<Duration>>);
+        impl ReadRunner for Source {
+            fn run(&self, _: ReadCommand, _: &[u8], timeout: Duration, _: usize) -> claude_watch_core::error::Result<Output> {
+                self.0.borrow_mut().push(timeout);
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(Output { status: 0, stdout: vec![], stderr: vec![] })
+            }
+        }
+        let source = Source(RefCell::new(vec![]));
+        let bounded = DeadlineRunner { runner: &source, deadline: Instant::now() + Duration::from_millis(100) };
+        for _ in 0..2 {
+            bounded.run(ReadCommand::ProcessTable, &[], Duration::from_secs(3), 1024).unwrap();
+        }
+        let timeouts = source.0.borrow();
+        assert!(timeouts[0] <= Duration::from_millis(100));
+        assert!(timeouts[1] + Duration::from_millis(15) < timeouts[0]);
+        drop(timeouts);
+        let expired = DeadlineRunner { runner: &source, deadline: Instant::now() };
+        assert_eq!(expired.run(ReadCommand::ProcessTable, &[], Duration::from_secs(3), 1024).err().unwrap().code, "command_timeout");
+        assert_eq!(source.0.borrow().len(), 2, "no command starts after the deadline");
+    }
     #[test]
     fn nested_coalition_state_cannot_replace_service_identity() {
         let live="gui/501/io.local.claudewatch.agent = {\n\tstate = running\n\tpid = 123\n\tresource coalition = {\n\t\tstate = active\n\t\tpid = 999\n\t}\n}\n";

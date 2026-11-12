@@ -39,14 +39,12 @@ private_temp_dir() {
   print -r -- "$result"
 }
 
-file_bytes() {
-  /usr/bin/wc -c < "$1" | /usr/bin/tr -d '[:space:]'
-}
-
 collect() {
   [[ $# == 1 && "$1" == <-> ]] || fail 'invalid collector parent'
   local supervisor_pid=$1
   [[ "$PPID" == "$supervisor_pid" ]] || fail 'collector parent mismatch'
+  zmodload zsh/datetime || fail 'collector clock unavailable'
+  zmodload -F zsh/stat b:zstat || fail 'collector file-size reader unavailable'
   local temp_dir
   temp_dir=$(private_temp_dir) || fail 'private temporary directory unavailable'
   cleanup_collector() {
@@ -68,28 +66,35 @@ collect() {
     (( seq += 1 ))
     local before="$temp_dir/before" net="$temp_dir/net" err="$temp_dir/net.err" after="$temp_dir/after"
     : > "$before"; : > "$net"; : > "$err"; : > "$after"
-    local start_epoch=$(/bin/date +%s)
+    local start_epoch=$EPOCHREALTIME
     /bin/ps -ww -axo 'pid=,ppid=,uid=,lstart=,comm=' > "$before" 2>/dev/null
     local before_rc=$?
     /usr/sbin/netstat -anv -p tcp 2> "$err" | /usr/bin/awk '$6 == "LISTEN" { print }' > "$net"
     local net_rc=$?
     /bin/ps -ww -axo 'pid=,ppid=,uid=,lstart=,comm=' > "$after" 2>/dev/null
     local after_rc=$?
-    local end_epoch=$(/bin/date +%s)
-    local before_len=$(file_bytes "$before") net_len=$(file_bytes "$net") err_len=$(file_bytes "$err") after_len=$(file_bytes "$after")
+    local end_epoch=$EPOCHREALTIME
+    local -a sizes
+    zstat -A sizes +size -- "$before" "$net" "$err" "$after" || fail 'cannot read collector frame sizes'
+    local before_len=${sizes[1]} net_len=${sizes[2]} err_len=${sizes[3]} after_len=${sizes[4]}
     local total_len=$((before_len + net_len + err_len + after_len))
     if (( before_len > MAX_FILE_BYTES || net_len > MAX_FILE_BYTES || err_len > MAX_FILE_BYTES || after_len > MAX_FILE_BYTES || total_len > MAX_TOTAL_BYTES )); then
       : > "$before"; : > "$net"; : > "$after"
       print -rn -- 'collector output exceeded bounded limit' > "$err"
       before_rc=125; net_rc=125; after_rc=125
-      before_len=0; net_len=0; after_len=0; err_len=$(file_bytes "$err")
+      zstat -A sizes +size -- "$err" || fail 'cannot read collector error size'
+      before_len=0; net_len=0; after_len=0; err_len=${sizes[1]}
     fi
     # External printf returns EPIPE as a normal child failure. zsh's builtin
     # can abort the function before its private-directory cleanup executes.
     /usr/bin/printf '%s\n' "$FRAME_MAGIC $supervisor_pid $$ $seq $start_epoch $end_epoch $before_rc $net_rc $after_rc $before_len $net_len $err_len $after_len" 2>/dev/null || break
     /bin/cat -- "$before" "$net" "$err" "$after" 2>/dev/null || break
     /usr/bin/printf '\n' 2>/dev/null || break
-    sleep "$ROUND_SECONDS"
+    # Include work and frame delivery in the interval. Sleeping a full round
+    # after collection can leave a gap longer than the VPN evidence lifetime.
+    local -F remaining=$(( ROUND_SECONDS - (EPOCHREALTIME - start_epoch) ))
+    if (( remaining > ROUND_SECONDS )); then remaining=$ROUND_SECONDS; fi
+    if (( remaining > 0 )); then /bin/sleep "$remaining"; fi
   done
   cleanup_collector
 }

@@ -283,6 +283,9 @@ pub fn record(
     }
 }
 pub fn error_reason(error: &io::Error) -> &'static str {
+    if let Some(stage) = claude_watch_system::launchd_gateway::gateway_error_stage(error) {
+        return stage;
+    }
     let message = error.to_string();
     if message.contains("still running") {
         "operation_busy"

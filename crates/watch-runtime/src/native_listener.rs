@@ -19,7 +19,7 @@ use std::{
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex,
     },
     thread,
@@ -37,6 +37,9 @@ const MAX_TOTAL: usize = 8 * 1024 * 1024;
 // then judged stale. Fifteen seconds covers two whole rounds plus scheduling
 // jitter while still refusing genuinely abandoned samples.
 const MAX_AGE: f64 = 15.0;
+/// Internal annotation ignored by netstat-row parsers. Consumers with tighter
+/// evidence TTLs must preserve this capture time instead of stamping a reread.
+pub(crate) const FRAME_META_PREFIX: &str = "# CW_LISTENER_FRAME ";
 fn error(code: &str, detail: &str) -> CoreError {
     CoreError::new(code, detail)
 }
@@ -112,8 +115,17 @@ fn frame<R: BufRead>(reader: &mut R) -> Result<Option<Raw>> {
     if fields.len() != 13 || fields[0] != "CWLISTENER1" {
         return Err(invalid());
     }
-    let n = fields[1..]
+    let timestamp = |value: &str| -> Result<f64> {
+        if value.len() > 32 || !value.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+            return Err(invalid());
+        }
+        value.parse::<f64>().ok().filter(|t| t.is_finite() && *t > 0.0).ok_or_else(invalid)
+    };
+    let started = timestamp(fields[4])?;
+    let finished = timestamp(fields[5])?;
+    let n = fields[1..4]
         .iter()
+        .chain(&fields[6..])
         .map(|v| v.parse::<u64>().map_err(|_| invalid()))
         .collect::<Result<Vec<_>>>()?;
     if n[0] < 2
@@ -121,14 +133,13 @@ fn frame<R: BufRead>(reader: &mut R) -> Result<Option<Raw>> {
         || n[0] > u32::MAX as u64
         || n[1] > u32::MAX as u64
         || n[2] == 0
-        || n[3] == 0
-        || n[4] < n[3]
-        || n[4] - n[3] > 5
-        || n[5..8].iter().any(|v| *v > 255)
+        || finished < started
+        || finished - started > 5.0
+        || n[3..6].iter().any(|v| *v > 255)
     {
         return Err(invalid());
     }
-    let lengths = n[8..12]
+    let lengths = n[6..10]
         .iter()
         .map(|v| usize::try_from(*v).map_err(|_| invalid()))
         .collect::<Result<Vec<_>>>()?;
@@ -151,9 +162,9 @@ fn frame<R: BufRead>(reader: &mut R) -> Result<Option<Raw>> {
         supervisor: n[0] as u32,
         collector: n[1] as u32,
         sequence: n[2],
-        started: n[3] as f64,
-        finished: n[4] as f64,
-        statuses: [n[5] as i32, n[6] as i32, n[7] as i32],
+        started,
+        finished,
+        statuses: [n[3] as i32, n[4] as i32, n[5] as i32],
         before: parts.next().unwrap(),
         table: parts.next().unwrap(),
         errors: parts.next().unwrap(),
@@ -309,10 +320,9 @@ fn verify_context<R: ReadRunner>(
         expected.push(c.clone());
     }
     let observer = Observer { runner };
-    let current = observer.identities(&expected, "native-listener-origin")?;
     if expected
         .iter()
-        .any(|i| !current.get(&i.pid).is_some_and(|v| v.same_process(i)))
+        .any(|i| !runner.process_identity(i.pid).is_some_and(|v| v.same_process(i)))
     {
         return Err(error(
             "native_listener_origin_changed",
@@ -344,6 +354,11 @@ fn verify_context<R: ReadRunner>(
                 "系统采样进程参数与固定组件不符",
             ));
         }
+    }
+    // Arguments are read between lifetime checks. PID reuse/exec or a replaced
+    // collector must not borrow a former source's validated argument prefix.
+    if expected.iter().any(|i| !runner.process_identity(i.pid).is_some_and(|v| v.same_process(i))) {
+        return Err(error("native_listener_origin_changed", "系统采样来源在参数读取期间变化"));
     }
     if job {
         let mut expected = prefix;
@@ -408,7 +423,7 @@ fn output<R: ReadRunner>(e: &Evidence, p: &Proof, runner: &R, job: bool) -> Resu
         }
     }
     let current = runner.run(
-        ReadCommand::ProcessTable,
+        ReadCommand::ProcessTablePids { pids: e.owners.keys().copied().collect() },
         &[],
         Duration::from_secs(3),
         MAX_PART,
@@ -461,7 +476,12 @@ fn output<R: ReadRunner>(e: &Evidence, p: &Proof, runner: &R, job: bool) -> Resu
     }
     Ok(Output {
         status: 0,
-        stdout: table.into_bytes(),
+        stdout: format!("{FRAME_META_PREFIX}{}\n{table}", json!({
+            "captured_at": e.finished, "sequence": e.sequence,
+            "origin_id": format!("{}:{}:{}:{}:{}:{}", p.supervisor.pid,
+                p.supervisor.start_seconds, p.supervisor.start_microseconds,
+                p.collector.pid, p.collector.start_seconds, p.collector.start_microseconds),
+        })).into_bytes(),
         stderr: vec![],
     })
 }
@@ -471,6 +491,8 @@ pub struct ListenerStream {
     worker: Identity,
     supervisor: Identity,
     state: Arc<(Mutex<Option<Result<Evidence>>>, Condvar)>,
+    revision: Arc<AtomicU64>,
+    published_revision: Mutex<Option<u64>>,
     finished: Arc<AtomicBool>,
 }
 impl ListenerStream {
@@ -485,22 +507,13 @@ impl ListenerStream {
         }
         let root =
             fs::canonicalize(executable.parent().ok_or_else(invalid)?).map_err(|_| invalid())?;
-        let inv = Observer { runner }.inventory()?;
-        let worker = inv
-            .processes
-            .get(&std::process::id())
-            .ok_or_else(invalid)?
-            .identity
-            .clone();
-        let supervisor = inv
-            .processes
-            .get(&worker.parent)
-            .ok_or_else(invalid)?
-            .identity
-            .clone();
+        let worker = runner.process_identity(std::process::id()).ok_or_else(invalid)?;
+        let supervisor = runner.process_identity(worker.parent).ok_or_else(invalid)?;
         resources(&root, worker.uid)?;
         let state = Arc::new((Mutex::new(None), Condvar::new()));
         let shared = state.clone();
+        let revision = Arc::new(AtomicU64::new(0));
+        let reader_revision = revision.clone();
         let finished = Arc::new(AtomicBool::new(false));
         let reader_finished = finished.clone();
         thread::Builder::new()
@@ -522,6 +535,7 @@ impl ListenerStream {
                     };
                     if let Ok(mut latest) = shared.0.lock() {
                         *latest = Some(raw);
+                        reader_revision.fetch_add(1, Ordering::Release);
                         shared.1.notify_all();
                     } else {
                         break;
@@ -538,34 +552,35 @@ impl ListenerStream {
             worker,
             supervisor,
             state,
+            revision,
+            published_revision: Mutex::new(None),
             finished,
         }))
     }
     pub fn is_finished(&self) -> bool {
         self.finished.load(Ordering::Acquire)
     }
-    fn latest(&self) -> Result<Evidence> {
+    fn latest_with_timeout(&self, timeout: Duration) -> Result<Evidence> {
+        self.publication_snapshot(timeout)?.1
+    }
+    fn publication_snapshot(&self, timeout: Duration) -> Result<(u64, Result<Evidence>)> {
         let mut state = self.state.0.lock().map_err(|_| invalid())?;
         if state.is_none() {
             state = self
                 .state
                 .1
-                .wait_timeout_while(state, Duration::from_secs(5), |s| s.is_none())
+                .wait_timeout_while(state, timeout, |s| s.is_none())
                 .map_err(|_| invalid())?
                 .0;
         }
-        state
+        let observed = state
             .clone()
-            .unwrap_or_else(|| Err(error("native_listener_pending", "尚未收到系统监听采样")))
+            .unwrap_or_else(|| Err(error("native_listener_pending", "尚未收到系统监听采样")));
+        Ok((self.revision.load(Ordering::Acquire), observed))
     }
     fn proof<R: ReadRunner>(&self, e: &Evidence, runner: &R) -> Result<Proof> {
-        let inv = Observer { runner }.inventory()?;
-        let collector = inv
-            .processes
-            .get(&e.collector)
-            .ok_or_else(|| error("native_listener_origin_changed", "系统采样进程已退出"))?
-            .identity
-            .clone();
+        let collector = runner.process_identity(e.collector)
+            .ok_or_else(|| error("native_listener_origin_changed", "系统采样进程已退出"))?;
         Ok(Proof {
             supervisor: self.supervisor.clone(),
             worker: self.worker.clone(),
@@ -574,11 +589,36 @@ impl ListenerStream {
         })
     }
     pub fn read<R: ReadRunner>(&self, runner: &R) -> Result<Output> {
-        let e = self.latest()?;
+        self.read_with_timeout(runner, Duration::from_secs(5))
+    }
+    pub(crate) fn read_with_timeout<R: ReadRunner>(&self, runner: &R, timeout: Duration) -> Result<Output> {
+        let e = self.latest_with_timeout(timeout)?;
         let p = self.proof(&e, runner)?;
         output(&e, &p, runner, false)
     }
     pub fn publish<R: ReadRunner>(&self, store: &StateStore, runner: &R) -> Result<()> {
+        let (revision, observed) = self.publication_snapshot(Duration::from_secs(5))?;
+        self.publish_observation(store, runner, observed)?;
+        *self.published_revision.lock().map_err(|_| invalid())? = Some(revision);
+        Ok(())
+    }
+    fn publish_changed<R: ReadRunner>(&self, store: &StateStore, runner: &R,
+        previous: &mut Option<u64>) -> Result<bool> {
+        let (revision, observed) = {
+            let state = self.state.0.lock().map_err(|_| invalid())?;
+            let Some(observed) = state.as_ref() else { return Ok(false); };
+            let revision = self.revision.load(Ordering::Acquire);
+            if *previous == Some(revision) { return Ok(false); }
+            (revision, observed.clone())
+        };
+        self.publish_observation(store, runner, observed)?;
+        *previous = Some(revision);
+        Ok(true)
+    }
+    fn publish_observation<R: ReadRunner>(&self, store: &StateStore, runner: &R,
+        observed: Result<Evidence>) -> Result<()> {
+        let bounded = crate::commands::DeadlineRunner::new(runner, Duration::from_secs(1));
+        let runner = &bounded;
         let actor = Actor {
             supervisor: self.supervisor.clone(),
             worker: self.worker.clone(),
@@ -587,7 +627,7 @@ impl ListenerStream {
         let value = (|| {
             verify_actor(&actor, runner, false)?;
             let observed = (|| {
-                let e = self.latest()?;
+                let e = observed?;
                 let p = self.proof(&e, runner)?;
                 output(&e, &p, runner, false)?;
                 Ok(Captured {
@@ -614,6 +654,66 @@ impl ListenerStream {
                 .unwrap_or_else(|e| json!({"schema":2,"error":e.code,"observed_at":native::now()})),
         )
     }
+
+    /// Publish new native frames independently from UI/process collection.
+    /// Identity checks happen only for a changed frame/error; unchanged frames
+    /// retain both their original capture time and cache publication time.
+    pub fn start_publisher<R: ReadRunner + Send + Sync + 'static>(self: &Arc<Self>,
+        store: StateStore, runner: Arc<R>, stop: Arc<AtomicBool>) -> Result<ListenerCachePublisher> {
+        let stream = self.clone();
+        let failure = Arc::new(Mutex::new(None));
+        let thread_failure = failure.clone();
+        let thread_stop = stop.clone();
+        // The bootstrap publication may already contain the newest frame.
+        let mut previous = *self.published_revision.lock().map_err(|_| invalid())?;
+        let worker = thread::Builder::new().name("watch-native-cache-publisher".into()).spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                while !thread_stop.load(Ordering::Acquire) {
+                    stream.publish_changed(&store, runner.as_ref(), &mut previous)?;
+                    if stream.is_finished() {
+                        // EOF can arrive during verification of the preceding
+                        // frame. Publish its terminal observation before exit.
+                        stream.publish_changed(&store, runner.as_ref(), &mut previous)?;
+                        return Err(error("native_listener_worker_failed", "系统采样通道已结束，等待后台重新启动"));
+                    }
+                    thread::sleep(Duration::from_millis(250));
+                }
+                Ok(())
+            })).unwrap_or_else(|_| Err(error("native_listener_publisher_panicked", "系统采样发布线程异常退出")));
+            if let Err(ref error) = outcome {
+                let _ = store.atomic_json(&store.paths.watch().join("state/native-listener-publisher-error.json"),
+                    &json!({"schema":1,"time":native::now(),"code":error.code}));
+                if let Ok(mut failure) = thread_failure.lock() { *failure = Some(error.clone()); }
+                thread_stop.store(true, Ordering::Release);
+            }
+            outcome
+        }).map_err(|_| error("native_listener_publisher_start_failed", "系统采样发布线程无法启动"))?;
+        Ok(ListenerCachePublisher { stop, failure, worker: Some(worker) })
+    }
+}
+
+pub struct ListenerCachePublisher {
+    stop: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<CoreError>>>,
+    worker: Option<thread::JoinHandle<Result<()>>>,
+}
+impl ListenerCachePublisher {
+    pub fn check(&self) -> Result<()> {
+        match self.failure.lock().map_err(|_| invalid())?.clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    pub fn finish(&mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap_or_else(|_| Err(error("native_listener_publisher_panicked", "系统采样发布线程异常退出")))?;
+        }
+        self.check()
+    }
+}
+impl Drop for ListenerCachePublisher {
+    fn drop(&mut self) { let _ = self.finish(); }
 }
 fn cache_path(store: &StateStore) -> PathBuf {
     store.paths.watch().join("state/native-listener.json")
@@ -690,8 +790,8 @@ mod tests {
             r.supervisor,
             r.collector,
             r.sequence,
-            r.started as u64,
-            r.finished as u64,
+            r.started,
+            r.finished,
             r.statuses[0],
             r.statuses[1],
             r.statuses[2],
@@ -709,8 +809,12 @@ mod tests {
     }
     #[test]
     fn frame_preserves_boundaries_and_rejects_partial_or_oversized_data() {
-        let mut data = encoded(&raw());
+        let mut sample = raw();
+        sample.started = 1000.125;
+        sample.finished = 1001.25;
+        let mut data = encoded(&sample);
         let r = frame(&mut Cursor::new(&data)).unwrap().unwrap();
+        assert_eq!((r.started, r.finished), (1000.125, 1001.25));
         assert_eq!(normalize(r).unwrap().owners.len(), 1);
         data.pop();
         assert!(frame(&mut Cursor::new(data)).is_err());
@@ -764,18 +868,172 @@ mod tests {
             start_stamp: "Mon Oct 26 20:45:10 2026".into(),
         }
     }
+    #[test]
+    fn missing_first_listener_frame_respects_caller_budget() {
+        struct Unused;
+        impl ReadRunner for Unused {
+            fn run(&self, _: ReadCommand, _: &[u8], _: Duration, _: usize) -> Result<Output> {
+                panic!("missing listener frame must not start identity queries");
+            }
+        }
+        let stream = ListenerStream {
+            root: PathBuf::from("/fixture"),
+            worker: identity(101, 100, 501, "/fixture/worker".into()),
+            supervisor: identity(100, 1, 501, "/bin/zsh".into()),
+            state: Arc::new((Mutex::new(None), Condvar::new())),
+            revision: Arc::new(AtomicU64::new(0)), published_revision: Mutex::new(None),
+            finished: Arc::new(AtomicBool::new(false)),
+        };
+        let started = std::time::Instant::now();
+        let error = stream.read_with_timeout(&Unused, Duration::from_millis(40)).err().unwrap();
+        assert_eq!(error.code, "native_listener_pending");
+        assert!(started.elapsed() < Duration::from_millis(400), "must not wait the old five-second default");
+    }
     struct Source {
         proof: Proof,
         job_pid: u32,
         changed: bool,
         extra_supervisor_argument: bool,
     }
+    struct PublisherFixture {
+        home: PathBuf,
+        store: StateStore,
+        stream: Arc<ListenerStream>,
+        source: Arc<Source>,
+    }
+    impl PublisherFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let home = std::env::temp_dir().join(format!("cw-independent-listener-{}",uuid::Uuid::new_v4()));
+            fs::create_dir(&home).unwrap();
+            let store = StateStore::new(crate::storage::Paths::new(&home).unwrap());
+            let root = store.paths.watch().join("runtime");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(SCRIPT),SCRIPT_BYTES).unwrap();
+            fs::write(root.join("watch-engine"),b"fixture").unwrap();
+            fs::set_permissions(root.join("watch-engine"),fs::Permissions::from_mode(0o700)).unwrap();
+            let uid = fs::metadata(&home).unwrap().uid();
+            let mut proof = Proof { supervisor:identity(100,1,uid,"/bin/zsh".into()),
+                worker:identity(103,100,uid,root.join("watch-engine").display().to_string()),
+                collector:identity(101,100,uid,"/bin/zsh".into()),root:root.clone() };
+            proof.collector.start_stamp = "Mon Oct 26 20:45:11 2026".into();
+            let source = Arc::new(Source { proof:proof.clone(),job_pid:100,changed:false,extra_supervisor_argument:false });
+            let stream = Arc::new(ListenerStream { root,worker:proof.worker,supervisor:proof.supervisor,
+                state:Arc::new((Mutex::new(None),Condvar::new())),revision:Arc::new(AtomicU64::new(0)),
+                published_revision:Mutex::new(None),finished:Arc::new(AtomicBool::new(false)) });
+            let fixture = Self { home,store,stream,source };
+            fixture.frame(1);
+            fixture
+        }
+        fn set(&self, observed: Result<Evidence>) {
+            let mut state = self.stream.state.0.lock().unwrap();
+            *state = Some(observed);
+            self.stream.revision.fetch_add(1,Ordering::Release);
+        }
+        fn frame(&self, sequence: u64) -> f64 {
+            let mut raw = raw();
+            raw.sequence = sequence; raw.started = native::now()-0.25; raw.finished = raw.started;
+            raw.before = String::from_utf8(raw.before).unwrap().replace(" 501 ",&format!(" {} ",self.source.proof.worker.uid)).into_bytes();
+            raw.after = raw.before.clone();
+            let at = raw.finished;
+            self.set(normalize(raw)); at
+        }
+    }
+    impl Drop for PublisherFixture {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.home); }
+    }
+    #[test]
+    fn independent_publisher_updates_during_blocked_collection_without_refreshing_the_same_frame() {
+        let fixture = PublisherFixture::new();
+        fixture.stream.publish(&fixture.store,fixture.source.as_ref()).unwrap();
+        let bootstrap = fs::read(cache_path(&fixture.store)).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut publisher = fixture.stream.start_publisher(fixture.store.clone(),fixture.source.clone(),stop).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(fs::read(cache_path(&fixture.store)).unwrap(),bootstrap,"bootstrap frame must not be republished");
+        let (release,blocked) = std::sync::mpsc::channel::<()>();
+        let slow_main = thread::spawn(move || blocked.recv_timeout(Duration::from_secs(3)));
+        let captured_at = fixture.frame(2);
+        let deadline = std::time::Instant::now()+Duration::from_secs(2);
+        while cached(&fixture.store).unwrap().listener.unwrap().evidence.sequence != 2
+            && std::time::Instant::now()<deadline { thread::sleep(Duration::from_millis(10)); }
+        let updated = cached(&fixture.store).unwrap();
+        assert_eq!(updated.listener.unwrap().evidence.sequence,2);
+        assert!(!slow_main.is_finished(),"cache must advance while the UI collector remains blocked");
+        let output = read_cached(&fixture.store,fixture.source.as_ref()).unwrap();
+        let metadata: Value = serde_json::from_str(output.text().unwrap().lines().next().unwrap().strip_prefix(FRAME_META_PREFIX).unwrap()).unwrap();
+        assert_eq!(metadata["captured_at"],captured_at);
+        let bytes = fs::read(cache_path(&fixture.store)).unwrap();
+        thread::sleep(Duration::from_millis(550));
+        assert_eq!(fs::read(cache_path(&fixture.store)).unwrap(),bytes,"same evidence cannot receive a fresh cache timestamp");
+        publisher.finish().unwrap();
+        let _ = release.send(()); let _ = slow_main.join();
+    }
+    #[test]
+    fn native_publisher_eof_and_write_failure_stop_workers_and_preserve_terminal_error() {
+        for eof in [true,false] {
+            let fixture = PublisherFixture::new();
+            fixture.stream.publish(&fixture.store,fixture.source.as_ref()).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            if eof {
+                fixture.set(Err(error("native_listener_closed","fixture EOF")));
+                fixture.stream.finished.store(true,Ordering::Release);
+            } else {
+                fs::remove_file(cache_path(&fixture.store)).unwrap();
+                fs::create_dir(cache_path(&fixture.store)).unwrap();
+                fixture.frame(2);
+            }
+            let mut publisher = fixture.stream.start_publisher(fixture.store.clone(),fixture.source.clone(),stop.clone()).unwrap();
+            let deadline = std::time::Instant::now()+Duration::from_secs(2);
+            while !stop.load(Ordering::Acquire) && std::time::Instant::now()<deadline { thread::sleep(Duration::from_millis(10)); }
+            assert!(stop.load(Ordering::Acquire));
+            assert!(publisher.check().is_err());
+            assert!(publisher.finish().is_err());
+            let terminal = fixture.store.read_json(&fixture.store.paths.watch().join("state/native-listener-publisher-error.json"),Value::Null).unwrap();
+            assert!(terminal["code"].is_string());
+            if eof { assert_eq!(read_cached(&fixture.store,fixture.source.as_ref()).err().unwrap().code,"native_listener_closed"); }
+        }
+    }
+    #[test]
+    fn native_publication_shares_one_total_validation_budget() {
+        struct Slow { source: Arc<Source>, calls: Mutex<Vec<Duration>> }
+        impl ReadRunner for Slow {
+            fn process_identity(&self,pid:u32)->Option<Identity> { self.source.as_ref().process_identity(pid) }
+            fn run(&self,c:ReadCommand,input:&[u8],timeout:Duration,limit:usize)->Result<Output> {
+                self.calls.lock().unwrap().push(timeout);
+                if timeout < Duration::from_millis(600) {
+                    thread::sleep(timeout); return Err(error("command_timeout","fixture bounded timeout"));
+                }
+                thread::sleep(Duration::from_millis(600));
+                self.source.run(c,input,timeout,limit)
+            }
+        }
+        let fixture=PublisherFixture::new();
+        let slow=Slow {source:fixture.source.clone(),calls:Mutex::new(vec![])};
+        let started=std::time::Instant::now();
+        fixture.stream.publish(&fixture.store,&slow).unwrap();
+        assert!(started.elapsed()<Duration::from_millis(1500));
+        let calls=slow.calls.lock().unwrap();
+        assert!(calls.len()>=2,"calls={calls:?}; cache={}",fs::read_to_string(cache_path(&fixture.store)).unwrap());
+        assert!(calls[0]<=Duration::from_secs(1));
+        assert!(calls[1]<Duration::from_millis(500));
+        assert_eq!(cached(&fixture.store).unwrap().error.unwrap().code,"command_timeout");
+    }
     impl ReadRunner for Source {
+        fn process_identity(&self, pid: u32) -> Option<Identity> {
+            let mut identity = [&self.proof.supervisor, &self.proof.worker, &self.proof.collector]
+                .into_iter().find(|identity| identity.pid == pid)?.clone();
+            if self.changed && pid == self.proof.worker.pid { identity.start_microseconds += 1; }
+            Some(identity)
+        }
         fn run(&self, c: ReadCommand, input: &[u8], _: Duration, _: usize) -> Result<Output> {
-            if matches!(c, ReadCommand::ProcessTable) {
+            if let ReadCommand::ProcessTablePids { ref pids } = c {
+                let table = String::from_utf8(raw().after).unwrap();
                 return Ok(Output {
                     status: 0,
-                    stdout: raw().after,
+                    stdout: table.lines().filter(|row| row.split_whitespace().next()
+                        .and_then(|pid| pid.parse::<u32>().ok()).is_some_and(|pid| pids.contains(&pid)))
+                        .collect::<Vec<_>>().join("\n").into_bytes(),
                     stderr: vec![],
                 });
             }
@@ -873,6 +1131,46 @@ mod tests {
             "native_listener_origin_changed"
         );
         r.changed = false;
+        // Exercise the actual stream fast path using a read runner that rejects
+        // every whole-machine operation. Two reads of one frame retain its
+        // capture time and each use just one argv + one targeted ps command.
+        struct Counted<'a> { source: &'a Source, calls: std::cell::RefCell<Vec<&'static str>> }
+        impl ReadRunner for Counted<'_> {
+            fn process_identity(&self, pid: u32) -> Option<Identity> {
+                self.calls.borrow_mut().push("fixed_identity");
+                self.source.process_identity(pid)
+            }
+            fn run(&self, command: ReadCommand, input: &[u8], timeout: Duration, limit: usize) -> Result<Output> {
+                self.calls.borrow_mut().push(match &command {
+                    ReadCommand::Observer(ObserverAction::Arguments) => "fixed_arguments",
+                    ReadCommand::ProcessTablePids { pids } => { assert_eq!(pids, &vec![102]); "targeted_ps" },
+                    _ => panic!("fast listener path attempted a global/unexpected read: {command:?}"),
+                });
+                self.source.run(command, input, timeout, limit)
+            }
+        }
+        let mut frame = normalize(raw()).unwrap();
+        frame.started = native::now() - 1.0;
+        frame.finished = frame.started;
+        frame.origins.insert(100, json!({"uid":uid,"executable":"/bin/zsh","stamp":p.supervisor.start_stamp}));
+        frame.origins.insert(101, json!({"uid":uid,"executable":"/bin/zsh","stamp":p.collector.start_stamp}));
+        let captured_at = frame.finished;
+        let stream = ListenerStream { root: root.clone(), supervisor: p.supervisor.clone(), worker: p.worker.clone(),
+            state: Arc::new((Mutex::new(Some(Ok(frame))), Condvar::new())), revision: Arc::new(AtomicU64::new(1)),
+            published_revision: Mutex::new(None), finished: Arc::new(AtomicBool::new(false)) };
+        let counted = Counted { source: &r, calls: std::cell::RefCell::new(Vec::new()) };
+        for _ in 0..2 {
+            let out = stream.read_with_timeout(&counted, Duration::from_secs(1)).unwrap();
+            let metadata = out.text().unwrap().lines().next().unwrap().strip_prefix(FRAME_META_PREFIX).unwrap();
+            let metadata: Value = serde_json::from_str(metadata).unwrap();
+            assert_eq!(metadata["captured_at"].as_f64(), Some(captured_at));
+            assert_eq!(metadata["sequence"], 1);
+        }
+        let calls = counted.calls.borrow();
+        assert_eq!(calls.iter().filter(|&&kind| kind == "fixed_arguments").count(), 2);
+        assert_eq!(calls.iter().filter(|&&kind| kind == "targeted_ps").count(), 2);
+        assert_eq!(calls.iter().filter(|&&kind| kind == "fixed_identity").count(), 14);
+        drop(calls);
         fs::write(root.join(SCRIPT), b"changed").unwrap();
         assert_eq!(
             verify(&p, &r, true).unwrap_err().code,

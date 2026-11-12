@@ -1,8 +1,7 @@
 //! Activation is opt-in. Owned files, shell configuration, and verified
 //! controlled invocations are separate facts.
 use crate::{
-    channel_policy_status::{process_protection, producer_is_current},
-    channel_supervisor::ChannelSupervisor,
+    channel_policy_status::{process_protection, FrameEvidence, FRAME_PATH},
     config_store::ConfigStore,
     managed_entry::{desktop_entry_plist, snapshot_running_processes, DesktopManagedEntrySpec},
     managed_entry_transaction::{commit, err, Change, Leaf, Object, Stamp},
@@ -688,33 +687,18 @@ pub fn observe_entry(
     now: f64,
 ) -> Result<EntryActivity> {
     let authority = storage.read_json(
-        &storage.paths.watch().join("state/channel-supervision.json"),
+        &storage.paths.watch().join(FRAME_PATH),
         Value::Null,
     )?;
-    let policy = ChannelSupervisor::compute_policy_version(
-        &(ConfigStore {
-            storage: storage.clone(),
-        })
-        .load()?,
-    )?;
+    let config = (ConfigStore { storage: storage.clone() }).load()?;
+    let frame = FrameEvidence::new(&authority, &config, now);
+    let policy = frame.policy.as_ref().map_err(Clone::clone)?;
     let family = PolicyCatalog::family_for(source.kind().provider()).map(|f| f.id).unwrap_or_default();
-    let state = &authority["families"][family];
-    let policy_wire = serde_json::json!(policy);
     let fresh = |at| (0.0..10.0).contains(&(now - at));
-    let boot = authority["executor_boot_id"].as_str().filter(|id| {
-        !id.is_empty()
-            && producer_is_current(&authority)
-            && authority["producer_boot_id"].as_str().is_some_and(|boot| !boot.is_empty())
-            && authority["saved_policy_version"] == policy_wire
-            && state["producer_boot_id"] == authority["producer_boot_id"]
-            && state["saved_policy_version"] == policy_wire
-            && authority["captured_at"].as_f64().is_some_and(fresh)
-    });
-    let child_tokens: Vec<BoundProcessToken> = if boot.is_some() {
-        serde_json::from_value(state["active_members"].clone()).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let family_evidence = frame.family(family).filter(|_| authority["captured_at"].as_f64().is_some_and(fresh));
+    let boot = frame.boot.filter(|_| family_evidence.is_some());
+    let child_tokens: Vec<BoundProcessToken> = family_evidence.and_then(|evidence|
+        serde_json::from_value(evidence.state["active_members"].clone()).ok()).unwrap_or_default();
     let instances: Vec<EntryRegistryRow> = storage
         .read_json(
             &storage
@@ -787,20 +771,20 @@ pub fn observe_entry(
                 && token.matches_process(live.pid, live.uid, live.start_seconds, live.start_microseconds, Some(&live.audit_token));
             if let Some((at, member)) = child {
                 let audit = live.audit_token.iter().map(u32::to_string).collect::<Vec<_>>().join(":");
-                i.state == ManagedInstanceState::ExecVerified && i.has_verified_subtree_protection(boot, &policy)
+                i.state == ManagedInstanceState::ExecVerified && i.has_verified_subtree_protection(boot, policy)
                     && fresh(at) && i.controlled_subtree_pids.contains(&live.pid) && member.currently_verified
                     && member.verified_executable.as_deref() == Some(live.executable_path.as_str())
                     && member.audit_identity_digest == claude_watch_system::sha256_bytes_hex(audit.as_bytes())
                     && child_tokens.iter().any(|token| token.role == ProcessRole::Child && matches_live(token))
             } else {
-                i.has_verified_main_protection(boot, &policy)
+                i.has_verified_main_protection(boot, policy)
                     && i.verified_executable.as_deref() == Some(live.executable_path.as_str())
                     && i.exec_identity.as_ref().is_some_and(matches_live)
             }
         });
         if verified {
             let id = &instance.unwrap().0.instance_id;
-            let protected = process_protection(storage, &authority, &identity, source.kind(), now)["state"] == "protected";
+            let protected = process_protection(storage, Some(&frame), &identity, source.kind(), now)["state"] == "protected";
             managed.entry(id).and_modify(|all| *all &= protected).or_insert(protected);
         } else if let Some((i, _)) = instance {
             pending_instances.insert(&i.instance_id);

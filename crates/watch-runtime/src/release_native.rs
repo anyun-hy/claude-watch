@@ -44,107 +44,49 @@ pub trait FixedCommandExecutor {
 pub struct SystemExecutor;
 /// `bootout` removes registration before the old process has necessarily died.
 /// Replacements must observe both conditions, then repeat the observation.
-pub(crate) fn stop_user_agent<E: FixedCommandExecutor>(executor: &mut E, uid: u32) -> Result<bool> {
+pub(crate) fn stop_user_agent<E: FixedCommandExecutor>(
+    executor: &mut E, uid: u32, runtime: &Path,
+) -> Result<bool> {
+    use claude_watch_core::processes::{is_watch_runtime_executable, watch_process_rows, WATCH_PROCESS_LIST_FIELDS};
     let job = format!("gui/{uid}/{AGENT}");
     let mut call = |program: &str, args: Vec<String>| {
-        executor.run(FixedCommand {
-            program: program.into(),
-            args,
-            timeout: Duration::from_secs(5),
-        })
+        executor.run(FixedCommand { program: program.into(), args, timeout: Duration::from_secs(5) })
     };
     let initial = call("/bin/launchctl", vec!["print".into(), job.clone()])?;
-    if initial.status != 0 {
-        return if initial.stderr.contains("Could not find service") {
-            Ok(false)
-        } else {
-            Err(error(
-                "agent_state_unavailable",
-                "后台状态读取失败，未当作未安装",
-            ))
-        };
+    let had_agent = initial.status == 0;
+    if !had_agent && !initial.stderr.contains("Could not find service") {
+        return Err(error("agent_state_unavailable", "后台状态读取失败，未当作未安装"));
     }
-    let pid = initial
-        .stdout
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("pid = ")?.parse::<u32>().ok());
-    if call("/bin/launchctl", vec!["bootout".into(), job.clone()])?.status != 0 {
+    let pid = initial.stdout.lines().find_map(|line| line.trim().strip_prefix("pid = ")?.parse::<u32>().ok());
+    if had_agent && call("/bin/launchctl", vec!["bootout".into(), job.clone()])?.status != 0 {
         return Err(error("agent_stop_failed", "旧后台注销失败，未替换程序"));
     }
     let until = Instant::now() + Duration::from_secs(20);
     let mut missing_since = None;
+    let mut observed_old_process = had_agent;
     while Instant::now() < until {
         let registered = call("/bin/launchctl", vec!["print".into(), job.clone()])?;
         if registered.status != 0 && !registered.stderr.contains("Could not find service") {
             return Err(error("agent_state_unavailable", "旧后台退出状态无法读取"));
         }
-        let processes = call("/bin/ps", vec!["-axo".into(), "pid=".into()])?;
+        let processes = call("/bin/ps", vec!["-axo".into(), WATCH_PROCESS_LIST_FIELDS.into()])?;
         if processes.status != 0 || processes.stdout.trim().is_empty() {
-            return Err(error(
-                "agent_state_unavailable",
-                "旧后台进程退出状态无法读取",
-            ));
+            return Err(error("agent_state_unavailable", "旧后台进程退出状态无法读取"));
         }
-        let alive = pid.is_some_and(|pid| {
-            processes
-                .stdout
-                .lines()
-                .any(|line| line.trim().parse::<u32>() == Ok(pid))
-        });
+        let alive = watch_process_rows(&processes.stdout, uid)
+            .any(|(candidate, executable)| Some(candidate) == pid || is_watch_runtime_executable(executable, runtime));
+        observed_old_process |= alive;
         if registered.status != 0 && !alive {
             let missing = missing_since.get_or_insert_with(Instant::now);
-            if missing.elapsed() >= Duration::from_secs(1) {
-                return Ok(true);
+            if !observed_old_process || missing.elapsed() >= Duration::from_secs(1) {
+                return Ok(had_agent);
             }
         } else {
             missing_since = None;
         }
         thread::sleep(Duration::from_millis(200));
     }
-    Err(error(
-        "agent_stop_timeout",
-        "旧后台尚未完全退出，未加载新后台",
-    ))
-}
-/// A launchd entry can disappear before its process exits. Wait for any
-/// current-user process using this exact managed runtime path; never signal an
-/// unregistered process merely because its name matches.
-pub(crate) fn stop_agent_for_runtime<E: FixedCommandExecutor>(
-    executor: &mut E,
-    uid: u32,
-    runtime: &Path,
-) -> Result<()> {
-    stop_user_agent(executor, uid)?;
-    let expected = runtime.join("watch-engine").to_string_lossy().into_owned();
-    for attempt in 0..6 {
-        let out = executor.run(FixedCommand {
-            program: "/bin/ps".into(),
-            args: vec!["-axo".into(), "pid=,uid=,comm=".into()],
-            timeout: Duration::from_secs(5),
-        })?;
-        if out.status != 0 || out.stdout.trim().is_empty() {
-            return Err(error("agent_state_unavailable", "无法确认后台进程是否退出"));
-        }
-        let alive = out.stdout.lines().any(|line| {
-            let Some((_, rest)) = line.trim_start().split_once(char::is_whitespace) else {
-                return false;
-            };
-            let Some((owner, exe)) = rest.trim_start().split_once(char::is_whitespace) else {
-                return false;
-            };
-            owner.parse::<u32>() == Ok(uid) && exe.trim_start() == expected
-        });
-        if !alive {
-            return Ok(());
-        }
-        if attempt < 5 {
-            thread::sleep(Duration::from_millis(200));
-        }
-    }
-    Err(error(
-        "agent_process_still_running",
-        "后台进程尚未退出；已保留组件及恢复记录",
-    ))
+    Err(error("agent_stop_timeout", "旧后台或自有子进程尚未退出，未移走或替换应用"))
 }
 pub(crate) fn validate_fixed_command(command: &FixedCommand) -> Result<()> {
         if !command.program.is_absolute()
@@ -760,10 +702,22 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
                 return Err(error("release_identity_mismatch", "受控入口组件不是arm64"));
             }
         }
+        // Diagnostic source identity is packaged by current builds. Older
+        // bundles remain recognizable, but a declared identity must pass the
+        // same regular-file and digest checks as every other listed component.
+        if hashes.contains_key("BuildIdentity.json") {
+            required.push("BuildIdentity.json");
+        }
         if hashes.len() != required.len() || required.iter().any(|key| !hashes.contains_key(*key)) {
+            let missing: Vec<_> = required.iter().filter(|key| !hashes.contains_key(**key)).copied().collect();
+            let unexpected: Vec<_> = hashes.keys().filter(|key| !required.contains(&key.as_str())).collect();
+            let unexpected_names: Vec<String> = unexpected.iter().take(8).map(|name| name.chars().take(64)
+                .map(|c| if c.is_ascii_alphanumeric() || ".-_".contains(c) { c } else { '_' }).collect()).collect();
             return Err(error(
                 "release_identity_mismatch",
-                "原生组件清单不完整或含旧业务依赖",
+                &format!("原生组件清单不匹配（缺少：{}；未支持 {} 项：{}）",
+                    if missing.is_empty() { "无".into() } else { missing.join(", ") },
+                    unexpected.len(), if unexpected_names.is_empty() { "无".into() } else { unexpected_names.join(", ") }),
             ));
         }
         for name in required {
@@ -845,7 +799,7 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
         Err(error("app_stop_timeout", "监控界面未退出，未替换程序"))
     }
     fn stop_agent(&mut self) -> Result<bool> {
-        stop_user_agent(&mut self.executor, self.uid)
+        stop_user_agent(&mut self.executor, self.uid, &self.paths.base.join("runtime"))
     }
     fn install_agent(&mut self, installed: &Path) -> Result<()> {
         self.validate_bundle(installed)?;

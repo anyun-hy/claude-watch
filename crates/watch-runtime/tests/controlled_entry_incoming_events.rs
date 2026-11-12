@@ -179,7 +179,25 @@ fn controlled_entry_standard_incoming_receipts_follow_forwarding_results() {
         0,
     );
     wait_for(&state, "URL=cw-fixture://no-reply");
-    wait_for(&log, "no-reply");
+    // Production diagnostics deliberately remove raw URLs. Wait for the actual
+    // structured forwarding completion rather than demanding leaked payloads.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let events: Vec<serde_json::Value> = fs::read_to_string(&log).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        let forwarded: Vec<_> = events.iter().filter(|event|
+            event["event"] == "forward_open_items" && event["url_count"] == 1).collect();
+        if let Some(event) = forwarded.first() {
+            assert_eq!(forwarded.len(), 1, "no-reply input must be forwarded exactly once");
+            assert_eq!(event["status"], "ok");
+            assert_eq!(event["apple_event_reply_confirmed"], true);
+            break;
+        }
+        assert!(Instant::now() < deadline, "missing no-reply forwarding completion: {events:?}");
+        thread::sleep(Duration::from_millis(15));
+    }
+    assert!(!fs::read_to_string(&log).unwrap().contains("cw-fixture://no-reply"),
+        "diagnostic logs must not retain the raw URL");
     assert_eq!(
         fs::read_to_string(&log)
             .unwrap()

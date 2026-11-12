@@ -60,6 +60,25 @@ pub enum LaunchTarget {
     ClaudeCli,
     CodexCli,
 }
+/// macOS ps executable rows used by release and reinstall. Match the
+/// executable itself and its owner, never a path appearing in argv.
+pub const WATCH_PROCESS_LIST_FIELDS: &str = "pid=,uid=,comm=";
+
+pub fn watch_process_rows(listing: &str, uid: u32) -> impl Iterator<Item = (u32, &str)> {
+    listing.lines().filter_map(move |line| {
+        let (pid, rest) = line.trim_start().split_once(char::is_whitespace)?;
+        let (owner, executable) = rest.trim_start().split_once(char::is_whitespace)?;
+        (owner.parse::<u32>().ok()? == uid).then_some((pid.parse().ok()?, executable.trim()))
+    })
+}
+
+pub fn is_watch_runtime_executable(executable: &str, runtime: &std::path::Path) -> bool {
+    let executable = std::path::Path::new(executable);
+    executable.parent() == Some(runtime)
+        && matches!(executable.file_name().and_then(std::ffi::OsStr::to_str),
+            Some("watch-engine" | "watch-native-observer" | "watch-process-control" | "watch-sandbox-launcher"))
+}
+
 impl LaunchTarget {
     pub fn parse(value: &str) -> Option<Self> {
         match value {

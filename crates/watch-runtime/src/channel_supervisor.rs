@@ -45,14 +45,27 @@ use std::{
 };
 
 pub const DEFAULT_ASYNC_AUDIT_TIMEOUT_SECONDS: f64 = 10.0;
+/// Failures before the display transitions from pending to revoked; recovery
+/// continues on a bounded schedule after this threshold.
 pub const MAX_ASYNC_AUDIT_RETRIES: u32 = 3;
 pub const ASYNC_AUDIT_RETRY_BACKOFF_SECONDS: f64 = 2.0;
+/// After the initial short retries, remain revoked and retry full verification
+/// with bounded backoff. A transient failure must not require a VPN/config
+/// change to make recovery possible.
+pub fn async_audit_retry_delay(failures: u32) -> f64 {
+    if failures < MAX_ASYNC_AUDIT_RETRIES {
+        ASYNC_AUDIT_RETRY_BACKOFF_SECONDS
+    } else {
+        (15.0 * 2_f64.powi(failures.saturating_sub(MAX_ASYNC_AUDIT_RETRIES).min(5) as i32)).min(300.0)
+    }
+}
 pub const MAX_EMITTED_EVENTS: usize = 128;
 pub const MAX_PERSISTED_EVENTS: usize = 64;
 
 #[cfg(test)]
 mod logging_tests {
     use super::*;
+    use claude_watch_core::processes::ProcessRole;
     use crate::{channel_diagnostics::ChannelDiagnostics, events::EventStore, storage::Paths};
     use std::{fs, sync::atomic::{AtomicUsize, Ordering}, time::{Duration, Instant}};
 
@@ -64,8 +77,286 @@ mod logging_tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Err(CoreError::new("fixture_apply_denied", "http://user:secret@proxy/?password=secret"))
         }
-        fn receipt_for(&self, _: &str, _: f64) -> Result<Option<ChannelEnforcementReceipt>> { Ok(None) }
+        fn receipt_for(&self, _: &str, _: f64) -> Result<Option<ChannelEnforcementReceipt>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(CoreError::new("fixture_receipt_unavailable", "executor state unavailable"))
+        }
         fn enforce_active_deadlines(&self, _: f64, _: bool) -> Result<Vec<ChannelEnforcementReceipt>> { Ok(vec![]) }
+    }
+
+    struct SessionLockProbe {
+        enforcer: Arc<crate::channel_enforcer::LocalTunnelEnforcer>,
+        storage: StateStore,
+    }
+    impl ChannelEnforcer for SessionLockProbe {
+        fn boot_id(&self) -> Result<String> { self.enforcer.boot_id() }
+        fn is_ready(&self) -> Result<bool> { self.enforcer.is_ready() }
+        fn apply_command(&self, command: &ChannelEnforcementCommand, now: f64) -> Result<ChannelEnforcementReceipt> {
+            if command.permit.state == ChannelPermitState::Permitted {
+                assert_eq!(self.storage.lock("session-guard", None).err().unwrap().code, "busy",
+                    "session transaction must cover executor application");
+            }
+            self.enforcer.apply_command(command, now)
+        }
+        fn receipt_for(&self, family: &str, now: f64) -> Result<Option<ChannelEnforcementReceipt>> {
+            self.enforcer.receipt_for(family, now)
+        }
+        fn enforce_active_deadlines(&self, now: f64, woke_from_sleep: bool) -> Result<Vec<ChannelEnforcementReceipt>> {
+            self.enforcer.enforce_active_deadlines(now, woke_from_sleep)
+        }
+        fn local_proxy_port(&self) -> Option<u16> { self.enforcer.local_proxy_port() }
+    }
+
+    fn blocked_supervisor(now: f64) -> (ChannelSupervisor, Arc<crate::channel_enforcer::LocalTunnelEnforcer>) {
+        let root = std::env::temp_dir().join(format!("cw-receipt-fixture-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let storage = StateStore::new(Paths::new(root).unwrap());
+        let enforcer = Arc::new(crate::channel_enforcer::LocalTunnelEnforcer::new("receipt-fixture"));
+        enforcer.set_local_proxy_ready(true, now).unwrap();
+        enforcer.configure_seatbelt_backend(true, now).unwrap();
+        let supervisor = ChannelSupervisor::new_with_config(storage, Config::default_for_new_install(), None,
+            Some(enforcer.clone()), None).unwrap();
+        (supervisor, enforcer)
+    }
+
+    #[test]
+    fn repeated_audit_failures_back_off_without_permanently_stopping_recovery() {
+        let now = 1_800_000_000.0;
+        let (mut supervisor, _enforcer) = blocked_supervisor(now);
+        let (tx, rx) = mpsc::channel();
+        supervisor.audit_tx = Some(tx);
+        let mut clock = now;
+        for delay in [2.0, 2.0, 15.0, 30.0, 60.0, 120.0, 240.0, 300.0, 300.0] {
+            supervisor.record_async_audit_failure("claude", None, "probe_failed", clock).unwrap();
+            assert_eq!(supervisor.tracks["claude"].audit_retry_not_before, Some(clock + delay));
+            supervisor.request_async_audit_if_needed("claude", None, None, clock + delay - 0.01);
+            assert!(rx.try_recv().is_err(), "no repeated work before the deadline");
+            supervisor.request_async_audit_if_needed("claude", None, None, clock + delay);
+            let request = rx.try_recv().expect("recovery must continue after the third failure");
+            assert_eq!(request.requested_at, clock + delay);
+            assert_ne!(supervisor.tracks["claude"].current_permit.as_ref().unwrap().state,
+                ChannelPermitState::Permitted, "retry scheduling cannot grant permission");
+            supervisor.tracks.get_mut("claude").unwrap().audit_in_flight = None;
+            clock += delay + 1.0;
+        }
+        assert_eq!(async_audit_retry_delay(u32::MAX), 300.0);
+    }
+
+    #[test]
+    fn receipt_diagnostics_keep_block_reason_separate_from_execution_failure() {
+        let now = 1_800_000_000.0;
+        let (mut supervisor, _enforcer) = blocked_supervisor(now);
+        let logger = ChannelDiagnostics::new(supervisor.storage.clone());
+        supervisor.set_diagnostics(logger.clone());
+        supervisor.issue_family_command("claude", None, ChannelPermitState::Revoked,
+            "vpn_observation_stale", now).unwrap();
+        let mut failed = supervisor.tracks["claude"].latest_receipt.clone().unwrap();
+        assert_eq!(failed.enforcement_state, ChannelEnforcementState::Blocked);
+        failed.observed_at = now + 1.0;
+        failed.enforcement_state = ChannelEnforcementState::Failed;
+        failed.error_code = Some("fixture_apply_denied".into());
+        supervisor.ingest_receipt(failed, now + 1.0).unwrap();
+        let events = EventStore::new(supervisor.storage.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let rows = loop {
+            let rows: Vec<_> = events.history().unwrap().events.into_iter()
+                .filter(|event| event.fields.channel_diagnostic.as_ref()
+                    .is_some_and(|d| d.stage == "receipt_received")).collect();
+            if rows.len() == 2 { break rows; }
+            assert!(Instant::now() < deadline); thread::sleep(Duration::from_millis(10));
+        };
+        let blocked = rows.iter().find(|r| r.fields.status.as_deref() == Some("blocked")).unwrap();
+        let diagnostic = blocked.fields.channel_diagnostic.as_ref().unwrap();
+        assert_eq!(diagnostic.reason_code.as_deref(), Some("vpn_observation_stale"));
+        assert_eq!(blocked.fields.code.as_deref(), Some("vpn_observation_stale"));
+        assert!(diagnostic.failure.is_none(), "successful cutoff is not an operation failure");
+        let failed = rows.iter().find(|r| r.fields.status.as_deref() == Some("failed")).unwrap();
+        assert_eq!(failed.fields.channel_diagnostic.as_ref().unwrap().failure.as_ref().unwrap().code,
+            "fixture_apply_denied");
+        assert_eq!(supervisor.tracks["claude"].policy_sync_state, PolicySyncState::ApplyFailed);
+    }
+
+    #[test]
+    fn expired_execution_evidence_is_unverified_until_live_executor_returns() {
+        let now = 1_800_000_000.0;
+        let (mut supervisor, enforcer) = blocked_supervisor(now);
+        supervisor.issue_family_command("claude", None, ChannelPermitState::Revoked,
+            "vpn_observation_stale", now).unwrap();
+        let command_seq = supervisor.tracks["claude"].command_seq;
+        supervisor.enforcer = None;
+        let snapshot = supervisor.handle_event(SupervisionEvent::LeaseExpired {
+            observed_at: now + 20.0, woke_from_sleep: false,
+        }).unwrap();
+        let state = &snapshot.families["claude"];
+        assert_eq!(state.permit_state, ChannelPermitState::Revoked);
+        assert_eq!(state.command_seq, command_seq);
+        assert_eq!(state.display_state, ChannelMonitorDisplayState::PendingVerification);
+        assert_eq!(state.display_label_zh, "执行回执已过期，当前结果待核验");
+        assert_eq!(state.policy_sync_state, PolicySyncState::PendingApply);
+        assert_eq!(state.policy_sync_label_zh, "执行回执待核验");
+        assert_eq!(supervisor.tracks["claude"].latest_receipt.as_ref().unwrap().observed_at, now);
+        assert!(matches!(&supervisor.tracks["claude"].verdict,
+            Some(ChannelSupervisionVerdict::EnforcementFailed { code, .. }) if code == "enforcement_receipt_expired"));
+        let unavailable = Arc::new(FailingEnforcer(AtomicUsize::new(0)));
+        supervisor.enforcer = Some(unavailable.clone());
+        for quarter in 1..=13 {
+            supervisor.refresh_execution_receipt("claude", now + 20.0 + f64::from(quarter) / 4.0).unwrap();
+        }
+        assert_eq!(unavailable.0.load(Ordering::SeqCst), 1, "failed reads must be bounded between deadline ticks");
+        assert_eq!(supervisor.tracks["claude"].latest_receipt.as_ref().unwrap().observed_at, now);
+        supervisor.enforcer = Some(enforcer);
+        let recovered = supervisor.handle_event(SupervisionEvent::LeaseExpired {
+            observed_at: now + 24.0, woke_from_sleep: false,
+        }).unwrap();
+        assert_eq!(recovered.families["claude"].display_state, ChannelMonitorDisplayState::Blocked);
+        assert_eq!(recovered.families["claude"].policy_sync_state, PolicySyncState::Applied);
+        assert_eq!(recovered.families["claude"].command_seq, command_seq);
+        assert_eq!(supervisor.tracks["claude"].latest_receipt.as_ref().unwrap().observed_at, now + 24.0);
+    }
+
+    #[test]
+    fn busy_inventory_reconciliation_revokes_only_affected_family_and_recovers_on_retry() {
+        let now = 1_800_000_000.0;
+        let (mut supervisor, _) = blocked_supervisor(now);
+        let old = BoundProcessToken::with_system_identity(7200, 501, 900, 1, ProcessRole::Cli)
+            .with_audit_token([501, 501, 20, 501, 20, 7200, 0, 9]);
+        let mut replaced = old.clone();
+        replaced.audit_token.as_mut().unwrap()[7] += 1;
+        supervisor.tracks.get_mut("claude").unwrap().processes = vec![old.clone()];
+        supervisor.latest_egress.insert("claude".into(), json!({
+            "ip": "1.1.1.1", "country": "JP", "observed_at": now,
+        }));
+        supervisor.issue_family_command("claude", None, ChannelPermitState::Permitted, "fixture_ready", now).unwrap();
+        assert_eq!(supervisor.snapshot(now).families["claude"].display_state, ChannelMonitorDisplayState::Forwarding);
+        let (audit_tx, _audit_rx) = std::sync::mpsc::channel();
+        supervisor.audit_tx = Some(audit_tx);
+        supervisor.request_async_audit_if_needed("claude", None, None, now);
+        assert!(supervisor.tracks["claude"].audit_in_flight.is_some());
+
+        let inventory = |family: &str, processes, at| SupervisionEvent::ProcessInventoryUpdated {
+            family: family.into(), desktops: vec![], processes, observed_at: at,
+        };
+        let lock = supervisor.storage.lock("session-guard", None).unwrap();
+        let blocked = supervisor.handle_event(inventory("claude", vec![replaced.clone()], now + 0.1)).unwrap();
+        assert_eq!(blocked.families["claude"].permit_state, ChannelPermitState::Revoked);
+        assert_eq!(blocked.families["claude"].display_state, ChannelMonitorDisplayState::Blocked);
+        assert_eq!(blocked.families["claude"].reason_code, "channel_inventory_incomplete");
+        assert_eq!(supervisor.tracks["claude"].processes, vec![old]);
+        assert!(supervisor.tracks["claude"].audit_in_flight.is_none());
+        supervisor.handle_event(inventory("openai", vec![], now + 0.2)).unwrap();
+        assert!(!supervisor.tracks["openai"].inventory_failed);
+        supervisor.handle_event(SupervisionEvent::VpnObservationUnavailable {
+            reason: "fixture_vpn_unavailable".into(), observed_at: now + 0.3,
+        }).unwrap();
+        assert_eq!(supervisor.latest_vpn_unavailable_reason.as_deref(), Some("fixture_vpn_unavailable"));
+        drop(lock);
+        let retried = supervisor.handle_event(inventory("claude", vec![replaced.clone()], now + 0.4)).unwrap();
+        assert!(!supervisor.tracks["claude"].inventory_failed);
+        assert_eq!(supervisor.tracks["claude"].processes, vec![replaced]);
+        assert_ne!(retried.families["claude"].reason_code, "channel_inventory_incomplete");
+        supervisor.storage.atomic_json(&supervisor.storage.paths.session_for("claude"), &json!({"schema": 7})).unwrap();
+        assert_eq!(supervisor.handle_event(inventory("claude", vec![], now + 0.5)).unwrap_err().code,
+            "invalid_session", "non-contention failures must remain visible");
+    }
+
+    #[test]
+    fn recovery_session_transaction_rejects_busy_changed_risk_and_failed_persistence() {
+        let now = 1_800_000_000.0;
+        for scenario in ["busy", "replaced", "ended", "new_risk", "persist_failed", "success"] {
+            let (mut supervisor, enforcer) = blocked_supervisor(now);
+            let sessions = SessionStore::for_family(supervisor.storage.clone(), "claude");
+            let expected: session::Session = serde_json::from_value(json!({
+                "schema": 1, "state": "locked", "session_id": "recovery-fixture",
+                "baseline": {"ip": "1.1.1.1", "country": "JP", "observed_at": now, "source": "fixture"},
+                "context_id": "fixture", "locked_at": now,
+            })).unwrap();
+            let path = supervisor.storage.paths.session_for("claude");
+            supervisor.storage.atomic_json(&path, &json!(expected)).unwrap();
+            supervisor.issue_family_command("claude", Some(&expected), ChannelPermitState::Revoked, "fixture_risk", now).unwrap();
+            let mut recovered = supervisor.tracks["claude"].current_permit.clone().unwrap();
+            recovered.state = ChannelPermitState::Permitted;
+            recovered.permit_generation += 1;
+            recovered.command_seq += 1;
+            recovered.issued_at = now + 2.0;
+            recovered.valid_until = now + 10.0;
+            let mut restored = expected.clone();
+            restored.state = Phase::Active;
+            let mut current = expected.clone();
+            match scenario {
+                "replaced" => current.session_id = "newer-session".into(),
+                "ended" => current.state = Phase::Ended,
+                "new_risk" => current.reason = Some(session::Reason::new("egress_ip_changed", "fixture", now + 1.5)),
+                "persist_failed" => supervisor.recovery_persist_failure = Some(CoreError::new("state_io_failed", "fixture write denied")),
+                _ => {},
+            }
+            supervisor.storage.atomic_json(&path, &json!(current)).unwrap();
+            let lock = (scenario == "busy").then(|| supervisor.storage.lock("session-guard", None).unwrap());
+            // The fresh-risk case is already visible at completion's initial
+            // load; it must still invalidate an audit started before that risk.
+            let checked = if scenario == "new_risk" { &current } else { &expected };
+            supervisor.enforcer = Some(Arc::new(SessionLockProbe {
+                enforcer: enforcer.clone(), storage: supervisor.storage.clone(),
+            }));
+            supervisor.tracks.get_mut("claude").unwrap().audit_retry_count = 3;
+            supervisor.tracks.get_mut("claude").unwrap().audit_retry_not_before = Some(now + 15.0);
+            supervisor.commit_channel_recovery("claude", &sessions, checked, &restored,
+                recovered, now + 1.0, now + 2.0).unwrap();
+            drop(lock);
+            let receipt = enforcer.receipt_for("claude", now + 2.0).unwrap().unwrap();
+            if scenario == "success" {
+                assert_eq!(receipt.permit_state, ChannelPermitState::Permitted);
+                assert_eq!(sessions.load(now + 2.0).unwrap(), Some(restored));
+                assert!(supervisor.storage.lock("session-guard", None).is_ok());
+                assert_eq!(supervisor.tracks["claude"].audit_retry_count,0);
+                assert!(supervisor.tracks["claude"].audit_retry_not_before.is_none());
+            } else {
+                assert_eq!(receipt.permit_state, ChannelPermitState::Revoked, "{scenario}");
+                assert_eq!(receipt.enforcement_state, ChannelEnforcementState::Blocked, "{scenario}");
+                assert_eq!(sessions.load(now + 2.0).unwrap(), Some(current), "{scenario} must not overwrite stored state");
+                assert!(supervisor.tracks["claude"].audit_retry_not_before.is_some());
+                assert_eq!(supervisor.tracks["claude"].audit_retry_count,4,"{scenario}");
+            }
+        }
+    }
+
+    #[test]
+    fn adoption_rechecks_session_and_holds_lock_through_permission() {
+        let now = 1_800_000_000.0;
+        for scenario in ["busy", "changed", "success"] {
+            let (mut supervisor, enforcer) = blocked_supervisor(now);
+            let sessions = SessionStore::for_family(supervisor.storage.clone(), "claude");
+            let adopted: session::Session = serde_json::from_value(json!({
+                "schema": 1, "state": "active", "session_id": "adoption-fixture",
+                "baseline": {"ip": "1.1.1.1", "country": "JP", "observed_at": now, "source": "fixture"},
+                "context_id": "fixture",
+            })).unwrap();
+            supervisor.latest_egress.insert("claude".into(), json!(adopted.baseline));
+            supervisor.issue_family_command("claude", None, ChannelPermitState::PendingVerification,
+                "initial_audit_pending", now).unwrap();
+            let mut current = adopted.clone();
+            if scenario == "changed" {
+                current.state = Phase::Locked;
+                current.reason = Some(session::Reason::new("egress_ip_changed", "fixture", now + 0.1));
+            }
+            supervisor.storage.atomic_json(&supervisor.storage.paths.session_for("claude"), &json!(current)).unwrap();
+            let lock = (scenario == "busy").then(|| supervisor.storage.lock("session-guard", None).unwrap());
+            supervisor.enforcer = Some(Arc::new(SessionLockProbe {
+                enforcer: enforcer.clone(), storage: supervisor.storage.clone(),
+            }));
+            supervisor.tracks.get_mut("claude").unwrap().audit_retry_count = 3;
+            supervisor.tracks.get_mut("claude").unwrap().audit_retry_not_before = Some(now + 15.0);
+            supervisor.commit_channel_adoption("claude", &sessions, &adopted, now + 0.2).unwrap();
+            drop(lock);
+            let receipt = enforcer.receipt_for("claude", now + 0.2).unwrap().unwrap();
+            assert_eq!(receipt.permit_state == ChannelPermitState::Permitted, scenario == "success", "{scenario}");
+            assert_eq!(supervisor.tracks["claude"].audit_retry_count,if scenario == "success" {0} else {4});
+            if scenario != "success" {
+                assert_eq!(receipt.permit_state, ChannelPermitState::Revoked, "a fast refresh must require recovery audit");
+                assert!(supervisor.tracks["claude"].audit_retry_not_before.is_some());
+            }
+            assert_eq!(sessions.load(now + 0.2).unwrap(), Some(current), "adoption recheck must not overwrite the session");
+            assert!(supervisor.storage.lock("session-guard", None).is_ok());
+        }
     }
 
     #[test]
@@ -79,21 +370,19 @@ mod logging_tests {
         let logger = ChannelDiagnostics::new(storage.clone());
         supervisor.set_diagnostics(logger.clone());
         // A directory cannot be atomically replaced by a JSON state file.
-        for file in ["channel-permits.json", "channel-supervision.json", "channel-events.json", "vpn-supervision.json"] {
-            fs::create_dir_all(storage.paths.watch().join("state").join(file)).unwrap();
-        }
+        fs::create_dir_all(storage.paths.watch().join(crate::channel_policy_status::FRAME_PATH)).unwrap();
         supervisor.handle_event(SupervisionEvent::ProcessInventoryUnavailable {
             family: "claude".into(), observed_at: 1_800_000_000.0,
         }).unwrap();
         assert!(enforcer.0.load(Ordering::SeqCst) > 0, "state logging failure must not suppress the revoke command");
         assert_eq!(supervisor.tracks["claude"].policy_sync_state, PolicySyncState::ApplyFailed);
-        assert!(logger.health().state_write_failed >= 4);
+        assert_eq!(logger.health().state_write_failed, 1);
         assert!(logger.health_message().unwrap().contains("状态保存失败"));
         let events = EventStore::new(storage);
         let deadline = Instant::now() + Duration::from_secs(5);
         let rows = loop {
             let rows: Vec<_> = events.history().unwrap().events.into_iter().filter_map(|e| e.fields.channel_diagnostic).collect();
-            if rows.iter().any(|r| r.stage == "persist_vpn_observation") { break rows; }
+            if rows.iter().any(|r| r.stage == "persist_supervision") { break rows; }
             assert!(Instant::now() < deadline); thread::sleep(Duration::from_millis(10));
         };
         let failure = rows.iter().find(|r| r.stage == "command_failed").unwrap();
@@ -232,6 +521,7 @@ struct FamilyRuntimeTrack {
     commanded_processes: Vec<BoundProcessToken>,
     current_permit: Option<ChannelPermit>,
     latest_receipt: Option<ChannelEnforcementReceipt>,
+    last_receipt_refresh_attempt: Option<f64>,
     latest_process_receipt: Option<ProcessDispositionReceipt>,
     previous_process_receipts: Vec<ProcessDispositionReceipt>,
     // Issued batches can finish after their authority is cancelled. Keep the
@@ -243,7 +533,7 @@ struct FamilyRuntimeTrack {
     policy_sync_state: PolicySyncState,
     verdict: Option<ChannelSupervisionVerdict>,
     revoked_at: Option<f64>,
-    last_risk_at: Option<f64>,
+    evidence_invalidated_at: Option<f64>,
     audit_in_flight: Option<AsyncAuditRequest>,
     audit_retry_count: u32,
     audit_retry_not_before: Option<f64>,
@@ -263,6 +553,7 @@ impl FamilyRuntimeTrack {
             commanded_processes: Vec::new(),
             current_permit: None,
             latest_receipt: None,
+            last_receipt_refresh_attempt: None,
             latest_process_receipt: None,
             previous_process_receipts: Vec::new(),
             pending_process_results: BTreeMap::new(),
@@ -272,7 +563,7 @@ impl FamilyRuntimeTrack {
             policy_sync_state: PolicySyncState::PendingApply,
             verdict: None,
             revoked_at: None,
-            last_risk_at: None,
+            evidence_invalidated_at: None,
             audit_in_flight: None,
             audit_retry_count: 0,
             audit_retry_not_before: None,
@@ -306,6 +597,8 @@ pub struct ChannelSupervisor {
     enforcer: Option<Arc<dyn ChannelEnforcer>>,
     inline_receipt_clock: Option<fn() -> f64>,
     diagnostics: Option<crate::channel_diagnostics::ChannelDiagnostics>,
+    #[cfg(test)]
+    recovery_persist_failure: Option<CoreError>,
     expected_executor_boot_id: Option<String>,
     audit_tx: Option<Sender<AsyncAuditRequest>>,
     next_audit_request_id: u64,
@@ -388,6 +681,8 @@ impl ChannelSupervisor {
             enforcer,
             inline_receipt_clock: None,
             diagnostics: None,
+            #[cfg(test)]
+            recovery_persist_failure: None,
             expected_executor_boot_id,
             audit_tx,
             next_audit_request_id: 0,
@@ -434,11 +729,41 @@ impl ChannelSupervisor {
         }
     }
 
-    fn persist_state(&self, file: &str, stage: &str, value: &Value, now: f64) {
-        if let Err(error) = self.storage.atomic_json(&self.storage.paths.watch().join(file), value) {
+    fn publish(&self, snapshot: &ChannelMonitorSnapshot) {
+        let now = snapshot.captured_at;
+        let mut value = json!(snapshot);
+        value["executor_boot_id"] = json!(self.expected_executor_boot_id);
+        value["producer_identity"] = crate::channel_policy_status::current_producer_identity();
+        value["authoritative_permits"] = json!(self.tracks.iter()
+            .filter_map(|(family, t)| t.current_permit.as_ref().map(|p| (family, p)))
+            .collect::<BTreeMap<_, _>>());
+        value["enforcement_receipts"] = json!(self.tracks.iter()
+            .filter_map(|(family, t)| t.latest_receipt.as_ref().map(|r| (family, r)))
+            .collect::<BTreeMap<_, _>>());
+        value["process_receipts"] = json!(self.tracks.iter()
+            .filter_map(|(family, t)| t.latest_process_receipt.as_ref().map(|r| (family, r)))
+            .collect::<BTreeMap<_, _>>());
+        value["events"] = json!(self.persisted_events);
+        value["egress"] = json!(self.latest_egress.iter().filter_map(|(family, raw)|
+            Egress::fresh(raw, now, session::GUARD_EGRESS_TTL).map(|egress| (family, egress)))
+            .collect::<BTreeMap<_, _>>());
+        value["vpn_supervision"] = json!({
+            "captured_at": now,
+            "network_backend": self.config.effective_network_backend(),
+            "requires_migration": self.config.requires_backend_migration_setup(),
+            "expectation": self.config.vpn_expectation,
+            "observation": self.latest_vpn_observation,
+            "unavailable_reason": self.latest_vpn_unavailable_reason,
+            "vpn_match": self.compute_vpn_match(now),
+        });
+        // The only published authority frame. A failed write never rolls back
+        // a command that already took effect in the executor.
+        if let Err(error) = self.storage.atomic_json(&self.storage.paths.watch().join(crate::channel_policy_status::FRAME_PATH), &value) {
             if let Some(logger) = &self.diagnostics {
-                logger.persistence_failed(self.diagnostic(None, stage), &error, now);
+                logger.persistence_failed(self.diagnostic(None, "persist_supervision"), &error, now);
             }
+        } else {
+            crate::native::notify_channel_update();
         }
     }
 
@@ -801,6 +1126,9 @@ impl ChannelSupervisor {
             SupervisionEvent::AsyncAuditCompleted { completed_at, .. } => *completed_at,
         };
         let now = delivered_at.unwrap_or(source_at);
+        let initial_seq = self.event_seq;
+        let mut publish = !matches!(&event, SupervisionEvent::LeaseExpired { .. }
+            | SupervisionEvent::EnforcementReceiptArrived { .. } | SupervisionEvent::ProcessReceiptArrived { .. });
 
         match event {
             SupervisionEvent::VpnObservationUpdated { observation, .. } => {
@@ -849,27 +1177,21 @@ impl ChannelSupervisor {
                             track.audit_retry_count = 0;
                             track.audit_retry_not_before = None;
                             track.audit_last_failure_code = None;
-                            track.last_risk_at = Some(now);
-                        } else if matched_now
-                            && track.audit_last_failure_code.as_deref()
-                                == Some("async_audit_retries_exhausted")
-                        {
-                            track.audit_retry_count = 0;
-                            track.audit_retry_not_before = None;
-                            track.audit_last_failure_code = None;
+                            track.evidence_invalidated_at = Some(now);
                         }
                     }
                     self.evaluate_family(&family, now)?;
                 }
             }
             SupervisionEvent::VpnObservationUnavailable { reason, .. } => {
-                self.latest_vpn_observation = None;
+                let newly_unavailable = self.latest_vpn_observation.take().is_some()
+                    || self.latest_vpn_unavailable_reason.is_none();
                 self.latest_vpn_unavailable_reason = Some(reason);
                 let family_ids: Vec<String> = self.tracks.keys().cloned().collect();
                 for family in family_ids {
                     if let Some(track) = self.tracks.get_mut(&family) {
                         track.audit_in_flight = None;
-                        track.last_risk_at = Some(source_at);
+                        if newly_unavailable { track.evidence_invalidated_at = Some(now); }
                     }
                     self.evaluate_family(&family, now)?;
                 }
@@ -881,7 +1203,7 @@ impl ChannelSupervisor {
                         track.end_process_authority();
                         track.permit_generation = track.permit_generation.saturating_add(1);
                         track.revoked_at = Some(now);
-                        track.last_risk_at = Some(source_at);
+                        track.evidence_invalidated_at = Some(source_at);
                         track.audit_in_flight = None;
                         track.audit_retry_count = 0;
                         track.audit_retry_not_before = None;
@@ -903,9 +1225,14 @@ impl ChannelSupervisor {
                 local_guard,
                 ..
             } => {
-                let fresh_egress = Egress::fresh(&egress, now, session::GUARD_EGRESS_TTL).is_some();
                 let measured_family = egress["family"].as_str().unwrap_or("*");
-                if measured_family == "*" {
+                if let Some(families) = egress["families"].as_object() {
+                    for (family, evidence) in families {
+                        if PolicyCatalog::family(family).is_some() {
+                            self.latest_egress.insert(family.clone(), evidence.clone());
+                        }
+                    }
+                } else if measured_family == "*" {
                     for family in self.tracks.keys() { self.latest_egress.insert(family.clone(), egress.clone()); }
                 } else {
                     self.latest_egress.insert(measured_family.to_string(), egress);
@@ -914,17 +1241,6 @@ impl ChannelSupervisor {
                 self.latest_environment_at = Some(source_at);
                 let family_ids: Vec<String> = self.tracks.keys().cloned().collect();
                 for family in family_ids {
-                    if fresh_egress {
-                        if let Some(track) = self.tracks.get_mut(&family) {
-                            if track.audit_last_failure_code.as_deref()
-                                == Some("async_audit_retries_exhausted")
-                            {
-                                track.audit_retry_count = 0;
-                                track.audit_retry_not_before = None;
-                                track.audit_last_failure_code = None;
-                            }
-                        }
-                    }
                     self.evaluate_family(&family, now)?;
                 }
             }
@@ -934,11 +1250,22 @@ impl ChannelSupervisor {
                 processes,
                 ..
             } => {
-                if let Some(spec) = PolicyCatalog::family(&family) {
-                    SessionStore::for_family(self.storage.clone(), spec.id)
-                        .reconcile_channel_processes(&processes, now)?;
-                }
-                if let Some(track) = self.tracks.get_mut(&family) {
+                let reconciled = if let Some(spec) = PolicyCatalog::family(&family) {
+                    match SessionStore::for_family(self.storage.clone(), spec.id)
+                        .reconcile_channel_processes(&processes, now) {
+                        Ok(()) => true,
+                        Err(error) if error.code == "busy" => false,
+                        Err(error) => return Err(error),
+                    }
+                } else { true };
+                if !reconciled {
+                    if let Some(track) = self.tracks.get_mut(&family) {
+                        // A concurrent collector owns the session transaction.
+                        // Keep known members, revoke now and retry on inventory.
+                        track.inventory_failed = true;
+                        track.audit_in_flight = None;
+                    }
+                } else if let Some(track) = self.tracks.get_mut(&family) {
                     if !track.processes.iter().any(|p| processes.contains(p)) && track.processes != processes {
                         // An audit of a replaced/execed process cannot authorize
                         // the new instance, even if its PID was reused.
@@ -1005,11 +1332,14 @@ impl ChannelSupervisor {
             }
             SupervisionEvent::LeaseExpired { woke_from_sleep, .. } => {
                 let mut receipt_received_at = now;
-                if let Some(enforcer) = &self.enforcer {
+                // The existing executor watchdog owns periodic socket cutoff
+                // in production. Explicit wake and standalone drives still
+                // synchronously cut the live sockets before inspecting state.
+                if let Some(enforcer) = self.enforcer.as_ref().filter(|_| woke_from_sleep || delivered_at.is_none()) {
                     let receipts = enforcer.enforce_active_deadlines(now, woke_from_sleep)?;
                     receipt_received_at = self.inline_receipt_clock.map_or(now, |clock| clock());
                     for receipt in receipts {
-                        self.ingest_receipt(receipt, receipt_received_at)?;
+                        publish |= self.ingest_receipt(receipt, receipt_received_at)?;
                     }
                 }
                 let vpn_stale_at_deadline = self
@@ -1018,35 +1348,23 @@ impl ChannelSupervisor {
                     .is_some_and(|obs| !obs.is_fresh(now));
                 let family_ids: Vec<String> = self.tracks.keys().cloned().collect();
                 for family in family_ids {
-                    if vpn_stale_at_deadline {
+                    let recovery_due = self.tracks.get(&family).is_some_and(|track|
+                        track.audit_in_flight.is_none()
+                            && track.audit_retry_not_before.is_some_and(|deadline| now >= deadline));
+                    if vpn_stale_at_deadline || (recovery_due && !woke_from_sleep) {
                         self.evaluate_family(&family, now)?;
-                        continue;
                     }
-                    if let Some(track) = self.tracks.get_mut(&family) {
-                        if let Some(permit) = track.current_permit.as_mut() {
-                            let (eff, reason) = permit.effective_state_with_clock(
-                                now,
-                                None,
-                                woke_from_sleep,
-                                &self.saved_policy_version,
-                            );
-                            if eff == ChannelPermitState::Revoked && permit.state != ChannelPermitState::Revoked {
-                                permit.state = ChannelPermitState::Revoked;
-                                permit.reason_code = reason.into();
-                                track.revoked_at = Some(now);
-                            }
-                        }
-                        if let Some(enforcer) = &self.enforcer {
-                            if let Ok(Some(r)) = enforcer.receipt_for(&family, receipt_received_at) {
-                                track.latest_receipt = Some(r);
-                            }
-                        }
-                    }
-                    self.refresh_verdict_and_emit(&family, receipt_received_at);
+                    // A stable revoked command still needs current executor
+                    // evidence, including while the VPN observation is stale.
+                    let (received_at, refreshed) = self.refresh_execution_receipt(&family, receipt_received_at)?;
+                    publish |= refreshed;
+                    self.refresh_verdict_and_emit(&family, received_at);
                 }
             }
             SupervisionEvent::EnforcementReceiptArrived { receipt, .. } => {
-                self.ingest_receipt(receipt, now)?;
+                let family = receipt.family.clone();
+                publish = self.ingest_receipt(receipt, now)?;
+                if !publish { self.refresh_verdict_and_emit(&family, now); }
             }
             SupervisionEvent::ProcessReceiptArrived { receipt, .. } => {
                 self.ingest_process_receipt(receipt, now)?;
@@ -1074,33 +1392,7 @@ impl ChannelSupervisor {
         }
 
         let snap = self.snapshot(now);
-        // Secondary persistence never blocks or rolls back the channel command
-        // already executed by the enforcer.
-        let mut published = json!(snap);
-        published["executor_boot_id"] = json!(self.expected_executor_boot_id);
-        published["producer_identity"] = crate::channel_policy_status::current_producer_identity();
-        published["authoritative_permits"] = json!(self.tracks.iter()
-            .filter_map(|(family, track)| track.current_permit.as_ref().map(|p| (family.clone(), p.clone())))
-            .collect::<BTreeMap<_, _>>());
-        published["enforcement_receipts"] = json!(self.tracks.iter()
-            .filter_map(|(family, track)| track.latest_receipt.as_ref().map(|r| (family.clone(), r.clone())))
-            .collect::<BTreeMap<_, _>>());
-        published["process_receipts"] = json!(self.tracks.iter()
-            .filter_map(|(family, track)| track.latest_process_receipt.as_ref().map(|r| (family.clone(), r.clone())))
-            .collect::<BTreeMap<_, _>>());
-        self.persist_state("state/channel-supervision.json", "persist_supervision", &published, now);
-        self.persist_state("state/channel-events.json", "persist_monitor_events", &json!(self.persisted_events), now);
-        let vpn_supervision = json!({
-            "captured_at": now,
-            "network_backend": self.config.effective_network_backend(),
-            "requires_migration": self.config.requires_backend_migration_setup(),
-            "expectation": self.config.vpn_expectation,
-            "observation": self.latest_vpn_observation,
-            "unavailable_reason": self.latest_vpn_unavailable_reason,
-            "vpn_match": self.compute_vpn_match(now),
-        });
-        self.persist_state("state/vpn-supervision.json", "persist_vpn_observation", &vpn_supervision, now);
-        crate::native::notify_channel_update();
+        if publish || self.event_seq != initial_seq { self.publish(&snap); }
         Ok(snap)
     }
 
@@ -1229,25 +1521,21 @@ impl ChannelSupervisor {
                     track.audit_in_flight = None;
                     track.audit_retry_count = 0;
                     track.audit_retry_not_before = None;
-                    track.last_risk_at = Some(now);
+                    if track.current_permit.as_ref().is_none_or(|p| p.reason_code != code) {
+                        track.evidence_invalidated_at = Some(now);
+                    }
                 }
-                if let Some(s) = session.as_ref() {
-                    let _ = sessions.mark_failure(
-                        Some(&s.session_id),
-                        now,
-                        &code,
-                        "VPN 实际状态与保存预期不符或观测证据失效，已立即撤销通道放行并保留进程",
-                        true,
-                    );
-                    session = sessions.load(now)?;
+                self.issue_family_command(family, session.as_ref(), ChannelPermitState::Revoked, &code, now)?;
+                // Missing/stale evidence closes the same network gate but does
+                // not establish a VPN mismatch or a confirmed session risk.
+                if matches!(vm, VpnMatch::Mismatched { .. }) {
+                    if let Some(s) = session.as_ref().filter(|s| matches!(s.state, Phase::Active | Phase::Rechecking)) {
+                        let _ = sessions.mark_failure(
+                            Some(&s.session_id), now, &code, "已确认 VPN 实际状态与保存预期不符", true,
+                        );
+                    }
                 }
-                return self.issue_family_command(
-                    family,
-                    session.as_ref(),
-                    ChannelPermitState::Revoked,
-                    &code,
-                    now,
-                );
+                return Ok(());
             }
         }
 
@@ -1448,7 +1736,7 @@ impl ChannelSupervisor {
                 {
                     (
                         ChannelPermitState::Revoked,
-                        "async_audit_retries_exhausted".into(),
+                        "async_audit_retry_wait".into(),
                     )
                 } else {
                     (
@@ -1468,7 +1756,7 @@ impl ChannelSupervisor {
             {
                 (
                     ChannelPermitState::Revoked,
-                    "async_audit_retries_exhausted".into(),
+                    "async_audit_retry_wait".into(),
                 )
             } else {
                 (
@@ -1512,16 +1800,12 @@ impl ChannelSupervisor {
                 track.audit_in_flight = None;
                 track.audit_retry_count = track.audit_retry_count.saturating_add(1);
                 track.audit_last_failure_code = Some("async_audit_timeout".into());
-                track.audit_retry_not_before = Some(now + ASYNC_AUDIT_RETRY_BACKOFF_SECONDS);
+                track.audit_retry_not_before = Some(now + async_audit_retry_delay(track.audit_retry_count));
             } else {
                 return;
             }
         }
 
-        if track.audit_retry_count >= MAX_ASYNC_AUDIT_RETRIES {
-            track.audit_last_failure_code = Some("async_audit_retries_exhausted".into());
-            return;
-        }
         if track
             .audit_retry_not_before
             .is_some_and(|not_before| now < not_before)
@@ -1555,13 +1839,13 @@ impl ChannelSupervisor {
                 track.audit_in_flight = None;
                 track.audit_retry_count = track.audit_retry_count.saturating_add(1);
                 track.audit_last_failure_code = Some("async_audit_channel_closed".into());
-                track.audit_retry_not_before = Some(now + ASYNC_AUDIT_RETRY_BACKOFF_SECONDS);
+                track.audit_retry_not_before = Some(now + async_audit_retry_delay(track.audit_retry_count));
             }
         } else {
             track.audit_in_flight = None;
             track.audit_retry_count = track.audit_retry_count.saturating_add(1);
             track.audit_last_failure_code = Some("async_audit_worker_missing".into());
-            track.audit_retry_not_before = Some(now + ASYNC_AUDIT_RETRY_BACKOFF_SECONDS);
+            track.audit_retry_not_before = Some(now + async_audit_retry_delay(track.audit_retry_count));
         }
     }
 
@@ -1604,14 +1888,14 @@ impl ChannelSupervisor {
             let audit_target = in_flight.target;
             let audit_vpn_epoch = in_flight.vpn_epoch.clone();
             track.audit_in_flight = None;
-            let risk_since_request = track
-                .last_risk_at
-                .is_some_and(|risk_at| risk_at > requested_at);
+            let invalidated_since_request = track
+                .evidence_invalidated_at
+                .is_some_and(|invalidated_at| invalidated_at > requested_at);
             let vpn_epoch_changed = current_vpn_epoch.is_some()
                 && audit_vpn_epoch != current_vpn_epoch;
             let is_stale = audit_policy != self.saved_policy_version
                 || audit_session_id != current_session_id
-                || risk_since_request
+                || invalidated_since_request
                 || vpn_epoch_changed;
             (true, is_stale, timeout_limit, audit_target, audit_vpn_epoch)
         };
@@ -1651,11 +1935,9 @@ impl ChannelSupervisor {
                         now,
                     );
                 }
-                if let Some(track) = self.tracks.get_mut(family) {
-                    track.audit_retry_count = 0;
-                    track.audit_retry_not_before = None;
-                    track.audit_last_failure_code = None;
-                }
+                // A completed probe can still carry an unready audit, stale
+                // epoch, or rejected recovery evidence. Only a committed
+                // verified adoption/recovery resets consecutive failures.
                 (audit, egress)
             }
             AsyncAuditOutcome::Failed { code, .. } => {
@@ -1769,27 +2051,19 @@ impl ChannelSupervisor {
                             restored.context_id = context_id.to_string();
                             restored.baseline = exit;
                             restored.reason = None;
-                            if let Err(error) = self.storage.atomic_json(
-                                &self.storage.paths.session_for(family), &json!(restored),
-                            ) {
-                                if let Some(logger) = &self.diagnostics {
-                                logger.persistence_failed(self.diagnostic(Some(family), "persist_recovered_session"), &error, now);
-                                }
-                            }
+                            return self.commit_channel_recovery(
+                                family, &sessions, s, &restored, recovered_permit, requested_at, now,
+                            );
                         }
                     }
-                    self.apply_permit_to_enforcer(family, recovered_permit, now)?;
+                    self.record_async_audit_failure(family, current_session.as_ref(),
+                        "recovery_session_unavailable", now)?;
                 }
                 Err(_) => {
                     // Keep channel revoked when recovery verification fails
                     let updated = sessions.load(now)?;
-                    self.issue_family_command(
-                        family,
-                        updated.as_ref(),
-                        ChannelPermitState::Revoked,
-                        "recovery_verification_failed",
-                        now,
-                    )?;
+                    self.record_async_audit_failure(family, updated.as_ref(),
+                        "recovery_verification_failed", now)?;
                 }
             }
             return Ok(());
@@ -1798,18 +2072,120 @@ impl ChannelSupervisor {
         // Case 2: One adoption path for desktops, CLIs and retained children.
         if current_session.is_none() {
             let processes = self.tracks.get(family).map(|t| t.processes.clone()).unwrap_or_default();
-            if processes.is_empty() { return Ok(()); }
+            if processes.is_empty() {
+                // Observed desktops alone do not confer managed membership.
+                // Bound repeat diagnostics instead of immediately running the
+                // same successful-but-inapplicable audit on every event.
+                return self.record_async_audit_failure(family, None, "audit_target_unmanaged", now);
+            }
             match sessions.begin_channel_verified(&receipts_store, &audit, &egress, &processes, now) {
                 Ok(adopted) => {
-                    self.issue_family_command(family, Some(&adopted), ChannelPermitState::Permitted,
-                        "session_adopted", now)?;
-                    return Ok(());
+                    return self.commit_channel_adoption(family, &sessions, &adopted, now);
                 }
                 Err(_) => return self.record_async_audit_failure(family, None, "initial_audit_rejected", now),
             }
         }
 
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn checked_session_authorization_lock(
+        &mut self,
+        family: &str,
+        sessions: &SessionStore,
+        expected: &session::Session,
+        requested_at: Option<f64>,
+        now: f64,
+        busy_code: &str,
+        changed_code: &str,
+    ) -> Result<Option<crate::storage::OperationLock>> {
+        let session_lock = match self.storage.lock(&sessions.lock_name(), None) {
+            Ok(lock) => lock,
+            Err(error) if error.code == "busy" => {
+                // The session may already be Active after adoption. Establish
+                // a recovery fence so fast observations cannot skip a new audit.
+                self.issue_family_command(family, Some(expected), ChannelPermitState::Revoked, busy_code, now)?;
+                self.record_async_audit_failure(family, Some(expected), busy_code, now)?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let current = sessions.load(now)?;
+        let risk_after_request = requested_at.is_some_and(|requested_at| current.as_ref().is_some_and(|s| {
+            s.locked_at.is_some_and(|at| at > requested_at)
+                || s.reason.as_ref().is_some_and(|reason| reason.observed_at > requested_at)
+                || s.last_reason.as_ref().is_some_and(|reason| reason.observed_at > requested_at)
+        }));
+        if current.as_ref() != Some(expected) || risk_after_request {
+            self.issue_family_command(family, current.as_ref(), ChannelPermitState::Revoked, changed_code, now)?;
+            self.record_async_audit_failure(family, current.as_ref(), changed_code, now)?;
+            return Ok(None);
+        }
+        Ok(Some(session_lock))
+    }
+
+    fn commit_channel_adoption(
+        &mut self,
+        family: &str,
+        sessions: &SessionStore,
+        adopted: &session::Session,
+        now: f64,
+    ) -> Result<()> {
+        let Some(_session_lock) = self.checked_session_authorization_lock(
+            family, sessions, adopted, None, now, "adoption_session_busy", "adoption_session_changed",
+        )? else { return Ok(()); };
+        self.issue_family_command(family, Some(adopted), ChannelPermitState::Permitted,
+            "session_adopted", now)?;
+        self.reset_audit_retry_after_commit(family);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_channel_recovery(
+        &mut self,
+        family: &str,
+        sessions: &SessionStore,
+        expected: &session::Session,
+        restored: &session::Session,
+        recovered_permit: ChannelPermit,
+        requested_at: f64,
+        now: f64,
+    ) -> Result<()> {
+        let Some(_session_lock) = self.checked_session_authorization_lock(
+            family, sessions, expected, Some(requested_at), now, "recovery_session_busy", "recovery_session_changed",
+        )? else { return Ok(()); };
+        let persist = || self.storage.atomic_json(
+            &self.storage.paths.session_for(family), &json!(restored),
+        );
+        #[cfg(test)]
+        let persisted = self.recovery_persist_failure.clone().map_or_else(persist, Err);
+        #[cfg(not(test))]
+        let persisted = persist();
+        if let Err(error) = persisted {
+            if let Some(logger) = &self.diagnostics {
+                logger.persistence_failed(self.diagnostic(Some(family), "persist_recovered_session"), &error, now);
+            }
+            return self.record_async_audit_failure(
+                family, Some(expected), "recovery_session_persist_failed", now,
+            );
+        }
+        // Keep the transaction lock through command application: no collector
+        // may replace the checked session between persistence and authorization.
+        self.apply_permit_to_enforcer(family, recovered_permit, now)?;
+        self.reset_audit_retry_after_commit(family);
+        Ok(())
+    }
+
+    fn reset_audit_retry_after_commit(&mut self, family: &str) {
+        if let Some(track) = self.tracks.get_mut(family) {
+            // Command construction can still downgrade an expired permit.
+            if track.current_permit.as_ref().is_some_and(|permit| permit.state == ChannelPermitState::Permitted) {
+                track.audit_retry_count = 0;
+                track.audit_retry_not_before = None;
+                track.audit_last_failure_code = None;
+            }
+        }
     }
 
     fn record_async_audit_failure(
@@ -1824,10 +2200,10 @@ impl ChannelSupervisor {
                 return Ok(());
             };
             track.audit_retry_count = track.audit_retry_count.saturating_add(1);
-            track.audit_retry_not_before = Some(now + ASYNC_AUDIT_RETRY_BACKOFF_SECONDS);
+            track.audit_retry_not_before = Some(now + async_audit_retry_delay(track.audit_retry_count));
             let exhausted = track.audit_retry_count >= MAX_ASYNC_AUDIT_RETRIES;
             let code = if exhausted {
-                "async_audit_retries_exhausted"
+                "async_audit_retry_wait"
             } else {
                 failure_code
             };
@@ -1839,7 +2215,7 @@ impl ChannelSupervisor {
             (exhausted, was_revoked)
         };
         let (state, reason) = if retries_exhausted {
-            (ChannelPermitState::Revoked, "async_audit_retries_exhausted")
+            (ChannelPermitState::Revoked, "async_audit_retry_wait")
         } else if was_revoked {
             (ChannelPermitState::Revoked, failure_code)
         } else {
@@ -1926,7 +2302,9 @@ impl ChannelSupervisor {
                     && p.backend == backend && p.coverage_scope == coverage_scope
                     && (p.state != ChannelPermitState::Permitted || p.vpn_epoch == vpn_epoch)
                     && now >= p.issued_at && (p.state != ChannelPermitState::Permitted
-                        || (p.valid_until > now + DEFAULT_PERMIT_TTL / 2.0 && p.valid_until <= valid_until))
+                        || (now < p.valid_until && p.valid_until <= valid_until
+                            && (p.valid_until == valid_until
+                                || p.valid_until - now > (p.valid_until - p.issued_at) / 2.0)))
             })
         }) { return Ok(()); }
 
@@ -1946,7 +2324,7 @@ impl ChannelSupervisor {
             }
             if effective_desired_state == ChannelPermitState::Revoked && state_changed {
                 track.revoked_at = Some(now);
-                track.last_risk_at = Some(now);
+                track.evidence_invalidated_at = Some(now);
             }
             track.session_id = session_id.clone();
             track.command_seq = track.command_seq.saturating_add(1);
@@ -2005,13 +2383,6 @@ impl ChannelSupervisor {
             track.policy_sync_state = PolicySyncState::PendingApply;
             track.latest_receipt = None;
         }
-        let mut all_permits: std::collections::BTreeMap<String, ChannelPermit> = std::collections::BTreeMap::new();
-        for (fam, tr) in &self.tracks {
-            if let Some(ref p) = tr.current_permit {
-                all_permits.insert(fam.clone(), p.clone());
-            }
-        }
-        self.persist_state("state/channel-permits.json", "persist_permits", &json!(all_permits), now);
         if let Some(logger) = &self.diagnostics {
             let mut diagnostic = self.diagnostic(Some(family), "command_issued");
             diagnostic.state = serde_json::to_value(command.permit.state).ok().and_then(|v| v.as_str().map(str::to_owned));
@@ -2042,7 +2413,39 @@ impl ChannelSupervisor {
         Ok(())
     }
 
-    fn ingest_receipt(&mut self, receipt: ChannelEnforcementReceipt, receiver_now: f64) -> Result<()> {
+    fn refresh_execution_receipt(&mut self, family: &str, now: f64) -> Result<(f64, bool)> {
+        let Some(enforcer) = self.enforcer.clone() else { return Ok((now, false)); };
+        let Some(track) = self.tracks.get_mut(family) else { return Ok((now, false)); };
+        // Deadline ticks can be frequent. Refresh well before evidence expires,
+        // and bound retry/write load when an executor is unavailable.
+        let refresh_interval = MAX_ENFORCEMENT_RECEIPT_AGE / 3.0;
+        let due = |at: f64| !at.is_finite() || at > now || now - at >= refresh_interval;
+        if track.current_permit.is_none()
+            || !track.latest_receipt.as_ref().is_none_or(|receipt| due(receipt.observed_at))
+            || !track.last_receipt_refresh_attempt.is_none_or(due)
+        {
+            return Ok((now, false));
+        }
+        track.last_receipt_refresh_attempt = Some(now);
+        match enforcer.receipt_for(family, now) {
+            Ok(Some(receipt)) => {
+                let received_at = self.inline_receipt_clock.map_or(now, |clock| clock());
+                let accepted = self.ingest_receipt(receipt, received_at)?;
+                Ok((received_at, accepted))
+            }
+            Ok(None) => Ok((now, false)),
+            Err(error) => {
+                if let Some(logger) = &self.diagnostics {
+                    let mut diagnostic = self.diagnostic(Some(family), "receipt_refresh_failed");
+                    diagnostic.failure = Some(crate::channel_diagnostics::DiagnosticFailure::from_error(&error));
+                    logger.record(diagnostic, now);
+                }
+                Ok((now, false))
+            }
+        }
+    }
+
+    fn ingest_receipt(&mut self, receipt: ChannelEnforcementReceipt, receiver_now: f64) -> Result<bool> {
         let family = receipt.family.clone();
         let expected_boot_id = self.expected_executor_boot_id.clone();
         let mut autonomous_cutoff = None;
@@ -2054,45 +2457,44 @@ impl ChannelSupervisor {
             || old.active_flows_count != receipt.active_flows_count);
         let accepted = {
             let Some(track) = self.tracks.get_mut(&family) else {
-                return Ok(());
+                return Ok(false);
             };
             // Reject stale session, older generation, or out-of-order command receipts
             // so old receipts never overwrite newer state!
             let Some(permit) = track.current_permit.as_ref() else {
-                return Ok(());
+                return Ok(false);
             };
+            let boot_id_valid = !receipt.executor_boot_id.is_empty() && expected_boot_id
+                .as_deref().is_none_or(|exp| exp == receipt.executor_boot_id.as_str());
+            let timing_valid = receipt.observed_at + CLOCK_ROLLBACK_TOLERANCE_SECONDS >= permit.issued_at
+                && receipt.observed_at <= receiver_now + CLOCK_ROLLBACK_TOLERANCE_SECONDS
+                && (receiver_now - receipt.observed_at) < MAX_ENFORCEMENT_RECEIPT_AGE;
+            let newer = track.latest_receipt.as_ref().is_none_or(|old| {
+                if old.receipt_seq != 0 || receipt.receipt_seq != 0 {
+                    receipt.receipt_seq > old.receipt_seq
+                } else {
+                    receipt.observed_at > old.observed_at
+                }
+            });
             if receipt.session_id != permit.session_id
-                || receipt.permit_generation < permit.permit_generation
-                || receipt.command_seq < permit.command_seq
+                || receipt.permit_generation != permit.permit_generation
+                || receipt.command_seq != permit.command_seq
+                || receipt.policy_version != self.saved_policy_version
+                || receipt.policy_version != permit.policy_version
+                || receipt.backend != permit.backend || receipt.vpn_epoch != permit.vpn_epoch
+                || receipt.system_extension_active || !boot_id_valid || !timing_valid || !newer
             {
                 false
             } else {
-                let boot_id_valid = expected_boot_id
-                    .as_deref()
-                    .is_none_or(|exp| exp == receipt.executor_boot_id.as_str());
-                let timing_valid = receipt.observed_at + CLOCK_ROLLBACK_TOLERANCE_SECONDS
-                    >= permit.issued_at
-                    && receipt.observed_at <= receiver_now + CLOCK_ROLLBACK_TOLERANCE_SECONDS
-                    && (receiver_now - receipt.observed_at) < MAX_ENFORCEMENT_RECEIPT_AGE;
-                if boot_id_valid && timing_valid && receipt.policy_version == self.saved_policy_version
-                    && receipt.policy_version == permit.policy_version
-                    && receipt.command_seq == permit.command_seq && receipt.permit_generation == permit.permit_generation
-                    && permit.state == ChannelPermitState::Permitted && receipt.permit_state == ChannelPermitState::Revoked {
+                if permit.state == ChannelPermitState::Permitted && receipt.permit_state == ChannelPermitState::Revoked {
                     autonomous_cutoff = Some(receipt.error_code.clone().unwrap_or_else(|| "executor_autonomous_cutoff".into()));
                     track.audit_in_flight = None;
                 }
-                if receipt.policy_version == self.saved_policy_version
-                    && receipt.command_seq == permit.command_seq
-                {
-                    if boot_id_valid
-                        && timing_valid
-                        && receipt.enforcement_state != ChannelEnforcementState::Failed
-                    {
-                        track.applied_policy_version = Some(receipt.policy_version.clone());
-                        track.policy_sync_state = PolicySyncState::Applied;
-                    } else {
-                        track.policy_sync_state = PolicySyncState::ApplyFailed;
-                    }
+                if receipt.enforcement_state != ChannelEnforcementState::Failed {
+                    track.applied_policy_version = Some(receipt.policy_version.clone());
+                    track.policy_sync_state = PolicySyncState::Applied;
+                } else {
+                    track.policy_sync_state = PolicySyncState::ApplyFailed;
                 }
                 track.latest_receipt = Some(receipt);
                 true
@@ -2108,7 +2510,11 @@ impl ChannelSupervisor {
                 diagnostic.command_seq = Some(receipt_for_log.command_seq);
                 diagnostic.source_observed_at = Some(receipt_for_log.observed_at);
                 diagnostic.state = serde_json::to_value(receipt_for_log.enforcement_state).ok().and_then(|v| v.as_str().map(str::to_owned));
-                diagnostic.failure = receipt_for_log.error_code.map(|code| crate::channel_diagnostics::DiagnosticFailure::from_error(&CoreError::new(&code, "")));
+                diagnostic.reason_code = receipt_for_log.error_code.clone();
+                if receipt_for_log.enforcement_state == ChannelEnforcementState::Failed {
+                    let code = receipt_for_log.error_code.as_deref().unwrap_or("enforcement_failed");
+                    diagnostic.failure = Some(crate::channel_diagnostics::DiagnosticFailure::from_error(&CoreError::new(code, "")));
+                }
                 logger.record(diagnostic, receiver_now);
             }
         }
@@ -2118,13 +2524,13 @@ impl ChannelSupervisor {
                 // Issue a new authority command and recovery fence. The
                 // executor's immutable old command is never edited in place.
                 self.issue_family_command(&family, session.as_ref(), ChannelPermitState::Revoked, &reason, receiver_now)?;
-                return Ok(());
+                return Ok(true);
             }
         }
         if accepted {
             self.refresh_verdict_and_emit(&family, receiver_now);
         }
-        Ok(())
+        Ok(accepted)
     }
 
     pub fn ingest_process_receipt(
@@ -2183,6 +2589,8 @@ impl ChannelSupervisor {
                 code: "enforcement_command_apply_failed".into(),
                 status_label_zh: "通道执行失败，未确认实际断流".into(),
             }
+        } else if track.latest_receipt.is_none() && self.enforcer.is_some() {
+            ChannelSupervisionVerdict::PendingVerification { state: ChannelEnforcementState::PendingVerification }
         } else { evaluate_channel_supervision_with_boot_id(
             permit,
             track.latest_receipt.as_ref(),
@@ -2190,8 +2598,12 @@ impl ChannelSupervisor {
             self.expected_executor_boot_id.as_deref(),
             now,
         ) };
-        if matches!(verdict, ChannelSupervisionVerdict::EnforcementFailed { .. }) {
-            track.policy_sync_state = PolicySyncState::ApplyFailed;
+        if let ChannelSupervisionVerdict::EnforcementFailed { code, .. } = &verdict {
+            track.policy_sync_state = if code == "enforcement_receipt_expired" {
+                PolicySyncState::PendingApply
+            } else {
+                PolicySyncState::ApplyFailed
+            };
         }
         track.verdict = Some(verdict);
         let local_proxy_port = self.enforcer.as_ref().and_then(|e| e.local_proxy_port());
@@ -2217,6 +2629,11 @@ impl ChannelSupervisor {
             unmanaged_pids,
             now,
         );
+        if self.persisted_events.iter().rev().find(|e| e.family_state.family == family).is_some_and(|e| {
+            let mut previous = e.family_state.clone();
+            previous.updated_at = family_state.updated_at;
+            previous == family_state
+        }) { return; }
         self.event_seq = self.event_seq.saturating_add(1);
         let event = ChannelMonitorEvent {
             producer_boot_id: self.producer_boot_id.clone(),
@@ -2374,7 +2791,10 @@ impl ChannelSupervisor {
             saved_policy_version: saved_policy_version.clone(),
             applied_policy_version: track.applied_policy_version.clone(),
             policy_sync_state: track.policy_sync_state,
-            policy_sync_label_zh: track.policy_sync_state.label_zh().into(),
+            policy_sync_label_zh: if matches!(&track.verdict,
+                Some(ChannelSupervisionVerdict::EnforcementFailed { code, .. }) if code == "enforcement_receipt_expired") {
+                "执行回执待核验".into()
+            } else { track.policy_sync_state.label_zh().into() },
             permit_generation: track.permit_generation,
             command_seq: track.command_seq,
             permit_state,

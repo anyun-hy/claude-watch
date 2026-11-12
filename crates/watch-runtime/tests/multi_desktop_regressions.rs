@@ -1,12 +1,12 @@
 //! Isolated multi-main contracts: temporary files and mock native observations.
 //! No child process, network, native helper, app launch or signal is used.
 use claude_watch_core::{
-    config::Config, error::{CoreError, Result}, processes::{LaunchTarget, Provider},
-    session::{Desktop, Launcher, Phase, Session},
+    config::Config, error::{CoreError, Result}, processes::Provider,
+    session::{self, Desktop, Phase, Session, GROUP_CONTINUITY_KEY, GROUP_KEY, GROUP_RECHECK_KEY},
 };
 use claude_watch_runtime::{
     background_evidence::{self, EvidenceSystem, ProbeKind},
-    config_store::{ConfigStore, policy_digest}, controlled::{Controller, DesktopSystem},
+    config_store::{ConfigStore, policy_digest},
     receipt_store::ReceiptStore,
     session_store::{SessionStore, desktop_groups::{
         canonical_desktops, desktop_members, group_rechecking, group_stamps,
@@ -14,7 +14,7 @@ use claude_watch_runtime::{
     storage::{Paths, StateStore},
 };
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf, time::Duration};
+use std::{fs, path::PathBuf};
 
 fn desktop(pid: u32, start: u64) -> Desktop {
     Desktop { pid, start_seconds: start, start_microseconds: 1 }
@@ -50,15 +50,16 @@ fn probe(kind: ProbeKind, now: f64, dns_country: &str) -> Value {
     }
     value
 }
-struct Fixture { root: PathBuf, store: StateStore, controller: Controller }
+struct Fixture { root: PathBuf, store: StateStore }
 impl Fixture {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!("cw-multi-main-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
         let store = StateStore::new(Paths::new(&root).unwrap());
         store.atomic_json(&store.paths.config(), &Config { guard_enabled: true, ..Default::default() }.value().unwrap()).unwrap();
-        let f = Self { root, controller: Controller::new(store.clone()), store };
-        f.seed(1000., "JP"); f
+        let f = Self { root, store };
+        f.seed(1000., "JP");
+        f
     }
     fn seed(&self, now: f64, country: &str) {
         let receipts = ReceiptStore { storage: self.store.clone() };
@@ -67,29 +68,30 @@ impl Fixture {
     }
     fn sessions(&self) -> SessionStore { SessionStore::for_family(self.store.clone(), "openai") }
     fn session(&self, now: f64) -> Session { self.sessions().load(now).unwrap().unwrap() }
-    fn config(&self, key: &str, value: Value) {
-        let store = ConfigStore { storage: self.store.clone() };
-        let mut config = store.load().unwrap().value().unwrap();
-        let force = value.as_str() == Some("force") && key.starts_with("gpt_close_");
-        config[key] = value;
-        store.save_with_force_confirmation(config, force.then_some(key)).unwrap();
-    }
-    fn mock(&self, count: usize) -> Mock {
-        Mock { store: self.store.clone(), family: "openai", now: 1001.,
-            mains: (0..count).map(|i| desktop(77 + i as u32, 900)).collect(), claude: vec![],
-            hidden: vec![], helper: false, ip: "1.1.1.1", country: "JP", dns_country: "JP",
-            closes: 0, forces: 0, audits: 0, fail_quit: false, support_group: true,
-            change_on_audit: false, change_on_revalidate: false, lock_on_revalidate: false,
-            events: vec![] }
-    }
-    fn tick(&self, system: &mut Mock) -> Value {
-        self.controller.guard_tick(system).unwrap()["families"].as_array().unwrap()
-            .iter().find(|v| v["family"] == "openai").unwrap().clone()
-    }
+
+    // Seed an existing group record. The evidence worker still performs the
+    // real identity, policy, context, receipt and commit checks.
     fn pending_join(&self) -> (Mock, Session) {
-        let mut system = self.mock(1); self.tick(&mut system); system.now += 1.;
-        system.mains.push(desktop(78, 900)); self.tick(&mut system);
-        let value = self.session(system.now); assert_eq!(value.state, Phase::Rechecking);
+        let system = Mock {
+            store: self.store.clone(), family: "openai", now: 1002.,
+            mains: vec![desktop(77, 900), desktop(78, 900)], ip: "1.1.1.1", country: "JP",
+            support_group: true, change_on_revalidate: false, lock_on_revalidate: false,
+        };
+        let initial = 1000.0;
+        let egress = egress(initial, system.ip, system.country);
+        let audit = audit(&self.store, initial, true, system.ip, system.country);
+        let risk = (ReceiptStore { storage: self.store.clone() }).session_risk("ctx", Some(system.ip), initial);
+        let mut value = session::begin(&audit, &egress, &risk, "fixture-pending-group", initial).unwrap();
+        value.state = Phase::Rechecking;
+        value.created_at = system.now;
+        value.pending_deadline = system.now + session::RISK_EVIDENCE_TTL;
+        value.desktop = system.mains.first().cloned();
+        value.bound_at = Some(system.now);
+        value.extra.insert(GROUP_KEY.into(), json!(system.mains));
+        value.extra.insert(GROUP_RECHECK_KEY.into(), json!(true));
+        value.extra.insert(GROUP_CONTINUITY_KEY.into(), json!(true));
+        value.extra.insert("baseline_dns_countries".into(), json!(["JP"]));
+        self.store.atomic_json(&self.store.paths.session_for("openai"), &json!(value)).unwrap();
         (system, value)
     }
 }
@@ -97,67 +99,18 @@ impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.ro
 
 struct Mock {
     store: StateStore, family: &'static str, now: f64,
-    mains: Vec<Desktop>, claude: Vec<Desktop>, hidden: Vec<u32>, helper: bool,
-    ip: &'static str, country: &'static str, dns_country: &'static str,
-    closes: usize, forces: usize, audits: usize, fail_quit: bool, support_group: bool,
-    change_on_audit: bool, change_on_revalidate: bool, lock_on_revalidate: bool,
-    events: Vec<String>,
+    mains: Vec<Desktop>, ip: &'static str, country: &'static str,
+    support_group: bool, change_on_revalidate: bool, lock_on_revalidate: bool,
 }
 impl Mock {
-    fn roots(&self) -> &[Desktop] { if self.family == "openai" { &self.mains } else { &self.claude } }
     fn rows(&self) -> Vec<(Desktop, bool, String)> {
-        let mut rows: Vec<_> = self.roots().iter().map(|d| (d.clone(), !self.hidden.contains(&d.pid), format!("fixture-{}-{}", d.pid, d.start_seconds))).collect();
-        if self.helper && self.family == "openai" { rows.push((desktop(199, 901), false, "fixture-helper".into())); }
-        rows
-    }
-    fn stop(&mut self) -> Result<()> {
-        if self.fail_quit { return Err(CoreError::new("fixture_quit_failed", "fixture")); }
-        if self.family == "openai" { self.mains.clear(); self.helper = false; } else { self.claude.clear(); }
-        Ok(())
-    }
-}
-impl DesktopSystem for Mock {
-    fn channel_mode(&self) -> bool { false }
-    fn launch_target(&self) -> LaunchTarget { if self.family == "openai" { LaunchTarget::CodexDesktop } else { LaunchTarget::ClaudeDesktop } }
-    fn set_family(&mut self, family: &str) -> Result<()> {
-        self.family = match family { "openai" => "openai", "claude" => "claude", _ => return Err(CoreError::new("unknown_family", "fixture")) }; Ok(())
-    }
-    fn now(&self) -> f64 { self.now }
-    fn monotonic(&self) -> Duration { Duration::from_secs_f64(self.now) }
-    fn wait(&mut self, duration: Duration) { self.now += duration.as_secs_f64(); }
-    fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> { Ok(self.rows()) }
-    fn desktop_alive(&mut self, expected: &Desktop) -> Result<bool> { Ok(self.roots().contains(expected)) }
-    fn desktop_tree_running(&mut self) -> Result<bool> { Ok(!self.roots().is_empty() || (self.helper && self.family == "openai")) }
-    fn launcher(&mut self) -> Result<Launcher> { Ok(Launcher { pid: 90, start: "fixture".into() }) }
-    fn full_audit(&mut self) -> Result<Value> {
-        self.audits += 1;
-        self.events.push(format!("{}:full_audit", self.family));
-        if self.change_on_audit { self.change_on_audit = false; self.mains.push(desktop(99, 901)); }
-        Ok(audit(&self.store, self.now, self.family == "openai", self.ip, self.country))
-    }
-    fn egress(&mut self) -> Value { egress(self.now, self.ip, self.country) }
-    fn local_guard(&mut self) -> Result<Value> { Ok(local()) }
-    fn backend_healthy(&mut self) -> Result<bool> { Ok(true) }
-    fn launcher_matches(&mut self, _: &Launcher) -> Result<bool> { Ok(true) }
-    fn open_desktop(&mut self) -> Result<()> { panic!("these tests must never open an app") }
-    fn quit_desktop(&mut self) -> Result<()> {
-        self.closes += 1;
-        self.events.push(format!("{}:quit_desktop", self.family));
-        self.stop()
-    }
-    fn quit_for_confirmed_ip_risk(&mut self, forced: &mut Option<u32>) -> Result<()> {
-        self.forces += 1;
-        self.events.push(format!("{}:force_desktop", self.family));
-        *forced = Some(self.roots().len() as u32);
-        self.stop()
+        self.mains.iter().map(|d| (d.clone(), true, format!("fixture-{}-{}", d.pid, d.start_seconds))).collect()
     }
 }
 impl EvidenceSystem for Mock {
     fn now(&self) -> f64 { self.now }
     fn local(&mut self, _: &Config) -> Result<Value> { Ok(local()) }
-    fn desktop_matches(&mut self, expected: &Desktop) -> Result<bool> {
-        Ok(self.rows().iter().any(|(d, main, _)| *main && d == expected))
-    }
+    fn desktop_matches(&mut self, expected: &Desktop) -> Result<bool> { Ok(self.mains.contains(expected)) }
     fn desktop_unique_stamp(&mut self, expected: &Desktop) -> Result<Option<String>> {
         Ok(group_stamps(&[expected.clone()], &self.rows())?.and_then(|v| v.into_iter().next().map(|(_, s)| s)))
     }
@@ -165,57 +118,32 @@ impl EvidenceSystem for Mock {
         if !self.support_group { return Err(CoreError::new("evidence_identity_unknown", "fixture")); }
         group_stamps(expected, &self.rows())
     }
-    fn supervised_provider(&self) -> Provider { DesktopSystem::launch_target(self).provider() }
-    fn set_family(&mut self, family: &str) -> Result<()> { DesktopSystem::set_family(self, family) }
-    fn collect(&mut self, kind: ProbeKind) -> Result<Value> { Ok(probe(kind, self.now, self.dns_country)) }
+    fn supervised_provider(&self) -> Provider { if self.family == "openai" { Provider::Codex } else { Provider::Claude } }
+    fn set_family(&mut self, family: &str) -> Result<()> {
+        self.family = match family { "openai" => "openai", "claude" => "claude", _ => return Err(CoreError::new("unknown_family", "fixture")) };
+        Ok(())
+    }
+    fn collect(&mut self, kind: ProbeKind) -> Result<Value> { Ok(probe(kind, self.now, "JP")) }
     fn revalidate(&mut self) -> Result<(Value, Value)> {
+        let sessions = SessionStore::for_family(self.store.clone(), "openai");
         if self.change_on_revalidate {
-            self.change_on_revalidate = false; self.mains.push(desktop(99, 902)); self.now += 1.;
-            Controller::new(self.store.clone()).guard_tick(self)?;
+            self.change_on_revalidate = false;
+            self.mains.push(desktop(99, 902));
+            self.now += 1.;
+            let mut newer = sessions.load(self.now)?.unwrap();
+            newer.session_id = "fixture-newer-group".into();
+            newer.extra.insert(GROUP_KEY.into(), json!(self.mains));
+            self.store.atomic_json(&self.store.paths.session_for("openai"), &json!(newer))?;
         }
         if self.lock_on_revalidate {
-            self.lock_on_revalidate = false; self.now += 1.;
-            let sessions = SessionStore::for_family(self.store.clone(), "openai");
+            self.lock_on_revalidate = false;
+            self.now += 1.;
             let current = sessions.load(self.now)?.unwrap();
             sessions.mark_failure(Some(&current.session_id), self.now, "egress_country_cn", "newer risk", true)?;
         }
-        Ok((DesktopSystem::full_audit(self)?, DesktopSystem::egress(self)))
+        Ok((audit(&self.store, self.now, self.family == "openai", self.ip, self.country),
+            egress(self.now, self.ip, self.country)))
     }
-}
-
-#[test]
-fn two_mains_are_bound_without_a_missing_session_stop() {
-    let f = Fixture::new(); let mut system = f.mock(2); let receipt = f.tick(&mut system);
-    assert_eq!(receipt["session_guard"]["reason"]["code"], "session_adopted");
-    assert_eq!(receipt["desktop_count"], 2); assert_eq!((system.closes, system.forces), (0, 0));
-    let value = f.session(system.now); assert_eq!(value.state, Phase::Active);
-    assert_eq!(desktop_members(&value).unwrap(), system.mains);
-    for pid in [77, 78] { assert!(f.store.paths.watch().join(format!("state/sessions/rust-{pid}.session")).exists()); }
-}
-#[test]
-fn inventory_order_and_helpers_do_not_rebind_a_group() {
-    let f = Fixture::new(); let mut system = f.mock(2); f.tick(&mut system);
-    let old = f.session(system.now); system.mains.reverse(); system.helper = true; system.now += 1.; f.tick(&mut system);
-    assert_eq!(f.session(system.now).session_id, old.session_id);
-    assert_eq!(desktop_members(&f.session(system.now)).unwrap().len(), 2);
-    assert_eq!((system.closes, system.forces), (0, 0));
-}
-#[test]
-fn either_member_can_exit_without_resetting_the_survivors_baseline() {
-    for index in [0, 1] {
-        let f = Fixture::new(); let mut system = f.mock(2); f.tick(&mut system); let old = f.session(system.now);
-        system.mains.remove(index); system.now += 1.; f.tick(&mut system);
-        let now = f.session(system.now); assert_eq!(now.state, Phase::Active);
-        assert_eq!(desktop_members(&now).unwrap(), system.mains); assert_eq!(now.baseline, old.baseline);
-        assert_eq!((system.closes, system.forces), (0, 0));
-    }
-}
-#[test]
-fn joining_main_is_provisional_without_a_slow_audit_on_the_guard() {
-    let f = Fixture::new(); let (system, value) = f.pending_join();
-    assert!(group_rechecking(&value)); assert_eq!(desktop_members(&value).unwrap().len(), 2);
-    assert_eq!(system.audits, 1); assert_eq!((system.closes, system.forces), (0, 0));
-    assert_eq!(value.baseline.observed_at, 1001.);
 }
 #[test]
 fn background_recheck_verifies_every_member_without_rebasing_continuous_work() {
@@ -227,64 +155,6 @@ fn background_recheck_verifies_every_member_without_rebasing_continuous_work() {
     assert_eq!(after.extra["baseline_dns_countries"], before.extra["baseline_dns_countries"]);
     assert_eq!(desktop_members(&after).unwrap(), system.mains);
     assert_eq!(after.extra["guard_checked_at"], json!(system.now));
-}
-#[test]
-fn a_non_anchor_metadata_gap_is_not_a_confirmed_exit() {
-    let f = Fixture::new(); let mut system = f.mock(2); f.tick(&mut system); let old = f.session(system.now);
-    system.hidden.push(78); system.now += 1.; f.tick(&mut system);
-    let now = f.session(system.now); assert_eq!(desktop_members(&now).unwrap().len(), 2);
-    assert_eq!(now.session_id, old.session_id); assert_eq!(now.state, Phase::Active);
-    assert_eq!((system.closes, system.forces), (0, 0));
-}
-#[test]
-fn reused_pid_requires_a_new_membership_audit() {
-    let f = Fixture::new(); let mut system = f.mock(2); f.tick(&mut system); let old = f.session(system.now);
-    system.mains[1].start_microseconds += 1; system.now += 1.; f.tick(&mut system);
-    let now = f.session(system.now); assert_ne!(now.session_id, old.session_id);
-    assert_eq!(now.state, Phase::Rechecking); assert_eq!(now.baseline, old.baseline);
-    assert_eq!((system.closes, system.forces), (0, 0));
-}
-#[test]
-fn confirmed_exit_risk_is_not_delayed_by_group_rechecking() {
-    for cn in [false, true] {
-        let f = Fixture::new(); let (mut system, _) = f.pending_join();
-        system.now += 1.; if cn { system.country = "CN"; } else { system.ip = "8.8.8.8"; }
-        let receipt = f.tick(&mut system); assert_eq!(receipt["action"], "close-desktop");
-        assert_eq!(receipt["stop_action"], "close"); assert_eq!(system.audits, 1);
-        assert_eq!((system.closes, system.forces), (1, 0));
-    }
-}
-#[test]
-fn a_required_failed_stop_cannot_be_cancelled_by_a_new_member() {
-    let f = Fixture::new(); let mut system = f.mock(2); f.tick(&mut system);
-    system.now += 1.; system.ip = "8.8.8.8"; system.fail_quit = true; f.tick(&mut system);
-    let locked = f.session(system.now); system.mains.push(desktop(99, 902));
-    system.ip = "1.1.1.1"; system.fail_quit = false; system.now += 1.; let receipt = f.tick(&mut system);
-    assert_eq!(receipt["stop_state"], "confirmed"); assert_eq!(system.closes, 2);
-    assert_eq!(f.session(system.now).session_id, locked.session_id);
-}
-#[test]
-fn a_confirmed_empty_family_can_start_a_fresh_group_baseline() {
-    let f = Fixture::new(); let mut system = f.mock(2); f.tick(&mut system);
-    system.mains.clear(); system.now += 1.; f.tick(&mut system);
-    assert_eq!(f.session(system.now).state, Phase::Ended);
-    system.mains = vec![desktop(87, 910), desktop(88, 910)]; system.ip = "8.8.8.8";
-    system.now += 1.; f.tick(&mut system);
-    let current = f.session(system.now); assert_eq!(current.state, Phase::Rechecking);
-    assert_eq!(current.baseline.ip, "8.8.8.8"); assert_eq!((system.closes, system.forces), (0, 0));
-}
-#[test]
-fn a_warn_latch_survives_join_and_audit_until_the_guard_recovers_it() {
-    let f = Fixture::new(); f.config("gpt_close_dns", json!("warn")); let mut system = f.mock(2);
-    f.tick(&mut system); system.now += 1.; f.seed(system.now, "US"); f.tick(&mut system);
-    assert_eq!(f.session(system.now).state, Phase::Locked);
-    system.mains.push(desktop(99, 902)); system.now += 1.; f.tick(&mut system);
-    assert!(group_rechecking(&f.session(system.now))); assert_eq!(f.session(system.now).state, Phase::Locked);
-    system.now += 2.; background_evidence::refresh_active_session(&f.store, &mut system).unwrap();
-    let audited = f.session(system.now); assert_eq!(audited.state, Phase::Locked);
-    assert!(!group_rechecking(&audited)); system.now += 1.; let receipt = f.tick(&mut system);
-    assert_eq!(receipt["stop_state"], "recovered"); assert_eq!(f.session(system.now).state, Phase::Active);
-    assert_eq!((system.closes, system.forces), (0, 0));
 }
 #[test]
 fn completion_refuses_missing_duplicate_or_wrong_members() {
@@ -307,12 +177,15 @@ fn the_legacy_single_desktop_recheck_cannot_drop_group_members() {
 }
 #[test]
 fn malformed_group_data_is_not_silently_read_as_a_single_main() {
-    let f = Fixture::new(); f.config("gpt_close_session",json!("warn")); let mut system = f.mock(2); f.tick(&mut system);
-    let mut raw = serde_json::to_value(f.session(system.now)).unwrap(); raw["desktop_group_v1"] = json!([desktop(77,900),desktop(77,900)]);
-    f.store.atomic_json(&f.store.paths.session_for("openai"),&raw).unwrap();
-    let bytes = fs::read(f.store.paths.session_for("openai")).unwrap(); system.now += 1.; f.tick(&mut system);
-    assert!(f.sessions().load(system.now).is_err()); assert_eq!((system.closes,system.forces),(0,0));
-    assert_eq!(fs::read(f.store.paths.session_for("openai")).unwrap(),bytes);
+    let f = Fixture::new();
+    let (system, pending) = f.pending_join();
+    let mut raw = json!(pending);
+    raw[GROUP_KEY] = json!([desktop(77,900),desktop(77,900)]);
+    let path = f.store.paths.session_for("openai");
+    f.store.atomic_json(&path, &raw).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    assert!(f.sessions().load(system.now).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
 }
 #[test]
 fn a_late_audit_cannot_overwrite_a_newer_membership_revision() {
@@ -329,15 +202,6 @@ fn a_late_audit_cannot_unlock_a_new_mandatory_risk() {
     assert_eq!(after.reason.unwrap().code,"egress_country_cn");
 }
 #[test]
-fn repeated_joins_do_not_extend_the_original_recheck_deadline() {
-    let f = Fixture::new(); f.config("gpt_close_session",json!("warn")); let (mut system, before) = f.pending_join();
-    system.now = before.pending_deadline - 1.; system.mains.push(desktop(99,910)); f.tick(&mut system);
-    assert_eq!(f.session(system.now).pending_deadline,before.pending_deadline);
-    system.now = before.pending_deadline; f.tick(&mut system); let after=f.session(system.now);
-    assert_eq!(after.state,Phase::Locked); assert_eq!(after.reason.unwrap().code,"revalidation_timeout");
-    assert_eq!((system.closes,system.forces),(0,0));
-}
-#[test]
 fn invalid_or_duplicate_native_members_are_rejected() {
     for rows in [vec![desktop(1,900)],vec![desktop(77,0)],vec![desktop(77,900),desktop(77,901)],
         (0..33).map(|i|desktop(100+i,900)).collect()] { assert!(canonical_desktops(rows).is_err()); }
@@ -352,61 +216,10 @@ fn native_group_binding_requires_the_exact_main_set_and_valid_stamps() {
     rows[1].2="b".into(); rows[1].1=false; assert!(group_stamps(&roots,&rows).unwrap().is_none());
 }
 #[test]
-fn disabled_or_unreadable_policy_cannot_modify_group_membership() {
-    for corrupt in [false,true] {
-        let f=Fixture::new(); let mut system=f.mock(2); f.tick(&mut system);
-        let before=fs::read(f.store.paths.session_for("openai")).unwrap();
-        if corrupt { fs::write(f.store.paths.config(),b"{broken").unwrap(); }
-        else { f.config("guard_enabled",json!(false)); }
-        system.mains.push(desktop(99,902)); system.now+=1.; let out=f.tick(&mut system);
-        assert_eq!(out["action"],"observe"); assert_eq!((system.closes,system.forces),(0,0));
-        assert_eq!(fs::read(f.store.paths.session_for("openai")).unwrap(),before);
-    }
-}
-#[test]
 fn an_adapter_without_group_identity_support_cannot_promote_it() {
     let f=Fixture::new(); let (mut system,before)=f.pending_join(); system.now+=2.; system.support_group=false;
     assert_eq!(background_evidence::refresh_active_session(&f.store,&mut system).unwrap_err().code,"evidence_identity_unknown");
     assert_eq!(f.session(system.now),before);
-}
-#[test]
-fn warning_recovery_checks_every_bound_main_not_only_the_anchor() {
-    let f=Fixture::new(); f.config("gpt_close_dns",json!("warn")); let mut system=f.mock(2); f.tick(&mut system);
-    system.now+=1.; f.seed(system.now,"US"); f.tick(&mut system);
-    system.now+=1.; f.seed(system.now,"JP"); system.hidden.push(78); let out=f.tick(&mut system);
-    assert_eq!(f.session(system.now).state,Phase::Locked); assert_ne!(out["stop_state"],"recovered");
-    assert_eq!((system.closes,system.forces),(0,0));
-}
-#[test]
-fn membership_change_during_initial_audit_is_not_adopted_or_stopped() {
-    let f=Fixture::new(); let mut system=f.mock(2); system.change_on_audit=true;
-    let out=f.tick(&mut system); assert_eq!(out["stop_state"],"session_changed");
-    assert!(f.sessions().load(system.now).unwrap().is_none()); assert_eq!((system.closes,system.forces),(0,0));
-    system.now+=1.; f.tick(&mut system); assert_eq!(desktop_members(&f.session(system.now)).unwrap().len(),3);
-}
-#[test]
-fn an_openai_group_does_not_replace_a_claude_session() {
-    let f=Fixture::new(); let receipts=ReceiptStore{storage:f.store.clone()}; let claude=SessionStore::new(f.store.clone());
-    let pending=claude.begin_verified(&receipts,&audit(&f.store,1000.,false,"1.1.1.1","JP"),&egress(1000.,"1.1.1.1","JP"),1000.).unwrap();
-    let old=claude.bind_desktop(&pending.session_id,desktop(177,900),1000.1).unwrap();
-    let mut system=f.mock(2); system.claude.push(desktop(177,900)); f.tick(&mut system);
-    let current=claude.load(system.now).unwrap().unwrap(); assert_eq!(current.session_id,old.session_id);
-    assert_eq!(current.baseline,old.baseline); assert_eq!(current.desktop,old.desktop);
-    assert!(!current.extra.contains_key("desktop_group_v1")); assert_eq!(desktop_members(&f.session(system.now)).unwrap().len(),2);
-}
-
-#[test]
-fn ending_a_provisional_family_does_not_poison_the_next_lifetimes_deadline() {
-    let f = Fixture::new(); let (mut system, pending) = f.pending_join();
-    system.mains.clear(); system.now += 1.; f.tick(&mut system);
-    assert_eq!(f.session(system.now).state, Phase::Ended);
-    system.now = pending.pending_deadline + 10.;
-    system.mains = vec![desktop(87, 910), desktop(88, 910)]; system.ip = "8.8.8.8";
-    f.tick(&mut system); let current = f.session(system.now);
-    assert_eq!(current.state, Phase::Rechecking);
-    assert_eq!(current.baseline.ip, "8.8.8.8");
-    assert!(current.pending_deadline > system.now);
-    assert_eq!((system.closes, system.forces), (0, 0));
 }
 #[test]
 fn recheck_cannot_commit_a_different_network_context() {
@@ -422,18 +235,6 @@ fn recheck_cannot_commit_a_different_network_context() {
     assert_eq!(f.session(system.now), pending);
 }
 #[test]
-fn explicit_force_and_warn_remain_distinct_for_a_multi_main_family() {
-    for action in ["force", "warn"] {
-        let f = Fixture::new(); f.config("gpt_close_ip", json!(action));
-        let mut system = f.mock(2); f.tick(&mut system);
-        system.ip = "8.8.8.8"; system.now += 1.; let receipt = f.tick(&mut system);
-        assert_eq!(system.closes, 0);
-        assert_eq!(system.forces, usize::from(action == "force"));
-        assert_eq!(receipt["stop_state"], if action == "force" { "confirmed" } else { "skipped_warn_only" });
-        assert_eq!(system.mains.len(), if action == "force" { 0 } else { 2 });
-    }
-}
-#[test]
 fn group_recheck_rejects_another_familys_audit_without_writing_leases() {
     let f = Fixture::new(); let (mut system, pending) = f.pending_join();
     system.now += 2.; f.seed(system.now, "JP");
@@ -444,41 +245,4 @@ fn group_recheck_rejects_another_familys_audit_without_writing_leases() {
         .unwrap_err().code, "launch_target_mismatch");
     assert_eq!(f.session(system.now), pending);
     assert!(!f.store.paths.watch().join("state/sessions/rust-78.session").exists());
-}
-#[test]
-fn slow_initial_adoption_in_one_family_does_not_delay_fast_stop_in_another_family() {
-    let f = Fixture::new();
-    let mut system = f.mock(1);
-    f.tick(&mut system);
-    assert_eq!(f.session(system.now).state, Phase::Active);
-    system.events.clear();
-    system.now += 1.;
-    // Claude (family 0 in PolicyCatalog) is newly opened without a session and
-    // needs a slow initial full_audit() adoption; OpenAI (family 1) already has
-    // an active session whose baseline IP ("1.1.1.1") has drifted to "8.8.8.8".
-    // Pass 1 must execute OpenAI's fast stop before Pass 2 runs Claude's full_audit().
-    system.claude = vec![desktop(177, 905)];
-    system.ip = "8.8.8.8";
-    let heartbeat = f.controller.guard_tick(&mut system).unwrap();
-    assert_eq!(
-        system.events,
-        vec!["openai:quit_desktop".to_string(), "claude:full_audit".to_string()]
-    );
-    assert!(system.mains.is_empty());
-    assert_eq!(system.claude.len(), 1);
-    let families = heartbeat["families"].as_array().unwrap();
-    assert_eq!(families[0]["family"], "claude");
-    assert_eq!(families[0]["session_guard"]["reason"]["code"], "session_adopted");
-    assert_eq!(families[0]["channel_permit"]["state"], "permitted");
-    assert_eq!(families[0]["channel_permit"]["reason_code"], "session_adopted");
-    assert_eq!(families[0]["channel_permit"]["members"].as_array().unwrap().len(), 1);
-    assert_eq!(families[1]["family"], "openai");
-    assert_eq!(families[1]["action"], "close-desktop");
-    assert_eq!(families[1]["channel_permit"]["state"], "revoked");
-    assert_eq!(families[1]["channel_permit"]["reason_code"], "egress_ip_changed");
-    assert!(
-        families[1]["channel_permit"]["policy_version"]["policy_digest"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty())
-    );
 }

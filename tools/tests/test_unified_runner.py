@@ -97,6 +97,39 @@ class UnifiedRunnerTests(unittest.TestCase):
         self.assertEqual(self.run_quiet(runner), 1)
         self.assertEqual([r["status"] for r in runner.results], ["blocked", "passed"])
 
+    def mechanism_runner(self, missing_last=False):
+        steps, _ = runner_module.build_plan(self.output)
+        fixture = next(s for s in steps if s.id == "rust.mechanism_review_fixtures")
+        marker = self.root / "decoder-ran"
+        runner = self.runner([
+            Step("rust.workspace", "test", [[sys.executable, "-c", "raise SystemExit(9)"]]),
+            fixture,
+            Step("decoder", "test", [[sys.executable, "-c", f"from pathlib import Path;Path({str(marker)!r}).touch()"]],
+                 dependencies=[fixture.id]),
+        ])
+        # Simulate receipts emitted by successful cases before an unrelated
+        # workspace target failed. The decoder still validates their content.
+        actions = fixture.prepare[:-1] if missing_last else fixture.prepare
+        for action in actions:
+            path = Path(action["path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}")
+        return runner, marker
+
+    def test_complete_mechanism_receipts_run_decoder_without_hiding_workspace_failure(self):
+        runner, marker = self.mechanism_runner()
+        self.assertEqual(self.run_quiet(runner), 1)
+        self.assertEqual([r["status"] for r in runner.results], ["failed", "passed", "passed"])
+        self.assertEqual(runner.results[0]["exit_code"], 9)
+        self.assertTrue(marker.is_file())
+        self.assertEqual(json.loads((self.output / "results.json").read_text())["outcome"], "failed")
+
+    def test_incomplete_mechanism_receipts_still_block_decoder_after_workspace_failure(self):
+        runner, marker = self.mechanism_runner(missing_last=True)
+        self.assertEqual(self.run_quiet(runner), 1)
+        self.assertEqual([r["status"] for r in runner.results], ["failed", "blocked", "blocked"])
+        self.assertFalse(marker.exists())
+
     def test_new_run_never_overwrites_existing_results(self):
         self.output.mkdir()
         marker = self.output / "prior.json"

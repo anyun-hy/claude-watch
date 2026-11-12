@@ -343,6 +343,10 @@ fn json_command(runner: &dyn Runner, args: &[String]) -> Result<Value> {
     Ok(value)
 }
 
+fn built_engine(layout: &Layout) -> PathBuf {
+    layout.project.join("target/aarch64-apple-darwin/release/claude-watch-engine")
+}
+
 fn preflight(layout: &Layout, runner: &dyn Runner, uid: u32) -> Result<LayoutPlan> {
     let home_info = std::fs::symlink_metadata(&layout.home)
         .map_err(|_| blocked("当前用户目录的归属或类型不匹配。"))?;
@@ -387,16 +391,18 @@ fn preflight(layout: &Layout, runner: &dyn Runner, uid: u32) -> Result<LayoutPla
             RunMode::Inherit,
         )?;
         require(verified.success(), "已安装应用签名校验失败。")?;
+        let uninstall = built_engine(layout);
+        require(is_executable(&uninstall), "缺少本轮构建的卸载组件；请使用 monitor/reinstall.sh。")?;
         let preview = json_command(
             runner,
-            &[engine.display().to_string(), "app-uninstall".to_string()],
+            &[uninstall.display().to_string(), "app-uninstall".to_string()],
         )?;
         let matching = preview.get("status").and_then(Value::as_str) == Some("preview")
             && preview.get("action").and_then(Value::as_str) == Some("app-uninstall")
             && preview.get("installed").and_then(Value::as_str)
                 == Some(layout.app.display().to_string().as_str());
         require(matching, "卸载预览与目标应用不一致。")?;
-        engine_hash = Some(digest(&engine)?);
+        engine_hash = Some(format!("{}:{}", digest(&engine)?, digest(&uninstall)?));
         old_identity = Some(identity);
     } else {
         // No app, but Watch-owned leftovers may still be here. They are the
@@ -510,33 +516,20 @@ fn wait_for_watch_exit(
     old: Option<&Path>,
     sleep: &dyn Fn(Duration),
 ) -> Result<()> {
-    let mut needles = vec![
-        format!("{}/", layout.base().join("runtime").display()),
-        format!("{}/Contents/", layout.app.display()),
-    ];
-    if let Some(old) = old {
-        needles.push(format!("{}/Contents/", old.display()));
-    }
-    // Once the application bundle and the data directory are gone, a process
-    // that still names either path is a leftover of the retired copy: it was
-    // started before the move and cannot be the install this flow is about to
-    // place. Blocking on it leaves the machine without an app, so such rows
-    // are reported and ignored instead.
-    let retired = !exists(&layout.app) && !exists(&layout.base());
-    let mut blocking: Vec<String> = Vec::new();
+    use claude_watch_core::processes::{is_watch_runtime_executable, watch_process_rows, WATCH_PROCESS_LIST_FIELDS};
+    let runtime = layout.base().join("runtime");
+    let old_gui = old.map(|app| app.join("Contents/MacOS/ClaudeWatchMonitor"));
+    let current_gui = layout.app.join("Contents/MacOS/ClaudeWatchMonitor");
+    let mut blocking = Vec::new();
     for attempt in 0..11 {
-        blocking.clear();
-        for row in process_rows(runner, uid)? {
-            if !needles.iter().any(|needle| row.contains(needle)) {
-                continue;
-            }
-            if retired {
-                println!("忽略已随旧版移出的残留进程：{row}");
-                let _ = std::io::stdout().flush();
-            } else {
-                blocking.push(row);
-            }
-        }
+        let out = runner.run(&["/bin/ps".into(), "-axo".into(), WATCH_PROCESS_LIST_FIELDS.into()], None, RunMode::Capture)?;
+        require(out.success() && !out.stdout.trim().is_empty(), "无法确认 Watch 自有进程是否已退出。")?;
+        blocking = watch_process_rows(&out.stdout, uid).filter_map(|(pid, executable)| {
+            let path = Path::new(executable);
+            (is_watch_runtime_executable(executable, &runtime)
+                || path == current_gui || old_gui.as_deref() == Some(path))
+                .then(|| format!("{pid}: {executable}"))
+        }).collect();
         if blocking.is_empty() {
             return Ok(());
         }
@@ -994,7 +987,7 @@ fn perform_with_environment(
     if plan.old_identity.is_some() {
         println!("[1/4] 卸载已安装应用（移入废纸篓，可恢复）。");
         let _ = std::io::stdout().flush();
-        let engine = layout.app.join("Contents/Resources/watch-engine");
+        let engine = built_engine(layout);
         let result = json_command(
             runner,
             &[

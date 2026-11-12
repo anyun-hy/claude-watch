@@ -138,13 +138,13 @@ fn bootout_registration_disappearing_does_not_prove_process_exit() {
         stdout: String::new(),
         stderr: "Could not find service".into(),
     };
-    // Deliberately end the fixture after proving that the old PID is still
-    // alive. Returning success before the next read would be a regression.
+    // The launchd PID is gone, but the old runtime still owns a child.
+    // Returning success before the next read would be a regression.
     let mut release = native(vec![
         ok("state = running\npid = 901\n"),
         ok(""),
         absent,
-        ok("901\n"),
+        ok("902 501 /base/runtime/watch-native-observer\n903 501 /fixture/runtime/watch-native-observer\n"),
     ]);
     assert_eq!(release.stop_agent().unwrap_err().code, "fixture");
     assert!(release
@@ -488,6 +488,82 @@ fn seatbelt_bundle_requires_hashed_arm64_sandbox_launcher_and_gateway_broker() {
     missing_manifest["RuntimeHashes"].as_object_mut().unwrap().remove("watch-gateway-broker");
     let mut missing = replies;
     missing[6] = ok(&missing_manifest.to_string());
-    assert_eq!(native(missing).validate_bundle(&app).unwrap_err().code, "release_identity_mismatch");
+    let missing_error = native(missing).validate_bundle(&app).unwrap_err();
+    assert_eq!(missing_error.code, "release_identity_mismatch");
+    assert!(missing_error.message.contains("缺少：watch-gateway-broker"));
+    assert!(missing_error.message.contains("未支持 0 项：无"));
     fs::remove_dir_all(app).unwrap();
+}
+
+#[test]
+fn packaged_seatbelt_manifest_accepts_pinned_build_identity_and_rejects_unlisted_dependencies() {
+    struct OwnedBundle(std::path::PathBuf);
+    impl Drop for OwnedBundle {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+    let app = OwnedBundle(std::env::temp_dir().join(format!("cw-release-identity-{}.app", Uuid::new_v4())));
+    let resources = app.0.join("Contents/Resources");
+    fs::create_dir_all(app.0.join("Contents/MacOS")).unwrap();
+    fs::create_dir_all(&resources).unwrap();
+    fs::write(app.0.join("Contents/MacOS/ClaudeWatchMonitor"), b"owned fixture").unwrap();
+    // Full current build.sh contract: runtime schema 2, Seatbelt, background
+    // evidence v2, native controlled entry, and diagnostic build provenance.
+    let required = [
+        "watch-engine", "watch-native-observer", "watch-process-control", "watch-admin.sh",
+        "watch-native-collector.zsh", "watch-leak-worker", "netcoffee_probe.html",
+        "netcoffee_probe.js", "netcoffee_probe.css", "ipleak_probe.html", "ipleak_probe.js",
+        "watch-sandbox-launcher", "watch-gateway-broker", "ControlledEntry", "BuildIdentity.json",
+    ];
+    let identity = serde_json::json!({"schema":1,"app_version":"4.0.0","app_build":"400",
+        "source_revision":"a".repeat(40),"source_dirty":false,"source_tree_digest":"b".repeat(64)}).to_string();
+    let mut hashes = serde_json::Map::new();
+    for name in required {
+        let content = if name == "BuildIdentity.json" { identity.clone() } else { format!("owned {name}") };
+        fs::write(resources.join(name), content.as_bytes()).unwrap();
+        hashes.insert(name.to_owned(), serde_json::json!(claude_watch_runtime::storage::sha256(content.as_bytes())));
+    }
+    let manifest = serde_json::json!({"Architecture":"arm64","ProductVersion":"4.0.0",
+        "BackendVariant":"rust-candidate","NetworkBackend":"seatbelt","RuntimeSchema":2,
+        "BackgroundEvidenceSchema":2,"RuntimeHashes":hashes});
+    let info = r#"{"CFBundleIdentifier":"io.local.watchpanel","CFBundleExecutable":"ClaudeWatchMonitor","CFBundleShortVersionString":"4.0.0","CFBundleVersion":"400"}"#;
+    let validate = |manifest: &serde_json::Value| {
+        let replies = vec![ok(info), ok(""), ok("arm64"), ok("arm64"), ok("arm64"), ok("arm64"),
+            ok(&manifest.to_string()), ok("arm64"), ok("arm64"), ok("arm64"), ok("arm64")];
+        let mut release = native(replies);
+        let result = release.validate_bundle(&app.0);
+        assert!(release.executor.calls.iter().all(|call| matches!(call.program.to_str(),
+            Some("/usr/bin/plutil" | "/usr/bin/codesign" | "/usr/bin/lipo"))),
+            "bundle validation must remain read-only");
+        result
+    };
+    let accepted = validate(&manifest).expect("the current packaged manifest must be accepted");
+    assert_eq!(accepted.version, "4.0.0");
+    assert_eq!(accepted.build, "400");
+
+    let build_identity = resources.join("BuildIdentity.json");
+    fs::remove_file(&build_identity).unwrap();
+    assert_eq!(validate(&manifest).unwrap_err().code, "release_identity_mismatch", "a declared file cannot be missing");
+    fs::write(&build_identity, b"tampered identity").unwrap();
+    assert_eq!(validate(&manifest).unwrap_err().code, "release_identity_mismatch", "build identity must retain its digest pin");
+    fs::remove_file(&build_identity).unwrap();
+    let other = app.0.join("outside-resources.json");
+    fs::write(&other, &identity).unwrap();
+    std::os::unix::fs::symlink(&other, &build_identity).unwrap();
+    assert_eq!(validate(&manifest).unwrap_err().code, "release_identity_mismatch", "matching bytes through a symlink are rejected");
+    fs::remove_file(&build_identity).unwrap();
+    fs::write(&build_identity, &identity).unwrap();
+
+    let mut unexpected = manifest.clone();
+    fs::write(resources.join("switcher.py"), b"retired dependency").unwrap();
+    unexpected["RuntimeHashes"]["switcher.py"] = serde_json::json!(claude_watch_runtime::storage::sha256(b"retired dependency"));
+    let unexpected_error = validate(&unexpected).unwrap_err();
+    assert_eq!(unexpected_error.code, "release_identity_mismatch", "explicit optional provenance must not allow arbitrary extra components");
+    assert!(unexpected_error.message.contains("缺少：无"));
+    assert!(unexpected_error.message.contains("未支持 1 项：switcher.py"));
+    fs::remove_file(resources.join("switcher.py")).unwrap();
+
+    let mut legacy = manifest;
+    legacy["RuntimeHashes"].as_object_mut().unwrap().remove("BuildIdentity.json");
+    fs::remove_file(&build_identity).unwrap();
+    assert_eq!(validate(&legacy).unwrap().version, "4.0.0", "older bundles without diagnostic provenance remain inspectable");
 }

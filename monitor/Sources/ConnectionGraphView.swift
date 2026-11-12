@@ -191,10 +191,11 @@ struct ConnectionGraphView: View {
         let tint: Color
         if let channelState = store.channelState(for: selectedProduct) {
             let now = store.now.timeIntervalSince1970
-            let disposition = channelState.processDispositionLabel(now: now)
+            let disposition = channelState.managedMemberCount > 0 || channelState.process_disposition_action == "force"
+                ? "（\(channelState.processDispositionLabel(now: now))）" : ""
             let previous = channelState.previousProcessDispositionLabel(now: now).map { "\n\($0)" } ?? ""
-            text = "通道状态：\(channelState.display_label_zh)（\(disposition)） · \(channelState.policy_sync_label_zh) · 活动连接 \(channelState.active_flows_count) / 已断开 \(channelState.terminated_flows_count) / 拒新连接 \(channelState.blocked_new_connections)\(previous)"
-            switch channelState.display_state {
+            text = "\(channelState.protectionScopeLabel)\(disposition) · \(channelState.scopeSummary)\n\(channelState.gatewayCountsLabel)\(previous)"
+            switch channelState.scopedDisplayState {
             case .forwarding:
                 symbol = "checkmark.shield.fill"; tint = p.mint
             case .disconnecting:
@@ -259,7 +260,7 @@ struct ConnectionGraphView: View {
         }
         let unmanaged = store.unmanagedPids(for: selectedProduct)
         if !unmanaged.isEmpty {
-            parts.append("发现实例（未受控）：PID \(unmanaged.map(String.init).joined(separator: ", "))")
+            parts.append("发现 \(unmanaged.count) 个未接管实例 · 点击网关查看详情")
         }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
@@ -666,8 +667,11 @@ struct ConnectionGraphView: View {
             let unmanaged = store.unmanagedPids(for: selectedProduct)
             let unmanagedNotice = unmanaged.isEmpty
                 ? ""
-                : "\n注意：发现未受控实例 PID \(unmanaged.map(String.init).joined(separator: ", "))（running_unprotected，未经过受控入口启动，不享受沙箱与通道保护）"
-            text = graph.gatewayDetail + (gatewayIsProxy ? "\n" + (proxy?.listenerPath ?? "监听者路径未取得") : "") + unmanagedNotice
+                : "\n未接管实例（\(unmanaged.count) 个）：PID \(unmanaged.map(String.init).joined(separator: ", "))。这些实例未纳入当前受控通道，网关状态不代表它们的连接状态。"
+            let scope = store.channelState(for: selectedProduct).map { "\n当前监督范围：\($0.scopeSummary)\n\($0.gatewayCountsLabel) · \($0.policy_sync_label_zh)\n累计计数来自当前网关记录，不代表本轮连接，也不包含未接管实例的流量。" } ?? ""
+            let path = graph.gatewayDetail + (gatewayIsProxy ? "\n" + (proxy?.listenerPath ?? "监听者路径未取得") : "")
+            let pathDetail = display.isHistorical ? "上次路径证据，不代表当前连接：\n" + path + "\n原始说明：" + (graph.flow?.reason ?? "") : path
+            return pathDetail + scope + unmanagedNotice
         case .tag:
             text = graph.flow?.chains.isEmpty == false
                 ? (graph.flow?.chains.joined(separator: " → ") ?? "") + "\n" + graph.summary

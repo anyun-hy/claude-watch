@@ -222,6 +222,55 @@ struct LeakCheckTests {
         cadenceContext = "rtc-ctx-2"
         cadence.refreshWebRTCIfNeeded(interval: 0)
         expect(cadence.rtc.running, "a proxy context change always re-probes webrtc")
+        let submitting = LeakCheckStore(isFixture: true)
+        var submittingContext = "rtc-submit-1"
+        var releaseReceipt = false
+        var rtcSubmitCalls = 0
+        submitting.contextProvider = { submittingContext }
+        submitting.automaticContextProvider = { submittingContext }
+        submitting.fixtureDelayNanoseconds = 1_000_000
+        submitting.onWebRTCComplete = { _, _ in
+            rtcSubmitCalls += 1
+            while !releaseReceipt { try? await Task.sleep(nanoseconds: 10_000_000) }
+            return true
+        }
+        let scheduleStart = Date()
+        submitting.refreshWebRTCIfNeeded(at: scheduleStart)
+        try await Task.sleep(nanoseconds: 450_000_000)
+        expect(!submitting.rtc.running && rtcSubmitCalls == 1, "the first webrtc receipt is still submitting after collection finishes")
+        let submittingFinishedAt = submitting.rtc.result!.finishedAt
+        submitting.refreshWebRTCIfNeeded(at: scheduleStart.addingTimeInterval(90))
+        expect(!submitting.rtc.running && submitting.rtc.result?.finishedAt == submittingFinishedAt,
+               "an elapsed schedule cannot overlap an in-flight webrtc receipt")
+        submittingContext = "rtc-submit-2"
+        submitting.refreshWebRTCIfNeeded(at: scheduleStart.addingTimeInterval(91))
+        expect(!submitting.rtc.running && rtcSubmitCalls == 1, "a context change waits for the pending submission before starting a new round")
+        releaseReceipt = true
+        try await Task.sleep(nanoseconds: 40_000_000)
+        expect(!submitting.initializationReceiptIsCurrent(.webrtc), "an old-context submission is not current evidence for the new context")
+        submitting.refreshWebRTCIfNeeded(at: scheduleStart.addingTimeInterval(92))
+        expect(submitting.rtc.running, "the deferred context change starts a new round once submission finishes")
+        try await Task.sleep(nanoseconds: 450_000_000)
+        expect(rtcSubmitCalls == 2 && submitting.initializationReceiptIsCurrent(.webrtc), "only the new-context receipt completes the second round")
+        let rejected = LeakCheckStore(isFixture: true)
+        var rejectedContext = "rtc-rejected-1"
+        var rejectedCalls = 0
+        rejected.contextProvider = { rejectedContext }
+        rejected.automaticContextProvider = { rejectedContext }
+        rejected.fixtureDelayNanoseconds = 1_000_000
+        rejected.onWebRTCComplete = { _, _ in rejectedCalls += 1; return false }
+        rejected.refreshWebRTCIfNeeded(at: scheduleStart)
+        try await Task.sleep(nanoseconds: 450_000_000)
+        expect(rejectedCalls == 1 && !rejected.initializationReceiptIsCurrent(.webrtc), "a rejected receipt remains unavailable")
+        rejected.refreshWebRTCIfNeeded(at: scheduleStart.addingTimeInterval(59))
+        expect(!rejected.rtc.running && rejectedCalls == 1, "a missing receipt cannot bypass the retry interval")
+        rejected.refreshWebRTCIfNeeded(at: scheduleStart.addingTimeInterval(60))
+        expect(rejected.rtc.running, "a rejected receipt retries when the schedule interval expires")
+        try await Task.sleep(nanoseconds: 450_000_000)
+        rejectedContext = "rtc-rejected-2"
+        rejected.refreshWebRTCIfNeeded(at: scheduleStart.addingTimeInterval(61))
+        expect(rejected.rtc.running && rejectedCalls == 2, "a new context bypasses the old-context retry delay after submission is finished")
+        rejected.cancel(.webrtc)
         let receiptProbe = LeakCheckStore(isFixture: true)
         let receiptStore = SwitcherStore(isFixture: true)
         receiptProbe.contextProvider = { "ctx" }

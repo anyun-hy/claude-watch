@@ -4,11 +4,11 @@ use crate::policy::PolicyCatalog;
 
 pub const STATES: &[&str] = &[
     "idle", "safe", "risk", "locked", "unknown", "missing", "pending",
-    "disabled", "active", "rechecking",
+    "disabled", "active", "rechecking", "pending_verification",
 ];
 
 pub const NON_POLICY_REASONS: &[&str] = &[
-    "egress_risk_persist_failed", "evidence_expired", "session_rechecking",
+    "egress_risk_persist_failed", "evidence_expired", "session_rechecking", "initial_audit_pending",
     "session_ended", "session_changed", "session_adopted", "session_resumed",
     "risk_evidence_unavailable", "risk_evidence_missing", "risk_evidence_invalid",
     "invalid_config", "invalid_session", "invalid_native_observation",
@@ -51,10 +51,10 @@ mod tests {
                 assert_eq!(reason(Some(code)), *code);
             }
         }
-        for value in ["active", "rechecking", "pending", "disabled"] {
+        for value in ["active", "rechecking", "pending", "disabled", "pending_verification"] {
             assert_eq!(state(Some(value)), value);
         }
-        for value in ["session_adopted", "session_resumed", "session_ended"] {
+        for value in ["session_adopted", "session_resumed", "session_ended", "initial_audit_pending"] {
             assert_eq!(reason(Some(value)), value);
         }
     }

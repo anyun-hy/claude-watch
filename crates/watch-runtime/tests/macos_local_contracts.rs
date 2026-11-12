@@ -97,6 +97,37 @@ fn guard_liveness_survives_a_degraded_monitoring_round_without_claiming_complete
 struct NoNetwork;
 
 #[test]
+fn independent_authority_pulse_survives_seventy_seven_second_collection_gap_without_ready_protection() {
+    let home = Home::new();
+    let host = home.host("surge", Some("interface: utun4\n"));
+    let config = Config { enabled:true, guard_enabled:true, ..Config::default() };
+    let now = native::now();
+    let stamp = "Mon Oct 26 01:02:03 2026";
+    host.storage.atomic_bytes(&host.storage.paths.watch().join("runtime/watch-engine"),b"fixture",0o700).unwrap();
+    host.storage.atomic_bytes(&host.storage.paths.watch().join("state/heartbeat"),
+        format!("77|{stamp}|{}|ok|GUARD\n",now-77.0).as_bytes(),0o600).unwrap();
+    let pulse_path = host.storage.paths.watch().join("state/guard-service-heartbeat.json");
+    let pulse = json!({"schema":1,"pid":77,"start_stamp":stamp,"time":now});
+    host.storage.atomic_json(&pulse_path,&pulse).unwrap();
+    host.storage.atomic_json(&host.storage.paths.base().join("guard-heartbeat.json"),
+        &json!({"time":now-77.0,"completed_at":now,"status":"ok",
+            "guard_policy_v1":claude_watch_runtime::config_store::guard_policy_digest(&config).unwrap()})).unwrap();
+    let state = host.backend_health_snapshot(&config).unwrap();
+    assert!(state.guard_backend_healthy);
+    assert!(!state.sampling_healthy);
+    assert!(!state.guard_healthy);
+    assert_eq!(state.diagnostics["sampling_state"],"stale");
+    assert_eq!(state.diagnostics["backend_alive"],true);
+    for (key,value) in [("time",json!(now-16.0)),("pid",json!(78)),("start_stamp",json!("reused-pid"))] {
+        let mut invalid = pulse.clone(); invalid[key] = value;
+        host.storage.atomic_json(&pulse_path,&invalid).unwrap();
+        let state = host.backend_health_snapshot(&config).unwrap();
+        assert!(!state.guard_backend_healthy,"{key}");
+        assert!(!state.guard_healthy,"{key}");
+    }
+}
+
+#[test]
 fn onboarding_uses_the_installed_backend_manifest_without_silent_legacy_migration() {
     use claude_watch_core::channel::NetworkBackendKind;
     use claude_watch_runtime::onboarding::{self, OnboardingSystem};

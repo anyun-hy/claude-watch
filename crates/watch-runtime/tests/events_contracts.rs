@@ -123,7 +123,7 @@ fn event_schema_drops_secret_shaped_unstructured_data_and_exports_bounded_histor
     fs::remove_dir_all(root).unwrap();
 }
 #[test]
-fn muted_and_failed_alerts_do_not_consume_cooldown_and_clock_rollback_is_suppressed() {
+fn muted_alerts_do_not_consume_cooldown_and_failed_alerts_back_off_before_recovery() {
     let (events, root) = store("cooldown");
     let ok = Fake {
         calls: AtomicUsize::new(0),
@@ -145,9 +145,12 @@ fn muted_and_failed_alerts_do_not_consume_cooldown_and_clock_rollback_is_suppres
         events.emit(&fail, &alert, 13.0).unwrap(),
         AlertOutcome::Failed("notification_failed".into())
     );
-    assert_eq!(events.emit(&ok, &alert, 14.0).unwrap(), AlertOutcome::Sent);
+    assert_eq!(events.emit(&ok, &alert, 14.0).unwrap(), AlertOutcome::Cooldown);
+    assert_eq!(events.emit(&fail, &alert, 43.0).unwrap(), AlertOutcome::Failed("notification_failed".into()));
+    assert_eq!(events.emit(&ok, &alert, 102.0).unwrap(), AlertOutcome::Cooldown);
+    assert_eq!(events.emit(&ok, &alert, 103.0).unwrap(), AlertOutcome::Sent);
     assert_eq!(
-        events.emit(&ok, &alert, 15.0).unwrap(),
+        events.emit(&ok, &alert, 104.0).unwrap(),
         AlertOutcome::Cooldown
     );
     assert_eq!(
@@ -155,7 +158,15 @@ fn muted_and_failed_alerts_do_not_consume_cooldown_and_clock_rollback_is_suppres
         AlertOutcome::ClockRollback
     );
     assert_eq!(ok.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(fail.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fail.calls.load(Ordering::SeqCst), 2);
+    let history = events.history().unwrap().events;
+    assert_eq!(history.iter().filter(|e| e.category == "alert-failed").count(), 2);
+    assert_eq!(history.iter().filter(|e| e.category == "alert-dispatched").count(), 1);
+    // A successful delivery resets failure backoff; the next independent
+    // failure after the normal cooldown gets the first retry delay again.
+    assert!(matches!(events.emit(&fail, &alert, 404.).unwrap(), AlertOutcome::Failed(_)));
+    assert_eq!(events.emit(&ok, &alert, 433.).unwrap(), AlertOutcome::Cooldown);
+    assert_eq!(events.emit(&ok, &alert, 434.).unwrap(), AlertOutcome::Sent);
     let raw = fs::read_to_string(
         root.join("Library/Application Support/ClaudeWatch/switcher/events.jsonl"),
     )
@@ -239,5 +250,59 @@ fn failed_critical_dialog_reserves_cooldown_before_the_next_tick() {
         AlertOutcome::Cooldown
     );
     assert_eq!(fail.calls.load(Ordering::SeqCst), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn warning_failure_backoff_survives_restart_is_capped_and_does_not_claim_delivery() {
+    let (events, root) = store("failure-persistence");
+    let fail = Fake { calls: AtomicUsize::new(0), ok: false };
+    let alert = Alert { title: "warning-fixture".into(), message: "not stored".into(), severity: Severity::Warning };
+    let mut at = 100.;
+    for delay in [30., 60., 120., 240., 300., 300.] {
+        let restarted = EventStore::new(StateStore::new(Paths::new(&root).unwrap()));
+        assert!(matches!(restarted.emit(&fail, &alert, at).unwrap(), AlertOutcome::Failed(_)));
+        assert_eq!(restarted.emit(&fail, &alert, at - 1.).unwrap(), AlertOutcome::ClockRollback);
+        assert_eq!(restarted.emit(&fail, &alert, at + delay - 1.).unwrap(), AlertOutcome::Cooldown);
+        at += delay;
+    }
+    assert_eq!(fail.calls.load(Ordering::SeqCst), 6);
+    let history = events.history().unwrap();
+    assert_eq!(history.events.iter().filter(|e| e.category == "alert-failed").count(), 6);
+    assert!(!history.events.iter().any(|e| e.category == "alert-dispatched"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_warning_does_not_suppress_a_new_critical_alert() {
+    let (events, root) = store("failure-severity");
+    let fail = Fake { calls: AtomicUsize::new(0), ok: false };
+    let ok = Fake { calls: AtomicUsize::new(0), ok: true };
+    let mut alert = Alert { title: "severity-fixture".into(), message: "fixture".into(), severity: Severity::Warning };
+    assert!(matches!(events.emit(&fail, &alert, 100.).unwrap(), AlertOutcome::Failed(_)));
+    alert.severity = Severity::Critical;
+    assert_eq!(events.emit(&ok, &alert, 101.).unwrap(), AlertOutcome::Sent);
+    assert_eq!(ok.calls.load(Ordering::SeqCst), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn guard_events_accept_only_known_families_and_keep_strict_field_validation() {
+    let (events, root) = store("guard-families");
+    for family in ["claude", "openai"] {
+        let decision = EventFields { family: Some(family.into()), action: Some("post_action".into()),
+            status: Some("idle".into()), code: Some("none".into()), ..Default::default() };
+        let event = events.append("guard-decision", decision.clone(), 100.).unwrap();
+        assert_eq!(event.fields.family.as_deref(), Some(family));
+        let stop = EventFields { family: Some(family.into()), correlation_id: Some(uuid::Uuid::new_v4().to_string()),
+            action: Some("request_post_action".into()), ..Default::default() };
+        events.append("guard-stop", stop, 101.).unwrap();
+        let mut extra = decision;
+        extra.pid = Some(123);
+        assert!(events.append("guard-decision", extra, 102.).is_err());
+    }
+    assert!(events.append("guard-decision", EventFields { family: Some("private-fixture".into()),
+        action: Some("post_action".into()), status: Some("idle".into()), code: Some("none".into()), ..Default::default() }, 103.).is_err());
+    assert_eq!(events.history().unwrap().events.len(), 4);
     fs::remove_dir_all(root).unwrap();
 }

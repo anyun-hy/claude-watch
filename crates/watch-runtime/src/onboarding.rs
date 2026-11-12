@@ -21,6 +21,7 @@ use claude_watch_core::{
 use serde_json::{json, Value};
 use uuid::Uuid;
 pub const TTL: f64 = 300.0;
+pub const CONFIRMED_PROTECTION_PREFIX: &str = "confirmed-protection:";
 pub const OPTIONS: [&str; 5] = [
     "apply_environment",
     "enable_policy",
@@ -37,8 +38,17 @@ fn text<'a>(v: &'a Value, k: &str) -> &'a str {
 
 pub trait OnboardingSystem: RepairSystem {
     fn network(&self) -> Result<Value>;
+    fn network_and_local(&self, config: &Config) -> Result<(Value, Value)> {
+        Ok((self.network()?, self.local(config)?))
+    }
     fn now(&self) -> f64;
     fn baseline_data(&self) -> Result<String>;
+    fn egress_for_local(&self, config: &Config, _: &Value) -> Result<Value> {
+        self.egress_reference(config)
+    }
+    fn setup_watchdog_state(&self, config: &Config) -> Result<Value> {
+        Ok(self.local(config)?["watchdog"].clone())
+    }
     fn packaged_backend(&self) -> Option<NetworkBackendKind> { None }
     fn vpn_observation(&self, _expectation: &VpnExpectation) -> Result<VpnObservation> {
         Err(err("vpn_observation_unavailable", "当前运行组件无法读取 VPN 监督预期"))
@@ -333,13 +343,12 @@ pub fn detect<S: OnboardingSystem>(
         ));
     }
     let cfg = setup_config(store, system)?;
-    let net = system.network()?;
-    let local = system.local(&cfg)?;
+    let (net, local) = system.network_and_local(&cfg)?;
     if text(&net, "service").is_empty() {
         return Err(err("network_unknown", "活动网络服务未确认"));
     }
     require_transport(&local)?;
-    let egress = system.egress_reference(&cfg)?;
+    let egress = system.egress_for_local(&cfg, &local)?;
     let measured = normalized_reference(&egress, zones)?;
     if text(&measured, "country") == "CN" {
         return Err(err(
@@ -348,8 +357,7 @@ pub fn detect<S: OnboardingSystem>(
         ));
     }
     let after_cfg = setup_config(store, system)?;
-    let after_net = system.network()?;
-    let after = system.local(&after_cfg)?;
+    let (after_net, after) = system.network_and_local(&after_cfg)?;
     require_transport(&after)?;
     if policy_digest(&cfg.value()?)? != policy_digest(&after_cfg.value()?)?
         || context(&net, &local)? != context(&after_net, &after)?
@@ -379,11 +387,76 @@ pub fn detect<S: OnboardingSystem>(
     store.atomic_json(&candidate_path(store), &out)?;
     Ok(out)
 }
+/// The protection step uses the already approved baseline and the exact
+/// current environment audit that checked the leak receipts. It does not
+/// create a new discovery candidate or renew any evidence timestamp.
+fn confirmed_protection_reference<S: OnboardingSystem>(
+    store: &StateStore,
+    system: &S,
+    id: &str,
+) -> Result<(Value, Config, Value, Value)> {
+    let observation_id = id.strip_prefix(CONFIRMED_PROTECTION_PREFIX)
+        .filter(|id| Uuid::parse_str(id).is_ok())
+        .ok_or_else(|| err("invalid_candidate", "启用守护需要本轮环境观测编号"))?;
+    let cfg = setup_config(store, system)?;
+    let policy = policy_digest(&cfg.value()?)?;
+    let accepted = store.read_json(&store.paths.base().join("confirmed-environment.json"), Value::Null)?;
+    if needs_vpn_setup(system, &cfg) && !cfg.vpn_expectation.as_ref().is_some_and(|v| v.configured) {
+        return Err(err("vpn_expectation_unconfigured", "尚未确认 Watch 使用的 VPN 预期"));
+    }
+    if !cfg.enabled || accepted["schema"] != 1 || accepted["policy"] != policy
+        || accepted["vpn_expectation"] != json!(cfg.vpn_expectation)
+    {
+        return Err(err("confirmed_environment_changed", "已确认的 Watch 环境与保存设置不一致"));
+    }
+    let audit = store.read_json(&store.paths.base().join("last-environment-detection.json"), Value::Null)?;
+    let now = system.now();
+    let observed = audit["observed_at"].as_f64().unwrap_or(f64::NAN);
+    let expires = audit["expires_at"].as_f64().unwrap_or(f64::NAN);
+    if audit["schema"] != 1 || audit["observation_id"] != observation_id || audit["policy"] != policy
+        || !observed.is_finite() || !expires.is_finite() || !(observed <= now && now < expires)
+        || audit["context_transition"]["state"] != "stable"
+        || audit["facts"]["state"] != "ok"
+        || !audit["blocked"].as_array().is_some_and(|rows|
+            rows.iter().all(|row| row == "guard" && !cfg.guard_enabled))
+    {
+        return Err(err("environment_receipt_unavailable", "启用守护所用的环境回执已过期或尚未确认"));
+    }
+    let values = &accepted["values"];
+    if ["ip", "country", "timezone"].iter().any(|key| {
+        text(values, key).is_empty() || values[*key] != audit["egress_reference"][*key]
+    }) {
+        return Err(err("egress_changed", "当前出口与已确认的环境不一致，未启用守护"));
+    }
+    let network = audit["display_facts"]["network"].clone();
+    let local = audit["display_facts"]["local"].clone();
+    require_transport(&local)?;
+    if text(&network, "service").is_empty() || text(&local, "context").is_empty()
+        || audit["context"] != local["context"]
+    {
+        return Err(err("environment_receipt_unavailable", "环境回执缺少本轮网络身份"));
+    }
+    let c = json!({"id":id,"observed_at":observed,"expires_at":expires,"policy":policy,
+        "context":context(&network, &local)?,"values":values,"accepted_environment":accepted,
+        "vpn_expectation":accepted["vpn_expectation"],"vpn_observation":accepted["vpn_observation"]});
+    Ok((c, cfg, network, local))
+}
+
 pub fn checked_candidate<S: OnboardingSystem>(
     store: &StateStore,
     system: &S,
     id: &str,
 ) -> Result<(Value, Config, Value, Value)> {
+    if id.starts_with(CONFIRMED_PROTECTION_PREFIX) {
+        let (c, cfg, _, _) = confirmed_protection_reference(store, system, id)?;
+        let (net, local) = system.network_and_local(&cfg)?;
+        require_transport(&local)?;
+        if text(&c, "context") != context(&net, &local)? {
+            return Err(err("stale_candidate", "启用守护前的网络或已确认环境发生变化"));
+        }
+        recheck_vpn(system, &c)?;
+        return Ok((c, cfg, net, local));
+    }
     let c = store.read_json(&candidate_path(store), Value::Null)?;
     if text(&c, "id") != id
         || system.now() - c["observed_at"].as_f64().unwrap_or(-1.0) > TTL
@@ -400,8 +473,7 @@ pub fn checked_candidate<S: OnboardingSystem>(
         return Err(err("invalid_candidate", "候选校验失败，请重新检测"));
     }
     let cfg = setup_config(store, system)?;
-    let net = system.network()?;
-    let local = system.local(&cfg)?;
+    let (net, local) = system.network_and_local(&cfg)?;
     require_transport(&local)?;
     if text(&c, "policy") != policy_digest(&cfg.value()?)?
         || text(&c, "context") != context(&net, &local)?
@@ -427,27 +499,46 @@ pub fn preview<S: OnboardingSystem>(
     options: &Value,
     merge: Option<&str>,
 ) -> Result<Value> {
+    let (c, cfg, _, mut local) = if id.starts_with(CONFIRMED_PROTECTION_PREFIX) {
+        confirmed_protection_reference(store, system, id)?
+    } else {
+        checked_candidate(store, system, id)?
+    };
+    if id.starts_with(CONFIRMED_PROTECTION_PREFIX) {
+        local["watchdog"] = system.setup_watchdog_state(&cfg)?;
+    }
+    preview_checked(id, options, merge, &c, &cfg, &local)
+}
+
+fn preview_checked(id: &str, options: &Value, merge: Option<&str>, c: &Value, cfg: &Config, local: &Value) -> Result<Value> {
     if !options_ok(options) {
         return Err(err("invalid_options", "请明确选择环境与后台选项"));
     }
-    let (c, cfg, _net, local) = checked_candidate(store, system, id)?;
+    let protection_only = id.starts_with(CONFIRMED_PROTECTION_PREFIX);
+    if protection_only && (options["apply_environment"] != false || options["enable_policy"] != true
+        || options["guard_enabled"] != true || options["timezone_watchdog"] != true
+        || options["auto_update"] != cfg.auto_update) {
+        return Err(err("invalid_options", "此预览只用于启用 Watch 保镖和时区守护"));
+    }
     let mut desired = cfg.value()?;
-    for k in [
-        "country",
-        "timezone",
-        "locale",
-        "proxy_mode",
-        "proxy_url",
-        "proxy_group",
-        "network_service",
-    ] {
-        if let Some(v) = c["values"].get(k) {
-            // A measured absence (for example an unverified TAG selection) is
-            // display data, not a request to replace a validated string field
-            // with JSON null.
-            if !v.is_null() {
-                desired[k] = v.clone();
-            }
+    if !protection_only {
+        for k in [
+                "country",
+                "timezone",
+                "locale",
+                "proxy_mode",
+                "proxy_url",
+                "proxy_group",
+                "network_service",
+            ] {
+                if let Some(v) = c["values"].get(k) {
+                    // A measured absence (for example an unverified TAG selection) is
+                    // display data, not a request to replace a validated string field
+                    // with JSON null.
+                    if !v.is_null() {
+                        desired[k] = v.clone();
+                    }
+                }
         }
     }
     desired["enabled"] = json!(options["enable_policy"].as_bool().unwrap());
@@ -456,7 +547,7 @@ pub fn preview<S: OnboardingSystem>(
     desired["guard_enabled"] = options["guard_enabled"].clone();
     desired["timezone_watchdog"] = options["timezone_watchdog"].clone();
     desired["auto_update"] = options["auto_update"].clone();
-    if !c["vpn_expectation"].is_null() {
+    if !protection_only && !c["vpn_expectation"].is_null() {
         desired["schema"] = json!(2);
         desired["network_backend"] = json!(NetworkBackendKind::Seatbelt);
         desired["vpn_expectation"] = c["vpn_expectation"].clone();
@@ -465,12 +556,13 @@ pub fn preview<S: OnboardingSystem>(
     if desired.guard_enabled && !desired.enabled {
         return Err(err("policy_required", "启用断线保护时也需启用受控环境策略"));
     }
-    let repair = repair::make_plan(&desired, &local, merge)?;
+    let repair = repair::make_plan(&desired, local, merge)?;
     let actions: Vec<Value> = repair["actions"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|a| {
+            if protection_only { return a["id"] == "watchdog"; }
             matches!(text(a, "id"), "watchdog" | "updater")
                 || (options["apply_environment"] == Value::Bool(true)
                     && matches!(text(a, "id"), "timezone" | "locale" | "language" | "ipv6"))
@@ -485,6 +577,9 @@ pub fn preview<S: OnboardingSystem>(
             json!(vpn_confirmation_lines(expected))
         } else { json!([]) };
     }
+    if protection_only {
+        out["accepted_environment_digest"] = json!(policy_digest(&c["accepted_environment"])?);
+    }
     out["id"] = json!(policy_digest(&out)?);
     Ok(out)
 }
@@ -497,14 +592,21 @@ fn apply_inner<S: OnboardingSystem>(
     merge: Option<&str>,
     transaction_id: &str,
 ) -> Result<Value> {
-    let plan = preview(store, system, candidate_id, options, merge)?;
+    let protection_only = candidate_id.starts_with(CONFIRMED_PROTECTION_PREFIX);
+    let (c, before, network, local) = if protection_only {
+        let (c, cfg, network, mut local) = confirmed_protection_reference(store, system, candidate_id)?;
+        local["watchdog"] = system.setup_watchdog_state(&cfg)?;
+        (c, cfg, network, local)
+    } else {
+        checked_candidate(store, system, candidate_id)?
+    };
+    let plan = preview_checked(candidate_id, options, merge, &c, &before, &local)?;
     if text(&plan, "id") != plan_id {
         return Err(err("stale_plan", "预览选项或环境变化，请重新预览"));
     }
-    let (c, before, network, local) = checked_candidate(store, system, candidate_id)?;
     let desired = Config::from_value(plan["desired_config"].clone())?;
     system.progress(Phase::VerifyEgress);
-    let reread = system.egress_reference(&before)?;
+    let reread = system.egress_for_local(&before, &local)?;
     confirm_reference(
         &c["values"],
         &reread,
@@ -512,7 +614,12 @@ fn apply_inner<S: OnboardingSystem>(
     )?;
     // Permission dialogs and writes must not begin on a context or candidate
     // that changed/expired while the network reference was being rechecked.
-    checked_candidate(store, system, candidate_id)?;
+    let (latest, live_config, live_network, live_local) = checked_candidate(store, system, candidate_id)?;
+    if protection_only && (system.now() >= c["expires_at"].as_f64().unwrap_or(0.0)
+        || preview_checked(candidate_id, options, merge, &latest, &live_config, &live_local)?["id"] != plan_id)
+    {
+        return Err(err("stale_plan", "确认期间守护计划或证据发生变化，请重新预览"));
+    }
     if setup_path(store).exists() {
         return Err(err("recovery_required", "已有初始化事务待恢复，未覆盖"));
     }
@@ -546,8 +653,12 @@ fn apply_inner<S: OnboardingSystem>(
     // Time and locale changes are expected; the transport identity and saved
     // policy must nevertheless still be the one bound to the preview.
     system.progress(Phase::VerifySettings);
-    let final_network = system.network()?;
-    let final_local = system.local(&desired)?;
+    let had_actions = !plan["actions"].as_array().unwrap().is_empty();
+    let (final_network, final_local) = if protection_only && !had_actions {
+        (live_network, live_local)
+    } else {
+        system.network_and_local(&desired)?
+    };
     require_transport(&final_local)?;
     let current = setup_config(store, system)?;
     if text(&local, "context") != text(&final_local, "context")
@@ -582,53 +693,58 @@ fn apply_inner<S: OnboardingSystem>(
     {
         return Err(err("setting_unconfirmed", "应用后的日期格式未能核对"));
     }
-    system.progress(Phase::SaveBaseline);
-    let mut baseline = system.baseline_data()?;
-    let end_network = system.network()?;
-    let end_local = system.local(&desired)?;
-    require_transport(&end_local)?;
-    if context(&final_network, &final_local)? != context(&end_network, &end_local)?
-        || final_network != end_network
-    {
-        return Err(err("context_changed", "基线读取期间代理或网络变化"));
-    }
-    if !baseline.lines().any(|x| x == "format=2")
-        || !baseline
-            .lines()
-            .any(|x| x == format!("timezone={}", end_local["timezone"].as_str().unwrap_or("")))
-    {
-        return Err(err("baseline_incomplete", "基线与最终本机时区未能核对"));
-    }
-    // Pin the observed TAG node, not the requested CLI mode: auto detection
-    // must still record the baseline photo when the machine really runs a
-    // TAG-transport client (values.proxy_mode is the observed transport).
-    if text(&c["values"], "proxy_mode") == "tag" {
-        let group = c["values"]["proxy_group"].as_str().unwrap_or("");
-        let node = c["values"]["node"].as_str().unwrap_or("");
-        if [group, node]
-            .iter()
-            .any(|value| value.contains(['\n', '\r', '\0']))
+    let mut outputs = vec![("config", serde_json::to_string(&desired.value()?).unwrap() + "\n")];
+    let confirmation = if protection_only {
+        if context(&final_network, &final_local)? != text(&c, "context") {
+            return Err(err("context_changed", "守护应用后，网络或已确认环境发生变化"));
+        }
+        if had_actions {
+            recheck_vpn(system, &c)?;
+        }
+        // Only rebind the saved policy hash. Keep the approved environment,
+        // its source times and the original baseline file intact.
+        let mut confirmation = c["accepted_environment"].clone();
+        confirmation["policy"] = json!(policy_digest(&desired.value()?)?);
+        confirmation
+    } else {
+        system.progress(Phase::SaveBaseline);
+        let mut baseline = system.baseline_data()?;
+        let (end_network, end_local) = system.network_and_local(&desired)?;
+        require_transport(&end_local)?;
+        if context(&final_network, &final_local)? != context(&end_network, &end_local)?
+            || final_network != end_network
         {
-            return Err(err("invalid_proxy_reference", "代理参考名称含无效控制字符"));
+            return Err(err("context_changed", "基线读取期间代理或网络变化"));
         }
-        if !baseline.ends_with('\n') {
-            baseline.push('\n');
+        if !baseline.lines().any(|x| x == "format=2")
+            || !baseline
+                .lines()
+                .any(|x| x == format!("timezone={}", end_local["timezone"].as_str().unwrap_or("")))
+        {
+            return Err(err("baseline_incomplete", "基线与最终本机时区未能核对"));
         }
-        baseline.push_str(&format!("tag_group={group}\ntag_node={node}\n"));
-    }
-    recheck_vpn(system, &c)?;
-    let confirmation = json!({"schema":1,"confirmed_at":system.now(),"observed_at":c["observed_at"],"policy":policy_digest(&desired.value()?)?,"values":c["values"],"sources":c["sources"],"vpn_expectation":c["vpn_expectation"],"vpn_observation":c["vpn_observation"]});
-    let outputs = [
-        (
-            "config",
-            serde_json::to_string(&desired.value()?).unwrap() + "\n",
-        ),
-        ("baseline", baseline),
-        (
-            "confirmation",
-            serde_json::to_string(&confirmation).unwrap() + "\n",
-        ),
-    ];
+        // Pin the observed TAG node, not the requested CLI mode: auto detection
+        // must still record the baseline photo when the machine really runs a
+        // TAG-transport client (values.proxy_mode is the observed transport).
+        if text(&c["values"], "proxy_mode") == "tag" {
+            let group = c["values"]["proxy_group"].as_str().unwrap_or("");
+            let node = c["values"]["node"].as_str().unwrap_or("");
+            if [group, node]
+                .iter()
+                .any(|value| value.contains(['\n', '\r', '\0']))
+            {
+                return Err(err("invalid_proxy_reference", "代理参考名称含无效控制字符"));
+            }
+            if !baseline.ends_with('\n') {
+                baseline.push('\n');
+            }
+            baseline.push_str(&format!("tag_group={group}\ntag_node={node}\n"));
+        }
+        recheck_vpn(system, &c)?;
+        outputs.push(("baseline", baseline));
+        json!({"schema":1,"confirmed_at":system.now(),"observed_at":c["observed_at"],"policy":policy_digest(&desired.value()?)?,"values":c["values"],"sources":c["sources"],"vpn_expectation":c["vpn_expectation"],"vpn_observation":c["vpn_observation"]})
+    };
+    outputs.push(("confirmation", serde_json::to_string(&confirmation).unwrap() + "\n"));
     for (key, after) in outputs {
         let path = managed_paths(store)
             .into_iter()

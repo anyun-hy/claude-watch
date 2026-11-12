@@ -2,7 +2,7 @@
 //! These are sampled immediately after each decision and never feed policy.
 use crate::{
     config_store::guard_heartbeat_policy_matches,
-    storage::{strict_json, StateStore},
+    storage::{StateStore},
 };
 use claude_watch_core::{
     config::Config,
@@ -106,53 +106,19 @@ pub fn capture_phase(store: &StateStore, config: &Config, local: &Value, now: f6
                 Err(_) => ("invalid", None),
             },
         };
-    let (guard_status, guard_age, guard_code, matches_policy) =
-        // Family permits and receipts are part of the heartbeat. Use the same
-        // bounded JSON size as StateStore::read_json, not the old tiny summary
-        // limit that misclassified valid multi-family heartbeats as unreadable.
-        match store.read_bytes(&store.paths.base().join("guard-heartbeat.json"), 2_000_000) {
-            Ok(None) => ("missing", None, None, None),
-            Err(_) => ("unreadable", None, None, None),
-            Ok(Some(bytes)) => match strict_json(&bytes) {
-                Ok(value) if value.is_object() => {
-                    let status = match value["status"].as_str() {
-                        Some("ok") => "ok",
-                        Some("degraded") => "degraded",
-                        Some("unknown") => "unknown",
-                        Some("disabled") => "disabled",
-                        Some("protection_triggered") => "protection_triggered",
-                        Some("protection_unavailable") => "protection_unavailable",
-                        Some("pending") => "pending",
-                        _ => "invalid",
-                    };
-                    let matches_policy = guard_heartbeat_policy_matches(&value, config);
-                    let code = value["code"].as_str().map(|code| {
-                        match code {
-                            "invalid_native_observation"
-                            | "native_observation_unavailable"
-                            | "desktop_inventory_incomplete"
-                            | "process_metadata_unavailable"
-                            | "state_io_failed"
-                            | "unsafe_path"
-                            | "home_owner_mismatch"
-                            | "invalid_config"
-                            | "invalid_snapshot_producer"
-                            | "snapshot_producer_changed"
-                            | "sampling_failed" => code,
-                            _ => "other",
-                        }
-                        .to_owned()
-                    });
-                    (
-                        status,
-                        age(now, value["time"].as_f64()),
-                        code,
-                        matches_policy,
-                    )
-                }
-                _ => ("invalid", None, None, None),
-            },
-        };
+    let frame = crate::channel_policy_status::read_frame(store);
+    let summary = crate::channel_policy_status::guard_summary(&frame, config, now);
+    let guard_status = match summary["status"].as_str() {
+        _ if frame.is_null() => "missing",
+        Some(status) => status,
+        None => "invalid",
+    };
+    let guard_age = age(now, summary["time"].as_f64());
+    let matches_policy = guard_heartbeat_policy_matches(&summary, config);
+    let guard_code = summary["code"].as_str().map(|code| match code {
+        "execution_evidence_stale_or_mismatched" | "execution_not_confirmed" | "guard_policy_unverified" => code.to_owned(),
+        _ => "other".into(),
+    });
     let decision = match local["guard_state"].as_str() {
         Some("ok") => "ok",
         Some("unknown") => "unknown",
@@ -218,6 +184,9 @@ impl GuardPhase {
                     | "invalid_snapshot_producer"
                     | "snapshot_producer_changed"
                     | "sampling_failed"
+                    | "execution_evidence_stale_or_mismatched"
+                    | "execution_not_confirmed"
+                    | "guard_policy_unverified"
                     | "other"
             )
         }) && self.sampled_at.is_finite()

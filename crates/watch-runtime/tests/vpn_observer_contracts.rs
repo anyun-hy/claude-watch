@@ -153,6 +153,186 @@ fn current_live_source_instance() -> String {
     format!("pid:{}:{}:{}", me.pid, me.start_seconds, me.start_microseconds)
 }
 
+fn live_owner_fixture() -> (MockControllerServer, VpnExpectation) {
+    let server = MockControllerServer::start(Some(7890),
+        vec![json!({"mode":"rule","mixed-port":7890,"revision":"stable"})],
+        vec![json!({"proxies":{"AI":{"name":"AI","type":"Selector","now":"US"},"US":{"name":"US","type":"Trojan"}}})],
+        json!({"rules":[]}));
+    let mut expectation = VpnExpectation::unconfigured();
+    expectation.configured = true;
+    expectation.proxy_mode = "tag".into();
+    expectation.proxy_url = "http://127.0.0.1:7890".into();
+    expectation.proxy_group = "AI".into();
+    (server, expectation)
+}
+
+fn captured_listener(server: &MockControllerServer, captured_at: f64, sequence: u64, origin: &str)
+    -> claude_watch_runtime::vpn_observer::KernelListenerSnapshot {
+    claude_watch_runtime::vpn_observer::KernelListenerSnapshot {
+        evidence: claude_watch_core::tag_flow::CommandEvidence { status: 0,
+            stdout: format!("tcp4 0 0 127.0.0.1.{} *.* LISTEN 0 0 1 1 fixture:{} 0\n", server.port, std::process::id()),
+            stderr: String::new(), source: "native-listener".into() },
+        captured_at, origin_id: Some(origin.into()), sequence: Some(sequence),
+    }
+}
+
+#[test]
+fn batch_listener_reads_are_two_per_sample_and_same_frame_cannot_renew_evidence() {
+    let (server, expectation) = live_owner_fixture();
+    let snapshot = captured_listener(&server, 999.0, 7, "collector-A");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let reader = HttpControllerVpnReader::new_live("tag", server.credentials())
+        .with_listener_snapshot_probe(Box::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Some(snapshot.clone())
+        }));
+    let mut observer = VpnObserver::new("snapshot", None);
+    for now in [1000.0, 1001.0] {
+        let result = observer.observe_from_reader(&reader, &expectation, false, now).unwrap();
+        assert_eq!(result.verdict, VpnMatch::Matched);
+        assert_eq!(result.observation.valid_until, 1002.5);
+        assert_eq!(result.observation.observed_at, now);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    let expired = observer.observe_from_reader(&reader, &expectation, false, 1003.0).unwrap();
+    assert_eq!(expired.observation.source_error.as_deref(), Some("vpn_listener_snapshot_stale"));
+    assert!(matches!(expired.verdict, VpnMatch::Unknown { .. }));
+}
+
+#[test]
+fn collector_replacement_or_frame_replay_fails_source_pair_verification() {
+    let (server, expectation) = live_owner_fixture();
+    let before = captured_listener(&server, 999.5, 7, "collector-A");
+    let mut variants = Vec::new();
+    variants.push(captured_listener(&server, 999.5, 7, "collector-B"));
+    variants.push(captured_listener(&server, 999.5, 6, "collector-A"));
+    variants.push(captured_listener(&server, 1000.0, 7, "collector-A"));
+    for after in variants {
+        let before = before.clone();
+        let reads = AtomicUsize::new(0);
+        let reader = HttpControllerVpnReader::new_live("tag", server.credentials())
+            .with_listener_snapshot_probe(Box::new(move |_| Some(if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                before.clone()
+            } else { after.clone() })));
+        let result = VpnObserver::new("replacement", None).observe_from_reader(&reader, &expectation, false, 1000.0).unwrap();
+        assert_eq!(result.observation.source_error.as_deref(), Some("vpn_listener_source_changed_during_sample"));
+        assert!(matches!(result.verdict, VpnMatch::Unknown { .. }));
+    }
+}
+
+#[test]
+fn missing_or_empty_kernel_snapshot_cannot_replace_verified_source() {
+    let (server, expectation) = live_owner_fixture();
+    let mut empty = captured_listener(&server, 999.5, 7, "collector-A");
+    empty.evidence.stdout.clear();
+    for snapshot in [None, Some(empty)] {
+        let reader = HttpControllerVpnReader::new_live("tag", server.credentials())
+            .with_listener_snapshot_probe(Box::new(move |_| snapshot.clone()));
+        let result = VpnObserver::new("missing", None).observe_from_reader(&reader, &expectation, false, 1000.0).unwrap();
+        assert!(result.observation.source_instance.is_none());
+        assert!(result.observation.source_error.is_some());
+        assert!(!result.observation.consistency.is_consistent());
+        assert!(matches!(result.verdict, VpnMatch::Unknown { .. }));
+    }
+}
+
+#[test]
+fn cross_user_owner_probe_is_authoritative_and_reverified_each_sample() {
+    let (server, expectation) = live_owner_fixture();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let reader = HttpControllerVpnReader::new_live("tag", server.credentials())
+        .with_listener_owner_probe(Box::new(move |_, remaining| {
+            assert!(!remaining.is_zero());
+            assert!(remaining <= claude_watch_runtime::vpn_observer::VPN_OBSERVATION_BUDGET);
+            observed.fetch_add(1, Ordering::SeqCst);
+            Some(std::process::id())
+        }));
+    let mut observer = VpnObserver::new("cross-user", None);
+    for timestamp in [1000.0, 1001.0] {
+        let transition = observer.observe_from_reader(&reader, &expectation, false, timestamp).unwrap();
+        assert_eq!(transition.observation.source_instance, Some(current_live_source_instance()));
+        assert_eq!(transition.verdict, VpnMatch::Matched);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 4,
+        "controller owner must be read twice, without a same-UID full scan replacing it");
+
+    // The controller is really owned by this test process. An ambiguous kernel
+    // lookup must nevertheless stay unverified, not be overridden by a UID scan.
+    let unavailable = HttpControllerVpnReader::new_live("tag", server.credentials())
+        .with_listener_owner_probe(Box::new(|_, _| None));
+    let transition = observer.observe_from_reader(&unavailable, &expectation, false, 1002.0).unwrap();
+    assert!(transition.observation.source_instance.is_none());
+    assert!(matches!(transition.verdict, VpnMatch::Unknown { .. }));
+}
+
+#[test]
+fn owner_handoff_during_recheck_never_produces_verified_instance() {
+    let (server, expectation) = live_owner_fixture();
+    let count = AtomicUsize::new(0);
+    let reader = HttpControllerVpnReader::new_live("tag", server.credentials())
+        .with_listener_owner_probe(Box::new(move |_, _| {
+            (count.fetch_add(1, Ordering::SeqCst) % 2 == 0).then_some(std::process::id())
+        }));
+    let transition = VpnObserver::new("handoff", None)
+        .observe_from_reader(&reader, &expectation, false, 1000.0).unwrap();
+    assert!(transition.observation.source_instance.is_none());
+    assert!(matches!(transition.verdict, VpnMatch::Unknown { .. }));
+}
+
+#[test]
+fn exhausted_sample_budget_fails_closed_without_timestamp_renewal() {
+    use claude_watch_runtime::vpn_observer::{DEFAULT_VPN_OBSERVATION_TTL_SECONDS, VPN_OBSERVATION_BUDGET};
+    let (server, expectation) = live_owner_fixture();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let reader = HttpControllerVpnReader::new_live("tag", server.credentials())
+        .with_listener_owner_probe(Box::new(move |_, remaining| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(remaining);
+            Some(std::process::id())
+        }));
+    let started = std::time::Instant::now();
+    let transition = VpnObserver::new("budget", None)
+        .observe_from_reader(&reader, &expectation, false, 1000.0).unwrap();
+    assert!(started.elapsed() >= VPN_OBSERVATION_BUDGET);
+    assert!(started.elapsed() < std::time::Duration::from_millis(3300));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no unbounded second check after deadline");
+    assert_eq!(transition.observation.source_error.as_deref(), Some("vpn_observation_budget_exceeded"));
+    assert!(!transition.observation.consistency.is_consistent());
+    assert!(transition.observation.source_instance.is_none());
+    assert_eq!(transition.observation.sample_started_at, 1000.0);
+    assert_eq!(transition.observation.observed_at, 1000.0);
+    assert_eq!(transition.observation.valid_until, 1000.0 + DEFAULT_VPN_OBSERVATION_TTL_SECONDS);
+    assert!(matches!(transition.verdict, VpnMatch::Unknown { .. }));
+}
+
+#[test]
+#[ignore = "macOS read-only host diagnostic; owns its temporary controller listener"]
+fn owned_controller_live_kernel_source_finishes_inside_evidence_ttl() {
+    use claude_watch_runtime::{commands::SystemRunner, vpn_observer::{
+        read_vpn_kernel_snapshot, VPN_OBSERVATION_BUDGET,
+    }};
+    let (server, expectation) = live_owner_fixture();
+    let runner = SystemRunner::development().unwrap();
+    let reader = HttpControllerVpnReader::new_live("tag", server.credentials())
+        .with_listener_snapshot_probe(Box::new(move |remaining| {
+            let snapshot = read_vpn_kernel_snapshot(&runner, remaining)?;
+            eprintln!("owned controller kernel read status={} stdout_bytes={} stderr_bytes={}",
+                snapshot.evidence.status, snapshot.evidence.stdout.len(), snapshot.evidence.stderr.len());
+            Some(snapshot)
+        }));
+    let started = std::time::Instant::now();
+    let transition = VpnObserver::new("owned-live-controller", None)
+        .observe_from_reader(&reader, &expectation, false, claude_watch_runtime::native::now()).unwrap();
+    let elapsed = started.elapsed();
+    eprintln!("owned controller + live kernel owner double-check elapsed={elapsed:?}; budget={VPN_OBSERVATION_BUDGET:?}");
+    assert_eq!(transition.observation.source_instance, Some(current_live_source_instance()));
+    assert_eq!(transition.verdict, VpnMatch::Matched);
+    assert!(elapsed < VPN_OBSERVATION_BUDGET);
+}
+
 #[test]
 fn fast_vpn_state_observes_custom_ports_protocol_selector_chain_and_never_calls_connections() {
     let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();

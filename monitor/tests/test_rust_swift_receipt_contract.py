@@ -102,6 +102,8 @@ def production_models() -> str:
         (MODELS, "BoundProcessTokenModel"),
         (MODELS, "VpnEpochModel"),
         (MODELS, "BackendCoverageScopeModel"),
+        (MODELS, "ProcessDispositionTargetModel"),
+        (MODELS, "ProcessDispositionReceiptModel"),
         (MODELS, "FamilyChannelMonitorState"),
         (MODELS, "ChannelMonitorSnapshot"),
         (MODELS, "ChannelMonitorEvent"),
@@ -277,12 +279,15 @@ struct RustSwiftReceiptContract {
             reason_code: "vpn_node_mismatch",
             process_preserved: true,
             active_member_pids: [1001],
+            active_members: [BoundProcessTokenModel(pid:1001, uid:501, start_seconds:900, start_microseconds:1, role:"desktop_main", audit_token:[501,501,20,501,20,1001,0,9])],
             active_flows_count: 0,
             terminated_flows_count: 4,
             blocked_new_connections: 1,
-            updated_at: 1007.0
+            updated_at: 1007.0,
+            backend: "seatbelt",
+            coverage_scope: BackendCoverageScopeModel(backend:"seatbelt", configured_entries:["claude"], protected_pids:[1001], unprotected_pids:[], uncovered_boundaries:[], server_identity_verified:true, gateway_endpoint_protection_verified:true, gateway_endpoint_protection_method:"fixture")
         )
-        require(blockedConfirmed.isConfirmedFlowBlocked == true, "U01: applied blocked receipt with 0 active flows must report isConfirmedFlowBlocked")
+        require(blockedConfirmed.isConfirmedFlowBlocked == true, "U01: current identity and coverage with an applied blocking receipt must report isConfirmedFlowBlocked")
 
         // Verify VpnSupervisionSnapshotModel diffs & unknown/stale reasons
         let vpnSnap = VpnSupervisionSnapshotModel(

@@ -66,12 +66,6 @@ fn runtime_mode_label(value: &Value) -> String {
         _ => "未知".into(),
     }
 }
-fn local(host: &Host, config: &Config) -> Result<Value> {
-    RepairSystem::local(host, config)
-}
-fn network(host: &Host) -> Result<Value> {
-    OnboardingSystem::network(host)
-}
 fn source(id: &str, local: &Value, network: &Value, candidate: bool) -> String {
     match id {
         "proxy_mode" => "运行进程身份 / 本机网络状态".into(),
@@ -103,16 +97,15 @@ impl EmptyFallback for String {
 fn value_rows(
     host: &Host,
     config: &Config,
-    mode: Option<&str>,
+    observed: Option<(&Value, &Value)>,
     proposed: Option<&Value>,
 ) -> Result<Vec<Value>> {
-    let net = network(host)?;
-    let mut probe = config.clone();
-    if let Some(mode) = mode.filter(|mode| !mode.is_empty()) {
-        probe.proxy_mode = mode.into();
-    }
-    let facts = local(host, &probe)?;
-    let current = onboarding::current_values(&net, &facts);
+    let (net, facts, current) = if let Some(values) = proposed {
+        (Value::Null, Value::Null, values.clone())
+    } else {
+        let (net, facts) = observed.ok_or_else(|| CoreError::new("setup_observation_missing", "未取得本轮设置观测"))?;
+        (net.clone(), facts.clone(), onboarding::current_values(net, facts))
+    };
     let confirmed = host.storage.read_json(
         &host.storage.paths.base().join("confirmed-environment.json"),
         Value::Null,
@@ -162,13 +155,15 @@ fn unsupported_actions(plan: &mut Value) {
 fn setup_inspect(paths: Paths, mode: &str) -> Result<Value> {
     let host = host(paths, Authority::ReadOnly)?;
     let config = onboarding::setup_config(&host.storage, &host)?;
-    let facts = local(&host, &config)?;
+    let mut probe = config.clone();
+    if !mode.is_empty() { probe.proxy_mode = mode.into(); }
+    let (net, facts) = OnboardingSystem::network_and_local(&host, &probe)?;
     let confirmed = host.storage.read_json(
         &host.storage.paths.base().join("confirmed-environment.json"),
         Value::Null,
     )?;
     Ok(
-        json!({"status":"ok","observed_at":OnboardingSystem::now(&host),"initialized":host.storage.paths.config().is_file()&&!config.country.is_empty()&&!config.timezone.is_empty(),"rows":value_rows(&host,&config,Some(mode),None)?,"candidates":facts["candidates"].as_array().cloned().unwrap_or_default(),"message":text(&facts,"proxy_detail").if_empty("本机读取完成；尚未联网检测"),"confirmed_at":if confirmed["policy"]==policy_digest(&config.value()?)? {confirmed["confirmed_at"].clone()} else {Value::Null},"recovery_required":host.storage.paths.base().join("setup-transaction.json").is_file()}),
+        json!({"status":"ok","observed_at":OnboardingSystem::now(&host),"initialized":host.storage.paths.config().is_file()&&!config.country.is_empty()&&!config.timezone.is_empty(),"rows":value_rows(&host,&config,Some((&net,&facts)),None)?,"candidates":facts["candidates"].as_array().cloned().unwrap_or_default(),"message":text(&facts,"proxy_detail").if_empty("本机读取完成；尚未联网检测"),"confirmed_at":if confirmed["policy"]==policy_digest(&config.value()?)? {confirmed["confirmed_at"].clone()} else {Value::Null},"recovery_required":host.storage.paths.base().join("setup-transaction.json").is_file()}),
     )
 }
 
@@ -186,7 +181,7 @@ fn setup_detect(paths: Paths, request: &Request) -> Result<Value> {
     candidate["rows"] = json!(value_rows(
         &host,
         &config,
-        Some(mode),
+        None,
         Some(&candidate["values"])
     )?);
     candidate["message"] = json!("本轮实测候选；确认前不会保存环境基线或修改系统设置。");
@@ -202,8 +197,14 @@ fn setup_preview(paths: Paths, request: &Request) -> Result<Value> {
     )?;
     let options = crate::bounded_input(request.input_limit())?;
     let mut plan = onboarding::preview(&host.storage, &host, id, &options, None)?;
-    let config = onboarding::setup_config(&host.storage, &host)?;
-    plan["rows"] = json!(value_rows(&host, &config, None, Some(&plan["values"]))?);
+    if id.starts_with(onboarding::CONFIRMED_PROTECTION_PREFIX) {
+        // The wizard shows only the service actions for this plan. Rendering
+        // environment rows here would take another full system observation.
+        plan["rows"] = json!([]);
+    } else {
+        let config = onboarding::setup_config(&host.storage, &host)?;
+        plan["rows"] = json!(value_rows(&host, &config, None, Some(&plan["values"]))?);
+    }
     unsupported_actions(&mut plan);
     Ok(plan)
 }
@@ -254,7 +255,7 @@ fn repair_dispatch(paths: Paths, request: &Request) -> Result<Value> {
             None,
         )?
     } else {
-        repair::make_plan(&config, &local(&host, &config)?, None)?
+        repair::make_plan(&config, &RepairSystem::local(&host, &config)?, None)?
     };
     if !request.flag("apply") {
         let mut plan = plan;

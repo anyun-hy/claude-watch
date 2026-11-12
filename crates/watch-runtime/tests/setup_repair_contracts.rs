@@ -27,6 +27,7 @@ struct Fake {
     baseline_read: Cell<bool>,
     local_reads: Cell<usize>,
     egress_reads: Cell<usize>,
+    vpn_reads: Cell<usize>,
     lose_backend_after_first_read: bool,
     egress: Value,
     egress_after_first_read: Option<Value>,
@@ -58,6 +59,9 @@ impl RepairSystem for Fake {
         if a["id"] == "language" {
             self.local["app_language"] = json!(["en-US"]);
         }
+        if a["id"] == "watchdog" {
+            self.local["watchdog"] = json!({"target":a["after"],"registered":!a["after"].is_null()});
+        }
         self.applied.push(a.clone());
         Ok(())
     }
@@ -86,8 +90,10 @@ impl RepairSystem for Fake {
     }
 }
 impl OnboardingSystem for Fake {
+    fn setup_watchdog_state(&self, _: &Config) -> Result<Value> { Ok(self.local["watchdog"].clone()) }
     fn packaged_backend(&self) -> Option<claude_watch_core::channel::NetworkBackendKind> { self.packaged_backend }
     fn vpn_observation(&self, _: &claude_watch_core::vpn::VpnExpectation) -> Result<claude_watch_core::vpn::VpnObservation> {
+        self.vpn_reads.set(self.vpn_reads.get() + 1);
         if self.baseline_read.get() {
             if let Some(ref observed) = self.vpn_after_baseline { return Ok(observed.clone()); }
         }
@@ -135,6 +141,7 @@ fn fake() -> Fake {
         baseline_read: Cell::new(false),
         local_reads: Cell::new(0),
         egress_reads: Cell::new(0),
+        vpn_reads: Cell::new(0),
         lose_backend_after_first_read: false,
         egress: json!({"trace":{"ip":"1.1.1.1","loc":"JP"},"geo":{"ip":"1.1.1.1","country":"JP","timezone":"Asia/Tokyo"}}),
         egress_after_first_read: None,
@@ -162,6 +169,62 @@ fn seatbelt_fake() -> Fake {
 
 fn settings_only_options() -> Value {
     json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false})
+}
+
+#[test]
+fn protection_preview_reuses_confirmed_environment_without_resampling() {
+    let (home, store) = store();
+    let mut f = seatbelt_fake();
+    f.local["timezone"] = json!("Asia/Tokyo");
+    f.baseline = "format=2\ntimezone=Asia/Tokyo\n".into();
+    let mut options = settings_only_options();
+    options["guard_enabled"] = json!(false);
+    let c = onboarding::detect(&store, &f, "auto", true, &claude_watch_runtime::region_catalog::load_system_catalog()).unwrap();
+    let original_id = c["id"].as_str().unwrap();
+    let p = onboarding::preview(&store, &f, original_id, &options, None).unwrap();
+    onboarding::apply(&store, &mut f, original_id, &options, p["id"].as_str().unwrap(), None).unwrap();
+    f.baseline_read.set(false);
+    let confirmation_path = store.paths.base().join("confirmed-environment.json");
+    let candidate_path = store.paths.base().join("environment-candidate.json");
+    let audit_path = store.paths.base().join("last-environment-detection.json");
+    let approved = store.read_json(&confirmation_path, Value::Null).unwrap();
+    let candidate_before = fs::read(&candidate_path).unwrap();
+    let baseline_before = fs::read(store.paths.watch().join("state/baseline.conf")).unwrap();
+    let observation = Uuid::new_v4().to_string();
+    let mut audit = json!({"schema":1,"observation_id":observation,"observed_at":99.9,"expires_at":129.9,
+        "policy":approved["policy"],"context":f.local["context"],"context_transition":{"state":"stable"},
+        "facts":{"state":"ok"},"blocked":["guard"],"egress_reference":approved["values"],
+        "display_facts":{"local":f.local,"network":f.network}});
+    let id = format!("{}{observation}", onboarding::CONFIRMED_PROTECTION_PREFIX);
+    options["guard_enabled"] = json!(true);
+    options["timezone_watchdog"] = json!(true);
+    store.atomic_json(&audit_path, &audit).unwrap();
+    let reads = (f.local_reads.get(), f.egress_reads.get(), f.vpn_reads.get());
+    let plan = onboarding::preview(&store, &f, &id, &options, None).unwrap();
+    assert_eq!((f.local_reads.get(), f.egress_reads.get(), f.vpn_reads.get()), reads);
+    assert_eq!(plan["observed_at"], audit["observed_at"]);
+    assert_eq!(plan["actions"].as_array().unwrap().len(), 1);
+    assert_eq!(plan["actions"][0]["id"], "watchdog");
+    assert_eq!(plan["confirmation_lines"], json!([]));
+    let mut wrong_scope = options.clone(); wrong_scope["apply_environment"] = json!(true);
+    assert_eq!(onboarding::preview(&store, &f, &id, &wrong_scope, None).unwrap_err().code, "invalid_options");
+    audit["expires_at"] = json!(99.99);
+    store.atomic_json(&audit_path, &audit).unwrap();
+    assert_eq!(onboarding::preview(&store, &f, &id, &options, None).unwrap_err().code, "environment_receipt_unavailable");
+    audit["expires_at"] = json!(129.9);
+    store.atomic_json(&audit_path, &audit).unwrap();
+    f.egress_reads.set(0);
+    onboarding::apply(&store, &mut f, &id, &options, plan["id"].as_str().unwrap(), None).unwrap();
+    assert_eq!(f.egress_reads.get(), 1, "only the confirmation boundary rechecks the exit");
+    assert!(!f.baseline_read.get(), "protection-only setup does not rebuild the environment baseline");
+    assert_eq!(fs::read(&candidate_path).unwrap(), candidate_before);
+    assert_eq!(fs::read(store.paths.watch().join("state/baseline.conf")).unwrap(), baseline_before);
+    let after = store.read_json(&confirmation_path, Value::Null).unwrap();
+    assert_eq!(after["confirmed_at"], approved["confirmed_at"]);
+    assert_eq!(after["vpn_observation"], approved["vpn_observation"]);
+    let saved = onboarding::setup_config(&store, &f).unwrap();
+    assert!(saved.guard_enabled && saved.timezone_watchdog);
+    fs::remove_dir_all(home).unwrap();
 }
 
 #[test]
@@ -264,7 +327,7 @@ fn seatbelt_setup_rechecks_vpn_before_preview_and_final_save_preserving_saved_ex
 fn missing_timezone_uses_same_unique_zone_for_detection_and_confirmation() {
     let (home, store) = store();
     let zones = claude_watch_runtime::region_catalog::load_system_catalog();
-    let mut system = fake();
+    let mut system = seatbelt_fake();
     system.egress["geo"]["timezone"] = Value::Null;
     let candidate = onboarding::detect(&store, &system, "auto", true, &zones).unwrap();
     assert_eq!(candidate["values"]["timezone"], "Asia/Tokyo");
@@ -323,7 +386,7 @@ fn changed_or_incomplete_confirmation_never_applies_settings() {
         ),
     ] {
         let (home, store) = store();
-        let mut system = fake();
+        let mut system = seatbelt_fake();
         system.egress_after_first_read = Some(replacement);
         let candidate = onboarding::detect(&store, &system, "auto", true, &zones).unwrap();
         let options = json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false});
@@ -383,7 +446,7 @@ fn ambiguous_missing_timezone_and_actual_timezone_change_fail_closed() {
 fn initialization_uses_native_liveness_through_detection_preview_and_apply() {
     let (home, store) = store();
     let zones: ZoneCatalog = serde_json::from_value(json!({"JP":["Asia/Tokyo"]})).unwrap();
-    let mut system = fake();
+    let mut system = seatbelt_fake();
     system.local["backend_healthy"] = json!(false);
     // Exactly the installed-315 case: complete proxy/TUN evidence and live
     // native daemon, while an unrelated process exited during socket sampling.
@@ -481,7 +544,7 @@ fn initialization_losing_native_heartbeat_during_detection_discards_candidate() 
 fn candidate_plan_is_expiring_and_context_bound_without_system_commands() {
     let (home, store) = store();
     let zones: ZoneCatalog = serde_json::from_value(json!({"JP":["Asia/Tokyo"]})).unwrap();
-    let mut f = fake();
+    let mut f = seatbelt_fake();
     let c = onboarding::detect(&store, &f, "auto", true, &zones).unwrap();
     let options = json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false});
     let p = onboarding::preview(&store, &f, c["id"].as_str().unwrap(), &options, None).unwrap();
@@ -500,12 +563,12 @@ fn candidate_plan_is_expiring_and_context_bound_without_system_commands() {
 
 #[test]
 fn auto_detection_still_pins_node_when_observed_proxy_is_tag() {
-    // Requested CLI mode "auto" must not silence node pinning: the pin is
-    // bound to the observed TAG transport (values.proxy_mode), so auto
-    // detection records the baseline photo exactly like explicit "tag".
+    // Requested CLI mode "auto" still records the observed TAG group/node
+    // in Watch's own baseline, exactly like explicit "tag". This does not
+    // select a node or write configuration in the external VPN client.
     let (home, store) = store();
     let zones: ZoneCatalog = serde_json::from_value(json!({"JP":["Asia/Tokyo"]})).unwrap();
-    let mut f = fake();
+    let mut f = seatbelt_fake();
     let c = onboarding::detect(&store, &f, "auto", true, &zones).unwrap();
     assert_eq!(c["values"]["runtime_mode"], "rule");
     let options = json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false});
@@ -520,43 +583,36 @@ fn auto_detection_still_pins_node_when_observed_proxy_is_tag() {
     )
     .unwrap();
     let baseline = fs::read_to_string(store.paths.watch().join("state/baseline.conf")).unwrap();
-    assert!(baseline.contains("tag_group=\ntag_node=\n"));
+    assert!(baseline.contains("tag_group=AI\ntag_node=JP-1\n"));
     let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn non_tag_transport_never_writes_node_pin() {
-    // A non-TAG client exposes no control API: without observed tag transport
-    // the pin lines must stay absent regardless of the requested CLI mode.
+    // Initial Seatbelt setup requires a supported, verified VPN observation.
+    // A non-TAG transport cannot fabricate that evidence or save a node pin.
     let (home, store) = store();
     let zones: ZoneCatalog = serde_json::from_value(json!({"JP":["Asia/Tokyo"]})).unwrap();
     let mut f = fake();
+    f.packaged_backend = Some(claude_watch_core::channel::NetworkBackendKind::Seatbelt);
     f.local["mode"] = json!("clashx");
-    f.local["tag"] = json!(null);
-    let c = onboarding::detect(&store, &f, "clashx", true, &zones).unwrap();
-    assert!(c["values"]["runtime_mode"].is_null());
-    let options = json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false});
-    let p = onboarding::preview(&store, &f, c["id"].as_str().unwrap(), &options, None).unwrap();
-    onboarding::apply(
-        &store,
-        &mut f,
-        c["id"].as_str().unwrap(),
-        &options,
-        p["id"].as_str().unwrap(),
-        None,
-    )
-    .unwrap();
-    let baseline = fs::read_to_string(store.paths.watch().join("state/baseline.conf")).unwrap();
-    assert!(!baseline.contains("tag_group="));
-    assert!(!baseline.contains("tag_node="));
-    let _ = fs::remove_dir_all(home);
+    f.local["tag"] = Value::Null;
+    let error = onboarding::detect(&store, &f, "clashx", true, &zones).unwrap_err();
+    assert_eq!(error.code, "vpn_observation_unavailable");
+    assert!(f.applied.is_empty());
+    assert!(!store.paths.config().exists());
+    assert!(!store.paths.watch().join("state/baseline.conf").exists());
+    for name in ["environment-candidate.json", "confirmed-environment.json", "setup-transaction.json"] {
+        assert!(!store.paths.base().join(name).exists(), "unexpected {name}");
+    }
+    fs::remove_dir_all(home).unwrap();
 }
 
 #[test]
 fn tag_apply_commits_all_three_files_and_only_tag_baseline_fields() {
     let (home, store) = store();
     let zones: ZoneCatalog = serde_json::from_value(json!({"JP":["Asia/Tokyo"]})).unwrap();
-    let mut f = fake();
+    let mut f = seatbelt_fake();
     let c = onboarding::detect(&store, &f, "tag", true, &zones).unwrap();
     let options = json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false});
     let p = onboarding::preview(&store, &f, c["id"].as_str().unwrap(), &options, None).unwrap();
@@ -570,7 +626,7 @@ fn tag_apply_commits_all_three_files_and_only_tag_baseline_fields() {
     )
     .unwrap();
     let baseline = fs::read_to_string(store.paths.watch().join("state/baseline.conf")).unwrap();
-    assert!(baseline.contains("tag_group=\ntag_node=\n"));
+    assert!(baseline.contains("tag_group=AI\ntag_node=JP-1\n"));
     assert!(store.paths.config().is_file());
     assert!(store
         .paths
@@ -585,7 +641,7 @@ fn tag_apply_commits_all_three_files_and_only_tag_baseline_fields() {
 fn injected_action_failure_rolls_back_only_its_fresh_journal() {
     let (home, store) = store();
     let zones: ZoneCatalog = serde_json::from_value(json!({"JP":["Asia/Tokyo"]})).unwrap();
-    let mut f = fake();
+    let mut f = seatbelt_fake();
     f.fail_action = Some("language".into());
     let c = onboarding::detect(&store, &f, "tag", true, &zones).unwrap();
     let options = json!({"apply_environment":true,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false});
@@ -609,7 +665,7 @@ fn injected_action_failure_rolls_back_only_its_fresh_journal() {
 fn network_change_during_baseline_read_rolls_back_without_writing_files() {
     let (home, store) = store();
     let zones: ZoneCatalog = serde_json::from_value(json!({"JP":["Asia/Tokyo"]})).unwrap();
-    let mut f = fake();
+    let mut f = seatbelt_fake();
     f.network_after_baseline = Some(json!({"service":"Ethernet","interface":"en7"}));
     let c = onboarding::detect(&store, &f, "tag", true, &zones).unwrap();
     let options = json!({"apply_environment":false,"enable_policy":true,"guard_enabled":true,"timezone_watchdog":false,"auto_update":false});

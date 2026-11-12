@@ -3,10 +3,8 @@
 //! of treating two legitimate mains as a missing session.
 use super::*;
 use crate::{config_store::ConfigStore, receipt_store::ReceiptStore};
-use claude_watch_core::config::Config;
 
 pub(crate) const GROUP: &str = claude_watch_core::session::GROUP_KEY;
-const RECHECK: &str = claude_watch_core::session::GROUP_RECHECK_KEY;
 const CONTINUITY: &str = claude_watch_core::session::GROUP_CONTINUITY_KEY;
 pub const MAX_DESKTOP_MEMBERS: usize = claude_watch_core::session::MAX_DESKTOP_MEMBERS;
 
@@ -66,108 +64,6 @@ fn put_members(value: &mut Session, members: Vec<Desktop>) -> Result<()> {
 }
 
 impl SessionStore {
-    /// Initial adoption publishes all members and the baseline in one write.
-    /// The caller must have re-read the same complete native set after audit.
-    pub(crate) fn adopt_desktop_group(
-        &self, receipts: &ReceiptStore, audit: &Value, egress: &Value,
-        members: Vec<Desktop>, config: &Config, now: f64,
-    ) -> Result<Option<Session>> {
-        self.require_audit_family(audit, None)?;
-        if self.family != "openai" || members.len() < 2 {
-            return Err(CoreError::new("protected_scope_mismatch", "此入口只接受多桌面 OpenAI 会话"));
-        }
-        let _operation = self.storage.lock("operation", None)?;
-        let _session = self.storage.lock(&self.lock_name(), None)?;
-        if self.load(now)?.is_some()
-            || (ConfigStore { storage: self.storage.clone() }).load()? != *config
-            || !config.enabled || !config.guard_enabled
-        { return Ok(None); }
-        let _observations = self.storage.lock("observations", None)?;
-        let context = audit["context_id"].as_str().unwrap_or("");
-        let risk = receipts.session_risk(context, egress["ip"].as_str(), now);
-        let mut value = session::begin(audit, egress, &risk, &Uuid::new_v4().to_string(), now)?;
-        Self::anchor_probe_baseline(&mut value, receipts, now);
-        put_members(&mut value, members)?;
-        value.state = Phase::Active;
-        value.bound_at = Some(now);
-        value.extra.insert("adopted_from".into(), json!("running_desktop_group"));
-        self.save(&value)?;
-        Ok(Some(value))
-    }
-
-    /// Called only after every disappeared member was independently confirmed
-    /// gone. Added identities are provisional, never silently made Active.
-    /// Any membership revision gets a new id so a delayed audit cannot commit.
-    pub(crate) fn reconcile_desktop_group(
-        &self, expected: &Session, members: Vec<Desktop>, config: &Config, now: f64,
-    ) -> Result<Option<Session>> {
-        let members = canonical_desktops(members)?;
-        let old = desktop_members(expected)?;
-        if members.is_empty() || !now.is_finite() || now <= 0.0 || self.family != "openai" {
-            return Err(CoreError::new("desktop_identity_unavailable", "无法确认多桌面会话变更"));
-        }
-        let _operation = self.storage.lock("operation", None)?;
-        let _session = self.storage.lock(&self.lock_name(), None)?;
-        if self.load(now)?.as_ref() != Some(expected)
-            || (ConfigStore { storage: self.storage.clone() }).load()? != *config
-            || !config.enabled || !config.guard_enabled
-            || expected.extra.get("guard_checked_at").and_then(Value::as_f64).is_some_and(|at| at > now)
-        { return Ok(None); }
-        if expected.state == Phase::Pending { return Ok(None); }
-        if expected.state == Phase::Locked && expected.reason.as_ref().is_none_or(|reason| {
-            config.close_action(&reason.code, Provider::Codex) != "warn"
-        }) { return Ok(None); }
-        let mut value = expected.clone();
-        let continuing = expected.state != Phase::Ended
-            || expected.extra.get("exit_tree_pending") == Some(&json!(true));
-        // A confirmed empty family ends the old deadline as well as its
-        // baseline lifetime. Lingering helpers do not count as an empty tree.
-        let pending = continuing && (group_rechecking(expected) || expected.state == Phase::Rechecking);
-        if pending && now >= expected.pending_deadline {
-            value = session::lock(value, "revalidation_timeout", "桌面集合复核未在原时限内完成", now, None, None);
-            self.save(&value)?;
-            return Ok(Some(value));
-        }
-        if old == members && expected.state != Phase::Ended { return Ok(Some(value)); }
-        let added = members.iter().any(|d| !old.contains(d)) || expected.state == Phase::Ended;
-        value.session_id = Uuid::new_v4().to_string();
-        put_members(&mut value, members)?;
-        if added {
-            let continuity = continuing
-                && expected.extra.get("recheck_baseline_pending") != Some(&json!(true));
-            value.created_at = now;
-            value.pending_deadline = if pending { expected.pending_deadline }
-                else { now + session::RISK_EVIDENCE_TTL };
-            value.bound_at = Some(now);
-            value.launcher = None;
-            value.unknown_count = 0;
-            value.unknown_since = None;
-            value.last_check = None;
-            value.last_risk_state = None;
-            value.extra.remove("guard_checked_at");
-            value.extra.remove("ended_at");
-            value.extra.remove("exit_tree_pending");
-            value.extra.insert(RECHECK.into(), json!(true));
-            if continuity {
-                value.extra.insert(CONTINUITY.into(), json!(true));
-                value.extra.remove("recheck_baseline_pending");
-            } else {
-                value.extra.remove(CONTINUITY);
-                value.extra.insert("recheck_baseline_pending".into(), json!(true));
-            }
-            // Preserve a warn latch while the new membership is audited. A
-            // background audit cannot resolve that warning on the guard's behalf.
-            if expected.state != Phase::Locked {
-                value.state = Phase::Rechecking;
-                value.reason = None;
-                value.last_reason = None;
-                value.locked_at = None;
-            }
-        }
-        self.save(&value)?;
-        Ok(Some(value))
-    }
-
     /// A group audit must supply every exact member and its current native
     /// start stamp. No fallback to the first/representative process is allowed.
     pub fn complete_group_recheck(

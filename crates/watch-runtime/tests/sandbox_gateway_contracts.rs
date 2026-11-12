@@ -303,7 +303,7 @@ fn i02_and_p01_live_loopback_tcp_socket_attribution_and_protocol_relay() {
 
     // Start Watch LocalTunnelEnforcer in Seatbelt mode
     let boot_id = "boot-sandbox-p01".to_string();
-    let enforcer = Arc::new(LocalTunnelEnforcer::new(boot_id.clone(), Some(store.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new(boot_id.clone()));
     let now = 1_700_000_100.0;
     enforcer.set_clock(move || now + 1.0).unwrap();
     enforcer.configure_seatbelt_backend(true, now).unwrap();
@@ -775,7 +775,7 @@ fn i03_gateway_port_takeover_probe_triggers_fail_closed_production_gate() {
 
     // 6. Verify that passing this report into the production enforcer gate keeps `sandbox_ready = false`
     //    and blocks `apply_command` with `seatbelt_identity_gate_blocked`!
-    let enforcer = LocalTunnelEnforcer::new("boot-i03", Some(store));
+    let enforcer = LocalTunnelEnforcer::new("boot-i03");
     enforcer
         .configure_seatbelt_backend_with_identity_gate(&report, 1_700_000_900.0)
         .expect("configure with identity gate");
@@ -991,7 +991,7 @@ while True:
         .start_registration_listener(&reg_sock, Arc::clone(&reg_stop))
         .unwrap();
 
-    let enforcer = Arc::new(LocalTunnelEnforcer::new(boot_id, Some(store.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new(boot_id));
     enforcer.set_clock(move || now + 1.0).unwrap();
     enforcer.configure_seatbelt_backend(true, now).unwrap();
     let gw_stop = Arc::new(AtomicBool::new(false));
@@ -1333,7 +1333,7 @@ fn r4_chunked_request_and_upgrade_boundaries_use_the_live_gateway() {
         }
         panic!("fixture header overflow");
     }
-    let (tmp, store) = make_temp_store("cw-r4-boundaries");
+    let (tmp, _store) = make_temp_store("cw-r4-boundaries");
     let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
     let upstream_addr = upstream.local_addr().unwrap();
     upstream.set_nonblocking(true).unwrap();
@@ -1408,7 +1408,7 @@ fn r4_chunked_request_and_upgrade_boundaries_use_the_live_gateway() {
         ProcessRole::Cli,
     )
     .with_audit_token(me.audit_token);
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("r4-boundaries", Some(store)));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("r4-boundaries"));
     enforcer.configure_seatbelt_backend(true, now).unwrap();
     enforcer.set_clock(move || now + 0.5).unwrap();
     let attribution = token.clone();

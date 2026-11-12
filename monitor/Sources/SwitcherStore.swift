@@ -272,10 +272,22 @@ struct BackgroundServiceRow: Decodable, Identifiable {
     var health_basis: String? = nil
     var reason_code: String? = nil
     var evidence_observed_at: Double? = nil
+    var backend_alive: Bool? = nil
+    var sampling_state: String? = nil
+    var protection_ready: Bool? = nil
+    var last_success_at: Double? = nil
     var statusLabel: String {
+        if state == "inactive" { return "已停用" }
+        if id == "guard" {
+            if protection_ready == true && healthy { return "保护就绪" }
+            if backend_alive == true && protection_ready != true { return "运行中 · 保护待核验" }
+        }
         switch state {
-        case "running": return "断线保护就绪"
-        case "scheduled": return execution_verified == false ? "已加载（执行待确认）" : "已加载"
+        case "running": return id == "guard" && healthy ? "保护就绪" : "运行中"
+        case "pending": return "保护待核验"
+        case "scheduled":
+            if id == "original", execution_verified == true, health_basis == "root_execution_receipt" { return "独立运行" }
+            return execution_verified == false || (id == "original" && execution_verified == nil) ? "已加载（执行待确认）" : "已加载"
         case "inactive": return "已停用"
         case "unavailable": return "尚不可用"
         case "mismatch": return "待同步"
@@ -283,7 +295,20 @@ struct BackgroundServiceRow: Decodable, Identifiable {
         default: return "未确认"
         }
     }
-    var healthy: Bool { state == "running" || (state == "scheduled" && execution_verified != false) }
+    var healthy: Bool {
+        if id == "guard", let protection_ready {
+            return protection_ready && state == "running" && backend_alive != false && execution_verified != false
+        }
+        if id == "original" { return state == "scheduled" && execution_verified == true && health_basis == "root_execution_receipt" }
+        return (state == "running" || state == "scheduled") && execution_verified != false
+    }
+    var evidenceSummary: String? {
+        var parts: [String] = []
+        if let backend_alive { parts.append("后台活性：" + (backend_alive ? "已确认" : "未确认")) }
+        if let sampling_state { parts.append("采样：" + BackgroundServiceReceipt.samplingLabel(sampling_state)) }
+        if let protection_ready { parts.append("保护：" + (state == "inactive" ? "停用" : protection_ready ? "就绪" : "待核验")) }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
 }
 struct PolicyIssue: Decodable, Identifiable { let id, title, detail: String }
 struct BackgroundServiceReceipt: Decodable {
@@ -297,6 +322,25 @@ struct BackgroundServiceReceipt: Decodable {
     var facts: ProtectionFacts?
     var session_guard: SessionGuardStatus?
     var backend_diagnostics: BackendInitializationDiagnostics?
+    var backend_alive: Bool? = nil
+    var protection_ready: Bool? = nil
+
+    static func samplingLabel(_ state: String) -> String {
+        switch state {
+        case "complete": return "有效"
+        case "incomplete": return "不完整"
+        case "stale": return "已过期"
+        default: return "待核验"
+        }
+    }
+    var evidenceSummary: String {
+        let alive = backend_alive ?? guard_backend_healthy ?? backend_healthy
+        let sampling = backend_sampling_state ?? (backend_healthy ? "complete" : "incomplete")
+        let guardService = services.first(where: { $0.id == "guard" })
+        let ready = protection_ready ?? guardService?.healthy ?? false
+        let protection = guardService?.state == "inactive" || guardService?.desired == false ? "停用" : ready ? "就绪" : "待核验"
+        return "后台活性：\(alive ? "已确认" : "未确认") · 监控采样：\(Self.samplingLabel(sampling)) · 保护：\(protection)"
+    }
 }
 struct SwitcherRepairPlan: Decodable {
     let id: String
@@ -727,8 +771,8 @@ final class SwitcherStore: ObservableObject {
     private var protectionChanges: [String: Bool]?
     private var detectionCancellation: SwitcherReadCancellation?
     private var environmentGeneration = 0
-    private var backgroundGeneration = 0
-    private var webRTCReceiptGeneration = 0
+    private var backgroundRequest: Task<Void, Never>?
+    private var leakReceiptGeneration: [LeakKind: Int] = [:]
     private var reviewScenario: SwitcherReviewScenario?
     private var reviewBackground: BackgroundServiceReceipt?
     private var lastLoginProbeAt: Date = .distantPast
@@ -1324,7 +1368,8 @@ final class SwitcherStore: ObservableObject {
         return code.flatMap { allowed.contains($0) ? $0 : nil } ?? "other"
     }
     func recordDNSLeak(_ probe: LeakProbeResult, runID: UUID? = nil) async -> Bool {
-        initializationDNSReceipt = nil
+        leakReceiptGeneration[.dns, default: 0] += 1
+        let generation = leakReceiptGeneration[.dns]
         guard !isFixture || receiptCommandFixture != nil else {
             initializationDNSReceipt = ("fixture-context-0001", "ok", probe.finishedAt)
             return true
@@ -1341,6 +1386,7 @@ final class SwitcherStore: ObservableObject {
             if isFixture, let fixture = receiptCommandFixture { data = try await fixture("dns-leak-record", payload) }
             else { data = try await Task.detached { try SwitcherCommandRunner.run(["dns-leak-record", "--apply"], input: payload) }.value }
             let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+            guard generation == leakReceiptGeneration[.dns] else { return false }
             guard raw["status"] as? String != "error" else {
                 backendRejected = true
                 let code = raw["code"] as? String
@@ -1353,7 +1399,8 @@ final class SwitcherStore: ObservableObject {
                 dnsReceiptError = "DNS 检测完成后代理上下文已变化，未接受该回执。"
                 return false
             }
-            guard let receipt = Self.initializationReceiptMetadata(raw, kind: .dns, sampledAt: probe.finishedAt) else {
+            guard let receipt = Self.initializationReceiptMetadata(raw, kind: .dns, sampledAt: probe.finishedAt),
+                  receipt.context == expectedContext else {
                 onReceiptDiagnostic?(.dns, "receipt_invalid", runID, "receipt_invalid")
                 dnsReceiptError = "DNS 后台回执缺少本轮上下文、时间或判定。"
                 return false
@@ -1367,15 +1414,15 @@ final class SwitcherStore: ObservableObject {
             onReceiptDiagnostic?(.dns, "receipt_accepted", runID, "none")
             return true
         } catch {
+            guard generation == leakReceiptGeneration[.dns] else { return false }
             if !backendRejected { onReceiptDiagnostic?(.dns, "receipt_transport_error", runID, "receipt_transport_error") }
             dnsReceiptError = "DNS 泄漏结果未能提交给启动预检：" + error.localizedDescription
             return false
         }
     }
     func recordWebRTCRisk(_ probe: LeakProbeResult, runID: UUID? = nil) async -> Bool {
-        webRTCReceiptGeneration += 1
-        let generation = webRTCReceiptGeneration
-        initializationWebRTCReceipt = nil
+        leakReceiptGeneration[.webrtc, default: 0] += 1
+        let generation = leakReceiptGeneration[.webrtc]
         if isFixture && receiptCommandFixture == nil {
             webRTCReceiptError = ""
             initializationWebRTCReceipt = ("fixture-context-0001", "ok", probe.finishedAt)
@@ -1383,7 +1430,7 @@ final class SwitcherStore: ObservableObject {
         }
         guard let expectedContext = diagnosticContextProvider?(), !expectedContext.isEmpty else {
             onReceiptDiagnostic?(.webrtc, "context_missing", runID, "context_missing")
-            if generation == webRTCReceiptGeneration {
+            if generation == leakReceiptGeneration[.webrtc] {
                 webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: nil, hasContext: false, contextStillMatches: false)
             }
             return false
@@ -1398,20 +1445,21 @@ final class SwitcherStore: ObservableObject {
             guard raw["status"] as? String != "error" else {
                 let code = raw["code"] as? String
                 onReceiptDiagnostic?(.webrtc, code == "superseded_receipt" ? "receipt_superseded" : code == "receipt_conflict" ? "receipt_conflict" : "receipt_backend_error", runID, Self.safeReceiptCode(code))
-                if generation == webRTCReceiptGeneration {
+                if generation == leakReceiptGeneration[.webrtc] {
                     webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: backendMessage, hasContext: true, contextStillMatches: true)
                 }
                 return false
             }
             guard diagnosticContextProvider?() == expectedContext else {
                 onReceiptDiagnostic?(.webrtc, "context_changed", runID, "context_changed")
-                if generation == webRTCReceiptGeneration {
+                if generation == leakReceiptGeneration[.webrtc] {
                     webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: nil, hasContext: true, contextStillMatches: false)
                 }
                 return false
             }
-            guard generation == webRTCReceiptGeneration else { onReceiptDiagnostic?(.webrtc, "receipt_superseded", runID, "receipt_superseded"); return false }
-            guard let receipt = Self.initializationReceiptMetadata(raw, kind: .webrtc, sampledAt: probe.finishedAt) else {
+            guard generation == leakReceiptGeneration[.webrtc] else { onReceiptDiagnostic?(.webrtc, "receipt_superseded", runID, "receipt_superseded"); return false }
+            guard let receipt = Self.initializationReceiptMetadata(raw, kind: .webrtc, sampledAt: probe.finishedAt),
+                  receipt.context == expectedContext else {
                 onReceiptDiagnostic?(.webrtc, "receipt_invalid", runID, "receipt_invalid")
                 webRTCReceiptError = "WebRTC 后台回执缺少本轮上下文、时间或判定。"
                 return false
@@ -1423,7 +1471,7 @@ final class SwitcherStore: ObservableObject {
             return true
         } catch {
             onReceiptDiagnostic?(.webrtc, "receipt_transport_error", runID, "receipt_transport_error")
-            if generation == webRTCReceiptGeneration {
+            if generation == leakReceiptGeneration[.webrtc] {
                 webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: error.localizedDescription, hasContext: true, contextStillMatches: true)
             }
             return false
@@ -1439,12 +1487,18 @@ final class SwitcherStore: ObservableObject {
         guard isFixture else { return }
         webRTCReceiptError = value
     }
-    func refreshBackground() async {
+    func refreshBackground(maximumAge: TimeInterval = 0) async {
+        if let request = backgroundRequest { await request.value; return }
         guard !busy else { return }
-        backgroundGeneration += 1
-        let generation = backgroundGeneration
+        if maximumAge > 0, let background, backgroundError.isEmpty,
+           (0..<maximumAge).contains(Date().timeIntervalSince1970 - background.observed_at) { return }
+        let request = Task { await self.readBackground() }
+        backgroundRequest = request
+        await request.value
+    }
+    private func readBackground() async {
         refreshingBackground = true
-        defer { if generation == backgroundGeneration { refreshingBackground = false } }
+        defer { refreshingBackground = false; backgroundRequest = nil }
         do {
             let value: BackgroundServiceReceipt
             if isFixture, let reviewBackground {
@@ -1455,10 +1509,8 @@ final class SwitcherStore: ObservableObject {
                 let data = try await Task.detached { try SwitcherCommandRunner.run(["service-status"]) }.value
                 value = try JSONDecoder().decode(BackgroundServiceReceipt.self, from: data)
             }
-            guard generation == backgroundGeneration else { return }
             publishBackground(value)
         } catch {
-            guard generation == backgroundGeneration else { return }
             backgroundError = error.localizedDescription
             if case DecodingError.keyNotFound(let key, _) = error {
                 backgroundReadFailureCode = "missing_" + BackendInitializationDiagnostics.code(key.stringValue)
@@ -1551,17 +1603,19 @@ final class SwitcherStore: ObservableObject {
             message = candidate?.message ?? ""; failure = false
         } catch { message = error.localizedDescription; failure = true }
     }
-    func previewEnvironment() async {
-        guard !busy, !hasUnsavedSettings, let candidate else { return }
+    func previewEnvironment(candidateID: String? = nil) async {
+        guard !busy, !hasUnsavedSettings, let id = candidateID ?? candidate?.id else { return }
         busy = true; setupPlan = nil
         defer { busy = false }
         do {
             if isFixture {
-                setupPlan = .init(id: "fixture-setup", candidate_id: candidate.id, actions: [], rows: candidate.rows, expires_at: candidate.expires_at)
+                let expires = id == candidate?.id ? candidate?.expires_at : currentEnvironment?.expires_at
+                guard let expires else { throw CocoaError(.fileReadCorruptFile) }
+                setupPlan = .init(id: "fixture-setup", candidate_id: id, actions: [], rows: candidate?.rows ?? [], expires_at: expires)
             } else {
                 let input = try JSONSerialization.data(withJSONObject: setupOptions)
                 let data = try await Task.detached {
-                    try SwitcherCommandRunner.run(["setup", "preview", "--candidate-id", candidate.id], input: input)
+                    try SwitcherCommandRunner.run(["setup", "preview", "--candidate-id", id], input: input)
                 }.value
                 try checkedSetupResult(data)
                 setupPlan = try JSONDecoder().decode(EnvironmentSetupPlan.self, from: data)
@@ -1574,8 +1628,10 @@ final class SwitcherStore: ObservableObject {
         let input = try? JSONSerialization.data(withJSONObject: setupOptions)
         await perform(["setup", "apply", "--candidate-id", setupPlan.candidate_id, "--plan-id", setupPlan.id, "--apply"], input: input, setupProgress: progress)
         self.setupPlan = nil; candidate = nil
-        progress?(.verifySettings)
-        await inspectEnvironment()
+        if !setupPlan.candidate_id.hasPrefix("confirmed-protection:") {
+            progress?(.verifySettings)
+            await inspectEnvironment()
+        }
         if refreshDetection { _ = await detectCurrentEnvironment() }
     }
     func diagnoseProxy() async {

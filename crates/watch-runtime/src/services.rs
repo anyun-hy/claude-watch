@@ -127,6 +127,12 @@ pub fn service_status<S: ServiceSystem>(system: &S, config: &Config) -> Result<V
             guard_healthy: false,
             diagnostics: json!({"reason":"status_read_failed"}),
         });
+    service_status_with_health(system, config, health, system.now())
+}
+
+pub fn service_status_with_health<S: ServiceSystem>(
+    system: &S, config: &Config, health: BackendHealthSnapshot, now: f64,
+) -> Result<Value> {
     let helper = system
         .admin_helper_status()
         .unwrap_or_else(|_| json!({"trusted":false,"abi":null}));
@@ -138,25 +144,18 @@ pub fn service_status<S: ServiceSystem>(system: &S, config: &Config) -> Result<V
     let update = job(system, "updater");
     let clock = job(system, "watchdog");
     let ready = !config.update_url.is_empty() && !config.update_public_key.is_empty();
-    let legacy_bodyguard_active = original["registered"] == true;
-    let legacy_tz_active = legacy_tz["registered"] == true;
-    let arbitration = claude_watch_core::policy::arbitrate_legacy_services(
-        config,
-        legacy_bodyguard_active,
-        legacy_tz_active,
-    );
-    let mut issues = policy_issues(config).as_array().cloned().unwrap_or_default();
-    for conflict in &arbitration.conflicts {
-        issues.push(json!({
-            "id": conflict.code,
-            "title": conflict.title,
-            "detail": conflict.detail,
-        }));
-    }
+    // Independent fallback tools are observed only. Their registration does
+    // not change Watch policy or add launch requirements to this application.
+    let external_services = json!({
+        "legacy_bodyguard_registered": original["registered"],
+        "legacy_timezone_registered": legacy_tz["registered"],
+    });
     let guard_state = if health.guard_healthy {
         "running"
-    } else if !config.guard_enabled {
+    } else if !config.enabled || !config.guard_enabled {
         "inactive"
+    } else if health.guard_backend_healthy {
+        "pending"
     } else {
         "error"
     };
@@ -164,13 +163,19 @@ pub fn service_status<S: ServiceSystem>(system: &S, config: &Config) -> Result<V
         else if guard_state == "inactive" { "guard_disabled" }
         else { health.diagnostics["guard"]["reason_code"].as_str().unwrap_or("execution_not_confirmed") };
     let guard_detail = crate::guard_readiness::detail(guard_reason);
+    let original_receipt = &original["execution_receipt"];
+    let original_receipt_fresh = original_receipt["schema"] == 1
+        && original_receipt["time"].as_f64().is_some_and(|at| at.is_finite() && (0.0..=35.0).contains(&(now - at)));
+    let original_verified = original["registered"] == true && original["trusted"] == true
+        && original_receipt_fresh && original_receipt["result"] == "ok";
     let original_state = if original["registered"].is_null()
         || (original["registered"] == true && original["trusted"] != true)
     {
         "unknown"
     } else if original["registered"] == false {
         "inactive"
-    } else if original["last_exit"].as_i64().is_some_and(|x| x != 0) {
+    } else if !original_verified && (original["last_exit"].as_i64().is_some_and(|x| x != 0)
+        || (original_receipt_fresh && original_receipt["result"] != "ok")) {
         "error"
     } else {
         "scheduled"
@@ -203,7 +208,9 @@ pub fn service_status<S: ServiceSystem>(system: &S, config: &Config) -> Result<V
     } else {
         "mismatch"
     };
-    let now = system.now();
+    let sampling_state = health.diagnostics["sampling_state"].as_str()
+        .filter(|s| matches!(*s, "complete" | "incomplete" | "stale"))
+        .unwrap_or(if health.sampling_healthy { "complete" } else { "incomplete" });
     let watchdog_last_success = watchdog.get("last_success_at").and_then(Value::as_f64);
     let watchdog_verified = watchdog_state == "scheduled"
         && watchdog_last_success.is_some_and(|ts| (0.0..=7200.0).contains(&(now - ts)));
@@ -214,9 +221,9 @@ pub fn service_status<S: ServiceSystem>(system: &S, config: &Config) -> Result<V
     };
 
     Ok(
-        json!({"status":"ok","observed_at":now,"backend_healthy":health.sampling_healthy,"guard_backend_healthy":health.guard_backend_healthy,"backend_diagnostics":health.diagnostics,"backend_sampling_state":if health.sampling_healthy{"complete"}else{"incomplete"},"admin_helper":helper,"update_source_ready":ready,"authority_arbitration":json!(arbitration),"policy_issues":Value::Array(issues),"services":[
-          {"id":"guard","title":"Claude Watch 保镖","state":guard_state,"desired":config.guard_enabled,"execution_verified":guard_state == "running","health_basis":"heartbeat_and_process_identity","source":"本工具保护心跳 / 后台进程身份","reason_code":guard_reason,"detail":guard_detail,"evidence_observed_at":health.diagnostics["guard"]["evidence_observed_at"]},
-          {"id":"original","title":"原版 Claude切换器保镖","state":original_state,"desired":null,"execution_verified":false,"health_basis":"launchd_registration_only","source":"system/local.claude-bodyguard / 原版任务定义"},
+        json!({"status":"ok","observed_at":now,"backend_healthy":health.sampling_healthy,"guard_backend_healthy":health.guard_backend_healthy,"backend_alive":health.guard_backend_healthy,"protection_ready":health.guard_healthy,"backend_diagnostics":health.diagnostics,"backend_sampling_state":sampling_state,"admin_helper":helper,"update_source_ready":ready,"external_services":external_services,"policy_issues":policy_issues(config),"services":[
+          {"id":"guard","title":"Claude Watch 保镖","state":guard_state,"desired":config.guard_enabled,"execution_verified":guard_state == "running","backend_alive":health.guard_backend_healthy,"sampling_state":sampling_state,"protection_ready":health.guard_healthy,"health_basis":"service_liveness_and_protection_evidence","source":"本工具监督循环心跳 / 后台身份 / 独立保护证据","reason_code":guard_reason,"detail":guard_detail,"evidence_observed_at":health.diagnostics["guard"]["evidence_observed_at"]},
+          {"id":"original","title":"原版 Claude切换器保镖","state":original_state,"desired":null,"execution_verified":original_verified,"health_basis":if original_verified {"root_execution_receipt"} else {"launchd_registration_only"},"last_success_at":if original_verified {original_receipt["time"].clone()} else {Value::Null},"detail":if original_verified {"原版独立运行，已确认最近巡检回执"} else if original_state == "scheduled" {"原版任务已注册，最近巡检回执尚未确认；由原版独立管理"} else {"原版状态尚未确认；由原版独立管理"},"source":"system/local.claude-bodyguard / 原版只读巡检回执"},
           {"id":"watchdog","title":"时区守护","state":watchdog_state,"desired":config.timezone_watchdog,"actual_target":watchdog["target"],"accepted_target":desired_target,"last_success_at":watchdog_last_success,"execution_verified":watchdog_verified,"health_basis":watchdog_basis,"source":"时区任务注册 / root 管理的目标文件"},
           {"id":"updater","title":"自动更新","state":update_state,"desired":config.auto_update,"interval_seconds":UPDATE_INTERVAL,"execution_verified":update_state == "scheduled","health_basis":"launchd_registration_and_manifest","source":"本项目发布配置 / 用户更新任务"}
         ]}),

@@ -43,6 +43,34 @@ fn channel_process_tokens(targets: &[Target], provider: Provider) -> Vec<claude_
             t.identity.start_seconds, t.identity.start_microseconds, t.kind.role())).collect()
 }
 
+type GuardInventory = (Vec<(Desktop, bool, String)>, Vec<claude_watch_core::channel::BoundProcessToken>);
+
+/// Derive guard membership from the same classified native round as the
+/// monitor. Audit-token verification is still performed on each selected PID.
+pub fn supervision_inventory(round: &crate::sampler::ProcessRound, provider: Provider) -> Result<GuardInventory> {
+    if !round.complete {
+        return Err(CoreError::new("channel_inventory_incomplete", "通道进程归属尚未完整确认"));
+    }
+    let mut tokens = channel_process_tokens(&round.targets, provider);
+    let mut desktops = Vec::new();
+    for token in &mut tokens {
+        let target = round.targets.iter().find(|t| t.identity.pid == token.pid)
+            .ok_or_else(|| CoreError::new("channel_identity_unavailable", "通道进程身份丢失"))?;
+        token.audit_token = Some(claude_watch_system::process_audit_token(token.pid, token.uid,
+            token.start_seconds, token.start_microseconds, &target.identity.executable)
+            .ok_or_else(|| CoreError::new("channel_identity_unavailable", "未取得当前进程的原始系统身份，通道保持阻断"))?);
+        if target.kind.desktop() {
+            desktops.push((Desktop { pid:token.pid, start_seconds:token.start_seconds, start_microseconds:token.start_microseconds },
+                token.role == claude_watch_core::processes::ProcessRole::DesktopMain, target.identity.start_stamp.clone()));
+        }
+    }
+    Ok((desktops, tokens))
+}
+
+fn unknown_guard_egress(family: &str, code: &str) -> Value {
+    serde_json::json!({"state":"unknown","family":family,"error":code,"via_controlled_path":false,"observed_at":native::now()})
+}
+
 fn with_controlled_path_evidence(
     mut data: Value,
     evidence: claude_watch_core::channel::ControlledPathEvidence,
@@ -127,7 +155,6 @@ pub struct NativeDesktop<R: ReadRunner> {
     selected: Option<SelectedApplication>,
     applications: PathBuf,
     cli: Option<SelectedCli>,
-    channel_tracked: Vec<Target>,
     discovery: std::sync::Mutex<Option<crate::target_discovery::DiscoveryHandle>>,
 }
 #[derive(Clone, PartialEq, Eq)]
@@ -283,7 +310,6 @@ impl<R: ReadRunner> NativeDesktop<R> {
             selected: None,
             applications,
             cli: None,
-            channel_tracked: Vec::new(),
             discovery: std::sync::Mutex::new(None),
         })
     }
@@ -872,11 +898,44 @@ pub struct DesktopRuntime<'a, R: ReadRunner, T: Transport, S: AuditSystem + Serv
     pub cli: Option<NativeCliState>,
 }
 impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopRuntime<'_, R, T, S> {
+    /// One local context per round for all family-bound egress probes. The
+    /// second observation is the required post-I/O identity/policy check.
+    pub fn sample_guard_environment(
+        &mut self, enforcer: &crate::channel_enforcer::LocalTunnelEnforcer, families: &[&str],
+    ) -> (std::collections::BTreeMap<String, Value>, Value) {
+        let configs = ConfigStore { storage: self.storage.clone() };
+        let result = (|| -> Result<_> {
+            let config = configs.load()?;
+            let before = self.system.local_for_target(&config, self.desktop.target())?;
+            let context = before["context_id"].as_str().filter(|s| !s.is_empty())
+                .ok_or_else(|| CoreError::new("missing_context_id", "当前环境上下文无法确认"))?;
+            let mut egress = std::collections::BTreeMap::new();
+            for &family in families {
+                let probe = enforcer.probe_via_controlled_diagnostic_channel(family, context, native::now(), |proxy| {
+                    self.network.fast_egress_via(Some(proxy)).data
+                        .ok_or_else(|| CoreError::new("controlled_probe_failed", "受控出口采样失败"))
+                }).map(|(data, evidence)| with_controlled_path_evidence(data, evidence))
+                    .unwrap_or_else(|error| unknown_guard_egress(family, &error.code));
+                egress.insert(family.to_owned(), probe);
+            }
+            let latest = configs.load()?;
+            let after = self.system.local_for_target(&latest, self.desktop.target())?;
+            if config.value()? != latest.value()? || after["context_id"].as_str() != Some(context) {
+                return Err(CoreError::new("audit_context_changed", "出口采样期间环境变化"));
+            }
+            Ok((egress, after))
+        })();
+        result.unwrap_or_else(|error| (
+            families.iter().map(|&family| (family.to_owned(), unknown_guard_egress(family, &error.code))).collect(),
+            serde_json::json!({"proxy":"unknown","tun":"unknown","code":error.code}),
+        ))
+    }
+
     /// The first screen renders its environment rows from `last-audit.json`.
     /// A fresh install, or any policy change, leaves that file missing or
     /// bound to the previous digest, so `status` reports `audit: null` and
     /// every row reads "未取得" until someone presses the check button.
-    /// The guard loop only publishes `guard-heartbeat.json`; nothing fills
+    /// The guard publishes execution evidence; nothing fills
     /// this baseline in the background. Collect it once after the daemon
     /// starts and let the UI pick it up on its next poll.
     ///
@@ -1064,27 +1123,6 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
     fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
         self.desktop.desktops()
     }
-    fn supervised_processes(&mut self) -> Result<Vec<claude_watch_core::channel::BoundProcessToken>> {
-        // Reuse the monitor's native root/CLI/descendant classification. A
-        // desktop-only fallback would silently lose Code and orphan children.
-        let mut sampler = crate::sampler::Sampler::new(&self.desktop.runner, self.storage.paths.clone());
-        sampler.set_discovery(self.desktop.discovery_for(Some(&self.storage.paths.home)));
-        sampler.retain_channel_targets(&self.desktop.channel_tracked);
-        let round = sampler.processes()?;
-        if !round.complete {
-            return Err(CoreError::new("channel_inventory_incomplete", "通道进程归属尚未完整确认"));
-        }
-        self.desktop.channel_tracked = round.targets.clone();
-        let mut tokens = channel_process_tokens(&round.targets, self.desktop.target.provider());
-        for token in &mut tokens {
-            let target = round.targets.iter().find(|t| t.identity.pid == token.pid)
-                .ok_or_else(|| CoreError::new("channel_identity_unavailable", "通道进程身份丢失"))?;
-            token.audit_token = Some(claude_watch_system::process_audit_token(token.pid, token.uid,
-                token.start_seconds, token.start_microseconds, &target.identity.executable)
-                .ok_or_else(|| CoreError::new("channel_identity_unavailable", "未取得当前进程的原始系统身份，通道保持阻断"))?);
-        }
-        Ok(tokens)
-    }
     fn desktop_alive(&mut self, desktop: &Desktop) -> Result<bool> {
         self.desktop.desktop_alive(desktop)
     }
@@ -1122,29 +1160,9 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
             .map(|f| f.id)
             .unwrap_or("claude");
 
-        // Bind fast diagnostics to the environment actually sampled this round.
-        // Failure on a controlled path must not turn into a direct fallback.
-        if let Some(ref enf) = enforcer {
-            let probe: Result<Value> = (|| {
-                let configs = ConfigStore { storage: self.storage.clone() };
-                let config = configs.load()?;
-                let local = self.system.local_for_target(&config, self.desktop.target())?;
-                let context = local["context_id"].as_str().filter(|s| !s.is_empty())
-                    .ok_or_else(|| CoreError::new("missing_context_id", "当前环境上下文无法确认"))?;
-                let (data, evidence) = enf.probe_via_controlled_diagnostic_channel(family_id, context, now, |proxy| {
-                    self.network.fast_egress_via(Some(proxy)).data
-                        .ok_or_else(|| CoreError::new("controlled_probe_failed", "受控出口采样失败"))
-                })?;
-                let latest = configs.load()?;
-                let after = self.system.local_for_target(&latest, self.desktop.target())?;
-                if config.value()? != latest.value()? || after["context_id"].as_str() != Some(context) {
-                    return Err(CoreError::new("audit_context_changed", "出口采样期间环境变化"));
-                }
-                Ok(with_controlled_path_evidence(data, evidence))
-            })();
-            return probe.unwrap_or_else(|error| serde_json::json!({
-                "state":"unknown", "error":error.code, "via_controlled_path":false, "observed_at":native::now()
-            }));
+        if let Some(ref enforcer) = enforcer {
+            let (mut egress, _) = self.sample_guard_environment(enforcer, &[family_id]);
+            return egress.remove(family_id).unwrap_or(Value::Null);
         }
 
         // Direct proxy fallback for CLI or direct config without active enforcer.
@@ -1193,9 +1211,6 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
     fn backend_healthy(&mut self) -> Result<bool> {
         Ok(ServiceSystem::backend_healthy(self.system))
     }
-    fn guard_backend_healthy(&mut self) -> Result<bool> {
-        Ok(ServiceSystem::guard_backend_healthy(self.system))
-    }
     fn launcher_matches(&mut self, l: &Launcher) -> Result<bool> {
         self.desktop.launcher_matches(l)
     }
@@ -1213,61 +1228,6 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
     fn quit_desktop(&mut self) -> Result<()> {
         self.desktop.quit()
     }
-    fn quit_for_confirmed_ip_risk(&mut self, forced: &mut Option<u32>) -> Result<()> {
-        self.desktop.quit_for_confirmed_ip_risk(forced)
-    }
-    fn delegates_process_disposition(&self) -> bool { true }
-    fn channel_mode(&self) -> bool {
-        true
-    }
-    fn delegates_slow_audit_to_worker(&self) -> bool {
-        crate::channel_enforcer::registered_production_enforcer(&self.storage.paths.watch())
-            .is_some()
-    }
-    fn enforce_channel(
-        &mut self,
-        command: &claude_watch_core::channel::ChannelEnforcementCommand,
-    ) -> Result<Option<claude_watch_core::channel::ChannelEnforcementReceipt>> {
-        if let Some(enforcer) =
-            crate::channel_enforcer::registered_production_enforcer(&self.storage.paths.watch())
-        {
-            use crate::channel_enforcer::ChannelEnforcer;
-            let receipt = enforcer.apply_command(command, self.now())?;
-            return Ok(Some(receipt));
-        }
-        let cmd_path = self
-            .storage
-            .paths
-            .watch()
-            .join(format!("state/channel-command-{}.json", command.family));
-        self.storage
-            .atomic_json(&cmd_path, &serde_json::to_value(command).unwrap_or(Value::Null))?;
-        self.channel_receipt(&command.family)
-    }
-    fn channel_receipt(
-        &mut self,
-        family: &str,
-    ) -> Result<Option<claude_watch_core::channel::ChannelEnforcementReceipt>> {
-        if let Some(enforcer) =
-            crate::channel_enforcer::registered_production_enforcer(&self.storage.paths.watch())
-        {
-            use crate::channel_enforcer::ChannelEnforcer;
-            if let Some(receipt) = enforcer.receipt_for(family, self.now())? {
-                return Ok(Some(receipt));
-            }
-        }
-        let receipt_path = self
-            .storage
-            .paths
-            .watch()
-            .join(format!("state/channel-receipt-{family}.json"));
-        let raw = self.storage.read_json(&receipt_path, Value::Null)?;
-        if raw.is_null() {
-            return Ok(None);
-        }
-        Ok(serde_json::from_value(raw).ok())
-    }
-
 }
 
 #[cfg(test)]

@@ -74,7 +74,7 @@ impl Fixture {
         let helper = hardened_helper::copy_signed(&helper, &root.join("watch-sandbox-launcher"));
         let verifier = build_helper_verifier_for_path(&helper).unwrap();
         let registry = Arc::new(SandboxLaunchRegistry::new(BOOT, policy.clone(), verifier, Some(storage.clone())));
-        let enforcer = Arc::new(LocalTunnelEnforcer::new(BOOT, Some(storage.clone())));
+        let enforcer = Arc::new(LocalTunnelEnforcer::new(BOOT));
         let stop = Arc::new(AtomicBool::new(false));
         let now = native::now();
         // Isolated component readiness. No production I03 or launchd override.

@@ -6,6 +6,7 @@ use claude_watch_core::{
 use claude_watch_runtime::{
     accounts::AccountStore,
     audit_store::{AuditOptions, AuditScope, AuditStore},
+    channel_policy_status::{self, FrameEvidence},
     commands::SystemRunner,
     config_store::{policy_digest, ConfigStore},
     desktop_native::NativeDesktop,
@@ -151,75 +152,78 @@ fn project_session_heartbeat(
 }
 
 pub fn session_view(host: &Host) -> Value {
-    let session = SessionStore::new(host.storage.clone()).load(native::now());
-    let ended_session = session
-        .as_ref()
-        .ok()
-        .and_then(|v| v.as_ref())
-        .is_some_and(|s| s.state == claude_watch_core::session::Phase::Ended);
-    let running = NativeDesktop::new(
-        host.runner.clone(),
-        process_component().unwrap_or_default(),
-        Authority::ReadOnly,
-    )
-    .ok()
-    .and_then(|d| {
-        let processes = d.desktops().ok()?;
-        if processes.is_empty() && ended_session {
-            d.desktop_tree_running().ok()
-        } else {
-            Some(!processes.is_empty())
-        }
-    });
-    match session {
+    let now = native::now();
+    let frame = claude_watch_runtime::channel_policy_status::read_frame(&host.storage);
+    let evidence = (ConfigStore { storage: host.storage.clone() }).load().ok()
+        .map(|config| claude_watch_runtime::channel_policy_status::guard_summary(&frame, &config, now))
+        .unwrap_or(Value::Null);
+    session_view_from_frame(host, &frame, &evidence, now)
+}
+
+fn session_view_from_frame(host: &Host, frame: &Value, evidence: &Value, now: f64) -> Value {
+    let row = evidence["families"].as_array().and_then(|rows| rows.iter().find(|row| row["family"] == "claude"))
+        .unwrap_or(&Value::Null);
+    let state = &frame["families"]["claude"];
+    let running = (row["channel_permit"].is_object() && row["channel_permit"]["reason_code"] != "channel_inventory_incomplete")
+        .then(|| !state["active_member_pids"].as_array().is_none_or(Vec::is_empty)
+            || !state["unmanaged_member_pids"].as_array().is_none_or(Vec::is_empty));
+    match SessionStore::new(host.storage.clone()).load(now) {
         Ok(Some(s)) => {
-            let mut status = claude_watch_core::session::status(&s, native::now(), running);
-            let heartbeat = host
-                .storage
-                .read_json(
-                    &host.storage.paths.base().join("guard-heartbeat.json"),
-                    Value::Null,
-                )
-                .unwrap_or(Value::Null);
-            project_session_heartbeat(&mut status, &s.session_id, running, &heartbeat);
+            let mut status = claude_watch_core::session::status(&s, now, running);
+            project_session_heartbeat(&mut status, &s.session_id, running, row);
+            if row["session_id"] == s.session_id && row["session_guard"]["current"].is_object() {
+                status["current"] = row["session_guard"]["current"].clone();
+            }
             status
         }
-        Ok(None) => {
-            json!({"state":if running==Some(false){"idle"}else{"missing"},"detail":if running==Some(false){"后台保护待命，无需操作"}else{"尚无受控启动会话"}})
-        }
+        Ok(None) => json!({"state":if running==Some(false){"idle"}else{"missing"},
+            "detail":if running==Some(false){"后台保护待命，无需操作"}else{"尚无受控启动会话"}}),
         Err(e) => json!({"state":"unknown","reason":{"code":e.code,"detail":e.message}}),
     }
 }
-fn background(host: &Host) -> Result<Value> {
-    let config = ConfigStore {
-        storage: host.storage.clone(),
-    }
-    .load()?;
-    let mut value = services::service_status(host, &config)?;
-    let at = value["observed_at"].clone();
-    for row in value["services"].as_array_mut().into_iter().flatten() {
+fn background_service_detail(row: &Value) -> &'static str {
         let verified = row["execution_verified"] == true;
-        let detail = match (
+        match (
             row["id"].as_str().unwrap_or(""),
             row["state"].as_str().unwrap_or(""),
         ) {
             ("guard", "running") => "保护心跳与后台身份已确认",
             (_, "inactive") => "该后台任务已停用",
             ("updater", "unavailable") => "尚未配置本项目发布源或固定公钥",
-            ("original", "scheduled") => "已在 launchd 注册（原版任务无执行回执，仅确认注册态）",
+            ("original", "scheduled") if verified => "原版独立运行，已确认最近巡检回执",
+            ("original", "scheduled") => "原版任务已注册，最近巡检回执尚未确认；由原版独立管理",
+            ("guard", "pending") => "保护后台运行中，正在等待有效保护证据",
             ("watchdog", "scheduled") if verified => "任务已注册，且已确认最近时区巡检回执",
             ("watchdog", "scheduled") => "任务已注册，等待或尚未确认最近执行回执",
             (_, "scheduled") => "任务已注册并按计划运行",
             (_, "mismatch") => "实际后台状态与已保存意愿不同",
             (_, "error") => "实际后台健康未通过核对",
             _ => "尚未取得完整后台运行证据",
-        };
+        }
+}
+fn enrich_background_services(value: &mut Value) {
+    let at = value["observed_at"].clone();
+    for row in value["services"].as_array_mut().into_iter().flatten() {
+        let detail = background_service_detail(row);
         if row["detail"].as_str().is_none_or(str::is_empty) {
             row["detail"] = json!(detail);
         }
         row["last_checked"] = at.clone();
     }
-    value["session_guard"] = session_view(host);
+}
+fn background(host: &Host) -> Result<Value> {
+    let config = (ConfigStore { storage: host.storage.clone() }).load()?;
+    let now = native::now();
+    let frame = claude_watch_runtime::channel_policy_status::read_frame(&host.storage);
+    let frame = FrameEvidence::new(&frame, &config, now);
+    let evidence = frame.guard_summary();
+    background_from_frame(host, &config, &frame, &evidence, now)
+}
+fn background_from_frame(host: &Host, config: &claude_watch_core::config::Config, frame: &FrameEvidence<'_>, evidence: &Value, now: f64) -> Result<Value> {
+    let health = host.backend_health_from_frame(frame, evidence);
+    let mut value = services::service_status_with_health(host, config, health, now)?;
+    enrich_background_services(&mut value);
+    value["session_guard"] = session_view_from_frame(host, frame.value(), evidence, now);
     Ok(value)
 }
 pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
@@ -338,13 +342,16 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
                 .status()?
                 .value();
             let env = host.environment().ok();
-            let policy_sync_state = claude_watch_runtime::channel_policy_status::read_policy_sync_state(
-                &host.storage, &config, native::now(),
-            );
+            let now = native::now();
+            let frame = claude_watch_runtime::channel_policy_status::read_frame(&host.storage);
+            let frame = FrameEvidence::new(&frame, &config, now);
+            let evidence = frame.guard_summary();
+            let policy_sync_state = frame.policy_sync_state();
+            let service_status = background_from_frame(&host, &config, &frame, &evidence, now)?;
             Ok(Some(
-                json!({"status":"ok","config":config.value()?,"legacy_openai_force_review":legacy_openai_force_review,"accounts":accounts,"audit":audit,"service_status":background(&host)?,"netcoffee_lookup":audit["netcoffee_lookup"],"source_notices":audit.get("source_notices").unwrap_or(&json!([])),
+                json!({"status":"ok","config":config.value()?,"legacy_openai_force_review":legacy_openai_force_review,"accounts":accounts,"audit":audit,"service_status":service_status,"netcoffee_lookup":audit["netcoffee_lookup"],"source_notices":audit.get("source_notices").unwrap_or(&json!([])),
                 "policy_sync_state": policy_sync_state,
-                "repair":host.storage.read_json(&host.storage.paths.base().join("last-repair.json"),Value::Null)?,"guard":host.storage.read_json(&host.storage.paths.base().join("guard-heartbeat.json"),Value::Null)?,
+                "repair":host.storage.read_json(&host.storage.paths.base().join("last-repair.json"),Value::Null)?,"guard":evidence,
                 "update_recovery_required":host.storage.paths.base().join("update-transaction.json").exists(),"setup_recovery_required":host.storage.paths.base().join("setup-transaction.json").exists()||host.storage.paths.base().join("service-transaction.json").exists()||host.storage.paths.watch().join("agent-install-transaction.json").exists(),"proxy_groups":[],
                 "claude_version":env.as_ref().and_then(|v|v.pointer("/claude_app/version")).and_then(Value::as_str).unwrap_or("")}),
             ))
@@ -541,9 +548,10 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
     {
         return Ok(None);
     }
-    if request.command != "guard-tick"
-        && !(request.command == "account" && request.action.as_deref() == Some("import"))
-    {
+    if request.command == "guard-tick" {
+        return Ok(Some(OperationOutcome::Receipt(channel_policy_status::read_guard_summary(&StateStore::new(paths), native::now()))));
+    }
+    if !(request.command == "account" && request.action.as_deref() == Some("import")) {
         request.require_apply()?;
     }
     let mut host = host(paths, Authority::ExplicitPermit)?;
@@ -574,7 +582,7 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
             json!({"status":"ok","receipt":receipts.record_webrtc(probe,&local,expected,native::now())?}),
         )));
     }
-    let authority = if request.flag("apply") || request.command == "guard-tick" {
+    let authority = if request.flag("apply") {
         Authority::ExplicitPermit
     } else {
         Authority::ReadOnly
@@ -632,13 +640,7 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
         started: Instant::now(),
         cli: None,
     };
-    if request.command == "launch" {
-        Ok(Some(dispatch_launch(request, &storage, &mut desktop_runtime)?))
-    } else {
-        Ok(Some(OperationOutcome::Receipt(
-            Controller::new(storage).guard_tick(&mut desktop_runtime)?,
-        )))
-    }
+    Ok(Some(dispatch_launch(request, &storage, &mut desktop_runtime)?))
 }
 
 #[cfg(test)]
@@ -708,41 +710,43 @@ mod session_heartbeat_projection_tests {
         let rows = vec![
             json!({"id": "guard", "state": "running", "execution_verified": true}),
             json!({"id": "original", "state": "scheduled", "execution_verified": false}),
+            json!({"id": "original", "state": "scheduled", "execution_verified": true}),
+            json!({"id": "guard", "state": "pending", "execution_verified": false}),
             json!({"id": "watchdog", "state": "scheduled", "execution_verified": true}),
             json!({"id": "watchdog", "state": "scheduled", "execution_verified": false}),
             json!({"id": "other", "state": "inactive", "execution_verified": false}),
         ];
-        let details: Vec<&str> = rows
-            .iter()
-            .map(|row| {
-                let verified = row["execution_verified"] == true;
-                match (
-                    row["id"].as_str().unwrap_or(""),
-                    row["state"].as_str().unwrap_or(""),
-                ) {
-                    ("guard", "running") => "保护心跳与后台身份已确认",
-                    (_, "inactive") => "该后台任务已停用",
-                    ("updater", "unavailable") => "尚未配置本项目发布源或固定公钥",
-                    ("original", "scheduled") => "已在 launchd 注册（原版任务无执行回执，仅确认注册态）",
-                    ("watchdog", "scheduled") if verified => "任务已注册，且已确认最近时区巡检回执",
-                    ("watchdog", "scheduled") => "任务已注册，等待或尚未确认最近执行回执",
-                    (_, "scheduled") => "任务已注册并按计划运行",
-                    (_, "mismatch") => "实际后台状态与已保存意愿不同",
-                    (_, "error") => "实际后台健康未通过核对",
-                    _ => "尚未取得完整后台运行证据",
-                }
-            })
-            .collect();
+        let details: Vec<&str> = rows.iter().map(background_service_detail).collect();
 
         assert_eq!(
             details,
             vec![
                 "保护心跳与后台身份已确认",
-                "已在 launchd 注册（原版任务无执行回执，仅确认注册态）",
+                "原版任务已注册，最近巡检回执尚未确认；由原版独立管理",
+                "原版独立运行，已确认最近巡检回执",
+                "保护后台运行中，正在等待有效保护证据",
                 "任务已注册，且已确认最近时区巡检回执",
                 "任务已注册，等待或尚未确认最近执行回执",
                 "该后台任务已停用",
             ]
         );
+    }
+
+    #[test]
+    fn service_wire_runs_the_public_background_enrichment() {
+        let Ok(dir) = std::env::var("CW_SERVICE_WIRE_FIXTURES") else { return; };
+        let dir = std::path::PathBuf::from(dir);
+        let output = dir.join("public");
+        std::fs::create_dir_all(&output).unwrap();
+        for name in ["live-stale-unready.json","original-fresh.json"] {
+            let mut value: Value = serde_json::from_slice(&std::fs::read(dir.join(name)).unwrap()).unwrap();
+            enrich_background_services(&mut value);
+            assert!(value["backend_diagnostics"]["reason"].is_string());
+            for row in value["services"].as_array().unwrap() {
+                assert!(row["detail"].as_str().is_some_and(|s| !s.is_empty()));
+                assert_eq!(row["last_checked"],value["observed_at"]);
+            }
+            std::fs::write(output.join(name),serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        }
     }
 }

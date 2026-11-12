@@ -278,9 +278,10 @@ final class LeakCheckStore: ObservableObject {
             runner.start(id: id) { [weak self] result in self?.complete(kind, id: id, result: result) }
         }
     }
-    func refreshWebRTCIfNeeded(interval: TimeInterval = 60) {
+    func refreshWebRTCIfNeeded(interval: TimeInterval = 60, at: Date = Date()) {
         guard source == .netCoffee else { traceSchedule(.webrtc, "schedule_source_manual"); return }
         guard !state(.webrtc).running else { traceSchedule(.webrtc, "schedule_running"); return }
+        guard !webRTCReceiptSubmitting else { traceSchedule(.webrtc, "schedule_busy"); return }
         let context = automaticContext()
         guard (automaticContextProvider == nil && contextProvider == nil) || (context?.isEmpty == false) else { traceSchedule(.webrtc, "schedule_context_missing"); return }
         let changed = context != lastAutomaticWebRTCContext
@@ -289,14 +290,14 @@ final class LeakCheckStore: ObservableObject {
         // the recorded receipt is stale re-collects evidence the backend still
         // accepts. While no receipt is on record (first round or a rejected
         // one), fall back to the schedule interval to keep retries throttled.
-        let receiptAge = lastRecordedWebRTCAt.map { Date().timeIntervalSince($0) } ?? .infinity
-        let scheduledAge = lastAutomaticWebRTCAt.map { Date().timeIntervalSince($0) } ?? .infinity
-        guard changed || receiptAge >= LeakPolicy.receiptDisplayTTL
-                || (lastRecordedWebRTCAt == nil && scheduledAge >= interval) else {
-            traceSchedule(.webrtc, "schedule_receipt_fresh"); return
+        let scheduledAge = lastAutomaticWebRTCAt.map { at.timeIntervalSince($0) } ?? .infinity
+        let refreshDue = lastRecordedWebRTCAt.map { at.timeIntervalSince($0) >= LeakPolicy.receiptDisplayTTL }
+            ?? (scheduledAge >= interval)
+        guard changed || refreshDue else {
+            traceSchedule(.webrtc, "schedule_wait_interval"); return
         }
         traceSchedule(.webrtc, "schedule_ready")
-        lastAutomaticWebRTCAt = Date(); lastAutomaticWebRTCContext = context
+        lastAutomaticWebRTCAt = at; lastAutomaticWebRTCContext = context
         start(.webrtc)
     }
     /// `maximumAge` mirrors the backend's evaluation window instead of inventing

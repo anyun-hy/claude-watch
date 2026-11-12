@@ -114,12 +114,8 @@ fn local_command(request: &claude_watch_core::cli::Request, paths: Paths) -> Res
         }
         ("config", Some("vpn-expectation-preview")) => {
             let current_cfg = config.load().unwrap_or_default();
-            let vpn_sup = storage
-                .read_json(
-                    &storage.paths.watch().join("state/vpn-supervision.json"),
-                    Value::Null,
-                )
-                .unwrap_or(Value::Null);
+            let frame = claude_watch_runtime::channel_policy_status::read_frame(&storage);
+            let vpn_sup = &frame["vpn_supervision"];
             let candidate = vpn_sup
                 .get("observation")
                 .and_then(|v| {

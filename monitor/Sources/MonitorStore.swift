@@ -66,7 +66,7 @@ final class MonitorStore: ObservableObject {
         }
         self.switcher.onWebRTCRiskRecorded = { [weak self] in
             guard let self, !self.initializing else { return }
-            Task { await self.switcher.refreshBackground() }
+            self.refreshBackgroundIfNeeded(at: Date())
         }
         self.switcher.onConfigUpdated = { [weak self] in
             guard let self else { return }
@@ -249,21 +249,8 @@ final class MonitorStore: ObservableObject {
         error = nil
         let transition = observeDiagnosticContext(from: value, at: receivedAt)
         snapshot = value
-        if !channelSubscription.needsResync, let events = value.channelEvents {
-            for event in events {
-                ingestChannelEvent(event)
-            }
-        }
-        if channelSubscription.needsResync, let channelSnap = value.channelSupervision {
-            channelSubscription.applySnapshot(channelSnap)
-            if let events = value.channelEvents {
-                for event in events where event.event_seq > channelSubscription.lastEventSeq {
-                    ingestChannelEvent(event)
-                }
-            }
-        } else if let channelSnap = value.channelSupervision, (value.channelEvents ?? []).isEmpty {
-            channelSubscription.applySnapshot(channelSnap)
-        }
+        if let channel = value.channelSupervision { channelSubscription.applySnapshot(channel) }
+        else { channelSubscription.markReconnected() }
         // The UI observes authoritative receipts; it never reissues permits.
         // Re-evaluate only after both the tracker and snapshot describe this
         // observation. Otherwise a recovered sampler can leave a fresh
@@ -275,12 +262,6 @@ final class MonitorStore: ObservableObject {
             refreshEnvironmentIfNeeded()
         }
     }
-    func ingestChannelEvent(_ event: ChannelMonitorEvent) {
-        let outcome = channelSubscription.applyEvent(event)
-        if case .gapDetectedResyncRequired = outcome {
-            refresh(full: true, manual: true)
-        }
-    }
     func channelState(for product: MonitoredProduct) -> FamilyChannelMonitorState? {
         let family = product == .claude ? "claude" : "openai"
         return channelSubscription.effectiveState(
@@ -290,7 +271,7 @@ final class MonitorStore: ObservableObject {
         )
     }
     func unmanagedPids(for product: MonitoredProduct) -> [UInt32] {
-        channelState(for: product)?.unmanaged_member_pids ?? []
+        channelState(for: product)?.unmanagedPids ?? []
     }
     func isProcessUnmanaged(_ process: WatchedProcess) -> Bool {
         guard let state = channelState(for: process.product) else { return true }
@@ -376,7 +357,7 @@ final class MonitorStore: ObservableObject {
     private func currentDiagnosticContext() -> String? {
         context(from: freshProxy(in: snapshot, at: now))
     }
-    var initializationContext: String? { currentDiagnosticContext() }
+    var initializationContext: String? { retainedDiagnosticContext() }
     func beginInitialization(startSnapshotPolling: Bool = true) {
         initializing = true
         if startSnapshotPolling { start() }
@@ -447,20 +428,16 @@ final class MonitorStore: ObservableObject {
               let ip = reference.ip, !ip.isEmpty else { return (nil, nil) }
         return (ip, at)
     }
-    private var graphSafetyBlocked: Bool {
-        let value = switcher.background?.session_guard
-        return value?.state == "locked" || value?.phase == "locked"
-    }
     private func rememberGraphPath() {
         graphContinuity.observe(snapshot: snapshot, selection: networkSelection, now: now.timeIntervalSince1970,
             error: error, automatic: automatic, claudeEgressIP: graphEgress.ip,
-            egressObservedAt: graphEgress.time, safetyBlocked: graphSafetyBlocked,
+            egressObservedAt: graphEgress.time, blockedProducts: Set(MonitoredProduct.allCases.filter { isConfirmedFlowBlocked(for: $0) }),
             references: serverReferences)
     }
     func graphDisplay(for product: MonitoredProduct) -> GraphDisplayState {
         graphContinuity.display(product: product, snapshot: snapshot, selection: networkSelection,
             now: now.timeIntervalSince1970, error: error, automatic: automatic,
-            claudeEgressIP: graphEgress.ip, egressObservedAt: graphEgress.time, safetyBlocked: graphSafetyBlocked)
+            claudeEgressIP: graphEgress.ip, egressObservedAt: graphEgress.time, safetyBlocked: isConfirmedFlowBlocked(for: product))
     }
     func reference(for flow: Flow?) -> ServerReference? {
         guard let request = ServerReferenceRequest(flow: flow), let value = serverReferences[request.key],

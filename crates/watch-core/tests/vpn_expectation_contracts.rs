@@ -285,7 +285,7 @@ fn channel_permit_and_supervision_enforce_backend_and_vpn_epoch_binding() {
         permit_generation: 1,
         command_seq: 1,
         executor_boot_id: "exec-1".into(),
-        permit_state: ChannelPermitState::Permitted,
+        receipt_seq: 0, permit_state: ChannelPermitState::Permitted,
         enforcement_state: ChannelEnforcementState::Forwarding,
         interception_active: true,
         local_proxy_ready: true,

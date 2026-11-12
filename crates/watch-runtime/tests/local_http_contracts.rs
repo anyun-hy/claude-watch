@@ -60,6 +60,33 @@ fn fixture(responses: Vec<Vec<u8>>, delay: Duration) -> (Client, thread::JoinHan
         Credentials::from_parts(&endpoint.to_string(), "fixture-token".into()).unwrap();
     (Client::new(credentials), server)
 }
+
+#[test]
+fn fast_snapshot_shares_deadline_with_closing_consistency_request() {
+    let configs = response(200, r#"{"mode":"rule","mixed-port":7890,"revision":"r1"}"#);
+    let proxies = response(200, r#"{"proxies":{"AI":{"name":"AI","type":"Selector","now":"US"},"US":{"name":"US","type":"Trojan"}}}"#);
+    // Each response fits the 800ms per-request timeout. Together the final
+    // consistency check exceeds the 240ms budget and must yield no snapshot.
+    let (client, server) = fixture(vec![configs.clone(), proxies, configs], Duration::from_millis(90));
+    let started = Instant::now();
+    let result = client.with_timeout(Duration::from_millis(800))
+        .observe_fast_vpn_state_before("AI", "127.0.0.1", Some(7890), false,
+            started + Duration::from_millis(240));
+    assert_eq!(result.unwrap_err(), Error::Timeout);
+    assert!(started.elapsed() < Duration::from_millis(600));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2].starts_with("GET /configs "));
+}
+
+#[test]
+fn expired_snapshot_budget_issues_no_http_request() {
+    let credentials = Credentials::from_parts("127.0.0.1:1", String::new()).unwrap();
+    let result = Client::new(credentials).observe_fast_vpn_state_before(
+        "AI", "127.0.0.1", Some(7890), true, Instant::now(),
+    );
+    assert_eq!(result.unwrap_err(), Error::Timeout);
+}
 #[test]
 fn real_loopback_get_is_authenticated_bounded_and_has_no_mutating_method_or_body() {
     let (client, server) = fixture(vec![response(200, r#"{"mode":"rule"}"#)], Duration::ZERO);

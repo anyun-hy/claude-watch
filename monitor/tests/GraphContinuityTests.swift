@@ -51,7 +51,7 @@ struct GraphContinuityTests {
                 selection.reconcile(proxy: value.proxy, processes: value.processes,
                     fresh: error == nil && value.proxy?.connectionObservationIsComplete == true)
                 timeline.observe(snapshot: value, selection: selection, now: value.capturedAt, error: error, automatic: automatic,
-                    claudeEgressIP: ip, egressObservedAt: ipTime ?? value.capturedAt, safetyBlocked: blocked)
+                    claudeEgressIP: ip, egressObservedAt: ipTime ?? value.capturedAt, blockedProducts: blocked ? [product] : [])
                 return timeline.display(product: product, snapshot: value, selection: selection, now: value.capturedAt,
                     error: error, automatic: automatic, claudeEgressIP: ip, egressObservedAt: ipTime ?? value.capturedAt, safetyBlocked: blocked)
             }
@@ -96,6 +96,7 @@ struct GraphContinuityTests {
             _ = apply(snapshot(product, time: 1130, flows: [flow(product, id: "matched")], node: "JP2"))
             let unmatched = apply(snapshot(product, time: 1131, flows: [flow(product, association: "unconfirmed")], node: "JP2"))
             expect(unmatched.phase == .unassociated && !unmatched.canAnimate && unmatched.sample?.flowID == "matched", "\(product) failed association cannot become a live path")
+            expect(unmatched.isHistorical && unmatched.currentFlows.allSatisfy { $0.id != "matched" }, "\(product) a historical path does not enter the current connection inventory")
             let ipChanged = apply(snapshot(product, time: 1140, flows: [], node: "JP2", collector: "empty"), ip: "222.10.87.170")
             if product == .claude {
                 expect(ipChanged.phase == .contextChanged && ipChanged.sample == nil, "confirmed Claude egress change archives its old path")

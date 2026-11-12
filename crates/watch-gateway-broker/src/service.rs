@@ -203,6 +203,17 @@ fn config(path: &Path) -> io::Result<GatewayInstallConfig> {
 fn same_config(a: &GatewayInstallConfig, b: &GatewayInstallConfig) -> bool {
     serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
 }
+fn known_definition(bytes: &[u8], value: &GatewayInstallConfig) -> bool {
+    bytes == super::plist(value).as_bytes() || bytes == super::legacy_plist(value).as_bytes()
+}
+fn verify_control_lock(paths: &Paths) -> io::Result<()> {
+    let path = paths.root.join("control.lock");
+    paths.secure(&path)?;
+    if !fs::symlink_metadata(&path)?.is_file() {
+        return Err(invalid("gateway control lock is not a protected regular file"));
+    }
+    Ok(())
+}
 fn baseline(value: Option<&GatewayInstallConfig>) -> String {
     value
         .map(|value| {
@@ -265,7 +276,7 @@ fn installed<H: Host>(
     paths.secure(&paths.broker())?;
     let value = config(&paths.config())?;
     scope(&value, uid, engine)?;
-    if bounded(&paths.plist, 32 * 1024)? != super::plist(&value).as_bytes()
+    if !known_definition(&bounded(&paths.plist, 32 * 1024)?, &value)
         || hash(&paths.broker())? != value.broker_sha256
         || host.signature(&paths.broker())? != value.broker_cdhash
     {
@@ -280,6 +291,7 @@ fn installed<H: Host>(
             Some("watch-gateway-broker" | "config.json" | "owner.json") => {
                 paths.secure(&item.path())?
             }
+            Some("control.lock") => verify_control_lock(paths)?,
             Some("control.sock") => {
                 use std::os::unix::fs::FileTypeExt;
                 let meta = fs::symlink_metadata(item.path())?;
@@ -303,6 +315,8 @@ struct Transaction {
     id: String,
     phase: String,
     previous: Option<GatewayInstallConfig>,
+    #[serde(default)]
+    previous_plist_sha256: Option<String>,
     next: GatewayInstallConfig,
     was_loaded: bool,
 }
@@ -318,9 +332,15 @@ fn read_transaction(paths: &Paths, id: &str, uid: u32, engine: &str) -> io::Resu
     let manifest = paths.transaction.join("transaction.json");
     paths.secure(&manifest)?;
     let tx: Transaction = serde_json::from_slice(&bounded(&manifest, 32 * 1024)?)?;
-    if tx.schema != 1 || tx.id != id || !matches!(tx.phase.as_str(), "preparing" | "replacing") {
+    if !matches!(tx.schema, 1 | 2) || tx.id != id || !matches!(tx.phase.as_str(), "preparing" | "replacing") {
         return Err(invalid("gateway transaction mismatch"));
     }
+    let definition_pin_valid = match (tx.schema, &tx.previous, &tx.previous_plist_sha256) {
+        (1, _, None) | (2, None, None) => true,
+        (2, Some(_), Some(pin)) => pin.len() == 64 && pin.bytes().all(|b| b.is_ascii_hexdigit()),
+        _ => false,
+    };
+    if !definition_pin_valid { return Err(invalid("gateway rollback definition pin is invalid")); }
     tx.next.validate()?;
     scope(&tx.next, uid, engine)?;
     if let Some(old) = &tx.previous {
@@ -363,11 +383,12 @@ fn start<H: Host>(paths: &Paths, host: &mut H) -> io::Result<()> {
 fn remove_known_files(paths: &Paths) -> io::Result<()> {
     // Directory was checked immediately before the mutation. Refuse extra
     // entries again; never recursively remove an unrecognized root directory.
+    if exists(&paths.root.join("control.lock")) { verify_control_lock(paths)?; }
     for item in fs::read_dir(&paths.root)? {
         let item = item?;
         if !matches!(
             item.file_name().to_str(),
-            Some("watch-gateway-broker" | "config.json" | "owner.json" | "control.sock")
+            Some("watch-gateway-broker" | "config.json" | "owner.json" | "control.sock" | "control.lock")
         ) {
             return Err(invalid("gateway changed during removal"));
         }
@@ -377,6 +398,10 @@ fn remove_known_files(paths: &Paths) -> io::Result<()> {
     fs::remove_file(&paths.plist)
 }
 fn copy_install(paths: &Paths, source: &Path, value: &GatewayInstallConfig) -> io::Result<()> {
+    copy_install_with_definition(paths, source, value, super::plist(value).as_bytes())
+}
+fn copy_install_with_definition(paths: &Paths, source: &Path, value: &GatewayInstallConfig, definition: &[u8]) -> io::Result<()> {
+    if !known_definition(definition, value) { return Err(invalid("gateway definition is not recognized")); }
     fs::create_dir(&paths.root)?;
     fs::set_permissions(&paths.root, fs::Permissions::from_mode(0o755))?;
     write(
@@ -385,7 +410,7 @@ fn copy_install(paths: &Paths, source: &Path, value: &GatewayInstallConfig) -> i
         0o755,
     )?;
     write(&paths.config(), &serde_json::to_vec_pretty(value)?, 0o644)?;
-    write(&paths.plist, super::plist(value).as_bytes(), 0o644)
+    write(&paths.plist, definition, 0o644)
 }
 fn rollback<H: Host>(
     paths: &Paths,
@@ -413,11 +438,12 @@ fn rollback<H: Host>(
     // this transaction may be removed. Unexpected data requires manual review.
     if exists(&paths.root) {
         paths.secure(&paths.root)?;
+        if exists(&paths.root.join("control.lock")) { verify_control_lock(paths)?; }
         for item in fs::read_dir(&paths.root)? {
             let item = item?;
             if !matches!(
                 item.file_name().to_str(),
-                Some("watch-gateway-broker" | "config.json" | "owner.json" | "control.sock")
+                Some("watch-gateway-broker" | "config.json" | "owner.json" | "control.sock" | "control.lock")
             ) {
                 return Err(invalid("gateway rollback found unknown data"));
             }
@@ -435,8 +461,37 @@ fn rollback<H: Host>(
             }
         }
     }
+    // Validate the complete previous pair before stopping or removing the
+    // current service. A valid executable alone cannot authenticate its plist.
+    let previous_definition = if let Some(previous) = &tx.previous {
+        let saved = paths.transaction.join("previous");
+        paths.secure(&saved)?;
+        paths.secure(&saved.join("watch-gateway-broker"))?;
+        if hash(&saved.join("watch-gateway-broker"))? != previous.broker_sha256
+            || host.signature(&saved.join("watch-gateway-broker"))? != previous.broker_cdhash
+        {
+            return Err(invalid("gateway rollback component identity mismatch"));
+        }
+        let definition = if tx.schema == 1 {
+            // Historical transactions predate local control binding and did
+            // not save a plist. Their only valid definition was this template.
+            super::legacy_plist(previous).into_bytes()
+        } else {
+            let path = saved.join("gateway.plist");
+            paths.secure(&path)?;
+            let bytes = bounded(&path, 32 * 1024)?;
+            if Some(claude_watch_system::sha256_bytes_hex(&bytes)).as_ref() != tx.previous_plist_sha256.as_ref()
+                || !known_definition(&bytes, previous)
+            {
+                return Err(invalid("gateway rollback definition identity mismatch"));
+            }
+            bytes
+        };
+        Some((saved, definition))
+    } else { None };
     stop(paths, host)?;
     if exists(&paths.root) {
+        if exists(&paths.root.join("control.lock")) { verify_control_lock(paths)?; }
         for item in fs::read_dir(&paths.root)? {
             fs::remove_file(item?.path())?;
         }
@@ -446,16 +501,8 @@ fn rollback<H: Host>(
         paths.secure(&paths.plist)?;
         fs::remove_file(&paths.plist)?;
     }
-    if let Some(previous) = &tx.previous {
-        let saved = paths.transaction.join("previous");
-        paths.secure(&saved)?;
-        paths.secure(&saved.join("watch-gateway-broker"))?;
-        if hash(&saved.join("watch-gateway-broker"))? != previous.broker_sha256
-            || host.signature(&saved.join("watch-gateway-broker"))? != previous.broker_cdhash
-        {
-            return Err(invalid("gateway rollback component identity mismatch"));
-        }
-        copy_install(paths, &saved, previous)?;
+    if let (Some(previous), Some((saved, definition))) = (&tx.previous, previous_definition) {
+        copy_install_with_definition(paths, &saved, previous, &definition)?;
         if tx.was_loaded {
             start(paths, host)?;
         }
@@ -554,6 +601,11 @@ fn install<H: Host>(paths: &Paths, host: &mut H, approved: ApprovedInstall, id: 
         return Err(invalid("gateway baseline changed after authorization; nothing replaced"));
     }
     let was_loaded = loaded(host, paths)?;
+    let previous_definition = if let Some(old) = &previous {
+        let bytes = bounded(&paths.plist, 32 * 1024)?;
+        if !known_definition(&bytes, old) { return Err(invalid("gateway definition changed before snapshot")); }
+        Some(bytes)
+    } else { None };
     // A consumed or cancelled approval cannot apply a second time, even if
     // the installed configuration still matches the earlier preview.
     advance_approval_generation(paths, generation)?;
@@ -564,10 +616,11 @@ fn install<H: Host>(paths: &Paths, host: &mut H, approved: ApprovedInstall, id: 
             .create(&paths.transaction)?;
     }
     let mut tx = Transaction {
-        schema: 1,
+        schema: 2,
         id: id.into(),
         phase: "preparing".into(),
         previous,
+        previous_plist_sha256: previous_definition.as_deref().map(claude_watch_system::sha256_bytes_hex),
         next,
         was_loaded,
     };
@@ -603,6 +656,8 @@ fn install<H: Host>(paths: &Paths, host: &mut H, approved: ApprovedInstall, id: 
                 &bounded(&paths.broker(), 256 * 1024 * 1024)?,
                 0o755,
             )?;
+            write(&saved.join("gateway.plist"), previous_definition.as_deref()
+                .ok_or_else(|| invalid("previous gateway definition snapshot missing"))?, 0o600)?;
         }
         tx.phase = "replacing".into();
         let update = paths.transaction.join("transaction.next");
@@ -934,6 +989,141 @@ mod tests {
         assert!(same_config(&config(&f.paths.config()).unwrap(), &f.value));
     }
     #[test]
+    fn local_control_definition_preserves_tcp_reservation_and_rejects_unknown_definitions() {
+        let mut f = fixture();
+        let current = super::super::plist(&f.value);
+        let legacy = super::super::legacy_plist(&f.value);
+        assert!(current.contains("<key>RunAtLoad</key><true/>"));
+        assert!(current.contains("<key>KeepAlive</key><true/>"));
+        assert!(current.contains("<key>ThrottleInterval</key><integer>10</integer>"));
+        assert!(!current.contains("<key>Control</key>"));
+        assert!(!current.contains("<key>SockPathName</key>"));
+        let tcp_entries = |value: &str| value.lines().filter(|line| line.starts_with("<key>GatewayV"))
+            .map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(tcp_entries(&current), tcp_entries(&legacy));
+        assert_eq!(tcp_entries(&current).len(), 2);
+        assert!(!legacy.contains("<key>RunAtLoad</key>"));
+        copy_install(&f.paths, &f.prepared, &f.value).unwrap();
+        for definition in [&current, &legacy] {
+            fs::write(&f.paths.plist, definition).unwrap();
+            assert!(installed(&f.paths, &mut f.host, f.value.engine_uid, &f.value.engine_executable).unwrap().is_some());
+        }
+        let unknown = legacy.replace("<integer>1023</integer>", "<integer>1022</integer>");
+        fs::write(&f.paths.plist, &unknown).unwrap();
+        assert!(installed(&f.paths, &mut f.host, f.value.engine_uid, &f.value.engine_executable).is_err());
+        assert_eq!(fs::read_to_string(&f.paths.plist).unwrap(), unknown);
+        assert!(!f.host.calls.iter().any(|call| call[0] == "bootout" || call[0] == "bootstrap"));
+    }
+    #[test]
+    fn protected_regular_control_lock_is_known_but_other_types_and_unknown_entries_are_rejected() {
+        use std::os::unix::net::UnixListener;
+        let mut f = fixture();
+        copy_install(&f.paths, &f.prepared, &f.value).unwrap();
+        let lock = f.paths.root.join("control.lock");
+        write(&lock, b"", 0o600).unwrap();
+        assert!(installed(&f.paths, &mut f.host, f.value.engine_uid, &f.value.engine_executable).unwrap().is_some());
+        fs::write(f.paths.root.join("unknown"), b"keep").unwrap();
+        assert!(installed(&f.paths, &mut f.host, f.value.engine_uid, &f.value.engine_executable).is_err());
+        assert_eq!(fs::read(f.paths.root.join("unknown")).unwrap(), b"keep");
+        fs::remove_file(f.paths.root.join("unknown")).unwrap();
+        remove_known_files(&f.paths).unwrap();
+        assert!(!f.paths.root.exists() && !f.paths.plist.exists());
+
+        for kind in ["symlink", "socket", "directory", "writable"] {
+            let mut f = fixture();
+            copy_install(&f.paths, &f.prepared, &f.value).unwrap();
+            let lock = f.paths.root.join("control.lock");
+            let _listener = match kind {
+                "symlink" => { std::os::unix::fs::symlink(f.paths.broker(), &lock).unwrap(); None },
+                "socket" => Some(UnixListener::bind(&lock).unwrap()),
+                "directory" => { fs::create_dir(&lock).unwrap(); None },
+                "writable" => { write(&lock, b"", 0o600).unwrap(); fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap(); None },
+                _ => unreachable!(),
+            };
+            assert!(installed(&f.paths, &mut f.host, f.value.engine_uid, &f.value.engine_executable).is_err(), "{kind}");
+            assert!(remove_known_files(&f.paths).is_err(), "{kind} must be rejected before removal");
+            assert!(f.paths.broker().exists() && f.paths.config().exists() && f.paths.plist.exists());
+            assert!(fs::symlink_metadata(&lock).is_ok());
+            assert!(!f.host.calls.iter().any(|call| call[0] == "bootout" || call[0] == "bootstrap"));
+        }
+
+        let mut f = fixture();
+        fixture_install(&mut f, "absent").unwrap();
+        write(&f.paths.root.join("control.lock"), b"", 0o600).unwrap();
+        rollback(&f.paths, &mut f.host, ID, f.value.engine_uid, &f.value.engine_executable).unwrap();
+        assert!(!f.host.active && !f.paths.root.exists() && !f.paths.plist.exists());
+    }
+    #[test]
+    fn legacy_control_upgrade_and_failed_upgrade_restore_exact_previous_definition() {
+        for fail_start in [false, true] {
+            let mut f = fixture();
+            let old_definition = super::super::legacy_plist(&f.value).into_bytes();
+            copy_install_with_definition(&f.paths, &f.prepared, &f.value, &old_definition).unwrap();
+            f.host.active = true;
+            let old_broker = fs::read(f.paths.broker()).unwrap();
+            fs::write(f.prepared.join("watch-gateway-broker"), b"new local-control broker").unwrap();
+            let mut next = f.value.clone();
+            next.broker_sha256 = hash(&f.prepared.join("watch-gateway-broker")).unwrap();
+            fs::write(f.prepared.join("config.json"), serde_json::to_vec(&next).unwrap()).unwrap();
+            f.host.fail_start = fail_start;
+            let previous = baseline(Some(&f.value));
+            let result = fixture_install(&mut f, &previous);
+            if fail_start {
+                assert!(result.unwrap_err().to_string().contains("activation failed"));
+            } else {
+                result.unwrap();
+                assert_eq!(fs::read(&f.paths.plist).unwrap(), super::super::plist(&next).as_bytes());
+                let tx = read_transaction(&f.paths, ID, f.value.engine_uid, &f.value.engine_executable).unwrap();
+                assert_eq!(tx.schema, 2);
+                assert_eq!(tx.previous_plist_sha256, Some(claude_watch_system::sha256_bytes_hex(&old_definition)));
+                assert_eq!(fs::read(f.paths.transaction.join("previous/gateway.plist")).unwrap(), old_definition);
+                rollback(&f.paths, &mut f.host, ID, f.value.engine_uid, &f.value.engine_executable).unwrap();
+            }
+            assert!(f.host.active);
+            assert_eq!(fs::read(f.paths.broker()).unwrap(), old_broker);
+            assert_eq!(fs::read(&f.paths.plist).unwrap(), old_definition);
+            assert!(!f.paths.transaction.exists());
+        }
+    }
+    #[test]
+    fn changed_saved_definition_cannot_stop_or_replace_current_gateway_during_rollback() {
+        let mut f = fixture();
+        copy_install_with_definition(&f.paths, &f.prepared, &f.value, super::super::legacy_plist(&f.value).as_bytes()).unwrap();
+        f.host.active = true;
+        let previous = baseline(Some(&f.value));
+        fixture_install(&mut f, &previous).unwrap();
+        let current_definition = fs::read(&f.paths.plist).unwrap();
+        let current_broker = fs::read(f.paths.broker()).unwrap();
+        // Even another recognized template is not the reviewed saved bytes.
+        fs::write(f.paths.transaction.join("previous/gateway.plist"), &current_definition).unwrap();
+        f.host.calls.clear();
+        let error = rollback(&f.paths, &mut f.host, ID, f.value.engine_uid, &f.value.engine_executable).unwrap_err();
+        assert!(error.to_string().contains("rollback definition identity mismatch"));
+        assert!(f.host.active);
+        assert_eq!(fs::read(&f.paths.plist).unwrap(), current_definition);
+        assert_eq!(fs::read(f.paths.broker()).unwrap(), current_broker);
+        assert!(f.paths.transaction.exists());
+        assert!(!f.host.calls.iter().any(|call| call[0] == "bootout" || call[0] == "bootstrap"));
+    }
+    #[test]
+    fn historical_transaction_without_saved_plist_restores_only_legacy_control_definition() {
+        let mut f = fixture();
+        let old_definition = super::super::legacy_plist(&f.value).into_bytes();
+        copy_install_with_definition(&f.paths, &f.prepared, &f.value, &old_definition).unwrap();
+        f.host.active = true;
+        let previous = baseline(Some(&f.value));
+        fixture_install(&mut f, &previous).unwrap();
+        let manifest = f.paths.transaction.join("transaction.json");
+        let mut tx: serde_json::Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        tx["schema"] = json!(1);
+        tx.as_object_mut().unwrap().remove("previous_plist_sha256");
+        fs::write(manifest, serde_json::to_vec(&tx).unwrap()).unwrap();
+        fs::remove_file(f.paths.transaction.join("previous/gateway.plist")).unwrap();
+        rollback(&f.paths, &mut f.host, ID, f.value.engine_uid, &f.value.engine_executable).unwrap();
+        assert!(f.host.active);
+        assert_eq!(fs::read(&f.paths.plist).unwrap(), old_definition);
+    }
+    #[test]
     fn unknown_root_contents_and_other_user_are_not_modified() {
         let mut f = fixture();
         copy_install(&f.paths, &f.prepared, &f.value).unwrap();
@@ -1000,6 +1190,7 @@ mod tests {
             id: ID.into(),
             phase: "preparing".into(),
             previous: Some(f.value.clone()),
+            previous_plist_sha256: None,
             next: f.value.clone(),
             was_loaded: true,
         };

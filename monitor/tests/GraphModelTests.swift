@@ -169,6 +169,64 @@ struct GraphModelTests {
         expect(localService.gatewayTitle == "本机服务", "local service has its own center")
         expect(localService.gatewayEdgeState == .pending, "local service is not a proxy path")
         expect(localService.routePresentation == "localService", "local service presentation")
+        func channel(_ changes: [String: Any] = [:]) -> FamilyChannelMonitorState {
+            var row: [String: Any] = ["producer_boot_id":"fixture", "family":"openai", "session_id":NSNull(),
+                "local_proxy_ready":true, "system_extension_active":false,
+                "saved_policy_version":["policy_digest":"p", "guard_policy_digest":"g"],
+                "applied_policy_version":["policy_digest":"p", "guard_policy_digest":"g"],
+                "policy_sync_state":"applied", "policy_sync_label_zh":"执行器已应用", "permit_generation":1,
+                "command_seq":1, "permit_state":"revoked", "display_state":"blocked", "display_label_zh":"已阻断",
+                "reason_code":"vpn_observation_stale", "process_preserved":true, "active_member_pids":[],
+                "active_members":[], "active_flows_count":0, "terminated_flows_count":40, "blocked_new_connections":10,
+                "updated_at":1000, "backend":"seatbelt", "unmanaged_member_pids":Array(1000..<1090)]
+            for (key, value) in changes { row[key] = value }
+            return try! JSONDecoder().decode(FamilyChannelMonitorState.self, from: JSONSerialization.data(withJSONObject: row))
+        }
+        let unowned = channel()
+        expect(!unowned.isConfirmedFlowBlocked, "an empty gateway cannot claim all 90 unmanaged processes are blocked")
+        expect(unowned.protectionScopeLabel == "发现但未接管" && unowned.managedMemberCount == 0, "empty scope names discovery, not enforcement")
+        expect(unowned.scopeSummary.contains("未接管 90 个") && !unowned.scopeSummary.contains("1000"), "summary shows counts instead of a long PID list")
+        expect(unowned.gatewayCountsLabel.contains("受控网关") && unowned.gatewayCountsLabel.contains("累计断开 40"), "gateway historical counters are scoped and explicitly cumulative")
+        expect(channel(["unmanaged_member_pids":[]]).protectionScopeLabel == "受控网关待命", "an idle gateway is distinct from blocking a managed application")
+        let member: [String: Any] = ["pid":77,"uid":501,"start_seconds":900,"start_microseconds":1,
+                                    "role":"desktop_main","audit_token":[501,501,20,501,20,77,0,9]]
+        let coverage: [String: Any] = ["backend":"seatbelt","configured_entries":["openai"],"protected_pids":[77],
+            "unprotected_pids":Array(1000..<1090),"uncovered_boundaries":["direct_launch_outside_controlled_entry"],
+            "server_identity_verified":true,"gateway_endpoint_protection_verified":true,"gateway_endpoint_protection_method":"fixture"]
+        let managedFields: [String: Any] = ["session_id":"current", "active_member_pids":[77], "active_members":[member], "coverage_scope":coverage]
+        let mixed = channel(managedFields)
+        expect(mixed.isConfirmedFlowBlocked && mixed.managedMemberCount == 1, "current identity and coverage establish blocking for one managed member")
+        var cliMember = member; cliMember["role"] = "cli"
+        var cliFields = managedFields; cliFields["active_member_pids"] = []; cliFields["active_members"] = [cliMember]
+        expect(channel(cliFields).isConfirmedFlowBlocked && channel(cliFields).managedMemberCount == 1,
+               "an independently controlled CLI is counted even when the desktop compatibility PID list is empty")
+        var cliCoverage = coverage; cliCoverage["configured_entries"] = ["codex-cli"]
+        cliFields["coverage_scope"] = cliCoverage
+        expect(channel(cliFields).isConfirmedFlowBlocked, "a controlled entry identifier is not required to equal the family name")
+        expect(mixed.protectionScopeLabel == "受控通道：已阻断" && mixed.scopeSummary.contains("未接管 90 个"), "partial coverage never becomes all-application protection")
+        var changed = managedFields; changed["session_id"] = NSNull()
+        expect(!channel(changed).isConfirmedFlowBlocked, "member evidence without a session does not establish protection")
+        changed = managedFields; changed["active_members"] = []
+        expect(!channel(changed).isConfirmedFlowBlocked, "PID-only coverage cannot substitute for bound identities")
+        var forgedMember = member; forgedMember["audit_token"] = [501,501,20,501,20,999,0,9]
+        changed = managedFields; changed["active_members"] = [forgedMember]
+        expect(!channel(changed).isConfirmedFlowBlocked, "an audit token for another PID is not a verified member")
+        changed = managedFields; changed["active_flows_count"] = 1
+        expect(!channel(changed).isConfirmedFlowBlocked, "one remaining managed flow prevents confirmed blocking")
+        changed = managedFields; changed["applied_policy_version"] = ["policy_digest":"old", "guard_policy_digest":"old"]
+        expect(!channel(changed).isConfirmedFlowBlocked, "an applied flag cannot override mismatched policy identity")
+        changed = managedFields; changed["coverage_scope"] = ["backend":"seatbelt","protected_pids":[77]]
+        expect(!channel(changed).isConfirmedFlowBlocked, "incomplete coverage remains unverified")
+        changed = managedFields; changed["unmanaged_member_pids"] = [77]
+        expect(!channel(changed).isConfirmedFlowBlocked, "contradictory unmanaged identity is not counted as protected")
+        changed = managedFields; changed["display_state"] = "pending_verification"
+        expect(!channel(changed).isConfirmedFlowBlocked, "stale or pending evidence never retains confirmed blocking")
+        changed = managedFields; changed["reason_code"] = "subscription_stale_or_disconnected"
+        let expired = channel(changed)
+        expect(!expired.isConfirmedFlowBlocked && expired.scopedDisplayState == .pendingVerification,
+               "a disconnected subscription cannot retain blocking merely because its last status was blocked")
+        expect(expired.scopeSummary.hasPrefix("上次") && expired.gatewayCountsLabel.contains("当前连接数待核验"),
+               "retained scope and counters are historical when channel subscription evidence expires")
         print("GraphModelTests: \(passed) assertions passed")
     }
 }

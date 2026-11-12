@@ -107,7 +107,7 @@ impl Fixture {
                 }
             }
         });
-        let enforcer = Arc::new(LocalTunnelEnforcer::new("managed-cli-boot", Some(store.clone())));
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("managed-cli-boot"));
         // Component fixture readiness only. The production I03 report is still closed.
         enforcer.configure_seatbelt_backend(true, now).unwrap(); enforcer.set_clock(move || now + 0.5).unwrap();
         let reg = registry.clone(); enforcer.set_accepted_connection_attributor(move |ctx| reg.attribute_accepted_connection(ctx, now + 0.5)).unwrap();

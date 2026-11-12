@@ -1,8 +1,10 @@
 use claude_watch_core::{
+    channel::{ChannelEnforcementReceipt, ChannelEnforcementState, ChannelPermit, ChannelPermitState},
     error::{CoreError, Result},
     session::{Desktop, Launcher, Phase},
 };
 use claude_watch_runtime::{
+    channel_policy_status::read_guard_summary,
     controlled::{Controller, DesktopSystem},
     receipt_store::ReceiptStore,
     session_store::SessionStore,
@@ -57,7 +59,6 @@ struct Fake {
     running: bool,
     opens: u32,
     closes: u32,
-    ip_force_calls: u32,
     ready: bool,
     fail_open: bool,
     fail_quit: bool,
@@ -96,11 +97,7 @@ struct Fake {
     /// Claude-only contracts keep the OpenAI tick idle.
     supervise_openai: bool,
     channel_mode_enabled: bool,
-    delegates_worker_enabled: bool,
-    terminated_supervised: Vec<claude_watch_core::channel::BoundProcessToken>,
-    fail_terminate_supervised: bool,
-    terminate_results_override: Option<Vec<claude_watch_core::channel::TargetProcessDispositionResult>>,
-    recorded_process_receipts: Vec<claude_watch_core::channel::ProcessDispositionReceipt>,
+
 }
 impl Default for Fake {
     fn default() -> Self {
@@ -109,7 +106,6 @@ impl Default for Fake {
             running: false,
             opens: 0,
             closes: 0,
-            ip_force_calls: 0,
             ready: true,
             fail_open: false,
             fail_quit: false,
@@ -145,11 +141,6 @@ impl Default for Fake {
             family: "claude",
             supervise_openai: false,
             channel_mode_enabled: false,
-            delegates_worker_enabled: false,
-            terminated_supervised: Vec::new(),
-            fail_terminate_supervised: false,
-            terminate_results_override: None,
-            recorded_process_receipts: Vec::new(),
         }
     }
 }
@@ -213,44 +204,6 @@ impl claude_watch_runtime::controlled::CliProcess for FakeCliChild {
 impl DesktopSystem for Fake {
     fn channel_mode(&self) -> bool {
         self.channel_mode_enabled
-    }
-    fn delegates_slow_audit_to_worker(&self) -> bool {
-        self.delegates_worker_enabled
-    }
-    fn terminate_supervised_processes(
-        &mut self,
-        tokens: &[claude_watch_core::channel::BoundProcessToken],
-        forced: &mut Option<u32>,
-    ) -> Result<Vec<claude_watch_core::channel::TargetProcessDispositionResult>> {
-        if self.fail_terminate_supervised {
-            return Err(CoreError::new("target_still_running", "mock failed"));
-        }
-        if let Some(ref custom) = self.terminate_results_override {
-            self.terminated_supervised.extend_from_slice(tokens);
-            let killed = custom
-                .iter()
-                .filter(|r| r.terminated && r.process_state == "terminated")
-                .count() as u32;
-            if killed > 0 {
-                *forced = Some(killed);
-            } else {
-                *forced = None;
-            }
-            return Ok(custom.clone());
-        }
-        self.terminated_supervised.extend_from_slice(tokens);
-        *forced = Some(tokens.len() as u32);
-        Ok(tokens
-            .iter()
-            .map(|t| claude_watch_core::channel::TargetProcessDispositionResult {
-                pid: t.pid,
-                requested_action: "force_quit".into(),
-                terminated: true,
-                process_state: "terminated".into(),
-                timestamp: 1000.0,
-                signal_sent_at: None,
-            })
-            .collect())
     }
     fn prepare_cli(&mut self) -> Result<()> {
         Ok(())
@@ -513,36 +466,15 @@ impl DesktopSystem for Fake {
         self.running = false;
         Ok(())
     }
-    fn quit_for_confirmed_ip_risk(&mut self, forced: &mut Option<u32>) -> Result<()> {
-        self.ip_force_calls += 1;
-        let had_child = self.test_child.is_some();
-        *forced = Some(u32::from(had_child));
-        self.quit_desktop()
-    }
-    fn record_process_disposition_receipt(
-        &mut self,
-        receipt: &claude_watch_core::channel::ProcessDispositionReceipt,
-    ) -> Result<()> {
-        self.recorded_process_receipts.push(receipt.clone());
-        Ok(())
-    }
+
 }
 
 #[test]
 fn enabled_guard_resumes_from_saved_config_and_explicit_disable_persists() {
     let fixture = Fixture::new();
-    let mut system = Fake::default();
-    let first = Controller::new(fixture.storage.clone())
-        .guard_tick(&mut system)
-        .unwrap();
-    assert_eq!(first["status"], "ok");
-    assert!(first["guard_policy_v1"].is_string());
-
-    // A newly constructed worker reads the saved intent, as it does at login.
-    let resumed = Controller::new(fixture.storage.clone())
-        .guard_tick(&mut system)
-        .unwrap();
-    assert_eq!(resumed["status"], "ok");
+    let first = read_guard_summary(&fixture.storage, 1000.0);
+    assert_eq!(first["status"], "unknown");
+    assert_eq!(first["session_guard"]["state"], "pending_verification");
     let mut config = claude_watch_runtime::config_store::ConfigStore {
         storage: fixture.storage.clone(),
     }
@@ -555,16 +487,14 @@ fn enabled_guard_resumes_from_saved_config_and_explicit_disable_persists() {
         .storage
         .atomic_json(&fixture.storage.paths.config(), &config)
         .unwrap();
-    let disabled = Controller::new(fixture.storage.clone())
-        .guard_tick(&mut system)
-        .unwrap();
+    let disabled = read_guard_summary(&fixture.storage, 1000.0);
     assert_eq!(disabled["status"], "disabled");
 }
 
 #[test]
 fn enabling_timezone_keeps_the_running_guard_and_session() {
     use claude_watch_runtime::{
-        macos::guard_heartbeat_confirmed,
+        config_store::{guard_policy_digest, ConfigStore},
         services::{self, ServiceSystem},
     };
     struct Clock {
@@ -607,9 +537,9 @@ fn enabling_timezone_keeps_the_running_guard_and_session() {
     let controller = Controller::new(fixture.storage.clone());
     let mut desktop = Fake::default();
     controller.launch(&mut desktop).unwrap();
-    desktop.now = 1001.0;
-    let previous = controller.guard_tick(&mut desktop).unwrap();
-    assert_eq!(previous["status"], "ok");
+    let session = fs::read(fixture.storage.paths.session()).unwrap();
+    let configs = ConfigStore { storage: fixture.storage.clone() };
+    let previous_policy = guard_policy_digest(&configs.load().unwrap()).unwrap();
     fixture
         .storage
         .atomic_json(
@@ -636,604 +566,10 @@ fn enabling_timezone_keeps_the_running_guard_and_session() {
     .load()
     .unwrap();
     assert!(config.guard_enabled && config.timezone_watchdog);
-    assert!(guard_heartbeat_confirmed(&config, true, 1001.0, &previous));
-    desktop.now = 1002.0;
-    let next = controller.guard_tick(&mut desktop).unwrap();
-    assert_eq!(next["status"], "ok", "{next}");
-    assert_eq!(next["action"], "observe");
+    assert_eq!(guard_policy_digest(&config).unwrap(), previous_policy);
+    assert_eq!(fs::read(fixture.storage.paths.session()).unwrap(), session);
     assert!(desktop.running);
     assert_eq!(desktop.closes, 0);
-}
-#[test]
-fn isolated_process_protection_handles_retry_recovery_and_confirmed_ip_change() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake {
-        spawn_test_process: true,
-        ..Fake::default()
-    };
-    controller.launch(&mut system).unwrap();
-    let pid = system.test_child.as_ref().unwrap().id();
-    system.now += 1.0;
-    assert_eq!(
-        controller.guard_tick(&mut system).unwrap()["action"],
-        "observe"
-    );
-    system.proxy = "unknown";
-    system.now += 1.0;
-    let transient = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(transient["session_guard"]["state"], "unknown");
-    assert!(system
-        .test_child
-        .as_mut()
-        .unwrap()
-        .try_wait()
-        .unwrap()
-        .is_none());
-    system.proxy = "ok";
-    system.now += 1.0;
-    assert_eq!(
-        controller.guard_tick(&mut system).unwrap()["action"],
-        "observe"
-    );
-    assert_eq!(system.test_child.as_ref().unwrap().id(), pid);
-    system.ip = "8.8.8.8";
-    system.now += 1.0;
-    let risk = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(risk["action"], "close-desktop");
-    assert!(system.test_child.is_none());
-    assert_eq!(system.closes, 1);
-    assert_eq!(
-        SessionStore::new(fixture.storage.clone())
-            .load(system.now)
-            .unwrap()
-            .unwrap()
-            .state,
-        Phase::Locked
-    );
-    system.ip = "1.1.1.1";
-    system.now += 1.0;
-    // A controlled launch is single-target: the runtime binds the Claude
-    // target before entering `launch` (guard_tick above left the family on
-    // the last supervised one, which must not leak into this launch).
-    system.set_family("claude").unwrap();
-    fixture.receipts(system.now);
-    assert_eq!(controller.launch(&mut system).unwrap()["status"], "ok");
-    assert!(system
-        .test_child
-        .as_mut()
-        .unwrap()
-        .try_wait()
-        .unwrap()
-        .is_none());
-    assert_eq!(
-        SessionStore::new(fixture.storage.clone())
-            .load(system.now)
-            .unwrap()
-            .unwrap()
-            .state,
-        Phase::Active
-    );
-}
-
-#[test]
-fn externally_exited_process_ends_session_and_replacement_keeps_fast_ip_guard() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake {
-        spawn_test_process: true,
-        ..Fake::default()
-    };
-    controller.launch(&mut system).unwrap();
-    let old = SessionStore::new(fixture.storage.clone())
-        .load(system.now)
-        .unwrap()
-        .unwrap();
-    let mut child = system.test_child.take().unwrap();
-    child.kill().unwrap();
-    child.wait().unwrap();
-    system.running = false;
-    system.now += 1.0;
-    let ended = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(ended["session_guard"]["state"], "idle");
-    assert_eq!(ended["ended_session_id"], old.session_id);
-    assert_eq!(
-        system.closes, 0,
-        "an already-exited process needs no duplicate stop"
-    );
-    assert_eq!(
-        SessionStore::new(fixture.storage.clone())
-            .load(system.now)
-            .unwrap()
-            .unwrap()
-            .state,
-        Phase::Ended
-    );
-
-    system.test_child = Some(TestChild(
-        std::process::Command::new("/bin/sleep")
-            .arg("300")
-            .spawn()
-            .unwrap(),
-    ));
-    system.running = true;
-    system.now += 1.0;
-    let pending = controller.guard_tick(&mut system).unwrap();
-    let replacement = SessionStore::new(fixture.storage.clone())
-        .load(system.now)
-        .unwrap()
-        .unwrap();
-    assert_eq!(replacement.state, Phase::Rechecking);
-    assert_ne!(replacement.session_id, old.session_id);
-    assert_eq!(pending["session_guard"]["state"], "pending");
-    assert_eq!(
-        system.closes, 0,
-        "a new process is rechecked, not closed merely for a new PID"
-    );
-
-    system.ip = "8.8.8.8";
-    system.now += 1.0;
-    let risk = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(risk["action"], "close-desktop");
-    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_ip_changed");
-    assert_eq!(system.ip_force_calls, 1);
-    assert_eq!(risk["stop_force_requested"], 1);
-    assert!(
-        system.test_child.is_none(),
-        "confirmed IP change stops the owned test process"
-    );
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[test]
-fn native_identity_and_owned_process_drive_the_guard_lifecycle() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake {
-        spawn_test_process: true,
-        native_liveness: true,
-        ..Fake::default()
-    };
-    controller.launch(&mut system).unwrap();
-    let old = system.test_child.as_mut().unwrap();
-    old.kill().unwrap();
-    old.wait().unwrap();
-    system.running = false;
-    let mut last_tick = Value::Null;
-    for _ in 0..5 {
-        system.now += 1.0;
-        last_tick = controller.guard_tick(&mut system).unwrap();
-        if SessionStore::new(fixture.storage.clone())
-            .load(system.now)
-            .unwrap()
-            .unwrap()
-            .state
-            == Phase::Ended
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert_eq!(
-        SessionStore::new(fixture.storage.clone())
-            .load(system.now)
-            .unwrap()
-            .unwrap()
-            .state,
-        Phase::Ended,
-        "owned process was reaped but guard did not end the session: {last_tick}"
-    );
-    assert_eq!(system.closes, 0);
-    system.test_child = Some(TestChild(
-        std::process::Command::new("/bin/sleep")
-            .arg("300")
-            .spawn()
-            .unwrap(),
-    ));
-    system.native_start =
-        Some(native_test_start(system.test_child.as_ref().unwrap().id()).unwrap());
-    system.running = true;
-    system.now += 1.0;
-    assert_eq!(
-        controller.guard_tick(&mut system).unwrap()["session_guard"]["state"],
-        "pending"
-    );
-    system.ip = "8.8.8.8";
-    system.now += 1.0;
-    let risk = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(risk["action"], "close-desktop");
-    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_ip_changed");
-    assert!(system.test_child.is_none());
-}
-
-#[test]
-fn missing_main_metadata_does_not_end_or_stop_a_still_live_process() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    system.now += 1.0;
-    system.hide_main = true;
-    system.alive_override = Some(true);
-    let result = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(result["session_guard"]["state"], "unknown");
-    assert_eq!(system.closes, 0);
-    assert_eq!(
-        SessionStore::new(fixture.storage.clone())
-            .load(system.now)
-            .unwrap()
-            .unwrap()
-            .state,
-        Phase::Active
-    );
-}
-
-#[test]
-fn exited_main_with_lingering_helper_does_not_look_like_a_new_main() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    system.now += 1.0;
-    system.hide_main = true;
-    system.alive_override = Some(false);
-    let partial = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(partial["session_guard"]["state"], "unknown");
-    assert_eq!(system.closes, 0);
-    let ended = SessionStore::new(fixture.storage.clone())
-        .load(system.now)
-        .unwrap()
-        .unwrap();
-    assert_eq!(ended.state, Phase::Ended);
-    assert_eq!(
-        claude_watch_core::session::status(&ended, system.now, Some(true))["state"],
-        "unknown"
-    );
-    assert_eq!(
-        claude_watch_core::session::status(&ended, system.now, Some(false))["state"],
-        "idle"
-    );
-    system.now += 1.0;
-    system.hide_main = false;
-    system.desktop_pid = 78;
-    let recheck = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(recheck["session_guard"]["state"], "pending");
-    assert_eq!(system.closes, 0);
-}
-
-#[test]
-fn lingering_helpers_are_still_stopped_if_ip_changes_after_main_exit() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    system.now += 1.0;
-    system.hide_main = true;
-    system.alive_override = Some(false);
-    system.tree_running_override = Some(true);
-    let waiting = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(waiting["session_guard"]["state"], "unknown");
-    assert_eq!(system.closes, 0);
-    system.ip = "8.8.8.8";
-    system.now += 1.0;
-    let risk = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(risk["action"], "close-desktop");
-    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_ip_changed");
-    assert_eq!(system.closes, 1);
-}
-
-#[test]
-fn native_tree_only_helpers_remain_guarded_after_the_main_is_gone() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    system.running = false;
-    system.alive_override = Some(false);
-    system.tree_running_override = Some(true);
-    system.now += 1.0;
-    let waiting = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(waiting["session_guard"]["state"], "unknown");
-    assert_eq!(system.closes, 0);
-    system.ip = "8.8.8.8";
-    system.now += 1.0;
-    let risk = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(risk["action"], "close-desktop");
-    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_ip_changed");
-    assert_eq!(system.closes, 1);
-}
-
-#[test]
-fn confirmed_proxy_failure_still_stops_lingering_helpers() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    system.running = false;
-    system.alive_override = Some(false);
-    system.tree_running_override = Some(true);
-    system.proxy = "fail";
-    system.now += 1.0;
-    let risk = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(risk["action"], "close-desktop");
-    assert_eq!(
-        risk["session_guard"]["reason"]["code"],
-        "proxy_or_tun_failed"
-    );
-    assert_eq!(
-        system.ip_force_calls, 0,
-        "non-IP failures use the existing normal-exit path"
-    );
-}
-
-#[test]
-fn replacement_uses_its_own_exit_baseline_after_old_session_ended() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    system.running = false;
-    system.now += 1.0;
-    controller.guard_tick(&mut system).unwrap();
-    system.running = true;
-    system.desktop_pid = 78;
-    system.ip = "8.8.8.8"; // Changed while the previous session was already closed.
-    system.now += 1.0;
-    let pending = controller.guard_tick(&mut system).unwrap();
-    let value = SessionStore::new(fixture.storage.clone())
-        .load(system.now)
-        .unwrap()
-        .unwrap();
-    assert_eq!(pending["session_guard"]["state"], "pending");
-    assert_eq!(value.baseline.ip, "8.8.8.8");
-    assert_eq!(
-        system.closes, 0,
-        "an old session baseline must not stop a new session"
-    );
-    system.ip = "9.9.9.9";
-    system.now += 1.0;
-    let risk = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(risk["action"], "close-desktop");
-    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_ip_changed");
-}
-
-#[test]
-fn replacement_seen_in_same_round_as_old_exit_is_rechecked_not_closed() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    let old = SessionStore::new(fixture.storage.clone())
-        .load(system.now)
-        .unwrap()
-        .unwrap();
-    system.desktop_pid = 78;
-    system.now += 1.0;
-    let result = controller.guard_tick(&mut system).unwrap();
-    let new = SessionStore::new(fixture.storage.clone())
-        .load(system.now)
-        .unwrap()
-        .unwrap();
-    assert_eq!(result["session_guard"]["state"], "pending");
-    assert_eq!(new.state, Phase::Rechecking);
-    assert_ne!(new.session_id, old.session_id);
-    assert_eq!(system.closes, 0);
-}
-
-#[test]
-fn replacement_cannot_absorb_a_changed_ip_without_a_confirmed_empty_tree() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    system.desktop_pid = 78;
-    system.ip = "8.8.8.8";
-    system.now += 1.0;
-    let risk = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_ip_changed");
-    assert_eq!(risk["action"], "close-desktop");
-    assert_eq!(system.ip_force_calls, 1);
-}
-
-#[test]
-fn unknown_sample_cannot_discard_previous_baseline_during_immediate_replacement() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    system.desktop_pid = 78;
-    system.ip = "";
-    system.now += 1.0;
-    let unknown = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(unknown["session_guard"]["state"], "unknown");
-    assert_eq!(system.closes, 0);
-    system.ip = "8.8.8.8";
-    system.now += 1.0;
-    let risk = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_ip_changed");
-    assert_eq!(risk["action"], "close-desktop");
-    assert_eq!(system.ip_force_calls, 1);
-}
-
-#[test]
-fn replacement_with_confirmed_cn_exit_is_closed_before_recheck() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    system.running = false;
-    system.now += 1.0;
-    controller.guard_tick(&mut system).unwrap();
-    system.running = true;
-    system.desktop_pid = 78;
-    system.country = "CN";
-    system.now += 1.0;
-    let risk = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(risk["action"], "close-desktop");
-    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_country_cn");
-    assert_eq!(system.ip_force_calls, 1);
-}
-
-#[test]
-fn confirmed_risk_stays_latched_until_remaining_desktop_tree_has_exited() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    system.ip = "8.8.8.8";
-    system.fail_quit = true;
-    system.now += 1.0;
-    let risk = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(risk["session_guard"]["state"], "risk");
-    assert_eq!(risk["stop_state"], "failed");
-    assert_eq!(system.closes, 1);
-
-    // Another protector has stopped the old main, but helpers still exist.
-    system.running = false;
-    system.alive_override = Some(false);
-    system.tree_running_override = Some(true);
-    system.now += 1.0;
-    let pending = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(pending["stop_state"], "failed");
-    assert_eq!(
-        system.closes, 2,
-        "confirmed risk keeps requesting full exit"
-    );
-    assert_eq!(
-        SessionStore::new(fixture.storage.clone())
-            .load(system.now)
-            .unwrap()
-            .unwrap()
-            .state,
-        Phase::Locked
-    );
-
-    // Once the tree is gone, whoever closed it, no duplicate stop is sent.
-    system.tree_running_override = Some(false);
-    system.now += 1.0;
-    let ended = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(ended["session_guard"]["state"], "idle");
-    assert_eq!(system.closes, 2);
-    assert_eq!(
-        SessionStore::new(fixture.storage.clone())
-            .load(system.now)
-            .unwrap()
-            .unwrap()
-            .state,
-        Phase::Ended
-    );
-}
-
-#[test]
-fn slow_new_process_audit_does_not_delay_stopping_owned_child_on_ip_change() {
-    use claude_watch_core::config::Config;
-    use claude_watch_runtime::background_evidence::{self, EvidenceSystem, ProbeKind};
-    use std::time::Instant;
-    struct BlockedAudit {
-        now: f64,
-        started: std::sync::mpsc::Sender<()>,
-        resume: std::sync::mpsc::Receiver<()>,
-    }
-    impl EvidenceSystem for BlockedAudit {
-        fn now(&self) -> f64 {
-            self.now
-        }
-        fn local(&mut self, _: &Config) -> Result<Value> {
-            Ok(json!({"context_id":"ctx","proxy":"ok","tun":"ok","observation_unavailable":[]}))
-        }
-        fn desktop_matches(&mut self, _: &Desktop) -> Result<bool> {
-            Ok(true)
-        }
-        fn desktop_unique_stamp(&mut self, _: &Desktop) -> Result<Option<String>> {
-            Ok(Some("fixture".into()))
-        }
-        fn collect(&mut self, _: ProbeKind) -> Result<Value> {
-            panic!("fresh fixture receipts should be reused")
-        }
-        fn revalidate(&mut self) -> Result<(Value, Value)> {
-            self.started.send(()).unwrap();
-            self.resume.recv_timeout(Duration::from_secs(3)).unwrap();
-            Ok((json!({}), json!({})))
-        }
-    }
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake {
-        spawn_test_process: true,
-        ..Fake::default()
-    };
-    controller.launch(&mut system).unwrap();
-    let mut old = system.test_child.take().unwrap();
-    old.kill().unwrap();
-    old.wait().unwrap();
-    system.running = false;
-    system.now += 1.0;
-    controller.guard_tick(&mut system).unwrap();
-    system.test_child = Some(TestChild(
-        std::process::Command::new("/bin/sleep")
-            .arg("300")
-            .spawn()
-            .unwrap(),
-    ));
-    system.running = true;
-    system.now += 1.0;
-    controller.guard_tick(&mut system).unwrap();
-    fixture.receipts(system.now);
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
-    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-    let store = fixture.storage.clone();
-    let at = system.now + 0.1;
-    let worker = std::thread::spawn(move || {
-        let mut adapter = BlockedAudit {
-            now: at,
-            started: started_tx,
-            resume: resume_rx,
-        };
-        background_evidence::refresh_active_session(&store, &mut adapter)
-    });
-    started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-    system.ip = "8.8.8.8";
-    system.now += 1.0;
-    let start = Instant::now();
-    let result = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(result["action"], "close-desktop");
-    assert_eq!(
-        result["session_guard"]["reason"]["code"],
-        "egress_ip_changed"
-    );
-    assert!(start.elapsed() < Duration::from_secs(2));
-    assert!(system.test_child.is_none());
-    resume_tx.send(()).unwrap();
-    assert!(
-        worker.join().unwrap().is_err(),
-        "late audit cannot revive the stopped session"
-    );
-}
-
-#[test]
-fn isolated_process_protection_stops_on_confirmed_cn_exit() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake {
-        spawn_test_process: true,
-        ..Fake::default()
-    };
-    controller.launch(&mut system).unwrap();
-    system.now += 1.0;
-    system.country = "CN";
-    let risk = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(risk["action"], "close-desktop");
-    assert_eq!(risk["session_guard"]["reason"]["code"], "egress_country_cn");
-    assert!(system.test_child.is_none());
-    assert_eq!(system.closes, 1);
-    assert_eq!(
-        SessionStore::new(fixture.storage.clone())
-            .load(system.now)
-            .unwrap()
-            .unwrap()
-            .state,
-        Phase::Locked
-    );
 }
 #[test]
 fn controlled_launch_builds_immutable_baseline_and_legacy_lease_only_after_full_audit() {
@@ -1260,85 +596,7 @@ fn controlled_launch_builds_immutable_baseline_and_legacy_lease_only_after_full_
         .unwrap()
         .count();
     assert_eq!(entries, 1);
-    system.now += 1.0;
-    system.ip = "8.8.8.8";
-    let guarded = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(guarded["action"], "close-desktop");
-    assert_eq!(system.closes, 1);
-    let locked = SessionStore::new(fixture.storage.clone())
-        .load(system.now)
-        .unwrap()
-        .unwrap();
-    assert_eq!(locked.state, Phase::Locked);
-    assert_eq!(locked.baseline.ip, "1.1.1.1");
-}
 
-#[test]
-fn a_stalled_resident_webview_does_not_delay_confirmed_ip_change_protection() {
-    use claude_watch_runtime::{
-        background_evidence::{ProbeExecutor, WORKER},
-        release_native::{FixedCommand, FixedCommandExecutor},
-    };
-    use std::{
-        os::unix::fs::PermissionsExt,
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        },
-        time::Instant,
-    };
-    let fixture = Fixture::new();
-    let script = fixture.home.join(WORKER);
-    let ready = fixture.home.join("probe-waiting");
-    fs::write(
-        &script,
-        format!(
-            r#"#!/usr/bin/python3
-import json,sys,time
-from pathlib import Path
-print(json.dumps({{'schema':1,'ready':True}}),flush=True)
-for line in sys.stdin:
- Path({:?}).write_text('waiting')
- time.sleep(30)
-"#,
-            ready.to_str().unwrap()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-    let cancel = stop.clone();
-    let probe = std::thread::spawn(move || {
-        ProbeExecutor::new(stop).run(FixedCommand {
-            program: script,
-            args: vec!["--dns".into()],
-            timeout: Duration::from_secs(30),
-        })
-    });
-    let wait = Instant::now();
-    while !ready.exists() && wait.elapsed() < Duration::from_secs(5) {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    system.now += 1.0;
-    system.ip = "8.8.8.8";
-    let started = Instant::now();
-    let protected = controller.guard_tick(&mut system).unwrap();
-    let elapsed = started.elapsed();
-    cancel.store(true, Ordering::Release);
-    assert!(probe.join().unwrap().is_err());
-    assert!(
-        ready.exists(),
-        "the isolated helper must be stalled during the guard check"
-    );
-    assert_eq!(protected["action"], "close-desktop");
-    assert_eq!(system.closes, 1);
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "confirmed IP change must not wait for the WebView"
-    );
 }
 
 #[test]
@@ -1396,69 +654,6 @@ fn launch_failure_locks_its_session_and_late_failure_cannot_close_a_new_session(
     assert_eq!(replacement.closes, 0);
 }
 #[test]
-fn sampling_failure_retries_then_closes_without_claiming_ip_changed_and_normal_close_is_idle() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    system.now += 1.0;
-    system.proxy = "unknown";
-    let first = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(first["action"], "observe");
-    assert_eq!(first["session_guard"]["state"], "unknown");
-    assert_eq!(system.closes, 0);
-    system.now += 1.0;
-    let second = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(second["action"], "observe");
-    system.now += 14.0;
-    let third = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(third["action"], "close-desktop");
-    assert_eq!(
-        system.ip_force_calls, 0,
-        "unconfirmed sampling does not use forced exit"
-    );
-    assert_eq!(
-        third["session_guard"]["reason"]["code"],
-        "proxy_or_tun_unconfirmed"
-    );
-    let fixture2 = Fixture::new();
-    let controller2 = Controller::new(fixture2.storage.clone());
-    let mut normal = Fake::default();
-    controller2.launch(&mut normal).unwrap();
-    normal.now += 1.0;
-    normal.running = false;
-    assert_eq!(
-        controller2.guard_tick(&mut normal).unwrap()["session_guard"]["state"],
-        "idle"
-    );
-}
-
-#[test]
-fn corrupt_session_fails_closed_without_overwriting_the_damaged_evidence() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    system.now += 1.0;
-    fs::write(fixture.storage.paths.session(), b"{corrupt-session").unwrap();
-    let result = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(result["action"], "close-desktop");
-    assert_eq!(
-        result["session_guard"]["reason"]["code"],
-        "session_state_invalid"
-    );
-    assert_eq!(system.closes, 1);
-    assert_eq!(
-        system.ip_force_calls, 0,
-        "session corruption is not a confirmed IP risk"
-    );
-    assert_eq!(
-        fs::read(fixture.storage.paths.session()).unwrap(),
-        b"{corrupt-session"
-    );
-}
-
-#[test]
 fn invalid_configuration_reports_without_authorising_a_stop() {
     let fixture = Fixture::new();
     let controller = Controller::new(fixture.storage.clone());
@@ -1466,21 +661,13 @@ fn invalid_configuration_reports_without_authorising_a_stop() {
     controller.launch(&mut system).unwrap();
     let before = fs::read(fixture.storage.paths.session()).unwrap();
     fs::write(fixture.storage.paths.config(), b"{invalid-config").unwrap();
-    // A missing policy is not a configured close, even after the normal
-    // sampling grace. Keep the fault visible without mutating the session.
-    for advance in [1.0, 1.0, 14.0] {
-        system.now += advance;
-        let result = controller.guard_tick(&mut system).unwrap();
-        assert_eq!(result["status"], "unknown");
-        assert_eq!(result["action"], "observe");
-        assert_eq!(result["policy_state"], "unavailable");
-        assert_eq!(result["stop_action"], "warn");
-        assert_eq!(result["stop_state"], "skipped_warn_only");
-        assert!(result["code"].is_string());
-        assert_eq!((system.closes, system.ip_force_calls), (0, 0));
-        assert!(system.running);
-        assert_eq!(fs::read(fixture.storage.paths.session()).unwrap(), before);
-    }
+    let result = read_guard_summary(&fixture.storage, 1016.0);
+    assert_eq!(result["status"], "unknown");
+    assert_eq!(result["action"], "observe");
+    assert!(result["code"].is_string());
+    assert_eq!(system.closes, 0);
+    assert!(system.running);
+    assert_eq!(fs::read(fixture.storage.paths.session()).unwrap(), before);
     assert!(!fixture.storage.paths.base().join("last-guard-stop.json").exists());
 }
 #[test]
@@ -1600,17 +787,6 @@ fn observed_desktop_uses_shared_fresh_gate_and_only_creates_identity_leases() {
         assert_eq!(leases.load(&inventory, 501, false).unwrap().len(), 1);
         inventory.get_mut(&77).unwrap().start_microseconds += 1;
         assert!(leases.load(&inventory, 501, true).unwrap().is_empty());
-        // The observation target belongs to a supervised family, so the guard
-        // accepts it. The leftover unparseable session file is read as state
-        // corruption: protection refuses to run unverified, and the family's
-        // own default action applies — a normal close.
-        let guard_receipt = controller.guard_tick(&mut system).unwrap();
-        assert_eq!(
-            guard_receipt["session_guard"]["reason"]["code"],
-            "session_state_invalid"
-        );
-        assert_eq!(guard_receipt["stop_action"], "close");
-        assert!(guard_receipt.get("stop_force_requested").is_none());
         let risk = ReceiptStore {
             storage: storage.clone(),
         };
@@ -1621,10 +797,7 @@ fn observed_desktop_uses_shared_fresh_gate_and_only_creates_identity_leases() {
                 .code,
             "launch_target_mismatch"
         );
-        // The launch itself never closed anything: the single close above is
-        // the guard's corrupted-state response, not an effect of the
-        // observation entry.
-        assert_eq!(system.closes, 1);
+        assert_eq!(system.closes, 0);
     }
 }
 
@@ -1808,231 +981,6 @@ fn cli_refusal_spawn_failure_wait_failure_and_interrupts_never_leave_authority()
 }
 
 #[test]
-fn locked_session_retries_failed_stop_without_another_probe() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    fixture.receipts(system.now);
-    controller.launch(&mut system).unwrap();
-    system.fail_quit = true;
-    system.proxy = "unknown";
-    system.ip = "8.8.8.8";
-    system.now += 1.0;
-    let first = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(first["session_guard"]["state"], "risk");
-    assert_eq!(first["stop_state"], "failed");
-    assert_eq!(first["action"], "observe");
-    let calls = system.egress_calls;
-    system.ip = "1.1.1.1";
-    system.fail_quit = false;
-    system.now += 1.0;
-    let second = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(second["session_guard"]["state"], "locked");
-    assert_eq!(second["stop_state"], "confirmed");
-    assert_eq!(system.egress_calls, calls);
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn confirmed_exit_stops_even_when_session_write_fails() {
-    struct Immutable(PathBuf);
-    impl Drop for Immutable {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("/usr/bin/chflags")
-                .arg("nouchg")
-                .arg(&self.0)
-                .status();
-        }
-    }
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    let path = fixture.storage.paths.session();
-    let _restore = Immutable(path.clone());
-    system.freeze_session = Some(path);
-    system.ip = "8.8.8.8";
-    system.now += 1.0;
-    let receipt = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(receipt["persistence_error"], "state_io_failed");
-    assert_eq!(receipt["stop_state"], "confirmed");
-    assert_eq!(receipt["action"], "close-desktop");
-    assert_eq!(
-        system.ip_force_calls, 1,
-        "confirmed IP risk still uses force fallback if state persistence fails"
-    );
-    assert!(!system.running);
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn failed_write_and_failed_stop_latch_same_session_until_retry() {
-    struct Immutable(PathBuf);
-    impl Drop for Immutable {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("/usr/bin/chflags")
-                .arg("nouchg")
-                .arg(&self.0)
-                .status();
-        }
-    }
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.launch(&mut system).unwrap();
-    let path = fixture.storage.paths.session();
-    let _restore = Immutable(path.clone());
-    system.freeze_session = Some(path);
-    system.ip = "8.8.8.8";
-    system.fail_quit = true;
-    system.now += 1.0;
-    let first = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(first["persistence_error"], "state_io_failed");
-    assert_eq!(first["stop_state"], "failed");
-    let calls = system.egress_calls;
-    system.ip = "1.1.1.1";
-    system.fail_quit = false;
-    system.now += 1.0;
-    let second = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(second["session_guard"]["state"], "locked");
-    assert_eq!(second["stop_state"], "confirmed");
-    assert_eq!(system.egress_calls, calls);
-    assert!(!system.running);
-    // The failure latch belongs only to the original session.
-    assert!(std::process::Command::new("/usr/bin/chflags")
-        .arg("nouchg")
-        .arg(&fixture.storage.paths.session())
-        .status()
-        .unwrap()
-        .success());
-    system.now += 1.0;
-    // A controlled launch is single-target: the runtime binds the Claude
-    // target before entering `launch` (guard_tick above left the family on
-    // the last supervised one, which must not leak into this launch).
-    system.set_family("claude").unwrap();
-    fixture.receipts(system.now);
-    controller.launch(&mut system).unwrap();
-    system.now += 1.0;
-    let new_session = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(new_session["action"], "observe");
-    assert_ne!(new_session["session_guard"]["state"], "locked");
-    assert!(system.running);
-}
-
-#[test]
-fn a_manually_started_claude_is_adopted_into_supervision() {
-    let fixture = Fixture::new();
-    let mut system = Fake {
-        running: true,
-        ..Default::default()
-    };
-    let receipt = Controller::new(fixture.storage.clone())
-        .guard_tick(&mut system)
-        .unwrap();
-    assert_eq!(receipt["action"], "observe");
-    assert_eq!(
-        receipt["session_guard"]["reason"]["code"],
-        "session_adopted"
-    );
-    // Adoption is supervision, not a stop: the running app is left alone.
-    assert_eq!(system.closes, 0);
-    assert!(system.running);
-    let session = SessionStore::new(fixture.storage.clone())
-        .load(system.now)
-        .unwrap()
-        .expect("adopted session");
-    assert_eq!(session.state, Phase::Active);
-    assert_eq!(session.extra["adopted_from"], json!("running_desktop"));
-    assert_eq!(session.baseline.ip, "1.1.1.1");
-}
-
-#[test]
-fn adoption_refuses_an_unverified_preflight() {
-    let fixture = Fixture::new();
-    let mut system = Fake {
-        running: true,
-        ready: false,
-        ..Default::default()
-    };
-    let receipt = Controller::new(fixture.storage.clone())
-        .guard_tick(&mut system)
-        .unwrap();
-    assert_eq!(receipt["adopt_error"], "preflight_blocked");
-    // The unadopted process is not allowed to run unguarded.
-    assert_eq!(system.closes, 1);
-}
-
-#[test]
-fn an_adopted_claude_is_force_stopped_when_the_exit_changes() {
-    let fixture = Fixture::new();
-    let mut system = Fake {
-        running: true,
-        ..Default::default()
-    };
-    let controller = Controller::new(fixture.storage.clone());
-    controller.guard_tick(&mut system).unwrap();
-    system.ip = "2.2.2.2";
-    let receipt = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(
-        receipt["session_guard"]["reason"]["code"],
-        "egress_ip_changed"
-    );
-    assert_eq!(system.ip_force_calls, 1);
-    assert_eq!(system.closes, 1);
-    assert!(!system.running);
-}
-
-#[test]
-fn adoption_refuses_a_cn_exit() {
-    let fixture = Fixture::new();
-    let mut system = Fake {
-        running: true,
-        country: "CN",
-        ..Default::default()
-    };
-    let receipt = Controller::new(fixture.storage.clone())
-        .guard_tick(&mut system)
-        .unwrap();
-    // A mainland exit is never a supervision baseline, even with a clean
-    // preflight: adopting it would bless the leak this guard exists to stop.
-    assert!(receipt["adopt_error"].is_null());
-    assert_ne!(
-        receipt["session_guard"]["reason"]["code"],
-        "session_adopted"
-    );
-    assert_eq!(system.closes, 1);
-    assert!(!system.running);
-    assert!(SessionStore::new(fixture.storage.clone())
-        .load(system.now)
-        .unwrap()
-        .is_none());
-}
-
-#[test]
-fn adoption_refuses_a_stale_exit() {
-    let fixture = Fixture::new();
-    let mut system = Fake {
-        running: true,
-        // Older than GUARD_EGRESS_TTL, so the exit cannot anchor a session.
-        egress_age: 11.0,
-        ..Default::default()
-    };
-    let receipt = Controller::new(fixture.storage.clone())
-        .guard_tick(&mut system)
-        .unwrap();
-    assert!(receipt["adopt_error"].is_null());
-    assert_ne!(
-        receipt["session_guard"]["reason"]["code"],
-        "session_adopted"
-    );
-    assert_eq!(system.closes, 1);
-    assert!(SessionStore::new(fixture.storage.clone())
-        .load(system.now)
-        .unwrap()
-        .is_none());
-}
-
-#[test]
 fn fake_family_switches_target_even_without_a_running_member() {
     use claude_watch_core::processes::LaunchTarget;
     // The absence of an OpenAI process does not exempt the adapter from
@@ -2058,781 +1006,6 @@ fn fake_family_switches_target_even_without_a_running_member() {
         "target_adapter_unavailable"
     );
     assert_eq!(DesktopSystem::launch_target(&fake), before);
-}
-
-fn policy_config(fixture: &Fixture, dns: &str, webrtc: &str) {
-    let mut config = claude_watch_core::config::Config::default();
-    config.guard_enabled = true;
-    let claude = claude_watch_core::policy::PolicyCatalog::family("claude").unwrap();
-    config.policy_actions.insert(claude.key("dns"), dns.into());
-    config.policy_actions.insert(claude.key("webrtc"), webrtc.into());
-    let config = config;
-    fixture
-        .storage
-        .atomic_json(&fixture.storage.paths.config(), &config.value().unwrap())
-        .unwrap();
-}
-/// Re-record fresh probe receipts with the given drift: DNS country set and
-/// WebRTC srflx address. The original Fixture baseline is JP / 1.1.1.1.
-fn drifted_receipts(fixture: &Fixture, now: f64, dns_country: &'static str, srflx: &'static str) {
-    let receipts = ReceiptStore {
-        storage: fixture.storage.clone(),
-    };
-    let local = json!({"context":"ctx","context_id":"ctx","proxy":"ok","tun":"ok"});
-    let probe = json!({"kind":"dns","status":"complete","contextChanged":false,"startedAt":now-1.0,"finishedAt":now,"errors":[],"observations":[{"kind":"http","address":"1.1.1.1"},{"kind":"resolver","address":"9.9.9.9"}],"externalJSON":serde_json::to_string(&json!({
-        "session":"a".repeat(40),"dns_servers":{"9.9.9.9":5},"http":{"address":"1.1.1.1","country":dns_country},"geoip":[{"ip":"9.9.9.9","country_code":dns_country}]
-    })).unwrap()});
-    receipts.record_dns(&probe, &local, None, now).unwrap();
-    receipts.record_webrtc(
-        &json!({"kind":"webrtc","status":"complete","contextChanged":false,"startedAt":now-1.0,"finishedAt":now,"errors":[],"observations":[{"kind":"http","address":"1.1.1.1","country":"JP"},{"kind":"srflx","address":srflx,"country":"JP"}]}),
-        &local,
-        None,
-        now,
-    )
-    .unwrap();
-}
-
-/// Set only the unestablished-session row, leaving every other criterion at
-/// its default, so a test can prove that this one row alone decides the
-/// outcome for an app the user opened by hand.
-fn session_policy(fixture: &Fixture, action: &str) {
-    let mut config = claude_watch_core::config::Config::default();
-    config.guard_enabled = true;
-    let claude = claude_watch_core::policy::PolicyCatalog::family("claude").unwrap();
-    config.policy_actions.insert(claude.key("session"), action.into());
-    fixture
-        .storage
-        .atomic_json(&fixture.storage.paths.config(), &config.value().unwrap())
-        .unwrap();
-}
-
-#[test]
-fn warn_configured_unestablished_session_notifies_without_closing() {
-    let fixture = Fixture::new();
-    session_policy(&fixture, "warn");
-    // The app is running but its protection state cannot be established, which
-    // is exactly the state a user reaches by opening the app from the Dock.
-    let mut system = Fake {
-        running: true,
-        ready: false,
-        ..Default::default()
-    };
-    let receipt = Controller::new(fixture.storage.clone())
-        .guard_tick(&mut system)
-        .unwrap();
-    assert_eq!(
-        receipt["session_guard"]["reason"]["code"],
-        "session_missing"
-    );
-    assert_eq!(receipt["action"], "observe");
-    assert_eq!(receipt["stop_state"], "skipped_warn_only");
-    assert_eq!(system.closes, 0, "a notice-only row never closes the app");
-    assert!(system.running);
-}
-
-#[test]
-fn close_configured_unestablished_session_still_closes() {
-    let fixture = Fixture::new();
-    session_policy(&fixture, "close");
-    let mut system = Fake {
-        running: true,
-        ready: false,
-        ..Default::default()
-    };
-    Controller::new(fixture.storage.clone())
-        .guard_tick(&mut system)
-        .unwrap();
-    // The row is a real switch: choosing close must actually close, otherwise
-    // the previous test would pass for the wrong reason.
-    assert_eq!(system.closes, 1);
-    assert!(!system.running);
-}
-
-#[test]
-fn warn_configured_probe_drift_notifies_without_closing() {
-    let fixture = Fixture::new();
-    policy_config(&fixture, "warn", "force");
-    let mut system = Fake {
-        running: true,
-        ..Default::default()
-    };
-    let controller = Controller::new(fixture.storage.clone());
-    controller.guard_tick(&mut system).unwrap();
-    drifted_receipts(&fixture, system.now + 1.0, "US", "1.1.1.1");
-    system.now += 2.0;
-    let receipt = controller.guard_tick(&mut system).unwrap();
-    // A warn-configured criterion reports but never closes: the session
-    // survives and the next round re-evaluates.
-    assert_eq!(receipt["session_notice"]["code"], "dns_egress_changed");
-    assert_eq!(receipt["action"], "observe");
-    assert_eq!(receipt["stop_state"], "skipped_warn_only");
-    assert_eq!(system.closes, 0);
-    assert!(system.running);
-}
-
-#[test]
-fn warn_configured_drift_never_closes_on_later_locked_rounds() {
-    // Regression: the first risk round latches the session to Locked, so the
-    // next guard tick reports state "locked". Warn must intercept that state
-    // too; before the fix the second tick closed the desktop despite warn.
-    let fixture = Fixture::new();
-    policy_config(&fixture, "warn", "force");
-    let mut system = Fake {
-        running: true,
-        ..Default::default()
-    };
-    let controller = Controller::new(fixture.storage.clone());
-    controller.guard_tick(&mut system).unwrap();
-    drifted_receipts(&fixture, system.now + 1.0, "US", "1.1.1.1");
-    system.now += 2.0;
-    let first = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(first["stop_state"], "skipped_warn_only");
-    system.now += 2.0;
-    let second = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(second["session_guard"]["state"], "locked");
-    assert_eq!(second["session_notice"]["code"], "dns_egress_changed");
-    assert_eq!(second["action"], "observe");
-    assert_eq!(second["stop_state"], "skipped_warn_only");
-    assert_eq!(system.closes, 0);
-    assert_eq!(system.ip_force_calls, 0);
-    assert!(system.running);
-}
-
-#[test]
-fn warn_configured_drift_resumes_supervision_once_recovered() {
-    // A warn tier never closes; when the drift clears, the session unlocks
-    // back to active supervision instead of latching the notice forever.
-    let fixture = Fixture::new();
-    policy_config(&fixture, "warn", "force");
-    let mut system = Fake {
-        running: true,
-        ..Default::default()
-    };
-    let controller = Controller::new(fixture.storage.clone());
-    controller.guard_tick(&mut system).unwrap();
-    drifted_receipts(&fixture, system.now + 1.0, "US", "1.1.1.1");
-    system.now += 2.0;
-    let warned = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(warned["stop_state"], "skipped_warn_only");
-    // Drift resolves back to the session baseline: supervision resumes.
-    drifted_receipts(&fixture, system.now + 1.0, "JP", "1.1.1.1");
-    system.now += 2.0;
-    let recovered = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(recovered["session_guard"]["state"], "active");
-    assert_eq!(recovered["session_notice"]["action"], "resume");
-    assert_eq!(recovered["stop_state"], "recovered");
-    assert_eq!(system.closes, 0);
-    assert!(system.running);
-    // A later drift warns again: the resume did not weaken the tier.
-    drifted_receipts(&fixture, system.now + 1.0, "US", "1.1.1.1");
-    system.now += 2.0;
-    let rewarned = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(rewarned["session_notice"]["code"], "dns_egress_changed");
-    assert_eq!(rewarned["stop_state"], "skipped_warn_only");
-    assert_eq!(system.closes, 0);
-    assert!(system.running);
-}
-
-#[test]
-fn combined_probe_drift_forces_by_default_and_never_softens() {
-    // Regression: the combined dns+webrtc code must inherit the stricter of
-    // the two configured actions. Before the fix it fell through to a plain
-    // close even with the default all-force policy.
-    let fixture = Fixture::new();
-    let mut system = Fake {
-        running: true,
-        ..Default::default()
-    };
-    let controller = Controller::new(fixture.storage.clone());
-    controller.guard_tick(&mut system).unwrap();
-    drifted_receipts(&fixture, system.now + 1.0, "US", "3.3.3.3");
-    system.now += 2.0;
-    let receipt = controller.guard_tick(&mut system).unwrap();
-    assert_eq!(
-        receipt["session_guard"]["reason"]["code"],
-        "dns_and_webrtc_egress_changed"
-    );
-    assert_eq!(receipt["stop_action"], "force");
-    assert_eq!(system.ip_force_calls, 1);
-    assert_eq!(system.closes, 1);
-    assert!(!system.running);
-}
-
-#[test]
-fn combined_probe_drift_applies_the_stricter_of_the_two_policies() {
-    let fixture = Fixture::new();
-    policy_config(&fixture, "warn", "force");
-    let mut system = Fake {
-        running: true,
-        ..Default::default()
-    };
-    let controller = Controller::new(fixture.storage.clone());
-    controller.guard_tick(&mut system).unwrap();
-    drifted_receipts(&fixture, system.now + 1.0, "US", "3.3.3.3");
-    system.now += 2.0;
-    let receipt = controller.guard_tick(&mut system).unwrap();
-    // DNS is warn but WebRTC is force: the wider drift keeps the strict tier.
-    assert_eq!(receipt["stop_action"], "force");
-    assert_eq!(system.ip_force_calls, 1);
-    assert!(!system.running);
-}
-
-#[test]
-fn the_openai_family_is_supervised_and_closed_on_confirmed_drift() {
-    // Regression: the guard supervised only the Claude target, so a ChatGPT /
-    // Codex disposition was configurable but never enforced. The guard now
-    // walks every family the policy table declares, so an OpenAI drift closes
-    // the OpenAI desktop by its own policy.
-    let fixture = Fixture::new();
-    let mut system = Fake {
-        running: true,
-        supervise_openai: true,
-        ..Default::default()
-    };
-    let controller = Controller::new(fixture.storage.clone());
-    // First round adopts the running OpenAI desktop into supervision. The
-    // per-family receipt lives in the heartbeat's `families` array.
-    let adopted = controller.guard_tick(&mut system).unwrap();
-    let openai = |receipt: &Value| -> Value {
-        receipt["families"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|v| v["family"] == "openai")
-            .cloned()
-            .unwrap()
-    };
-    let adopted_openai = openai(&adopted);
-    assert_eq!(adopted_openai["action"], "observe");
-    // The audit declares this family's own target, so the session layer must
-    // accept it. Resolving the target from the audit used to be a fixed
-    // ClaudeDesktop, which made every OpenAI adoption fail with
-    // `launch_target_mismatch` in production while this test passed.
-    assert!(
-        adopted_openai.get("adopt_error").is_none(),
-        "adopt_error: {}",
-        adopted_openai["adopt_error"]
-    );
-    assert_eq!(
-        adopted_openai["session_guard"]["reason"]["code"],
-        "session_adopted"
-    );
-    // A changed exit is a confirmed drift under the OpenAI family's policy.
-    system.ip = "8.8.8.8";
-    system.now += 2.0;
-    let risk = controller.guard_tick(&mut system).unwrap();
-    let risk_openai = openai(&risk);
-    assert_eq!(risk_openai["action"], "close-desktop");
-    assert_eq!(risk_openai["stop_action"], "close");
-    assert_eq!(system.ip_force_calls, 0, "OpenAI's default close is not force");
-    assert!(!system.running);
-    assert_eq!(system.closes, 1);
-}
-
-#[test]
-fn each_supervised_family_keeps_its_own_session_record() {
-    // The per-family session file keeps Claude and OpenAI supervision from
-    // overwriting each other, and the heartbeat lists every family the policy
-    // table declares.
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake::default();
-    controller.guard_tick(&mut system).unwrap();
-    let heartbeat = fixture
-        .storage
-        .read_json(&fixture.storage.paths.base().join("guard-heartbeat.json"), json!(null))
-        .unwrap();
-    let families: Vec<&str> = heartbeat["families"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v["family"].as_str().unwrap())
-        .collect();
-    assert!(families.contains(&"claude"));
-    assert!(families.contains(&"openai"));
-    // The OpenAI session path exists and is distinct from the Claude record.
-    assert_ne!(
-        fixture.storage.paths.session_for("claude"),
-        fixture.storage.paths.session_for("openai")
-    );
-}
-
-#[test]
-fn n0_cli_old_permit_cannot_authorize_process_signal() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake {
-        channel_mode_enabled: true,
-        delegates_worker_enabled: true,
-        ..Fake::default()
-    };
-    let mut config = claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.load().unwrap();
-    config.guard_enabled = true;
-    config.policy_actions.insert("claude_close_ip".into(), "force".into());
-    claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.save(config.value().unwrap()).unwrap();
-
-    let token = claude_watch_core::channel::BoundProcessToken::with_system_identity(
-        8822, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
-    ).with_audit_token([501, 501, 20, 501, 20, 8822, 0, 9]);
-    let session: claude_watch_core::session::Session = serde_json::from_value(json!({
-        "schema": 1,
-        "state": "locked",
-        "session_id": "s-cli-1",
-        "baseline": {
-            "ip": "1.1.1.1",
-            "country": "JP",
-            "observed_at": 1000.0,
-            "source": "fixture"
-        },
-        "reason": {
-            "code": "egress_ip_changed",
-            "detail": "IP changed",
-            "source": "fixture",
-            "observed_at": 1000.0
-        },
-        "channel_processes_v1": [token]
-    })).unwrap();
-    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &serde_json::to_value(&session).unwrap()).unwrap();
-
-    let permit = claude_watch_core::channel::ChannelPermit {
-        family: "claude".into(),
-        session_id: Some("s-cli-1".into()),
-        context_id: None,
-        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest: "p1".into(), guard_policy_digest: "g1".into() },
-        permit_generation: 1,
-        command_seq: 1,
-        state: claude_watch_core::channel::ChannelPermitState::Revoked,
-        reason_code: "egress_ip_changed".into(),
-        issued_at: 1000.0,
-        valid_until: 1000.0,
-        baseline_ip: None,
-        members: Vec::new(),
-        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt,
-        vpn_epoch: None,
-        coverage_scope: None,
-    };
-    fixture.storage.atomic_json(
-        &fixture.storage.paths.watch().join("state/channel-permits.json"),
-        &json!({"claude": permit}),
-    ).unwrap();
-
-    let receipt = controller.guard_tick_for_family(&mut system, "claude").unwrap();
-    eprintln!("DEBUG_RECEIPT_N2: {}", serde_json::to_string_pretty(&receipt).unwrap());
-
-
-    assert_eq!(receipt["action"], "disconnect-channel");
-    assert_eq!(receipt["process_execution_state"], "awaiting_supervisor");
-    assert!(receipt["process_preserved"].is_null());
-    assert!(system.terminated_supervised.is_empty());
-    assert!(system.recorded_process_receipts.is_empty());
-}
-
-#[test]
-fn n0_cli_old_permit_cannot_fabricate_force_failure() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake {
-        channel_mode_enabled: true,
-        delegates_worker_enabled: true,
-        fail_terminate_supervised: true,
-        ..Fake::default()
-    };
-    let mut config = claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.load().unwrap();
-    config.guard_enabled = true;
-    config.policy_actions.insert("claude_close_ip".into(), "force".into());
-    claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.save(config.value().unwrap()).unwrap();
-
-    let token = claude_watch_core::channel::BoundProcessToken::with_system_identity(
-        8823, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
-    ).with_audit_token([501, 501, 20, 501, 20, 8823, 0, 9]);
-    let session: claude_watch_core::session::Session = serde_json::from_value(json!({
-        "schema": 1,
-        "state": "locked",
-        "session_id": "s-cli-2",
-        "baseline": {
-            "ip": "1.1.1.1",
-            "country": "JP",
-            "observed_at": 1000.0,
-            "source": "fixture"
-        },
-        "reason": {
-            "code": "egress_ip_changed",
-            "detail": "IP changed",
-            "source": "fixture",
-            "observed_at": 1000.0
-        },
-        "channel_processes_v1": [token]
-    })).unwrap();
-    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &serde_json::to_value(&session).unwrap()).unwrap();
-
-    let permit = claude_watch_core::channel::ChannelPermit {
-        family: "claude".into(),
-        session_id: Some("s-cli-2".into()),
-        context_id: None,
-        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest: "p1".into(), guard_policy_digest: "g1".into() },
-        permit_generation: 1, command_seq: 1,
-        state: claude_watch_core::channel::ChannelPermitState::Revoked,
-        reason_code: "egress_ip_changed".into(),
-        issued_at: 1000.0, valid_until: 1000.0, baseline_ip: None, members: Vec::new(),
-        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt, vpn_epoch: None, coverage_scope: None,
-    };
-    fixture.storage.atomic_json(
-        &fixture.storage.paths.watch().join("state/channel-permits.json"),
-        &json!({"claude": permit}),
-    ).unwrap();
-
-    let receipt = controller.guard_tick_for_family(&mut system, "claude").unwrap();
-    eprintln!("DEBUG_RECEIPT_N2: {}", serde_json::to_string_pretty(&receipt).unwrap());
-
-
-    assert_eq!(receipt["action"], "disconnect-channel");
-    assert_eq!(receipt["process_execution_state"], "awaiting_supervisor");
-    assert!(receipt["process_preserved"].is_null());
-    assert!(system.terminated_supervised.is_empty());
-    assert!(system.recorded_process_receipts.is_empty());
-}
-
-#[test]
-fn n0_cli_channel_session_close_disposition_preserves_process_and_disconnects_channel() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake {
-        channel_mode_enabled: true,
-        delegates_worker_enabled: true,
-        ..Fake::default()
-    };
-    let mut config = claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.load().unwrap();
-    config.guard_enabled = true;
-    config.policy_actions.insert("claude_close_ip".into(), "close".into());
-    claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.save(config.value().unwrap()).unwrap();
-
-    let token = claude_watch_core::channel::BoundProcessToken::with_system_identity(
-        8824, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
-    ).with_audit_token([501, 501, 20, 501, 20, 8824, 0, 9]);
-    let session: claude_watch_core::session::Session = serde_json::from_value(json!({
-        "schema": 1,
-        "state": "locked",
-        "session_id": "s-cli-3",
-        "baseline": {
-            "ip": "1.1.1.1",
-            "country": "JP",
-            "observed_at": 1000.0,
-            "source": "fixture"
-        },
-        "reason": {
-            "code": "egress_ip_changed",
-            "detail": "IP changed",
-            "source": "fixture",
-            "observed_at": 1000.0
-        },
-        "channel_processes_v1": [token]
-    })).unwrap();
-    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &serde_json::to_value(&session).unwrap()).unwrap();
-
-    let permit = claude_watch_core::channel::ChannelPermit {
-        family: "claude".into(),
-        session_id: Some("s-cli-3".into()),
-        context_id: None,
-        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest: "p1".into(), guard_policy_digest: "g1".into() },
-        permit_generation: 1, command_seq: 1,
-        state: claude_watch_core::channel::ChannelPermitState::Revoked,
-        reason_code: "egress_ip_changed".into(),
-        issued_at: 1000.0, valid_until: 1000.0, baseline_ip: None, members: Vec::new(),
-        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt, vpn_epoch: None, coverage_scope: None,
-    };
-    fixture.storage.atomic_json(
-        &fixture.storage.paths.watch().join("state/channel-permits.json"),
-        &json!({"claude": permit}),
-    ).unwrap();
-
-    let receipt = controller.guard_tick_for_family(&mut system, "claude").unwrap();
-    eprintln!("DEBUG_RECEIPT_N2: {}", serde_json::to_string_pretty(&receipt).unwrap());
-
-
-    assert_eq!(receipt["action"], "disconnect-channel");
-    assert_eq!(receipt["disposition_mode"], "disconnect_channel_keep_process");
-    assert_eq!(receipt["process_preserved"], true);
-    assert_eq!(receipt["process_execution_state"], "preserved");
-    assert_eq!(system.terminated_supervised.len(), 0);
-}
-
-#[test]
-fn n0_openai_cli_channel_without_per_key_force_approval_falls_back_to_close() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake {
-        family: "openai",
-        supervise_openai: true,
-        channel_mode_enabled: true,
-        delegates_worker_enabled: true,
-        ..Fake::default()
-    };
-    let mut config = claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.load().unwrap();
-    config.guard_enabled = true;
-    claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.save(config.value().unwrap()).unwrap();
-    assert_eq!(config.close_action("egress_ip_changed", claude_watch_core::processes::Provider::Codex), "close");
-
-    let token = claude_watch_core::channel::BoundProcessToken::with_system_identity(
-        8825, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
-    ).with_audit_token([501, 501, 20, 501, 20, 8825, 0, 9]);
-    let session: claude_watch_core::session::Session = serde_json::from_value(json!({
-        "schema": 1,
-        "state": "locked",
-        "session_id": "s-cli-openai",
-        "baseline": {
-            "ip": "1.1.1.1",
-            "country": "JP",
-            "observed_at": 1000.0,
-            "source": "fixture"
-        },
-        "reason": {
-            "code": "egress_ip_changed",
-            "detail": "IP changed",
-            "source": "fixture",
-            "observed_at": 1000.0
-        },
-        "channel_processes_v1": [token]
-    })).unwrap();
-    fixture.storage.atomic_json(&fixture.storage.paths.session_for("openai"), &serde_json::to_value(&session).unwrap()).unwrap();
-
-    let permit = claude_watch_core::channel::ChannelPermit {
-        family: "openai".into(),
-        session_id: Some("s-cli-openai".into()),
-        context_id: None,
-        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest: "p1".into(), guard_policy_digest: "g1".into() },
-        permit_generation: 1, command_seq: 1,
-        state: claude_watch_core::channel::ChannelPermitState::Revoked,
-        reason_code: "egress_ip_changed".into(),
-        issued_at: 1000.0, valid_until: 1000.0, baseline_ip: None, members: Vec::new(),
-        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt, vpn_epoch: None, coverage_scope: None,
-    };
-    fixture.storage.atomic_json(
-        &fixture.storage.paths.watch().join("state/channel-permits.json"),
-        &json!({"openai": permit}),
-    ).unwrap();
-
-    let receipt = controller.guard_tick_for_family(&mut system, "openai").unwrap();
-
-    assert_eq!(receipt["action"], "disconnect-channel");
-    assert_eq!(receipt["disposition_mode"], "disconnect_channel_keep_process");
-    assert_eq!(receipt["process_preserved"], true);
-    assert_eq!(receipt["process_execution_state"], "preserved");
-    assert_eq!(system.terminated_supervised.len(), 0);
-}
-
-#[test]
-fn n1_stale_permit_session_mismatch_rejects_channel_disposition() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake {
-        channel_mode_enabled: true,
-        delegates_worker_enabled: true,
-        ..Fake::default()
-    };
-    let token = claude_watch_core::channel::BoundProcessToken::with_system_identity(
-        8901, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
-    ).with_audit_token([501, 501, 20, 501, 20, 8901, 0, 9]);
-    let session: claude_watch_core::session::Session = serde_json::from_value(json!({
-        "schema": 1,
-        "state": "locked",
-        "session_id": "session-active-new",
-        "baseline": {
-            "ip": "1.1.1.1",
-            "country": "JP",
-            "observed_at": 1000.0,
-            "source": "fixture"
-        },
-        "reason": {
-            "code": "egress_ip_changed",
-            "detail": "IP changed",
-            "source": "fixture",
-            "observed_at": 1000.0
-        },
-        "channel_processes_v1": [token]
-    })).unwrap();
-    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &serde_json::to_value(&session).unwrap()).unwrap();
-
-    // Permit belongs to an old/different session ID
-    let permit = claude_watch_core::channel::ChannelPermit {
-        family: "claude".into(),
-        session_id: Some("session-stale-old".into()),
-        context_id: None,
-        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest: "p1".into(), guard_policy_digest: "g1".into() },
-        permit_generation: 1, command_seq: 1,
-        state: claude_watch_core::channel::ChannelPermitState::Revoked,
-        reason_code: "egress_ip_changed".into(),
-        issued_at: 1000.0, valid_until: 1030.0, baseline_ip: None, members: Vec::new(),
-        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt, vpn_epoch: None, coverage_scope: None,
-    };
-    fixture.storage.atomic_json(
-        &fixture.storage.paths.watch().join("state/channel-permits.json"),
-        &json!({"claude": permit}),
-    ).unwrap();
-
-    let receipt = controller.guard_tick_for_family(&mut system, "claude").unwrap();
-
-    assert_eq!(receipt["action"], "disconnect-channel");
-    assert_eq!(receipt["disposition_mode"], "disconnect_channel_keep_process");
-    assert_eq!(receipt["process_execution_state"], "session_mismatch");
-    assert_eq!(receipt["process_preserved"], true);
-    assert_eq!(system.terminated_supervised.len(), 0);
-}
-
-#[test]
-fn n2_legacy_consumer_cannot_import_fake_partial_execution() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake {
-        channel_mode_enabled: true,
-        delegates_worker_enabled: true,
-        ..Fake::default()
-    };
-    let mut config = claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.load().unwrap();
-    config.guard_enabled = true;
-    config.policy_actions.insert("claude_close_ip".into(), "force".into());
-    claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.save(config.value().unwrap()).unwrap();
-
-    let t1 = claude_watch_core::channel::BoundProcessToken::with_system_identity(
-        9001, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
-    ).with_audit_token([501, 501, 20, 501, 20, 9001, 0, 9]);
-    let t2 = claude_watch_core::channel::BoundProcessToken::with_system_identity(
-        9002, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
-    ).with_audit_token([501, 501, 20, 501, 20, 9002, 0, 9]);
-    let session: claude_watch_core::session::Session = serde_json::from_value(json!({
-        "schema": 1,
-        "state": "locked",
-        "session_id": "session-dual-1",
-        "baseline": {
-            "ip": "1.1.1.1",
-            "country": "JP",
-            "observed_at": 1000.0,
-            "source": "fixture"
-        },
-        "reason": {
-            "code": "egress_ip_changed",
-            "detail": "IP changed",
-            "source": "fixture",
-            "observed_at": 1000.0
-        },
-        "channel_processes_v1": [t1, t2]
-    })).unwrap();
-    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &serde_json::to_value(&session).unwrap()).unwrap();
-
-    let permit = claude_watch_core::channel::ChannelPermit {
-        family: "claude".into(),
-        session_id: Some("session-dual-1".into()),
-        context_id: None,
-        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest: "p1".into(), guard_policy_digest: "g1".into() },
-        permit_generation: 1, command_seq: 1,
-        state: claude_watch_core::channel::ChannelPermitState::Revoked,
-        reason_code: "egress_ip_changed".into(),
-        issued_at: 1000.0, valid_until: 1030.0, baseline_ip: None, members: Vec::new(),
-        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt, vpn_epoch: None, coverage_scope: None,
-    };
-    fixture.storage.atomic_json(
-        &fixture.storage.paths.watch().join("state/channel-permits.json"),
-        &json!({"claude": permit}),
-    ).unwrap();
-
-    // Simulate 9001 being terminated, 9002 failing to terminate
-    system.terminate_results_override = Some(vec![
-        claude_watch_core::channel::TargetProcessDispositionResult {
-            pid: 9001,
-            requested_action: "force_quit".into(),
-            terminated: true,
-            process_state: "terminated".into(),
-            timestamp: 1000.0,
-            signal_sent_at: None,
-        },
-        claude_watch_core::channel::TargetProcessDispositionResult {
-            pid: 9002,
-            requested_action: "force_quit".into(),
-            terminated: false,
-            process_state: "still_running".into(),
-            timestamp: 1000.0,
-            signal_sent_at: None,
-        },
-    ]);
-
-    let receipt = controller.guard_tick_for_family(&mut system, "claude").unwrap();
-
-    assert_eq!(receipt["action"], "disconnect-channel");
-    assert_eq!(receipt["process_execution_state"], "awaiting_supervisor");
-    assert!(receipt["process_preserved"].is_null());
-    assert!(system.terminated_supervised.is_empty());
-    assert!(system.recorded_process_receipts.is_empty());
-}
-
-#[test]
-fn n3_already_exited_process_not_counted_in_forced() {
-    let fixture = Fixture::new();
-    let controller = Controller::new(fixture.storage.clone());
-    let mut system = Fake {
-        channel_mode_enabled: true,
-        delegates_worker_enabled: true,
-        ..Fake::default()
-    };
-    let mut config = claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.load().unwrap();
-    config.guard_enabled = true;
-    config.policy_actions.insert("claude_close_ip".into(), "force".into());
-    claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.save(config.value().unwrap()).unwrap();
-
-    let t = claude_watch_core::channel::BoundProcessToken::with_system_identity(
-        9003, 501, 1000, 0, claude_watch_core::processes::ProcessRole::Cli,
-    ).with_audit_token([501, 501, 20, 501, 20, 9003, 0, 9]);
-    let session: claude_watch_core::session::Session = serde_json::from_value(json!({
-        "schema": 1,
-        "state": "locked",
-        "session_id": "session-exited-1",
-        "baseline": {
-            "ip": "1.1.1.1",
-            "country": "JP",
-            "observed_at": 1000.0,
-            "source": "fixture"
-        },
-        "reason": {
-            "code": "egress_ip_changed",
-            "detail": "IP changed",
-            "source": "fixture",
-            "observed_at": 1000.0
-        },
-        "channel_processes_v1": [t]
-    })).unwrap();
-    fixture.storage.atomic_json(&fixture.storage.paths.session_for("claude"), &serde_json::to_value(&session).unwrap()).unwrap();
-
-    let permit = claude_watch_core::channel::ChannelPermit {
-        family: "claude".into(),
-        session_id: Some("session-exited-1".into()),
-        context_id: None,
-        policy_version: claude_watch_core::channel::PolicyVersion { policy_digest: "p1".into(), guard_policy_digest: "g1".into() },
-        permit_generation: 1, command_seq: 1,
-        state: claude_watch_core::channel::ChannelPermitState::Revoked,
-        reason_code: "egress_ip_changed".into(),
-        issued_at: 1000.0, valid_until: 1030.0, baseline_ip: None, members: Vec::new(),
-        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt, vpn_epoch: None, coverage_scope: None,
-    };
-    fixture.storage.atomic_json(
-        &fixture.storage.paths.watch().join("state/channel-permits.json"),
-        &json!({"claude": permit}),
-    ).unwrap();
-
-    system.terminate_results_override = Some(vec![
-        claude_watch_core::channel::TargetProcessDispositionResult {
-            pid: 9003,
-            requested_action: "force_quit".into(),
-            terminated: false,
-            process_state: "already_exited".into(),
-            timestamp: 1000.0,
-            signal_sent_at: None,
-        },
-    ]);
-
-    let receipt = controller.guard_tick_for_family(&mut system, "claude").unwrap();
-
-    assert_eq!(receipt["action"], "disconnect-channel");
-    assert_eq!(receipt["process_execution_state"], "awaiting_supervisor");
-    assert!(receipt["process_preserved"].is_null());
-    assert!(system.terminated_supervised.is_empty());
 }
 
 #[test]
@@ -2871,4 +1044,96 @@ fn n4_supervisor_does_not_import_disk_process_receipt() {
     assert!(monitor.process_disposition_receipt.is_none());
     assert!(monitor.process_execution_state.is_none());
     assert!(monitor.process_disposition_action.is_none());
+}
+
+fn blocked_guard_fixture(fixture: &Fixture, mut permit: ChannelPermit) -> (ChannelPermit, ChannelEnforcementReceipt) {
+    let config = claude_watch_runtime::config_store::ConfigStore { storage: fixture.storage.clone() }.load().unwrap();
+    permit.policy_version = claude_watch_runtime::channel_supervisor::ChannelSupervisor::compute_policy_version(&config).unwrap();
+    let receipt = ChannelEnforcementReceipt {
+        family: permit.family.clone(), session_id: permit.session_id.clone(), policy_version: permit.policy_version.clone(),
+        permit_generation: permit.permit_generation, command_seq: permit.command_seq, executor_boot_id: "fixture-executor".into(),
+        receipt_seq: 1, permit_state: ChannelPermitState::Revoked, enforcement_state: ChannelEnforcementState::Blocked,
+        interception_active: true, local_proxy_ready: true, system_extension_active: false, new_connections_blocked: true,
+        active_flows_closed: true, direct_fallback_blocked: true, active_flows_count: 0, terminated_flows_count: 0,
+        blocked_new_connections: 0, observed_at: permit.issued_at, error_code: None, backend: permit.backend,
+        vpn_epoch: permit.vpn_epoch.clone(), coverage_scope: permit.coverage_scope.clone(), sandbox_ready: true,
+    };
+    (permit, receipt)
+}
+
+fn publish_guard_fixture(fixture: &Fixture, permit: &ChannelPermit, receipt: &ChannelEnforcementReceipt) {
+    let identity = claude_watch_system::inspect_process_identity(std::process::id()).unwrap();
+    let family = &permit.family;
+    let frame = json!({
+        "captured_at": 1000.0, "producer_boot_id": "fixture-supervisor",
+        "producer_identity": {"pid": identity.pid, "uid": identity.uid,
+            "start_seconds": identity.start_seconds, "start_microseconds": identity.start_microseconds,
+            "executable_path": identity.executable_path, "audit_token": identity.audit_token},
+        "executor_boot_id": receipt.executor_boot_id, "saved_policy_version": permit.policy_version,
+        "families": {(family): {
+            "producer_boot_id": "fixture-supervisor", "session_id": permit.session_id,
+            "saved_policy_version": permit.policy_version,
+            "command_seq": permit.command_seq, "permit_generation": permit.permit_generation,
+            "process_preserved": true,
+        }},
+        "authoritative_permits": {(family): permit},
+        "enforcement_receipts": {(family): receipt},
+    });
+    let path = fixture.storage.paths.watch().join(claude_watch_runtime::channel_policy_status::FRAME_PATH);
+    fixture.storage.atomic_json(&path, &frame).unwrap();
+}
+
+fn channel_collector_fixture(fixture: &Fixture) -> (Value, ChannelPermit, ChannelEnforcementReceipt) {
+    use claude_watch_core::channel::{BoundProcessToken, NetworkBackendKind, PolicyVersion};
+    let token = BoundProcessToken::with_system_identity(8822, 501, 1000, 0,
+        claude_watch_core::processes::ProcessRole::Cli).with_audit_token([501,501,20,501,20,8822,0,9]);
+    let session = json!({"schema":1,"state":"locked","session_id":"collector-channel",
+        "baseline":{"ip":"1.1.1.1","country":"JP","observed_at":1000.,"source":"fixture"},
+        "reason":{"code":"egress_ip_changed","detail":"fixture risk","source":"fixture","observed_at":1000.},
+        "channel_processes_v1":[token]});
+    let permit = ChannelPermit { family:"claude".into(), session_id:Some("collector-channel".into()),
+        context_id:None, policy_version:PolicyVersion { policy_digest: String::new(), guard_policy_digest: String::new() }, permit_generation:3, command_seq:41,
+        state:ChannelPermitState::Revoked, reason_code:"egress_ip_changed".into(), issued_at:1000., valid_until:1030.,
+        baseline_ip:None, members:vec![], backend:NetworkBackendKind::Seatbelt, vpn_epoch:None, coverage_scope:None };
+    let (permit, receipt) = blocked_guard_fixture(fixture, permit);
+    (session, permit, receipt)
+}
+
+#[test]
+fn guard_reader_uses_only_the_supervisor_frame_and_never_changes_the_session() {
+    let fixture = Fixture::new();
+    let (session, permit, mut receipt) = channel_collector_fixture(&fixture);
+    let store = &fixture.storage;
+    let session_path = store.paths.session_for("claude");
+    store.atomic_json(&session_path, &session).unwrap();
+    let session_bytes = fs::read(&session_path).unwrap();
+    store.atomic_json(&store.paths.watch().join("state/channel-permits.json"), &json!({"claude": permit})).unwrap();
+    store.atomic_json(&store.paths.base().join("guard-heartbeat.json"), &json!({"status":"ok","time":1000.0})).unwrap();
+
+    let status = || read_guard_summary(store, 1000.0)["families"][0].clone();
+    assert_eq!(status()["session_guard"]["state"], "pending_verification");
+    assert!(status()["channel_receipt"].is_null());
+
+    publish_guard_fixture(&fixture, &permit, &receipt);
+    let blocked = status();
+    assert_eq!(blocked["channel_receipt"]["command_seq"], 41);
+    assert_eq!(blocked["channel_supervision"]["verdict"], "isolated_keep_process");
+    assert_eq!(blocked["process_preserved"], true);
+    assert!(blocked["process_disposition_receipt"].is_null());
+
+    receipt.observed_at = 900.0;
+    publish_guard_fixture(&fixture, &permit, &receipt);
+    let expired = status();
+    assert_eq!(expired["channel_execution_state"], "pending_verification");
+    assert_eq!(expired["channel_supervision"]["code"], "enforcement_receipt_expired");
+    assert_eq!(expired["channel_permit"]["state"], "revoked");
+
+    receipt.observed_at = 1000.0;
+    receipt.enforcement_state = ChannelEnforcementState::Failed;
+    receipt.error_code = Some("enforcement_reported_failure".into());
+    publish_guard_fixture(&fixture, &permit, &receipt);
+    let failed = status();
+    assert_eq!(failed["status"], "protection_unavailable");
+    assert_eq!(failed["channel_supervision"]["code"], "enforcement_reported_failure");
+    assert_eq!(fs::read(&session_path).unwrap(), session_bytes);
 }

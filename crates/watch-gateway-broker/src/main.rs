@@ -17,17 +17,31 @@ fn code_hash(path: &Path) -> io::Result<String> {
 }
 
 fn plist(config: &GatewayInstallConfig) -> String {
+    gateway_plist(config, false)
+}
+
+// Exact historical definition, accepted only for migration and recovery.
+fn legacy_plist(config: &GatewayInstallConfig) -> String {
+    gateway_plist(config, true)
+}
+
+fn gateway_plist(config: &GatewayInstallConfig, legacy_control_activation: bool) -> String {
+    let lifecycle = if legacy_control_activation { "" } else {
+        "<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>10</integer>\n"
+    };
+    let control = if legacy_control_activation {
+        format!("<key>Control</key><dict><key>SockFamily</key><string>Unix</string><key>SockType</key><string>stream</string><key>SockPathName</key><string>{CONTROL_PATH}</string><key>SockPathMode</key><integer>438</integer></dict>\n")
+    } else { String::new() };
     format!(r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>{SERVICE_LABEL}</string>
 <key>ProgramArguments</key><array><string>{BROKER_PATH}</string></array>
 <key>UserName</key><string>root</string>
-<key>Sockets</key><dict>
+{lifecycle}<key>Sockets</key><dict>
 <key>GatewayV4</key><dict><key>SockFamily</key><string>IPv4</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string><key>SockNodeName</key><string>0.0.0.0</string><key>SockServiceName</key><integer>{0}</integer></dict>
 <key>GatewayV6</key><dict><key>SockFamily</key><string>IPv6</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string><key>SockNodeName</key><string>::</string><key>SockServiceName</key><integer>{0}</integer></dict>
-<key>Control</key><dict><key>SockFamily</key><string>Unix</string><key>SockType</key><string>stream</string><key>SockPathName</key><string>{CONTROL_PATH}</string><key>SockPathMode</key><integer>438</integer></dict>
-</dict></dict></plist>
+{control}</dict></dict></plist>
 "#, config.gateway_port)
 }
 
@@ -80,7 +94,7 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         },
         Err(error) => {
-            if let Some(operation) = operation { logging::record(operation, "failed", logging::error_reason(&error), transaction, error.raw_os_error()); }
+            if let Some(operation) = operation { logging::record(operation, "failed", logging::error_reason(&error), transaction, claude_watch_system::launchd_gateway::gateway_error_os_code(&error)); }
             eprintln!("gateway_broker_unavailable: {error}"); std::process::ExitCode::from(78) }
     }
 }

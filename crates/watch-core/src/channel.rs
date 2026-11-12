@@ -580,6 +580,9 @@ pub struct ChannelEnforcementReceipt {
     pub permit_generation: u64,
     pub command_seq: u64,
     pub executor_boot_id: String,
+    /// Executor-local observation order; timestamps still determine freshness.
+    #[serde(default)]
+    pub receipt_seq: u64,
     pub permit_state: ChannelPermitState,
     pub enforcement_state: ChannelEnforcementState,
     /// Must remain true even when the channel is revoked. Turning off proxy
@@ -632,6 +635,9 @@ impl ChannelSupervisionVerdict {
             Self::ForwardingVerified => ChannelMonitorDisplayState::Forwarding,
             Self::PendingIsolation { .. } => ChannelMonitorDisplayState::Disconnecting,
             Self::IsolatedKeepProcess => ChannelMonitorDisplayState::Blocked,
+            Self::EnforcementFailed { code, .. } if code == "enforcement_receipt_expired" => {
+                ChannelMonitorDisplayState::PendingVerification
+            }
             Self::EnforcementFailed { .. } => ChannelMonitorDisplayState::Failed,
         }
     }
@@ -717,7 +723,7 @@ pub fn evaluate_channel_supervision_with_boot_id(
     {
         return ChannelSupervisionVerdict::EnforcementFailed {
             code: "enforcement_receipt_expired".into(),
-            status_label_zh: "执行失败".into(),
+            status_label_zh: "执行回执已过期，当前结果待核验".into(),
         };
     }
     if receipt.observed_at + 0.001 < permit.issued_at {
@@ -1317,7 +1323,7 @@ mod tests {
             permit_generation: permit.permit_generation,
             command_seq: permit.command_seq,
             executor_boot_id: "boot-1".into(),
-            permit_state: permit.state,
+            receipt_seq: 0, permit_state: permit.state,
             enforcement_state,
             interception_active: true,
             local_proxy_ready: true,
@@ -1706,9 +1712,17 @@ mod tests {
             ),
             ChannelSupervisionVerdict::EnforcementFailed {
                 code: "enforcement_receipt_expired".into(),
-                status_label_zh: "执行失败".into(),
+                status_label_zh: "执行回执已过期，当前结果待核验".into(),
             }
         );
+        let expired = evaluate_channel_supervision_with_boot_id(
+            &permit, Some(&receipt), &v1, Some("boot-1"), 1012.0,
+        );
+        assert_eq!(expired.display_state(), ChannelMonitorDisplayState::PendingVerification);
+        let wrong_executor = evaluate_channel_supervision_with_boot_id(
+            &permit, Some(&receipt), &v1, Some("boot-2"), 1003.0,
+        );
+        assert_eq!(wrong_executor.display_state(), ChannelMonitorDisplayState::Failed);
     }
 
     #[test]

@@ -453,9 +453,7 @@ fn install_mode<E: FixedCommandExecutor>(
     cleanup.preserve = true;
     let had_runtime = runtime.exists();
     let outcome = (|| {
-        if loaded {
-            crate::release_native::stop_user_agent(executor, uid)?;
-        }
+        crate::release_native::stop_user_agent(executor, uid, &runtime)?;
         if had_runtime {
             fs::rename(&runtime, &previous)
                 .map_err(|_| err("runtime_replace_failed", "旧运行组件无法暂存"))?;
@@ -512,7 +510,7 @@ fn install_mode<E: FixedCommandExecutor>(
                 "任务定义被外部修改，保留安装事务",
             ));
         }
-        crate::release_native::stop_agent_for_runtime(executor, uid, &runtime)?;
+        crate::release_native::stop_user_agent(executor, uid, &runtime)?;
         if previous.exists() {
             if runtime.exists() {
                 fs::remove_dir_all(&runtime)
@@ -678,7 +676,7 @@ pub fn recover<E: FixedCommandExecutor>(
         ));
     }
     if !committed {
-        crate::release_native::stop_agent_for_runtime(executor, uid, &runtime)?;
+        crate::release_native::stop_user_agent(executor, uid, &runtime)?;
         if previous.exists() {
             if runtime.exists() {
                 fs::remove_dir_all(&runtime)

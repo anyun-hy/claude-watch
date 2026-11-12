@@ -72,7 +72,7 @@ fn fixed_command(alert: &Alert) -> FixedCommand {
     let message = alert.message.replace(['\r', '\n'], " ");
     let destination = match alert.title.as_str() {
         "Claude Watch：保护采样异常" => "environment",
-        "Claude Watch：已触发保护" => "protection",
+        "Claude Watch：已触发保护" | "Claude Watch：保护状态变化" => "protection",
         _ => "events",
     };
     FixedCommand {

@@ -341,7 +341,9 @@ struct BoundProcessTokenModel: Codable, Equatable, Sendable {
     let audit_token: [UInt32]?
 
     var auditIdentityDigest: String? {
-        guard let audit_token, audit_token.count == 8 else { return nil }
+        guard pid > 1, uid > 0, start_seconds > 0,
+              let audit_token, audit_token.count == 8, audit_token[5] == pid,
+              audit_token[1] == uid || audit_token[3] == uid else { return nil }
         let data = Data(audit_token.map(String.init).joined(separator: ":").utf8)
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
@@ -537,14 +539,61 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
     }
 
     var hasUnmanagedMembers: Bool {
-        !(unmanaged_member_pids ?? []).isEmpty
+        !unmanagedPids.isEmpty
+    }
+
+    var unmanagedPids: [UInt32] {
+        Array(Set((unmanaged_member_pids ?? []) + (coverage_scope?.unprotected_pids ?? []))).sorted()
+    }
+
+    /// Registration and an empty gateway do not establish an application scope.
+    var managedMemberCount: Int {
+        guard session_id?.isEmpty == false, backend == "seatbelt",
+              let scope = coverage_scope, scope.backend == backend,
+              scope.hasRequiredFacts, scope.hasVerifiedEndpoint,
+              !scope.configured_entries.isEmpty else { return 0 }
+        let covered = Set(scope.protected_pids).subtracting(unmanagedPids)
+        return Set(active_members.filter { covered.contains($0.pid) && $0.auditIdentityDigest != nil }.map(\.pid)).count
+    }
+
+    var protectionScopeLabel: String {
+        if hasExpiredSubscription { return "受控范围与通道状态待核验" }
+        guard managedMemberCount > 0 else {
+            if !active_members.isEmpty || session_id?.isEmpty == false { return "接管范围待核验" }
+            return hasUnmanagedMembers ? "发现但未接管" : "受控网关待命"
+        }
+        if display_state == .blocked && !isConfirmedFlowBlocked { return "受控通道待核验" }
+        if reason_code == "async_audit_retry_wait" { return "受控通道：\(display_state.labelZh) · 恢复检查待重试" }
+        return "受控通道：" + display_state.labelZh
+    }
+
+    var scopedDisplayState: ChannelMonitorDisplayState {
+        hasExpiredSubscription || managedMemberCount == 0 || (display_state == .blocked && !isConfirmedFlowBlocked) ? .pendingVerification : display_state
+    }
+
+    private var hasExpiredSubscription: Bool {
+        reason_code == "subscription_stale_or_disconnected"
+    }
+
+    var scopeSummary: String {
+        hasExpiredSubscription
+            ? "上次受控成员 \(managedMemberCount) 个 · 上次未接管 \(unmanagedPids.count) 个"
+            : "已核验受控成员 \(managedMemberCount) 个 · 未接管 \(unmanagedPids.count) 个"
+    }
+
+    var gatewayCountsLabel: String {
+        hasExpiredSubscription
+            ? "受控网关当前连接数待核验 · 上次累计断开 \(terminated_flows_count) / 拒绝 \(blocked_new_connections)"
+            : "受控网关活动连接 \(active_flows_count) · 累计断开 \(terminated_flows_count) / 拒绝 \(blocked_new_connections)"
     }
 
     /// True only when a real executor flow-termination receipt has been applied
     /// (`display_state == .blocked` and `policy_sync_state == .applied`).
     /// Never true while `pending_apply` or `disconnecting`.
     var isConfirmedFlowBlocked: Bool {
-        display_state == .blocked && policy_sync_state == .applied && active_flows_count == 0
+        !hasExpiredSubscription && managedMemberCount > 0 && permit_state == "revoked"
+            && display_state == .blocked && policy_sync_state == .applied
+            && applied_policy_version == saved_policy_version && active_flows_count == 0
     }
 
     /// Binds network flows and process rows to the same supervised session and
@@ -561,7 +610,7 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
 
     func isUnmanagedProcess(_ process: WatchedProcess) -> Bool {
         let pid = UInt32(max(0, process.pid))
-        if unmanaged_member_pids?.contains(pid) == true {
+        if unmanagedPids.contains(pid) {
             return true
         }
         return !matchesProcess(process)
@@ -592,6 +641,7 @@ enum ChannelSubscriptionApplyOutcome: Equatable, Sendable {
 struct ChannelMonitorSubscriptionStore: Sendable {
     private(set) var producerBootId: String? = nil
     private(set) var lastEventSeq: UInt64 = 0
+    private var lastCapturedAt: Double?
     private(set) var needsResync: Bool = true
     private(set) var savedPolicyVersion: ChannelPolicyVersionModel? = nil
     private(set) var families: [String: FamilyChannelMonitorState] = [:]
@@ -606,9 +656,9 @@ struct ChannelMonitorSubscriptionStore: Sendable {
             && producerBootId != nil
             && !producerBootId!.isEmpty
             && producerBootId != snapshot.producer_boot_id
-        if snapshot.snapshot_seq < lastEventSeq && !needsResync && !bootIdChanged {
-            return false
-        }
+        if !bootIdChanged, let lastCapturedAt, snapshot.captured_at < lastCapturedAt { return false }
+        if snapshot.snapshot_seq < lastEventSeq && !needsResync && !bootIdChanged { return false }
+        lastCapturedAt = snapshot.captured_at
         if !snapshot.producer_boot_id.isEmpty {
             producerBootId = snapshot.producer_boot_id
         }
@@ -693,6 +743,7 @@ struct ChannelMonitorSubscriptionStore: Sendable {
                 reason_code: "subscription_stale_or_disconnected",
                 process_preserved: false,
                 active_member_pids: state.active_member_pids,
+                active_members: state.active_members,
                 active_flows_count: state.active_flows_count,
                 terminated_flows_count: state.terminated_flows_count,
                 blocked_new_connections: state.blocked_new_connections,

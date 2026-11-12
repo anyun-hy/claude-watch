@@ -57,14 +57,7 @@ struct SwitcherPage: View {
         }.padding(.top, 24)
             .task(id: section) {
                 if !store.loaded { await store.load() }
-                await store.refreshBackground()
                 if section == .accounts { await store.refreshCurrentLogin(force: true) }
-                if section == .protection {
-                    while !Task.isCancelled {
-                        do { try await Task.sleep(nanoseconds: 10_000_000_000) } catch { break }
-                        await store.refreshBackground()
-                    }
-                }
             }
             .alert(pendingTitle, isPresented: $confirmation) {
                 Button("取消", role: .cancel) {}
@@ -553,7 +546,7 @@ struct SwitcherPage: View {
                 InlineNotice(title: "后台操作未完成", detail: store.message, symbol: "exclamationmark.triangle", tint: p.amber, p: p)
             }
             if let result = store.background {
-                Label("保护后台：\((result.guard_backend_healthy ?? result.backend_healthy) ? "身份与心跳已确认" : "尚未确认") · 监控采样：\(result.backend_healthy ? "完整" : "待复核") · 状态读取于 \(timeLabel(result.observed_at))", systemImage: "clock")
+                Label(result.evidenceSummary + " · 状态读取于 \(timeLabel(result.observed_at))", systemImage: "clock")
                     .font(WatchTypography.caption).foregroundStyle(p.secondary)
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     LazyVGrid(columns: [GridItem(.flexible(minimum: 310), spacing: 14, alignment: .top),
@@ -589,7 +582,9 @@ struct SwitcherPage: View {
                         .font(WatchTypography.caption).foregroundStyle(stale ? p.secondary : service.healthy ? p.mint : service.state == "inactive" ? p.secondary : p.amber)
                 }
                 Text(service.detail).font(WatchTypography.body).fixedSize(horizontal: false, vertical: true)
+                if let summary = service.evidenceSummary { Text(summary).font(WatchTypography.small).foregroundStyle(p.secondary) }
                 if let desired = service.desired { Text("保存设置：" + (desired ? "开启" : "关闭") + " · 实际状态见回读结果").font(WatchTypography.small).foregroundStyle(p.secondary) }
+                if let successful = service.last_success_at { Text("最近有效巡检：" + timeLabel(successful)).font(WatchTypography.small).foregroundStyle(p.secondary) }
                 if let checked = service.last_checked { Text("最近检查：" + timeLabel(checked)).font(WatchTypography.small).foregroundStyle(p.secondary) }
                 HStack {
                     serviceControls(service, descriptor)

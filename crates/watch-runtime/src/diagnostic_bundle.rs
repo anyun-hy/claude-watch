@@ -43,6 +43,8 @@ fn allowed(key: &str) -> bool {
         | "instance_id" | "target" | "trigger" | "outcome" | "error" | "family_state" | "snapshot_seq"
         | "coverage_scope" | "protection_state" | "phases" | "elapsed_ms" | "log_available" | "log_rotated"
         | "omitted_lines" | "heartbeat_present" | "heartbeat_pid" | "heartbeat_status" | "heartbeat_age_seconds"
+        | "backend_alive" | "protection_ready" | "sampling_state" | "backend_sampling_state"
+        | "service_heartbeat_present" | "service_heartbeat_age_seconds" | "evidence_observed_at"
         | "process_found" | "start_identity_matches" | "native_path_matches" | "launchd_registered"
         | "launchd_state" | "launchd_pid" | "worker_verified" | "worker_error_code" | "source_error_code"
         | "backend_read_error" | "backend_healthy" | "native_backend_healthy" | "backend_receipt_age_seconds"
@@ -215,7 +217,7 @@ fn collect_with_broker(storage: &StateStore, broker: &Path) -> Value {
     for name in ["events.jsonl", "events.previous.jsonl", "traffic-events.jsonl", "traffic-events.previous.jsonl", "diagnostic-events.jsonl", "diagnostic-events.previous.jsonl"] {
         sources.push(source(&base.join(name), name, true));
     }
-    for name in ["channel-supervision.json", "channel-events.json", "vpn-supervision.json", "seatbelt-runtime.json", "channel-log-health.json"] {
+    for name in ["channel-supervision.json", "seatbelt-runtime.json", "channel-log-health.json"] {
         sources.push(source(&storage.paths.watch().join("state").join(name), name, false));
     }
     let logs = storage.paths.watch().join("logs");
@@ -261,6 +263,20 @@ fn collect_with_broker(storage: &StateStore, broker: &Path) -> Value {
 mod tests {
     use super::*;
     use crate::storage::Paths;
+    #[test]
+    fn service_liveness_export_keeps_layers_without_private_identity_or_network_data() {
+        let value = json!({"backend_alive":true,"protection_ready":false,"sampling_state":"stale",
+            "backend_sampling_state":"stale","service_heartbeat_present":true,
+            "service_heartbeat_age_seconds":1.0,"evidence_observed_at":20.0,
+            "start_stamp":"private process identity","endpoint":"http://secret@proxy","detail":"private details"});
+        let projected = project(&value,0,&mut TruncationTracker::default()).unwrap();
+        assert_eq!(projected["backend_alive"],true);
+        assert_eq!(projected["protection_ready"],false);
+        assert_eq!(projected["sampling_state"],"stale");
+        assert_eq!(projected["service_heartbeat_age_seconds"],1.0);
+        assert!(!projected.to_string().contains("private"));
+        assert!(!projected.to_string().contains("secret"));
+    }
     #[test]
     fn complete_snapshot_uses_file_budget_and_recent_logs_use_modification_time() {
         let root = std::env::temp_dir().join(format!("cw-large-snapshot-{}", uuid::Uuid::new_v4()));

@@ -17,6 +17,8 @@ const EVENT_MAX_BYTES: usize = 1_048_576;
 const EXPORT_MAX_BYTES: usize = 2_000_000;
 const DEFAULT_COOLDOWN: f64 = 300.0;
 const CRITICAL_COOLDOWN: f64 = 600.0;
+const FAILURE_RETRY_BASE: f64 = 30.0;
+const FAILURE_RETRY_MAX: f64 = 300.0;
 #[cfg(target_os = "macos")]
 const NOFOLLOW: i32 = 0x0100;
 #[cfg(target_os = "linux")]
@@ -78,6 +80,8 @@ pub struct EventFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -134,6 +138,9 @@ pub struct EventFields {
 }
 impl EventFields {
     fn validate(&self) -> Result<()> {
+        if self.family.as_deref().is_some_and(|v| claude_watch_core::policy::PolicyCatalog::family(v).is_none()) {
+            return Err(invalid("策略家族无效"));
+        }
         for value in [
             &self.operation,
             &self.account,
@@ -222,7 +229,7 @@ pub struct NotifyError {
 }
 fn alert_purpose(title: &str) -> &'static str {
     match title {
-        "Claude Watch：已触发保护" => "guard_stop",
+        "Claude Watch：已触发保护" | "Claude Watch：保护状态变化" => "guard_stop",
         "Claude Watch：保护采样异常" => "guard_sampling",
         "Claude Watch：监控采样异常" => "monitor_sampling",
         "Claude Watch：敏感目录文件描述符" => "sensitive_file",
@@ -246,6 +253,20 @@ pub enum AlertOutcome {
 #[serde(default, deny_unknown_fields)]
 struct Cooldowns {
     entries: BTreeMap<String, f64>,
+    failures: BTreeMap<String, FailureCooldown>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FailureCooldown {
+    attempted_at: f64,
+    consecutive_failures: u32,
+}
+impl FailureCooldown {
+    fn retry_seconds(&self) -> f64 {
+        (FAILURE_RETRY_BASE * 2.0_f64.powi(self.consecutive_failures.saturating_sub(1).min(4) as i32))
+            .min(FAILURE_RETRY_MAX)
+    }
 }
 
 pub struct EventStore {
@@ -439,8 +460,8 @@ impl EventStore {
             let value = serde_json::to_value(&fields).map_err(|_| invalid("事件无法编码"))?;
             let allowed: &[&str] = match category {
                 "sampling-state" => &["operation", "status", "action", "previous_state", "elapsed_seconds", "round_id", "confirmed_exited_count", "reason_counts", "process_reason_counts", "sampling_diagnostics"],
-                "guard-decision" => &["session_id", "status", "previous_state", "code", "action", "egress_sampled_at", "dns_sampled_at", "webrtc_sampled_at"],
-                _ => &["session_id", "correlation_id", "action", "status", "code", "count", "elapsed_seconds"],
+                "guard-decision" => &["family", "session_id", "status", "previous_state", "code", "action", "egress_sampled_at", "dns_sampled_at", "webrtc_sampled_at"],
+                _ => &["family", "session_id", "correlation_id", "action", "status", "code", "count", "elapsed_seconds"],
             };
             if value.as_object().is_none_or(|m| m.keys().any(|k| !allowed.contains(&k.as_str()))) { return Err(invalid("诊断事件包含不允许的字段")); }
             let valid = match category {
@@ -752,6 +773,17 @@ impl EventStore {
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
         let key = Self::key(alert);
+        // A failed warning must be throttled without recording delivery or
+        // suppressing a subsequent critical alert with the same title.
+        let failure_key = format!("{}:{}", key, if alert.severity == Severity::Critical { "critical" } else { "warning" });
+        if let Some(failure) = cooldowns.failures.get(&failure_key) {
+            if at < failure.attempted_at {
+                return Ok(AlertOutcome::ClockRollback);
+            }
+            if at - failure.attempted_at < failure.retry_seconds() {
+                return Ok(AlertOutcome::Cooldown);
+            }
+        }
         if let Some(last) = cooldowns.entries.get(&key).copied() {
             if at < last {
                 return Ok(AlertOutcome::ClockRollback);
@@ -772,6 +804,7 @@ impl EventStore {
         match notifier.notify(alert) {
             Ok(()) => {
                 cooldowns.entries.insert(key, at);
+                cooldowns.failures.remove(&failure_key);
                 self.storage.atomic_json(
                     &self.cooldowns_path(),
                     &serde_json::to_value(cooldowns).map_err(|_| invalid("冷却状态无效"))?,
@@ -796,6 +829,13 @@ impl EventStore {
                 Ok(AlertOutcome::Sent)
             }
             Err(error) => {
+                let consecutive_failures = cooldowns.failures.get(&failure_key)
+                    .map_or(1, |v| v.consecutive_failures.saturating_add(1));
+                cooldowns.failures.insert(failure_key, FailureCooldown { attempted_at: at, consecutive_failures });
+                self.storage.atomic_json(
+                    &self.cooldowns_path(),
+                    &serde_json::to_value(&cooldowns).map_err(|_| invalid("冷却状态无效"))?,
+                )?;
                 self.append(
                     "alert-failed",
                     EventFields {

@@ -94,6 +94,7 @@ fn known_alerts_route_to_the_relevant_watch_pages() {
     for (title, expected) in [
         ("Claude Watch：保护采样异常", "environment"),
         ("Claude Watch：已触发保护", "protection"),
+        ("Claude Watch：保护状态变化", "protection"),
         ("Claude Watch：敏感目录文件描述符", "events"),
     ] {
         notifier.notify(&alert(title, Severity::Warning)).unwrap();

@@ -117,7 +117,7 @@ def build_plan(run_dir: Path) -> tuple[list[Step], dict]:
         Step("rust.workspace", "test", [["cargo", "test", "--workspace", "--locked", "--no-fail-fast",
               "--", "--test-threads=1", "--nocapture"]], dependencies=["rust.build", "macos.gui_session"],
              environment=cargo_env, timeout_seconds=7200,
-             notes=["Default Cargo tests; the three ignored cases have separate entries.",
+             notes=["Default Cargo tests; automatic opt-in cases have separate entries; the root launchd diagnostic requires separate authorization and is excluded.",
                     "May open owned fixture windows and terminate owned child processes."]),
         Step("rust.engine", "prerequisite", dependencies=["rust.build"], prepare=[
             {"kind": "require_file", "path": "{engine}"}]),
@@ -457,7 +457,8 @@ class Runner:
             # A workspace assertion failure need not discard fresh fixture
             # exports from other passing tests. These steps verify the actual
             # files in this NEW run directory; they never reuse an older run.
-            if step.id in ("rust.monitor_coverage_fixture", "rust.process_protection_fixture", "rust.target_discovery_fixture"):
+            if step.id in ("rust.monitor_coverage_fixture", "rust.process_protection_fixture",
+                           "rust.target_discovery_fixture", "rust.mechanism_review_fixtures"):
                 bad_deps = [dep for dep in bad_deps if prior.get(dep) != "failed"]
             if step.excluded_reason:
                 result.update(status="excluded", reason=step.excluded_reason)

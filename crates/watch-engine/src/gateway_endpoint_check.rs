@@ -2,11 +2,11 @@
 //! these handles verifies the installed broker and both protected listeners;
 //! this short-lived command never accepts or forwards application traffic.
 use claude_watch_core::error::{CoreError, Result};
-use claude_watch_system::launchd_gateway::{acquire_gateway_listener, VerifiedGatewayListener};
+use claude_watch_system::launchd_gateway::{acquire_gateway_listener_for_install, VerifiedGatewayListener};
 use serde_json::{json, Value};
 
 pub fn run(arguments: &[String]) -> Result<Value> {
-    check(arguments, acquire_gateway_listener)
+    check(arguments, acquire_gateway_listener_for_install)
 }
 
 fn check(

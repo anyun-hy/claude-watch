@@ -467,9 +467,6 @@ impl<R: ReadRunner> Sampler<R> {
             discovery: Some(json!({"revision":discovery_snapshot.revision,"complete":discovery_snapshot.complete,"issues":discovery_snapshot.issues})),
         })
     }
-    pub(crate) fn retain_channel_targets(&mut self, tracked: &[Target]) {
-        self.tracked = tracked.to_vec();
-    }
     pub fn sockets(&self, round: &ProcessRound) -> Result<SocketRound> {
         if round.targets.is_empty() {
             return Ok(SocketRound {

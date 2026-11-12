@@ -51,7 +51,7 @@ fn command(state: ChannelPermitState, seq: u64, now: f64) -> ChannelEnforcementC
     }
 }
 fn enforcer() -> LocalTunnelEnforcer {
-    let e = LocalTunnelEnforcer::new("boot", None);
+    let e = LocalTunnelEnforcer::new("boot");
     e.set_strict_peer_verification(true);
     e.set_local_proxy_ready(true, 100.).unwrap();
     e.configure_seatbelt_backend(true, 100.).unwrap();
@@ -184,7 +184,7 @@ fn failed_inventory_revokes_but_retains_managed_cli_membership() {
     let root = std::env::temp_dir().join(format!("cw-inventory-contract-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&root).unwrap();
     let store = StateStore::new(Paths::new(&root).unwrap());
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot", Some(store.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot"));
     enforcer.activate_interception(100.).unwrap();
     let mut supervisor = ChannelSupervisor::new(store.clone(), Some(enforcer.clone()), None).unwrap();
     let mut processes = command(ChannelPermitState::Revoked, 1, 100.).allowed_processes;
@@ -196,9 +196,9 @@ fn failed_inventory_revokes_but_retains_managed_cli_membership() {
         family: "claude".into(), observed_at: 101.,
     }).unwrap();
     assert_eq!(snapshot.families["claude"].permit_state, ChannelPermitState::Revoked);
-    let command = store.read_json(&store.paths.watch().join("state/channel-command-claude.json"), json!(null)).unwrap();
-    assert_eq!(command["allowed_processes"][0]["pid"], 1234);
-    assert_eq!(command["permit"]["reason_code"], "channel_inventory_incomplete");
+    let frame = claude_watch_runtime::channel_policy_status::read_frame(&store);
+    assert_eq!(frame["families"]["claude"]["active_members"][0]["pid"], 1234);
+    assert_eq!(frame["authoritative_permits"]["claude"]["reason_code"], "channel_inventory_incomplete");
     std::fs::remove_dir_all(root).unwrap();
 }
 #[test]
@@ -245,7 +245,7 @@ fn explicit_proxy_connection_does_not_tunnel_upstream_back_to_itself() {
             "revocation must close the real TAG connection"
         );
     });
-    let e = LocalTunnelEnforcer::new("explicit-proxy", None);
+    let e = LocalTunnelEnforcer::new("explicit-proxy");
     e.activate_interception(100.).unwrap();
     let mut cmd = command(ChannelPermitState::Permitted, 1, 100.);
     cmd.target_executor_boot_id = Some(e.boot_id().unwrap());

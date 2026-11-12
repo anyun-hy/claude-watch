@@ -244,11 +244,30 @@ impl SamplingHistory {
 }
 #[derive(Default)]
 pub struct GuardHistory {
-    last: Option<(Option<String>, String, String)>,
-    last_failed: Option<String>,
+    families: BTreeMap<String, FamilyGuardHistory>,
 }
 impl GuardHistory {
     pub fn observe(&mut self, queue: &DiagnosticQueue, receipt: &Value, at: f64) {
+        let rows: Vec<&Value> = receipt["families"].as_array()
+            .map(|rows| rows.iter().collect()).unwrap_or_else(|| vec![receipt]);
+        for row in rows {
+            let family = row["family"].as_str();
+            if family.is_some_and(|f| claude_watch_core::policy::PolicyCatalog::family(f).is_none()) {
+                continue;
+            }
+            self.families.entry(family.unwrap_or("claude").into()).or_default()
+                .observe(queue, row, at);
+        }
+    }
+}
+#[derive(Default)]
+struct FamilyGuardHistory {
+    last: Option<(Option<String>, String, String)>,
+    last_failed: Option<String>,
+}
+impl FamilyGuardHistory {
+    fn observe(&mut self, queue: &DiagnosticQueue, receipt: &Value, at: f64) {
+        let family = receipt["family"].as_str().map(str::to_owned);
         let session = uuid(&receipt["session_id"]);
         let guard = &receipt["session_guard"];
         let current = if guard.is_null()
@@ -265,6 +284,7 @@ impl GuardHistory {
                 queue.send(
                     "guard-decision",
                     EventFields {
+                        family: family.clone(),
                         session_id: Some(ended),
                         status: Some("idle".into()),
                         code: Some("session_ended".into()),
@@ -287,6 +307,7 @@ impl GuardHistory {
             queue.send(
                 "guard-decision",
                 EventFields {
+                    family: family.clone(),
                     session_id: session.clone(),
                     status: Some(current.clone()),
                     previous_state: self
@@ -363,6 +384,7 @@ impl GuardHistory {
             queue.send(
                 "guard-stop",
                 EventFields {
+                    family: family.clone(),
                     session_id: session.clone(),
                     correlation_id: Some(action_id.clone()),
                     action: Some(
@@ -380,6 +402,7 @@ impl GuardHistory {
             queue.send(
                 "guard-stop",
                 EventFields {
+                    family: family.clone(),
                     session_id: session.clone(),
                     correlation_id: Some(action_id),
                     action: Some("result_post_action".into()),
@@ -421,6 +444,35 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(ready());
+    }
+    #[test]
+    fn guard_history_keeps_family_transitions_and_pending_vocabulary() {
+        let (path, store) = fixture();
+        let queue = DiagnosticQueue::new(store.clone());
+        let events = EventStore::new(store);
+        let mut history = GuardHistory::default();
+        let sid = Uuid::new_v4().to_string();
+        let claude = json!({"family":"claude","session_guard":{"state":"idle"}});
+        let openai = |state: &str, code: &str| json!({"family":"openai", "session_id":sid,
+            "session_guard":{"state":state,"reason":{"code":code}}});
+        let pending = openai("pending_verification", "initial_audit_pending");
+        history.observe(&queue, &json!({"session_guard":{"state":"idle"},"families":[claude,pending]}), 1000.0);
+        // Reordering families cannot create a false transition or hide one.
+        history.observe(&queue, &json!({"families":[pending,claude]}), 1001.0);
+        history.observe(&queue, &json!({"families":[claude,openai("locked","egress_ip_changed")]}), 1002.0);
+        wait_for(|| events.history().is_ok_and(|h| h.events.iter().filter(|e| e.category == "guard-decision").count() == 3));
+        let rows = events.history().unwrap().events;
+        let decisions: Vec<_> = rows.iter().filter(|e| e.category == "guard-decision").collect();
+        assert_eq!(decisions.len(), 3);
+        assert_eq!(decisions.iter().filter(|e| e.fields.family.as_deref() == Some("claude")).count(), 1);
+        let pending = decisions.iter().find(|e| e.fields.status.as_deref() == Some("pending_verification")).unwrap();
+        assert_eq!(pending.fields.family.as_deref(), Some("openai"));
+        assert_eq!(pending.fields.code.as_deref(), Some("initial_audit_pending"));
+        let locked = decisions.iter().find(|e| e.fields.status.as_deref() == Some("locked")).unwrap();
+        assert_eq!(locked.fields.family.as_deref(), Some("openai"));
+        assert_eq!(locked.fields.previous_state.as_deref(), Some("pending_verification"));
+        drop(queue);
+        fs::remove_dir_all(path).unwrap();
     }
     #[test]
     fn transitions_recovery_and_guard_attempts_remain_correlated() {
@@ -583,117 +635,28 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
     #[test]
-    fn controller_quit_precedes_full_or_failed_log_queue() {
-        use claude_watch_core::{
-            config::Config,
-            error::Result,
-            session::{self, Desktop, Launcher},
+    fn channel_cutoff_precedes_full_or_failed_log_queue() {
+        use claude_watch_core::config::Config;
+        use claude_watch_runtime::{
+            channel_enforcer::LocalTunnelEnforcer,
+            channel_policy_status::read_guard_summary,
+            channel_supervisor::{ChannelSupervisor, SupervisionEvent},
         };
-        use claude_watch_runtime::controlled::{Controller, DesktopSystem};
-        struct Fake {
-            running: bool,
-            family: &'static str,
-        }
-        impl DesktopSystem for Fake {
-            fn channel_mode(&self) -> bool {
-                false
-            }
-            fn now(&self) -> f64 {
-                1001.0
-            }
-            fn set_family(&mut self, family_id: &str) -> Result<()> {
-                // The fixture supervises one Claude-shaped target; the OpenAI
-                // family has no processes, so its tick stays idle.
-                self.family = if family_id == "claude" { "claude" } else { "openai" };
-                Ok(())
-            }
-            fn monotonic(&self) -> Duration {
-                Duration::from_secs(1001)
-            }
-            fn wait(&mut self, _: Duration) {}
-            fn desktops(&mut self) -> Result<Vec<(Desktop, bool, String)>> {
-                Ok(if self.running && self.family == "claude" {
-                    vec![(
-                        Desktop {
-                            pid: 77,
-                            start_seconds: 10,
-                            start_microseconds: 20,
-                        },
-                        true,
-                        "fixture".into(),
-                    )]
-                } else {
-                    vec![]
-                })
-            }
-            fn desktop_alive(&mut self, _: &Desktop) -> Result<bool> {
-                Ok(self.running)
-            }
-            fn desktop_tree_running(&mut self) -> Result<bool> {
-                Ok(self.running)
-            }
-            fn launcher(&mut self) -> Result<Launcher> {
-                unreachable!()
-            }
-            fn full_audit(&mut self) -> Result<Value> {
-                unreachable!()
-            }
-            fn egress(&mut self) -> Value {
-                panic!("locked session must not probe")
-            }
-            fn local_guard(&mut self) -> Result<Value> {
-                // The Claude-shaped target has a locked session and must not
-                // sample; the OpenAI family has no process and reports idle.
-                if self.family == "claude" {
-                    panic!("locked session must not sample")
-                }
-                Ok(json!({"proxy":"ok","tun":"ok","guard_backend_healthy":true}))
-            }
-            fn backend_healthy(&mut self) -> Result<bool> {
-                Ok(true)
-            }
-            fn launcher_matches(&mut self, _: &Launcher) -> Result<bool> {
-                Ok(false)
-            }
-            fn open_desktop(&mut self) -> Result<()> {
-                unreachable!()
-            }
-            fn quit_desktop(&mut self) -> Result<()> {
-                self.running = false;
-                Ok(())
-            }
-            fn quit_for_confirmed_ip_risk(&mut self, forced: &mut Option<u32>) -> Result<()> {
-                *forced = Some(0);
-                self.quit_desktop()
-            }
-        }
         let (path, store) = fixture();
-        let config = Config {
-            guard_enabled: true,
-            ..Default::default()
+        let config = Config { guard_enabled: true, ..Config::default_for_new_install() };
+        store.atomic_json(&store.paths.config(), &config.value().unwrap()).unwrap();
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("queue-fixture"));
+        enforcer.activate_interception(1000.0).unwrap();
+        let mut supervisor = ChannelSupervisor::new(store.clone(), Some(enforcer), None).unwrap();
+        let mut cutoff = |at| {
+            supervisor.handle_event(SupervisionEvent::ProcessInventoryUnavailable {
+                family: "claude".into(), observed_at: at,
+            }).unwrap();
+            let receipt = read_guard_summary(&store, at);
+            assert_eq!(receipt["families"][0]["channel_state"], "blocked");
+            assert_eq!(receipt["families"][0]["process_preserved"], true);
+            receipt
         };
-        store
-            .atomic_json(&store.paths.config(), &config.value().unwrap())
-            .unwrap();
-        let reference = json!({"ip":"1.1.1.1","country":"JP","checked_at":1000.0,"context":"ctx","source":"fixture"});
-        let audit = json!({"ready":true,"observed_at":1000.0,"expires_at":1030.0,"context_id":"ctx","context_transition":{"state":"stable"},"egress_reference":reference});
-        let exit = json!({"ip":"1.1.1.1","country":"JP","observed_at":1000.0});
-        let session = session::begin(
-            &audit,
-            &exit,
-            &json!({"state":"safe","observed_at":1000.0}),
-            &Uuid::new_v4().to_string(),
-            1000.0,
-        )
-        .unwrap();
-        let locked = session::lock(session, "egress_ip_changed", "fixture", 1000.5, None, None);
-        store
-            .atomic_json(
-                &store.paths.session(),
-                &serde_json::to_value(locked).unwrap(),
-            )
-            .unwrap();
-        let controller = Controller::new(store.clone());
         let (sender, receiver) = mpsc::sync_channel(1);
         let queue = DiagnosticQueue {
             sender,
@@ -701,20 +664,12 @@ mod tests {
             failed: Arc::new(AtomicU64::new(0)),
         };
         queue.send("sampling-state", EventFields::default(), 1000.0);
-        let mut fake = Fake { running: true, family: "claude" };
-        let receipt = controller.guard_tick(&mut fake).unwrap();
-        assert!(!fake.running);
-        assert_eq!(receipt["stop_state"], "confirmed");
-        GuardHistory::default().observe(&queue, &receipt, 1001.0);
+        GuardHistory::default().observe(&queue, &cutoff(1001.0), 1001.0);
         assert!(queue.dropped.load(Ordering::Relaxed) > 0);
         drop(receiver);
         fs::create_dir(store.paths.base().join("events.jsonl")).unwrap();
-        let failing = DiagnosticQueue::new(store);
-        fake.running = true;
-        let receipt = controller.guard_tick(&mut fake).unwrap();
-        assert!(!fake.running);
-        assert_eq!(receipt["stop_state"], "confirmed");
-        GuardHistory::default().observe(&failing, &receipt, 1001.0);
+        let failing = DiagnosticQueue::new(store.clone());
+        GuardHistory::default().observe(&failing, &cutoff(1002.0), 1002.0);
         wait_for(|| failing.failed.load(Ordering::Relaxed) > 0);
         drop(failing);
         fs::remove_dir_all(path).unwrap();

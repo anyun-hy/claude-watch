@@ -29,6 +29,9 @@ pub trait AuditSystem {
     ) -> Result<Value> {
         self.local(config)
     }
+    fn network_and_local(&self, config: &Config, target: claude_watch_core::processes::LaunchTarget) -> Result<(Value, Value)> {
+        Ok((self.network()?, self.local_for_target(config, target)?))
+    }
     fn online(&mut self, config: &Config, local: &Value) -> Result<Value>;
     fn online_for_target(
         &mut self,
@@ -208,8 +211,7 @@ impl AuditStore {
         }
         .load()?;
         let policy = policy_digest(&config.value()?)?;
-        let before_network = system.network()?;
-        let mut before = system.local_for_target(&config, target)?;
+        let (before_network, mut before) = system.network_and_local(&config, target)?;
         if let Some(capture) = guard_capture.as_deref_mut() {
             capture.before = Some(crate::guard_diagnostics::capture_phase(
                 &self.storage, &config, &before, system.now(),
@@ -280,8 +282,11 @@ impl AuditStore {
             storage: self.storage.clone(),
         }
         .load()?;
-        let after_network = system.network()?;
-        let after = system.local_for_target(&after_config, target)?;
+        let (after_network, after) = if options.launch || (options.online && config.online_enabled && transport) {
+            system.network_and_local(&after_config, target)?
+        } else {
+            (before_network.clone(), before.clone())
+        };
         if let Some(capture) = guard_capture {
             capture.after = Some(crate::guard_diagnostics::capture_phase(
                 &self.storage, &after_config, &after, system.now(),
@@ -421,31 +426,25 @@ impl AuditStore {
         {
             return Err(CoreError::new("context_changed", "采样期间策略已变化"));
         }
-        let mut updated: Vec<_> = history
-            .into_iter()
-            .filter(|v| now - v.get("time").and_then(Value::as_f64).unwrap_or(0.0) <= 172_800.0)
-            .collect();
-        if let Some(ip) = output
-            .pointer("/egress_reference/ip")
-            .and_then(Value::as_str)
-            .filter(|v| !v.is_empty())
+        let superseded = self.storage.read_json(&self.audit_path(), Value::Null)?["observed_at"]
+            .as_f64().is_some_and(|old| old > now);
+        if let Some(ip) = output.pointer("/egress_reference/ip").and_then(Value::as_str)
+            .filter(|v| !v.is_empty() && output["context_transition"]["state"] == "stable")
         {
+            // The earlier history was only input to this audit. Merge under
+            // the writer lock so a concurrent observation is never replaced.
+            let current = self.storage.read_json(&self.history_path(), json!([]))?;
+            let cutoff = system.now() - 172_800.0;
+            let mut updated = current.as_array().into_iter().flatten().filter(|v|
+                v["time"].as_f64().is_some_and(|at| at >= cutoff)).cloned().collect::<Vec<_>>();
             updated.push(json!({"time":now,"ip":ip}));
+            updated.sort_by(|a,b| a["time"].as_f64().unwrap_or(0.0).total_cmp(&b["time"].as_f64().unwrap_or(0.0)));
+            updated.drain(..updated.len().saturating_sub(2_048));
+            self.storage.atomic_json(&self.history_path(), &json!(updated))?;
         }
-        if updated.len() > 2_048 {
-            updated.drain(..updated.len() - 2_048);
+        if superseded {
+            return Err(CoreError::new("superseded_audit", "更晚审计已保存，未用迟到结果覆盖"));
         }
-        if self.storage.read_json(&self.audit_path(), Value::Null)?["observed_at"]
-            .as_f64()
-            .is_some_and(|old| old > now)
-        {
-            return Err(CoreError::new(
-                "superseded_audit",
-                "更晚审计已保存，未用迟到结果覆盖",
-            ));
-        }
-        self.storage
-            .atomic_json(&self.history_path(), &json!(updated))?;
         self.storage.atomic_json(&self.audit_path(), &output)?;
         self.storage.atomic_json(&self.detection_path(), &output)?;
         Ok(output)

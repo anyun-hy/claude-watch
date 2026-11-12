@@ -3,7 +3,7 @@ mod hardened_helper;
 
 use claude_watch_core::{
     channel::{
-        BoundProcessToken, ChannelEnforcementState, ChannelPermitState, NetworkBackendKind,
+        BoundProcessToken, ChannelEnforcementState, ChannelPermit, ChannelPermitState, NetworkBackendKind,
     },
     config::Config,
     processes::ProcessRole,
@@ -208,7 +208,7 @@ fn setup_active_session_and_supervisor(
     let (tmp, store, cfg) = setup_store_with_vpn_expectation(configure);
     let now = 1_720_000_000.0;
     seed_probe_receipts(&store, now, "US");
-    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-vpn-guard", Some(store.clone())));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("boot-vpn-guard"));
     enforcer.set_local_proxy_ready(true, now).unwrap();
     enforcer
         .configure_seatbelt_backend(true, now)
@@ -385,6 +385,72 @@ fn queued_vpn_refresh_uses_delivery_clock_without_extending_sample_expiry() {
 }
 
 #[test]
+fn stable_vpn_cutoff_refreshes_live_execution_evidence_without_reissuing_commands() {
+    use claude_watch_core::channel::{ChannelMonitorDisplayState, PolicySyncState};
+    let (_tmp, store, _) = setup_store_with_vpn_expectation(|_, _| {});
+    let now = 1_720_000_000.0;
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("stable-cutoff"));
+    enforcer.set_local_proxy_ready(true, now).unwrap();
+    enforcer.configure_seatbelt_backend(true, now).unwrap();
+    let mut supervisor = ChannelSupervisor::new(store.clone(), Some(enforcer.clone()), None).unwrap();
+    let observation = sample_vpn_observation(now, 1);
+    supervisor.handle_event(SupervisionEvent::VpnObservationUpdated { observation,
+        observed_at: now }).unwrap();
+    let first = supervisor.handle_event(SupervisionEvent::LeaseExpired {
+        observed_at: now + 4.0, woke_from_sleep: false }).unwrap();
+    let command_seq = first.families["claude"].command_seq;
+    assert_eq!(first.families["claude"].display_state, ChannelMonitorDisplayState::Blocked);
+
+    let (receipt_tx, receipt_rx) = mpsc::channel();
+    enforcer.set_receipt_event_sink(move |receipt| { receipt_tx.send(receipt).unwrap(); }).unwrap();
+    // Frequent deadline ticks refresh before expiry without publishing on every tick.
+    for quarter in 1..=13 {
+        supervisor.handle_event(SupervisionEvent::LeaseExpired {
+            observed_at: now + 4.0 + f64::from(quarter) / 4.0, woke_from_sleep: false,
+        }).unwrap();
+    }
+    assert!(receipt_rx.try_recv().is_err());
+    supervisor.handle_event(SupervisionEvent::LeaseExpired {
+        observed_at: now + 7.5, woke_from_sleep: false,
+    }).unwrap();
+    assert!(receipt_rx.try_recv().is_err(), "inline refresh must not queue a duplicate");
+    let frame = claude_watch_runtime::channel_policy_status::read_frame(&store);
+    assert_eq!(frame["enforcement_receipts"]["claude"]["observed_at"], now + 7.5);
+
+    for elapsed in [20.0, 70.0, 210.0] {
+        let current = supervisor.handle_event(SupervisionEvent::LeaseExpired {
+            observed_at: now + elapsed, woke_from_sleep: false }).unwrap();
+        let state = &current.families["claude"];
+        assert_eq!(state.command_seq, command_seq, "a stable cutoff does not need another command");
+        assert_eq!(state.permit_state, ChannelPermitState::Revoked);
+        assert_eq!(state.vpn_match, Some(VpnMatch::Stale));
+        assert_eq!(state.display_state, ChannelMonitorDisplayState::Blocked);
+        assert_eq!(state.policy_sync_state, PolicySyncState::Applied);
+        let persisted = store.read_json(&store.paths.watch().join("state/channel-supervision.json"), Value::Null).unwrap();
+        let receipt: claude_watch_core::channel::ChannelEnforcementReceipt =
+            serde_json::from_value(persisted["enforcement_receipts"]["claude"].clone()).unwrap();
+        assert_eq!(receipt.observed_at, now + elapsed, "read live state, never renew a stored receipt");
+        assert!(receipt.new_connections_blocked && receipt.active_flows_closed);
+        assert_eq!(receipt.active_flows_count, 0);
+        let disk = store.read_json(&store.paths.watch().join("state/channel-receipt-claude.json"), Value::Null).unwrap();
+        assert_eq!(disk["observed_at"], json!(now + elapsed));
+        assert_eq!(disk["command_seq"], json!(command_seq));
+    }
+
+    // A later read must reflect lost confinement, not just stamp the old blocked receipt.
+    enforcer.configure_seatbelt_backend(false, now + 214.0).unwrap();
+    let unavailable = supervisor.handle_event(SupervisionEvent::LeaseExpired {
+        observed_at: now + 214.0, woke_from_sleep: false }).unwrap();
+    assert_eq!(unavailable.families["claude"].display_state, ChannelMonitorDisplayState::Failed);
+    let persisted = store.read_json(&store.paths.watch().join("state/channel-supervision.json"), Value::Null).unwrap();
+    let receipt: claude_watch_core::channel::ChannelEnforcementReceipt =
+        serde_json::from_value(persisted["enforcement_receipts"]["claude"].clone()).unwrap();
+    assert_eq!(receipt.observed_at, now + 214.0);
+    assert!(!receipt.interception_active);
+    assert_eq!(receipt.enforcement_state, ChannelEnforcementState::Failed);
+}
+
+#[test]
 fn v01_v02_v03_v10_vpn_node_mode_or_direct_chain_mismatch_revokes_immediately_without_egress_change_or_warn_exemption() {
     // Configure ALL warn policies to "warn" to prove V10: warn policy NEVER exempts VPN mismatch/unknown/stale
     let (_tmp, _store, _cfg, enforcer, mut supervisor, _rx, proc_tok, now) =
@@ -521,23 +587,18 @@ fn v08_v09_mid_dial_vpn_epoch_change_aborts_connection_and_recovery_requires_new
 
     // V08: Mid-dial VPN epoch change aborts in-flight dial
     let enforcer_for_hook = enforcer.clone();
-    let store_for_hook = store.clone();
+    let frame = claude_watch_runtime::channel_policy_status::read_frame(&store);
+    let permit: ChannelPermit = serde_json::from_value(frame["authoritative_permits"]["claude"].clone()).unwrap();
+    let command = claude_watch_core::channel::ChannelEnforcementCommand {
+        family: permit.family.clone(), session_id: permit.session_id.clone(), policy_version: permit.policy_version.clone(),
+        permit_generation: permit.permit_generation, command_seq: permit.command_seq, issued_at: permit.issued_at,
+        target_executor_boot_id: frame["executor_boot_id"].as_str().map(str::to_owned),
+        allowed_processes: serde_json::from_value(frame["families"]["claude"]["active_members"].clone()).unwrap(),
+        upstream_endpoint: supervisor.upstream_endpoint().to_owned(), permit,
+    };
     enforcer
-        .set_on_dial_hook(move |fam| {
-            // Simulate supervisor issuing a new command or VPN epoch changing during dial
-            let mut cmd =
-                serde_json::from_value::<claude_watch_core::channel::ChannelEnforcementCommand>(
-                    store_for_hook
-                        .read_json(
-                            &store_for_hook
-                                .paths
-                                .watch()
-                                .join(format!("state/channel-command-{fam}.json")),
-                            Value::Null,
-                        )
-                        .unwrap(),
-                )
-                .unwrap();
+        .set_on_dial_hook(move |_| {
+            let mut cmd = command.clone();
             cmd.command_seq += 1;
             cmd.permit.command_seq = cmd.command_seq;
             cmd.permit.vpn_epoch = Some(VpnEpoch::new("vpn-obs-boot-1", 99));
@@ -1082,7 +1143,7 @@ fn r1_r2_seatbelt_missing_vpn_expectation_corrupt_config_or_legacy_migration_fai
     assert!(resolved_fresh.blocking_reason().is_none());
 
     let enforcer1: Arc<dyn ChannelEnforcer> =
-        Arc::new(LocalTunnelEnforcer::new("boot-r1-fresh", Some(store1.clone())));
+        Arc::new(LocalTunnelEnforcer::new("boot-r1-fresh"));
     let (tx1, _rx1) = mpsc::channel();
     let mut sup1 = ChannelSupervisor::new_with_config(
         store1.clone(),
@@ -1146,7 +1207,7 @@ fn r1_r2_seatbelt_missing_vpn_expectation_corrupt_config_or_legacy_migration_fai
         "corrupt config.json must produce config_invalid blocking reason"
     );
     let enforcer2: Arc<dyn ChannelEnforcer> =
-        Arc::new(LocalTunnelEnforcer::new("boot-r1-corrupt", Some(store2.clone())));
+        Arc::new(LocalTunnelEnforcer::new("boot-r1-corrupt"));
     let (tx2, _rx2) = mpsc::channel();
     let mut sup2 = ChannelSupervisor::new(store2.clone(), Some(enforcer2), Some(tx2)).unwrap();
     let snap2 = sup2
@@ -1497,7 +1558,7 @@ fn f02_f03_gateway_process_crash_preserves_target_for_5s_and_stalled_supervisor_
         let registration = registry
             .start_registration_listener(&socket, stop.clone())
             .unwrap();
-        let enforcer = Arc::new(LocalTunnelEnforcer::new(boot, Some(store)));
+        let enforcer = Arc::new(LocalTunnelEnforcer::new(boot));
         // Component-only capability injection. The production identity-report gate is not
         // changed or supplied with a fabricated authentication success.
         enforcer.configure_seatbelt_backend(true, now).unwrap();
@@ -1533,7 +1594,6 @@ fn f02_f03_gateway_process_crash_preserves_target_for_5s_and_stalled_supervisor_
                 stop.clone(),
                 Duration::from_millis(25),
                 move || read_clock.load(Ordering::Acquire) as f64 / 1000.0,
-                |_| {},
             )
             .unwrap();
         let req = ControlledLaunchRequest {
@@ -2057,7 +2117,7 @@ fn r3_verified_orphan_child_retains_gateway_permission_and_survives_revocation()
             }
         }
     });
-    let enforcer = Arc::new(LocalTunnelEnforcer::new(boot, Some(store)));
+    let enforcer = Arc::new(LocalTunnelEnforcer::new(boot));
     enforcer.configure_seatbelt_backend(true, now).unwrap();
     enforcer.set_clock(move || now + 0.5).unwrap();
     let reg = registry.clone();

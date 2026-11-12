@@ -16,7 +16,7 @@ use claude_watch_core::{
     config::Config,
     error::{CoreError, Result},
     processes::LaunchTarget,
-    session::Phase,
+    session::{Egress, Phase, GUARD_EGRESS_TTL},
     vpn::{VpnEpoch, VpnExpectation, VpnObservation},
 };
 use claude_watch_runtime::{
@@ -45,7 +45,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
-    sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc},
+    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, mpsc, Arc},
     thread,
     time::{Duration, Instant},
 };
@@ -210,11 +210,11 @@ impl Drop for OwnedStack {
     }
 }
 
-struct FixtureVpn;
+struct FixtureVpn { revision: Arc<AtomicU64> }
 impl VpnSourceReader for FixtureVpn {
     fn read_observation(&self, expectation: &VpnExpectation, _: bool, sample_seq: u64,
         epoch: VpnEpoch, now: f64) -> VpnObservation {
-        let mut sample = fixtures::sample_vpn_observation(now, 1);
+        let mut sample = fixtures::sample_vpn_observation(now, self.revision.load(Ordering::Acquire));
         sample.sample_seq = sample_seq;
         sample.epoch = epoch;
         sample.upstream_endpoint = Some(expectation.proxy_url.clone());
@@ -270,6 +270,13 @@ fn wait_read(path: &Path, expected: &str) -> String {
         assert!(Instant::now() < deadline, "{}: expected {expected}, found {text:?}", path.display());
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn persisted_egress(egress: Egress) -> Egress {
+    // SessionStore persists and reloads JSON. Apply that same representation
+    // to worker evidence before exact equality (no timestamp epsilon): the
+    // JSON parser can otherwise differ by one f64 ULP from the in-memory row.
+    serde_json::from_slice(&serde_json::to_vec(&egress).unwrap()).unwrap()
 }
 
 fn upstream(mut stream: TcpStream) {
@@ -356,8 +363,9 @@ pub fn run_contract() {
     let release_audit = Arc::clone(&audit_ready);
     let audit_store = storage.clone();
     let (audits, audit_records) = mpsc::channel();
+    let vpn_revision = Arc::new(AtomicU64::new(1));
     let mut production = OwnedStack(Some(assemble_production_channel_stack_with_vpn_reader(
-        storage.clone(), workers.0.clone(), false, Some(Arc::new(FixtureVpn)),
+        storage.clone(), workers.0.clone(), false, Some(Arc::new(FixtureVpn { revision: vpn_revision.clone() })),
         move |req| {
             let until = Instant::now() + Duration::from_secs(3);
             while !release_audit.load(Ordering::Acquire) {
@@ -496,6 +504,7 @@ pub fn run_contract() {
         };
         assert_eq!(pending.families["claude"].permit_state, ChannelPermitState::PendingVerification, "{pending:?}");
         assert!(sessions.load(native::now()).unwrap().is_none_or(|s| s.state == Phase::Ended));
+        stack.supervisor.drain_emitted_events();
         audit_ready.store(true, Ordering::Release);
         // Wait for the worker's real result, then leave it queued while the
         // executor's deadline clock advances. No event or session is injected.
@@ -514,21 +523,38 @@ pub fn run_contract() {
         assert!(watchdog_at - completed_before_delivery > claude_watch_core::channel::CLOCK_ROLLBACK_TOLERANCE_SECONDS);
         stack.enforcer.enforce_active_deadlines(watchdog_at, false).unwrap();
         assert!(sessions.load(watchdog_at).unwrap().is_none_or(|s| s.state == Phase::Ended));
-        let deadline = Instant::now() + Duration::from_secs(4);
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut events = Vec::new();
+        let mut refresh = None;
         let projection = loop {
             let snapshot = stack.step_with_system(&mut system).unwrap();
+            events.extend(stack.supervisor.drain_emitted_events());
             let state = &snapshot.families["claude"];
+            if refresh.is_none() {
+                if let Some(adoption) = events.iter().find(|event| event.family_state.family == "claude"
+                    && event.family_state.reason_code == "session_adopted") {
+                    // Reproduce the original race deterministically through the
+                    // synthetic reader, not an injected permit/session/event.
+                    let revision = vpn_revision.fetch_add(1, Ordering::AcqRel) + 1;
+                    refresh = Some((revision, adoption.family_state.vpn_epoch.clone()));
+                }
+            }
             if state.permit_state == ChannelPermitState::Permitted && state.display_state == ChannelMonitorDisplayState::Forwarding {
-                break snapshot;
+                if let Some((revision, adopted_epoch)) = &refresh {
+                    let vpn: Value = claude_watch_runtime::channel_policy_status::read_frame(&storage)["vpn_supervision"].clone();
+                    if state.vpn_epoch != *adopted_epoch && vpn["observation"]["source_revision"] == format!("rev-{revision}") {
+                        break snapshot;
+                    }
+                }
             }
             if Instant::now() >= deadline {
-                let timeline: Vec<_> = stack.supervisor.drain_emitted_events().into_iter()
+                let timeline: Vec<_> = events.iter()
                     .filter(|event| event.family_state.family == "claude")
                     .map(|event| (event.family_state.updated_at, event.family_state.command_seq,
-                        event.family_state.permit_state, event.family_state.reason_code)).collect();
+                        event.family_state.permit_state, &event.family_state.reason_code, &event.family_state.vpn_epoch)).collect();
                 eprintln!("production adoption event timeline: {timeline:?}");
                 known_audits.extend(audit_records.try_iter());
-                panic!("no automatically adopted session: {state:?}; audits={known_audits:?}");
+                panic!("no automatically adopted and reverified session: {state:?}; audits={known_audits:?}");
             }
             stack.wait_or_drain(deadline, &workers.0);
         };
@@ -540,7 +566,7 @@ pub fn run_contract() {
         let audit_deadline = Instant::now() + Duration::from_secs(1);
         let audit = loop {
             if let Some(index) = known_audits.iter().position(|row| row["audit_observation_id"] == adopted.audit_observation_id) {
-                break known_audits.remove(index);
+                break known_audits[index].clone();
             }
             let row = audit_records.recv_timeout(audit_deadline.saturating_duration_since(Instant::now())).unwrap_or_else(|_| {
                 panic!("audit for adopted observation {} not captured: {known_audits:?}", adopted.audit_observation_id)
@@ -550,9 +576,15 @@ pub fn run_contract() {
         assert_eq!(audit["target"], json!(target), "adopted session must bind this target: {audit}");
         assert_eq!(audit["audit_ready"], true);
         assert_eq!(audit["session_id"], Value::Null, "new adoption cannot start with a hand-built session");
-        assert_eq!(audit["request_vpn_epoch"], json!(state.vpn_epoch));
-        assert_eq!(audit["egress"]["vpn_epoch"], json!(state.vpn_epoch));
-        assert_eq!(audit["policy_version"], json!(state.saved_policy_version));
+        let adoption = events.iter().find(|event| {
+            let state = &event.family_state;
+            state.family == "claude" && state.session_id.as_deref() == Some(adopted.session_id.as_str())
+                && state.reason_code == "session_adopted" && state.permit_state == ChannelPermitState::Permitted
+        }).expect("the production supervisor must emit this session's adoption");
+        assert!(adoption.family_state.vpn_epoch.as_ref().is_some_and(VpnEpoch::is_valid));
+        assert_eq!(audit["request_vpn_epoch"], json!(adoption.family_state.vpn_epoch));
+        assert_eq!(audit["egress"]["vpn_epoch"], json!(adoption.family_state.vpn_epoch));
+        assert_eq!(audit["policy_version"], json!(adoption.family_state.saved_policy_version));
         assert_eq!(audit["egress"]["policy_version"], audit["policy_version"]);
         assert_eq!(audit["egress"]["via_controlled_path"], true);
         let queue_age = watchdog_at - audit["completed_at"].as_f64().unwrap();
@@ -563,12 +595,57 @@ pub fn run_contract() {
         assert_eq!(adopted.extra["adopted_from"], "running_processes");
         assert_eq!(adopted.extra["channel_processes_v1"], json!(state.active_members));
         assert_eq!(state.session_id.as_deref(), Some(adopted.session_id.as_str()));
+        // The observer may invalidate/refresh its epoch before Forwarding is
+        // visible. Recovery preserves the initial audit ID but replaces the
+        // session baseline. Bind the final permission to that actual baseline,
+        // rather than falsely requiring the adoption epoch to last forever.
+        let current_audit = loop {
+            if let Some(row) = known_audits.iter().find(|row|
+                Egress::parse(&row["egress"], projection.captured_at).map(persisted_egress).as_ref() == Some(&adopted.baseline)) {
+                break row.clone();
+            }
+            let row = audit_records.recv_timeout(audit_deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| panic!("audit for current session baseline not captured: {adopted:?}; audits={known_audits:?}"));
+            known_audits.push(row);
+        };
+        let current_authority = events.iter().rev().find(|event| {
+            let authority = &event.family_state;
+            authority.family == "claude" && authority.session_id == state.session_id
+                && authority.permit_generation == state.permit_generation
+                && authority.permit_state == ChannelPermitState::Permitted
+                && matches!(authority.reason_code.as_str(), "session_adopted" | "channel_recovered")
+        }).expect("current permission must come from an observed adoption or verified recovery");
+        assert_eq!(current_authority.family_state.reason_code, "channel_recovered");
+        assert_ne!(current_authority.family_state.vpn_epoch, adoption.family_state.vpn_epoch);
+        assert_eq!(current_authority.family_state.vpn_epoch, state.vpn_epoch);
+        assert!(current_authority.family_state.command_seq <= state.command_seq);
+        assert_eq!(current_audit["target"], json!(target));
+        assert_eq!(current_audit["audit_ready"], true);
+        assert_eq!(current_audit["request_vpn_epoch"], json!(state.vpn_epoch));
+        assert_eq!(current_audit["egress"]["vpn_epoch"], json!(state.vpn_epoch));
+        assert_eq!(current_audit["policy_version"], json!(state.saved_policy_version));
+        assert_eq!(current_audit["egress"]["policy_version"], current_audit["policy_version"]);
+        assert_eq!(current_audit["egress"]["via_controlled_path"], true);
+        assert_eq!(current_audit["audit_context"], adopted.context_id);
+        assert_eq!(Egress::fresh(&current_audit["egress"], projection.captured_at, GUARD_EGRESS_TTL).map(persisted_egress), Some(adopted.baseline.clone()));
+        assert!(current_audit["completed_at"].as_f64().unwrap() <= current_authority.family_state.updated_at);
+        if current_authority.family_state.reason_code == "session_adopted" {
+            assert_eq!(current_audit["audit_observation_id"], audit["audit_observation_id"]);
+            assert_eq!(current_audit["session_id"], Value::Null);
+        } else {
+            assert_ne!(current_audit["audit_observation_id"], audit["audit_observation_id"]);
+            assert_eq!(current_audit["session_id"], adopted.session_id);
+        }
+        let vpn: Value = claude_watch_runtime::channel_policy_status::read_frame(&storage)["vpn_supervision"].clone();
+        assert_eq!(vpn["observation"]["epoch"], json!(state.vpn_epoch));
+        assert!(vpn["observation"]["valid_until"].as_f64().unwrap() > projection.captured_at);
+        assert!(state.vpn_match.as_ref().is_some_and(|m| m.is_matched()));
         let receipt = stack.enforcer.receipt_for("claude", native::now()).unwrap().unwrap();
         assert_eq!(receipt.session_id, state.session_id);
         assert_eq!(receipt.command_seq, state.command_seq);
         assert_eq!(receipt.vpn_epoch, state.vpn_epoch);
         assert_eq!(receipt.executor_boot_id, stack.enforcer.boot_id().unwrap());
-        assert_eq!(audit["egress"]["executor_boot_id"], receipt.executor_boot_id);
+        assert_eq!(current_audit["egress"]["executor_boot_id"], receipt.executor_boot_id);
         let observed = entry("status", target);
         assert_eq!(observed["status_report"]["active_managed_count"], 1);
         assert_eq!(observed["status_report"]["protected_instance_count"], 0, "fixture readiness is not I03");
@@ -591,7 +668,9 @@ pub fn run_contract() {
         assert!(exit.success(), "generated {role} entry: {exit}");
         proof.push(json!({"role":role,"pid":pid,"helper_pid":helper_pid,"native_registry":true,"gateway_round_trip":tunneled.trim(),
             "fixture_readiness_only":true,"entry_exit":exit.code(),"status_report":observed["status_report"],
-            "pending":pending,"audit":audit,"other_audit_count":known_audits.len(),"queue_age_seconds":queue_age,
+            "pending":pending,"audit":audit,"adoption_event":adoption,"current_audit":current_audit,
+            "current_authority_event":current_authority,"vpn_observation":vpn["observation"],"events":events,
+            "other_audit_count":known_audits.len().saturating_sub(1),"queue_age_seconds":queue_age,
             "watchdog_at_before_delivery":watchdog_at,
             "adopted":adopted,"applied":projection,"enforcer_receipt":receipt}));
         drop(own_helper);

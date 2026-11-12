@@ -79,15 +79,22 @@ impl Client {
         self.credentials.base()
     }
     pub fn get(&self, path: &str) -> Result<Value, Error> {
+        self.get_before(path, Instant::now() + self.timeout)
+    }
+    fn get_before(&self, path: &str, deadline: Instant) -> Result<Value, Error> {
         if !API_PATHS.contains(&path) {
             return Err(Error::Path);
         }
         let started = Instant::now();
+        let timeout = self.timeout.min(deadline.saturating_duration_since(started));
+        if timeout.is_zero() {
+            return Err(Error::Timeout);
+        }
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .proxy(None)
             .max_redirects(0)
             .http_status_as_error(false)
-            .timeout_global(Some(self.timeout))
+            .timeout_global(Some(timeout))
             .max_response_header_size(MAX_HEADERS)
             .build()
             .into();
@@ -140,7 +147,7 @@ impl Client {
         if !value.is_object() {
             return Err(Error::Json);
         }
-        if started.elapsed() > self.timeout {
+        if started.elapsed() > timeout || Instant::now() >= deadline {
             return Err(Error::Timeout);
         }
         Ok(value)
@@ -187,10 +194,26 @@ impl Client {
         expected_port: Option<u16>,
         include_rules: bool,
     ) -> Result<(ControllerFastSnapshot, ObservationConsistency), Error> {
-        let configs_before = self.get("/configs")?;
-        let proxies_before = self.get("/proxies")?;
+        self.observe_fast_vpn_state_before(
+            group, expected_host, expected_port, include_rules,
+            Instant::now() + self.timeout * 5,
+        )
+    }
+
+    /// All controller requests, including the closing consistency read, share
+    /// one deadline. A partial snapshot never substitutes for that last read.
+    pub fn observe_fast_vpn_state_before(
+        &self,
+        group: &str,
+        expected_host: &str,
+        expected_port: Option<u16>,
+        include_rules: bool,
+        deadline: Instant,
+    ) -> Result<(ControllerFastSnapshot, ObservationConsistency), Error> {
+        let configs_before = self.get_before("/configs", deadline)?;
+        let proxies_before = self.get_before("/proxies", deadline)?;
         let rules_payload = if include_rules {
-            Some(self.get("/rules")?)
+            Some(self.get_before("/rules", deadline)?)
         } else {
             None
         };
@@ -206,7 +229,7 @@ impl Client {
         .map_err(|_| Error::Protocol)?;
 
         if let Some(ref rev_before) = snap_before.revision {
-            let configs_after = self.get("/configs")?;
+            let configs_after = self.get_before("/configs", deadline)?;
             let rev_after = configs_after.get("revision").and_then(|v| {
                 v.as_str()
                     .map(str::to_owned)
@@ -224,8 +247,8 @@ impl Client {
         }
 
         // Two-phase boundary verification when controller does not expose a monotonic revision
-        let configs_after = self.get("/configs")?;
-        let proxies_after = self.get("/proxies")?;
+        let configs_after = self.get_before("/configs", deadline)?;
+        let proxies_after = self.get_before("/proxies", deadline)?;
         let snap_after = tag_config::fast_controller_snapshot(
             &self.base(),
             group,
@@ -236,6 +259,10 @@ impl Client {
             rules_payload.as_ref(),
         )
         .map_err(|_| Error::Protocol)?;
+
+        if Instant::now() >= deadline {
+            return Err(Error::Timeout);
+        }
 
         let consistent = snap_before.running_mode == snap_after.running_mode
             && snap_before.upstream_endpoint == snap_after.upstream_endpoint
